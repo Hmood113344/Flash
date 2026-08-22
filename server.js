@@ -688,4 +688,6 @@ init();
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`🚀 ${CONFIG.SITE_NAME} server running on port ${CONFIG.PORT}`);
+    const t = CONFIG.BOT_TOKEN || "";
+    console.log(`🔑 BOT_TOKEN تشخيص — الطول: ${t.length} | البداية: ${t.slice(0, 6)} | النهاية: ${t.slice(-6)} | عدد النقاط (يجب 2): ${(t.match(/\./g) || []).length}`);
 });
