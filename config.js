@@ -8,7 +8,7 @@ const CONFIG = {
     DISCORD_CLIENT_ID: "1270290369359384600",
     DISCORD_CLIENT_SECRET: "alqaq47MY2ge50dJ2YOp6wevAak0y1av",
     DISCORD_CALLBACK_URL: "https://your-site.onrender.com/auth/discord/callback",
-    BOT_TOKEN: "ضع_توكن_البوت_هنا",
+    BOT_TOKEN: "MTI3MDI5MDM2OTM1OTM4NDYwMA.GSLZp2.ZQZVr1GY8M7JcCo9NehuXxAJrA7tdFjMYBuACw",
     GUILD_ID: "ضع_آيدي_السيرفر_هنا",
 
     // ── قاعدة البيانات ──
