@@ -16,7 +16,7 @@ const CONFIG = {
 
     // ── الموقع ──
     SITE_NAME: "فلاش",
-    SESSION_SECRET: "غيّر_هذا_السر_MOI_2026",
+    SESSION_SECRET: "norv_moi_secret_789",
     PORT: process.env.PORT || 7700,
 
     // ── رتب العسكر المعتمدة لتسجيل الدخول (قابلة للزيادة، ضع آيدي الرتبة/الرول) ──
