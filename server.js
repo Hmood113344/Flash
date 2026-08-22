@@ -58,9 +58,14 @@ async function fetchGuildMember(discordId) {
             `https://discord.com/api/v10/guilds/${CONFIG.GUILD_ID}/members/${discordId}`,
             { headers: { Authorization: `Bot ${CONFIG.BOT_TOKEN}` } }
         );
-        if (!r.ok) return null;
+        if (!r.ok) {
+            const body = await r.text().catch(() => "");
+            console.error(`❌ fetchGuildMember فشل — status: ${r.status} — body: ${body}`);
+            return null;
+        }
         return await r.json();
     } catch (e) {
+        console.error("❌ fetchGuildMember خطأ:", e);
         return null;
     }
 }
@@ -70,6 +75,17 @@ async function isMilitary(discordId) {
     if (!member || !member.roles) return false;
     return member.roles.some(r => CONFIG.MILITARY_ROLE_IDS.includes(r));
 }
+
+// ⚠️ مؤقت للتشخيص فقط — احذف هذا الراوت بعد ما تحل المشكلة
+app.get("/api/debug-roles", ensureAuth, async (req, res) => {
+    const member = await fetchGuildMember(req.user.id);
+    res.json({
+        guildIdUsed: CONFIG.GUILD_ID,
+        yourDiscordId: req.user.id,
+        militaryRoleIdsConfigured: CONFIG.MILITARY_ROLE_IDS,
+        memberFetchResult: member ? { roles: member.roles, nick: member.nick } : "فشل الجلب — شوف اللوق بالسيرفر لمعرفة السبب (status code)",
+    });
+});
 
 // ══════════════════════════════════════════════════════════════════════════
 // API
@@ -348,6 +364,11 @@ app.get("/", (req, res) => {
         background: #1e293b; padding: 10px 20px; border-radius: 10px;
         border: 1px solid #3b82f6; z-index: 999; display: none;
     }
+    footer {
+        text-align: center; padding: 1.5rem; margin-top: 2rem;
+        border-top: 1px solid rgba(59,130,246,0.2);
+        background: rgba(5,15,30,0.8); color: #475569; font-size: 0.9rem;
+    }
 </style>
 </head>
 <body>
@@ -355,6 +376,9 @@ app.get("/", (req, res) => {
     <div class="card center">جارِ التحميل...</div>
 </div>
 <div id="toast"></div>
+<footer>
+    <p>جميع الحقوق محفوظة © 2026 | <span style="color:#3b82f6;font-weight:bold;">${CONFIG.SITE_NAME} — نظام مخالفات وزارة الداخلية</span></p>
+</footer>
 
 <script>
 let ME = null;
