@@ -12,7 +12,7 @@ const CONFIG = {
     GUILD_ID: "ضع_آيدي_السيرفر_هنا",
 
     // ── قاعدة البيانات ──
-    MONGO_URI: "ضع_رابط_MongoDB_هنا",
+    MONGO_URI: "mongodb+srv://hmooduu6_db_user:0ks7Ktqh5IIteciW@cluster0.6bk7qm9.mongodb.net/?appName=Cluster0",
 
     // ── الموقع ──
     SITE_NAME: "فلاش",
