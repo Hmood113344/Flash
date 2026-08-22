@@ -9,7 +9,7 @@ const CONFIG = {
     DISCORD_CLIENT_SECRET: "alqaq47MY2ge50dJ2YOp6wevAak0y1av",
     DISCORD_CALLBACK_URL: "https://your-site.onrender.com/auth/discord/callback",
     BOT_TOKEN: "MTI3MDI5MDM2OTM1OTM4NDYwMA.GSLZp2.ZQZVr1GY8M7JcCo9NehuXxAJrA7tdFjMYBuACw",
-    GUILD_ID: "ضع_آيدي_السيرفر_هنا",
+    GUILD_ID: "1497233353030766662",
 
     // ── قاعدة البيانات ──
     MONGO_URI: "mongodb+srv://hmooduu6_db_user:0ks7Ktqh5IIteciW@cluster0.6bk7qm9.mongodb.net/?appName=Cluster0",
