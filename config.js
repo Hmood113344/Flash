@@ -5,8 +5,8 @@ const mongoose = require("mongoose");
 // ══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
     // ── ديسكورد ──
-    DISCORD_CLIENT_ID: "ضع_CLIENT_ID_هنا",
-    DISCORD_CLIENT_SECRET: "ضع_CLIENT_SECRET_هنا",
+    DISCORD_CLIENT_ID: "1270290369359384600",
+    DISCORD_CLIENT_SECRET: "alqaq47MY2ge50dJ2YOp6wevAak0y1av",
     DISCORD_CALLBACK_URL: "https://your-site.onrender.com/auth/discord/callback",
     BOT_TOKEN: "ضع_توكن_البوت_هنا",
     GUILD_ID: "ضع_آيدي_السيرفر_هنا",
