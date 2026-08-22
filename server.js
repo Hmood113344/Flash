@@ -1,4 +1,3 @@
-ق
 const express = require("express");
 const session = require("express-session");
 const passport = require("passport");
@@ -416,8 +415,14 @@ function renderLogin() {
     document.getElementById('app').innerHTML = \`
         <div class="card center" style="margin-top:60px;">
             <h1>${CONFIG.SITE_NAME}</h1>
-            <p style="color:#94a3b8;margin-bottom:20px;">نظام تسجيل المخالفات لمنسوبي الجهات العسكرية</p>
-            <a class="btn" href="/auth/discord">تسجيل الدخول عبر ديسكورد</a>
+            <p style="color:#94a3b8;margin-bottom:24px;">نظام تسجيل المخالفات لمنسوبي الجهات العسكرية</p>
+            <a href="/auth/discord" style="
+                display:inline-flex; align-items:center; justify-content:center; gap:10px;
+                background:#5b6cf5; color:#fff; font-weight:bold; font-size:17px;
+                padding:16px 34px; border-radius:999px; text-decoration:none;
+                box-shadow:0 6px 18px rgba(91,108,245,0.45); transition:0.2s;">
+                <span>🔒</span><span>تسجيل الدخول عبر ديسكورد</span>
+            </a>
         </div>\`;
 }
 
