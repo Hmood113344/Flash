@@ -683,7 +683,7 @@ app.get("/", (req, res) => {
 <body>
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
-<footer><p>جميع الحقوق محفوظة © 2026 | <span style="color:#3b82f6;font-weight:bold;">${CONFIG.SITE_NAME} — نظام مخالفات وزارة الداخلية</span></p></footer>
+<footer><p>جميع الحقوق محفوظة © 2026 | <span style="color:#3b82f6;font-weight:bold;">${CONFIG.SITE_NAME} — نظام مخالفات لمهيدي و اصدقائه</span></p></footer>
 
 <script>
 let ME = null;
