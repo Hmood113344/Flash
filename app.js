@@ -37,7 +37,7 @@ const CONFIG = {
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
-    SITE_NAME: "فلاش",
+    SITE_NAME: "فلاش رجع و اقوى من قبل",
     // رابط الموقع (يُستخرج من رابط الكولباك تلقائياً، أو يُحدَّد يدوياً عبر SITE_URL بمتغيرات البيئة)
     SITE_URL: process.env.SITE_URL || (process.env.DISCORD_CALLBACK_URL ? process.env.DISCORD_CALLBACK_URL.replace(/\/auth\/discord\/callback.*$/, "") : "https://flash1-gtsp.onrender.com"),
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
