@@ -5,7 +5,7 @@
 const express = require("express");
 const session = require("express-session");
 const passport = require("passport");
-const DiscordStrategy = require("passport-discord").Strategy;
+const crypto = require("crypto");
 const mongoose = require("mongoose");
 const {
     Client,
@@ -43,19 +43,11 @@ const CONFIG = {
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7700,
 
-    // رتب العسكر المعتمدة لتسجيل الدخول بالموقع (رولات ديسكورد)
-    MILITARY_ROLE_IDS: [
-        "1500064443537686588",
-        "1533192878510178304",
-        "1500064767082233926",
-        "1545415273438249010",
-        "1505185480394932455",
-    ],
-
-    // آيديات كبار المسؤولين — نفس أسلوب ملف البنك (مصفوفة ثابتة بالكود)
-    SENIOR_ADMIN_IDS: [
-         "1003511814140743825",
-    ],
+    // ── حساب كبير المسؤولين (يُنشأ تلقائياً أول مرة) — تقدر تغيّر الإيميل وكلمة المرور من لوحة الكبار بعد الدخول ──
+    ADMIN_EMAIL: process.env.ADMIN_EMAIL || "admin@moi.sa.com",
+    ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "Admin@12345",
+    // (اختياري) آيديات ديسكورد المسموح لها بأوامر البوت الخاصة بالكبار — لا علاقة لها بالموقع
+    BOT_ADMIN_IDS: (process.env.BOT_ADMIN_IDS || "").split(",").map(x => x.trim()).filter(Boolean),
 
     // الرتب العسكرية الرسمية بالترتيب من الأدنى للأعلى
     MILITARY_RANKS: [
@@ -135,7 +127,7 @@ const CONFIG = {
 // 2) قاعدة البيانات والموديلات
 // ══════════════════════════════════════════════════════════════════════════
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(() => console.log("✅ MongoDB connected"))
+    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 const PersonnelSchema = new mongoose.Schema({
@@ -190,6 +182,89 @@ const PersonnelSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 const Personnel = mongoose.model("Personnel", PersonnelSchema);
+
+// ══════════════════════════════════════════════════════════════════════════
+// حسابات الموقع (تسجيل بالإيميل) — بدل تسجيل الدخول عبر ديسكورد
+// ══════════════════════════════════════════════════════════════════════════
+const AccountSchema = new mongoose.Schema({
+    uid: { type: String, required: true, unique: true },           // المعرّف الداخلي (نفس مفتاح Personnel.discord)
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    fullName: String,
+    age: Number,
+    nationality: String,
+    passwordHash: String,   // للتحقق عند تسجيل الدخول (scrypt)
+    passwordEnc: String,    // نسخة مشفّرة (AES-256-GCM) عشان الكبار والإدارة يشوفونها من اللوحة
+    status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+    isSenior: { type: Boolean, default: false },
+    sector: { type: String, default: null },        // patrol | roadSecurity | antiDrugs | null
+    isMP: { type: Boolean, default: false },        // شرطة عسكرية
+    answers: { available: { type: Boolean, default: false }, capable: { type: Boolean, default: false }, terms: { type: Boolean, default: false } },
+    rejectReason: { type: String, default: null },
+    reviewedBy: String, reviewedByTag: String, reviewedAt: Date,
+    createdAt: { type: Date, default: Date.now },
+});
+const Account = mongoose.model("Account", AccountSchema);
+
+function newUid() { return "u" + crypto.randomBytes(9).toString("hex"); }
+function hashPassword(pw) {
+    const salt = crypto.randomBytes(16);
+    const h = crypto.scryptSync(pw, salt, 64);
+    return salt.toString("hex") + ":" + h.toString("hex");
+}
+function verifyPassword(pw, stored) {
+    if (!stored || typeof stored !== "string") return false;
+    const [saltHex, hashHex] = stored.split(":");
+    if (!saltHex || !hashHex) return false;
+    const calc = crypto.scryptSync(pw, Buffer.from(saltHex, "hex"), 64);
+    const hb = Buffer.from(hashHex, "hex");
+    return hb.length === calc.length && crypto.timingSafeEqual(hb, calc);
+}
+const ACC_ENC_KEY = crypto.createHash("sha256").update("acc-key:" + CONFIG.SESSION_SECRET).digest();
+function encryptText(t) {
+    const iv = crypto.randomBytes(12);
+    const c = crypto.createCipheriv("aes-256-gcm", ACC_ENC_KEY, iv);
+    const enc = Buffer.concat([c.update(String(t), "utf8"), c.final()]);
+    return [iv, c.getAuthTag(), enc].map(x => x.toString("base64")).join(":");
+}
+function decryptText(str) {
+    try {
+        const [iv, tag, enc] = String(str || "").split(":").map(x => Buffer.from(x, "base64"));
+        const d = crypto.createDecipheriv("aes-256-gcm", ACC_ENC_KEY, iv);
+        d.setAuthTag(tag);
+        return Buffer.concat([d.update(enc), d.final()]).toString("utf8");
+    } catch (e) { return null; }
+}
+
+// كبار المسؤولين = الحسابات اللي فيها isSenior (نخزنها بذاكرة عشان isSeniorAdmin تبقى متزامنة)
+const seniorUids = new Set();
+async function refreshSeniors() {
+    const list = await Account.find({ isSenior: true, status: "approved" }, { uid: 1 }).lean();
+    seniorUids.clear();
+    list.forEach(a => seniorUids.add(a.uid));
+}
+async function ensureSeniorAccount() {
+    try {
+        const has = await Account.findOne({ isSenior: true });
+        if (!has) {
+            const email = CONFIG.ADMIN_EMAIL.toLowerCase();
+            const pw = CONFIG.ADMIN_PASSWORD;
+            const existing = await Account.findOne({ email });
+            if (existing) {
+                existing.isSenior = true; existing.status = "approved";
+                await existing.save();
+            } else {
+                await Account.create({
+                    uid: newUid(), email, fullName: "كبير المسؤولين", age: 30, nationality: "سعودي",
+                    passwordHash: hashPassword(pw), passwordEnc: encryptText(pw),
+                    status: "approved", isSenior: true,
+                    answers: { available: true, capable: true, terms: true },
+                });
+            }
+            console.log("✅ تم إنشاء حساب كبير المسؤولين:", email, "— غيّر كلمة المرور من لوحة الحسابات بعد أول دخول");
+        }
+        await refreshSeniors();
+    } catch (e) { console.error("❌ فشل إنشاء حساب كبير المسؤولين:", e.message); }
+}
 
 const ViolationSchema = new mongoose.Schema({
     reporterDiscord: String,
@@ -425,7 +500,11 @@ function rankIndex(rank) {
 }
 
 function isSeniorAdmin(userId) {
-    return CONFIG.SENIOR_ADMIN_IDS.includes(userId);
+    return seniorUids.has(userId);
+}
+// أوامر بوت ديسكورد الخاصة بالكبار (اختياري عبر متغير BOT_ADMIN_IDS) — منفصلة تماماً عن الموقع
+function isBotAdmin(discordUserId) {
+    return CONFIG.BOT_ADMIN_IDS.includes(discordUserId);
 }
 
 async function isAnyAdmin(userId) {
@@ -591,15 +670,9 @@ async function ensureGuildMembersFetched(guild) {
 }
 // يرجع مصفوفة آيديات لو نجح، أو null لو صار خطأ فعلي بالجلب (عشان ما نلخبط "فشل" مع "لا يوجد أعضاء")
 async function getSectorMemberIds(sectorKey) {
-    const roleId = sectorRoleId(sectorKey);
-    if (!roleId) return [];
-    if (!botReady) return null;
     try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const role = await guild.roles.fetch(roleId);
-        if (!role) return [];
-        await ensureGuildMembersFetched(guild);
-        return role.members.map(m => m.id);
+        const list = await Account.find({ status: "approved", sector: sectorKey }, { uid: 1 }).lean();
+        return list.map(a => a.uid);
     } catch (e) {
         console.error("❌ فشل جلب أعضاء القطاع:", e.message);
         return null;
@@ -653,14 +726,11 @@ const client = new Client({
 const pendingMessages = new Map(); // violationId -> { channelId, messageId }
 let botReady = false;
 
-async function isMilitary(discordId) {
-    if (!botReady) return { ok: false, reason: "البوت لسا ما اتصل بديسكورد، حاول بعد ثوانٍ" };
+async function isMilitary(uid) {
     try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const member = await guild.members.fetch(discordId);
-        const has = member.roles.cache.some(r => CONFIG.MILITARY_ROLE_IDS.includes(r.id));
-        const isAntiDrugs = member.roles.cache.has(CONFIG.ANTI_DRUGS_ROLE_ID);
-        return { ok: has, member, isAntiDrugs };
+        const a = await Account.findOne({ uid, status: "approved" }).lean();
+        if (!a) return { ok: false, reason: "حسابك غير مقبول" };
+        return { ok: true, isAntiDrugs: a.sector === "antiDrugs" };
     } catch (e) {
         console.error("❌ isMilitary خطأ:", e.message);
         return { ok: false, reason: e.message };
@@ -687,23 +757,17 @@ async function sendSummonDM(discordId, timeLabel) {
     }
 }
 
-async function isMilitaryPoliceMember(discordId) {
-    if (!botReady) return false;
+async function isMilitaryPoliceMember(uid) {
     try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const member = await guild.members.fetch(discordId);
-        return member.roles.cache.has(CONFIG.MILITARY_POLICE_ROLE_ID);
+        const a = await Account.findOne({ uid, status: "approved" }, { isMP: 1 }).lean();
+        return !!(a && a.isMP);
     } catch (e) { return false; }
 }
 // يرجع آيديات كل حاملي رتبة الشرطة العسكرية، أو null لو تعذر الجلب فعلياً
 async function getMilitaryPoliceMemberIds() {
-    if (!botReady) return null;
     try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const role = await guild.roles.fetch(CONFIG.MILITARY_POLICE_ROLE_ID);
-        if (!role) return [];
-        await ensureGuildMembersFetched(guild);
-        return role.members.map(m => m.id);
+        const list = await Account.find({ status: "approved", isMP: true }, { uid: 1 }).lean();
+        return list.map(a => a.uid);
     } catch (e) {
         console.error("❌ فشل جلب أعضاء الشرطة العسكرية:", e.message);
         return null;
@@ -711,15 +775,10 @@ async function getMilitaryPoliceMemberIds() {
 }
 
 // يرجع مفتاح القطاع اللي هذا الشخص عضو فيه حسب رول ديسكورد (للاستخدام بنظام الإجازات والبصمة)
-async function getMemberSectorKey(discordId) {
-    if (!botReady) return null;
+async function getMemberSectorKey(uid) {
     try {
-        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
-        const member = await guild.members.fetch(discordId);
-        if (member.roles.cache.has(CONFIG.ANTI_DRUGS_ROLE_ID)) return "antiDrugs";
-        if (member.roles.cache.has(CONFIG.PATROL_ROLE_ID)) return "patrol";
-        if (member.roles.cache.has(CONFIG.ROAD_SECURITY_ROLE_ID)) return "roadSecurity";
-        return null;
+        const a = await Account.findOne({ uid, status: "approved" }, { sector: 1 }).lean();
+        return a ? (a.sector || null) : null;
     } catch (e) {
         console.error("❌ getMemberSectorKey خطأ:", e.message);
         return null;
@@ -974,7 +1033,7 @@ client.on("interactionCreate", async interaction => {
             const { commandName } = interaction;
 
             if (commandName === "حظر") {
-                if (!isSeniorAdmin(interaction.user.id)) {
+                if (!isBotAdmin(interaction.user.id)) {
                     return interaction.reply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط.", ephemeral: true });
                 }
                 const target = interaction.options.getUser("اللاعب");
@@ -993,7 +1052,7 @@ client.on("interactionCreate", async interaction => {
             }
 
             if (commandName === "فك-حظر") {
-                if (!isSeniorAdmin(interaction.user.id)) {
+                if (!isBotAdmin(interaction.user.id)) {
                     return interaction.reply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط.", ephemeral: true });
                 }
                 const target = interaction.options.getUser("اللاعب");
@@ -1063,7 +1122,7 @@ client.on("messageCreate", async message => {
     const [cmd] = message.content.slice(1).trim().split(/\s+/);
     if (cmd !== "مركبات") return;
 
-    const senior = isSeniorAdmin(message.author.id);
+    const senior = isBotAdmin(message.author.id);
     if (!senior) return;
     if (activeVehicleSessions.has(message.author.id)) {
         return message.reply("عندك جلسة إضافة مركبات شغالة حالياً، أكملها أول.");
@@ -1189,37 +1248,85 @@ app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialize
 app.use(passport.initialize());
 app.use(passport.session());
 
-passport.serializeUser((user, done) => done(null, user));
-passport.deserializeUser((obj, done) => done(null, obj));
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser(async (uid, done) => {
+    try {
+        const a = await Account.findOne({ uid, status: "approved" }).lean();
+        if (!a) return done(null, false); // الحساب انحذف أو انرفض = تنتهي جلسته فوراً
+        if (a.isSenior) seniorUids.add(a.uid);
+        done(null, { id: a.uid, username: a.fullName || a.email, email: a.email, avatar: null });
+    } catch (e) { done(e); }
+});
 
-passport.use(new DiscordStrategy({
-    clientID: CONFIG.DISCORD_CLIENT_ID,
-    clientSecret: CONFIG.DISCORD_CLIENT_SECRET,
-    callbackURL: CONFIG.DISCORD_CALLBACK_URL,
-    scope: ["identify", "guilds.members.read"],
-}, (accessToken, refreshToken, profile, done) => done(null, profile)));
+// ── حماية بسيطة من التخمين (بالذاكرة) ──
+const authAttempts = new Map();
+function authRateLimit(key, max, windowMs) {
+    const now = Date.now();
+    const arr = (authAttempts.get(key) || []).filter(t => now - t < windowMs);
+    if (arr.length >= max) { authAttempts.set(key, arr); return false; }
+    arr.push(now); authAttempts.set(key, arr);
+    return true;
+}
+function clientIp(req) { return String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim(); }
 
-app.get("/auth/discord", passport.authenticate("discord"));
-app.get("/auth/discord/callback", (req, res, next) => {
-    passport.authenticate("discord", (err, user) => {
-        if (err) {
-            // مثال شائع: "Failed to obtain access token" — يصير غالباً لو الرابط انفتح مرتين
-            // أو تصفّح متصفح الجوال جهّز (prefetch) الرابط قبل الضغط عليه فعلياً، فينستهلك الكود قبل لا يوصل السيرفر
-            console.error("❌ فشل تسجيل الدخول عبر ديسكورد:", err.message);
-            console.error("🔎 تفاصيل إضافية للتشخيص — callbackURL المستخدم:", CONFIG.DISCORD_CALLBACK_URL);
-            console.error("🔎 host اللي وصل بيه الطلب:", req.headers.host, "| x-forwarded-host:", req.headers["x-forwarded-host"], "| x-forwarded-proto:", req.headers["x-forwarded-proto"]);
-            if (err.oauthError) console.error("🔎 err.oauthError:", JSON.stringify(err.oauthError));
-            if (err.data) console.error("🔎 err.data (رد ديسكورد الفعلي):", err.data);
-            if (err.body) console.error("🔎 err.body:", err.body);
-            const isRateLimited = err.oauthError?.statusCode === 429 || (err.data && String(err.data).includes("1015"));
-            return res.redirect(isRateLimited ? "/?loginError=ratelimit" : "/?loginError=1");
-        }
-        if (!user) return res.redirect("/");
-        req.logIn(user, (loginErr) => {
-            if (loginErr) { console.error("❌ فشل تسجيل الدخول (session):", loginErr.message); return res.redirect("/?loginError=1"); }
-            res.redirect("/");
+function validateAccountFields(b, opts = {}) {
+    const fullName = String(b.fullName || "").trim().replace(/\s+/g, " ");
+    const age = parseInt(b.age, 10);
+    const nationality = String(b.nationality || "").trim();
+    const email = String(b.email || "").trim().toLowerCase();
+    const password = String(b.password || "");
+    if (fullName.length < 3 || fullName.length > 60) return { error: "اكتب الاسم الرباعي كامل" };
+    if (!Number.isFinite(age) || age < 10 || age > 99) return { error: "اكتب عمر صحيح" };
+    if (nationality.length < 2 || nationality.length > 30) return { error: "اكتب الجنسية" };
+    if (email.length > 120 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "اكتب بريد إلكتروني صحيح" };
+    if (!(opts.passwordOptional && !password)) {
+        if (password.length < 6 || password.length > 64) return { error: "كلمة المرور لازم تكون من 6 إلى 64 حرف" };
+    }
+    return { vals: { fullName, age, nationality, email, password } };
+}
+
+app.post("/auth/register", async (req, res) => {
+    if (!authRateLimit("reg:" + clientIp(req), 8, 60 * 60 * 1000)) return res.status(429).json({ error: "محاولات كثيرة، انتظر شوي وجرب مرة ثانية" });
+    const b = req.body || {};
+    const v = validateAccountFields(b);
+    if (v.error) return res.status(400).json({ error: v.error });
+    if (!b.terms) return res.status(400).json({ error: "لازم توافق على القوانين والشروط وسياسة السيرفر" });
+    const { fullName, age, nationality, email, password } = v.vals;
+    const exists = await Account.findOne({ email });
+    if (exists) {
+        const msg = exists.status === "pending" ? "عندك طلب قيد المراجعة بنفس هذا البريد، انتظر القبول"
+            : exists.status === "rejected" ? "تم رفض طلب سابق بهذا البريد، تواصل مع الإدارة"
+            : "هذا البريد مسجّل من قبل، سجّل دخولك";
+        return res.status(409).json({ error: msg });
+    }
+    try {
+        await Account.create({
+            uid: newUid(), email, fullName, age, nationality,
+            passwordHash: hashPassword(password), passwordEnc: encryptText(password),
+            status: "pending",
+            answers: { available: !!b.available, capable: !!b.capable, terms: true },
         });
-    })(req, res, next);
+    } catch (e) {
+        if (e && e.code === 11000) return res.status(409).json({ error: "هذا البريد مسجّل من قبل" });
+        throw e;
+    }
+    await logEvent({ action: "طلب تسجيل جديد", actorTag: fullName, details: email });
+    res.json({ ok: true });
+});
+
+app.post("/auth/login", async (req, res, next) => {
+    if (!authRateLimit("login:" + clientIp(req), 30, 10 * 60 * 1000)) return res.status(429).json({ error: "محاولات كثيرة، انتظر شوي وجرب مرة ثانية" });
+    const email = String((req.body || {}).email || "").trim().toLowerCase();
+    const password = String((req.body || {}).password || "");
+    if (!email || !password) return res.status(400).json({ error: "اكتب البريد وكلمة المرور" });
+    const a = await Account.findOne({ email });
+    if (!a || !verifyPassword(password, a.passwordHash)) return res.status(401).json({ error: "البريد أو كلمة المرور غير صحيحة" });
+    if (a.status === "pending") return res.status(403).json({ error: "تم إرسال طلبك للإدارة، انتظر القبول" });
+    if (a.status === "rejected") return res.status(403).json({ error: "تم رفض طلب التسجيل" + (a.rejectReason ? " — السبب: " + a.rejectReason : "") });
+    req.logIn({ id: a.uid }, (err) => {
+        if (err) return next(err);
+        res.json({ ok: true });
+    });
 });
 app.get("/auth/logout", (req, res) => { req.logout(() => res.redirect("/")); });
 
@@ -1378,6 +1485,129 @@ async function ensureJuniorInMySector(req, res, discordId) {
     if (!isJuniorRank(p.rank)) { res.status(403).json({ error: "صلاحيتك تشمل رتبة رئيس رقباء وتحت فقط" }); return null; }
     return p;
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// طلبات التسجيل + إدارة الحسابات
+// ══════════════════════════════════════════════════════════════════════════
+function accView(a, withPw) {
+    return {
+        uid: a.uid, email: a.email, fullName: a.fullName, age: a.age, nationality: a.nationality,
+        status: a.status, isSenior: !!a.isSenior, sector: a.sector || null, isMP: !!a.isMP,
+        answers: a.answers || {}, rejectReason: a.rejectReason || null,
+        reviewedByTag: a.reviewedByTag || null, reviewedAt: a.reviewedAt || null, createdAt: a.createdAt,
+        password: withPw ? decryptText(a.passwordEnc) : undefined,
+    };
+}
+
+async function approveAccount(a, actor) {
+    a.status = "approved"; a.rejectReason = null;
+    a.reviewedBy = actor.id; a.reviewedByTag = actor.username; a.reviewedAt = new Date();
+    await a.save();
+    const settings = await getSettings();
+    await Personnel.findOneAndUpdate(
+        { discord: a.uid },
+        {
+            $set: { registeredName: a.fullName, discordTag: a.fullName },
+            $setOnInsert: {
+                unit: a.sector ? (CONFIG.SECTORS[a.sector] || "غير محدد") : "غير محدد",
+                leaveBalance: settings.leaveBalanceDefault ?? CONFIG.DEFAULT_LEAVE_BALANCE,
+            },
+        },
+        { upsert: true, new: true }
+    );
+    if (a.isSenior) await refreshSeniors();
+}
+
+async function rejectAccount(a, actor, reason) {
+    a.status = "rejected"; a.rejectReason = reason || null;
+    a.reviewedBy = actor.id; a.reviewedByTag = actor.username; a.reviewedAt = new Date();
+    await a.save();
+}
+
+// الطلبات الجديدة — تظهر لكبار المسؤولين والإدارة
+app.get("/api/admin/registrations", ensureAnyAdmin, async (req, res) => {
+    const list = await Account.find({ status: "pending" }).sort({ createdAt: 1 }).lean();
+    res.json({ list: list.map(a => accView(a, true)) });
+});
+
+app.post("/api/admin/registrations/:uid/approve", ensureAnyAdmin, async (req, res) => {
+    const a = await Account.findOne({ uid: req.params.uid, status: "pending" });
+    if (!a) return res.status(404).json({ error: "الطلب غير موجود أو تمت معالجته" });
+    await approveAccount(a, req.user);
+    await logEvent({ action: "قبول حساب جديد", actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
+    res.json({ ok: true });
+});
+
+app.post("/api/admin/registrations/:uid/reject", ensureAnyAdmin, async (req, res) => {
+    const a = await Account.findOne({ uid: req.params.uid, status: "pending" });
+    if (!a) return res.status(404).json({ error: "الطلب غير موجود أو تمت معالجته" });
+    await rejectAccount(a, req.user, String((req.body || {}).reason || "").trim().slice(0, 200));
+    await logEvent({ action: "رفض حساب جديد", actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
+    res.json({ ok: true });
+});
+
+// الحسابات المقبولة / المرفوضة (كبار المسؤولين فقط)
+app.get("/api/senior/accounts", ensureSeniorAdmin, async (req, res) => {
+    const status = req.query.status === "rejected" ? "rejected" : "approved";
+    const list = await Account.find({ status }).sort({ createdAt: -1 }).lean();
+    res.json({ list: list.map(a => accView(a, true)) });
+});
+
+app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res) => {
+    const a = await Account.findOne({ uid: req.params.uid });
+    if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
+    const b = req.body || {};
+    const v = validateAccountFields(b, { passwordOptional: true });
+    if (v.error) return res.status(400).json({ error: v.error });
+    const { fullName, age, nationality, email, password } = v.vals;
+    let sector = b.sector ? String(b.sector) : null;
+    if (sector && !CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير صحيح" });
+    if (email !== a.email) {
+        const dup = await Account.findOne({ email, uid: { $ne: a.uid } });
+        if (dup) return res.status(409).json({ error: "هذا البريد مستخدم لحساب ثاني" });
+    }
+    const oldSector = a.sector;
+    a.fullName = fullName; a.age = age; a.nationality = nationality; a.email = email;
+    a.sector = sector; a.isMP = !!b.isMP;
+    let pwChanged = false;
+    if (password && !verifyPassword(password, a.passwordHash)) {
+        a.passwordHash = hashPassword(password); a.passwordEnc = encryptText(password); pwChanged = true;
+    }
+    await a.save();
+    const p = await Personnel.findOne({ discord: a.uid });
+    if (p) {
+        p.registeredName = fullName; p.discordTag = fullName;
+        const oldLabel = oldSector ? CONFIG.SECTORS[oldSector] : null;
+        if (!p.unit || p.unit === "غير محدد" || (oldLabel && p.unit === oldLabel)) {
+            p.unit = sector ? CONFIG.SECTORS[sector] : "غير محدد";
+        }
+        await p.save();
+    }
+    await logEvent({ action: "تعديل حساب", actorId: req.user.id, actorTag: req.user.username, details: fullName + " — " + email + (pwChanged ? " (تغيير كلمة المرور)" : "") });
+    res.json({ ok: true });
+});
+
+app.post("/api/senior/accounts/:uid/status", ensureSeniorAdmin, async (req, res) => {
+    const a = await Account.findOne({ uid: req.params.uid });
+    if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
+    if (a.isSenior) return res.status(400).json({ error: "ما تقدر ترفض حساب كبير المسؤولين" });
+    const status = (req.body || {}).status;
+    if (status === "approved") await approveAccount(a, req.user);
+    else if (status === "rejected") await rejectAccount(a, req.user, String((req.body || {}).reason || "").trim().slice(0, 200));
+    else return res.status(400).json({ error: "حالة غير صحيحة" });
+    await logEvent({ action: status === "approved" ? "قبول حساب" : "رفض حساب", actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
+    res.json({ ok: true });
+});
+
+app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
+    const a = await Account.findOne({ uid: req.params.uid });
+    if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
+    if (a.isSenior) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير المسؤولين" });
+    await Account.deleteOne({ uid: a.uid });
+    await Personnel.deleteOne({ discord: a.uid });
+    await logEvent({ action: "حذف حساب نهائي", actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
+    res.json({ ok: true });
+});
 
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
@@ -2587,16 +2817,27 @@ app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
 
 app.get("/api/senior/admins", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
-    res.json({ list: settings.adminList });
+    const accs = await Account.find({ uid: { $in: settings.adminList } }, { uid: 1, fullName: 1, email: 1 }).lean();
+    const info = {};
+    accs.forEach(a => { info[a.uid] = a.fullName + " — " + a.email; });
+    res.json({ list: settings.adminList, info });
 });
 
 app.post("/api/senior/hire-admin", ensureSeniorAdmin, async (req, res) => {
     const { discordId, name } = req.body;
-    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حط آيدي الإداري" });
+    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حط بريد الإداري" });
+    let id = discordId.trim();
+    let label = name || "";
+    if (id.includes("@")) {
+        const acc = await Account.findOne({ email: id.toLowerCase(), status: "approved" });
+        if (!acc) return res.status(404).json({ error: "ما لقيت حساب مقبول بهذا البريد" });
+        id = acc.uid;
+        if (!label) label = acc.fullName;
+    }
     const settings = await getSettings();
-    if (!settings.adminList.includes(discordId.trim())) settings.adminList.push(discordId.trim());
+    if (!settings.adminList.includes(id)) settings.adminList.push(id);
     await settings.save();
-    await logEvent({ action: "توظيف إداري", discordId: discordId.trim(), actorId: req.user.id, actorTag: req.user.username, details: name || "" });
+    await logEvent({ action: "توظيف إداري", discordId: id, actorId: req.user.id, actorTag: req.user.username, details: label });
     res.json({ ok: true });
 });
 
@@ -3609,6 +3850,7 @@ app.get("/", (req, res) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${CONFIG.SITE_NAME}</title>
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
     :root {
         --bg1: #0a1628; --bg2: #0d1f3c; --panel: rgba(255,255,255,0.04); --border: rgba(59,130,246,0.25);
@@ -3710,7 +3952,46 @@ app.get("/", (req, res) => {
     .vtype-opt.sel { border-color: #22c55e; background: rgba(34,197,94,0.28); color: #4ade80; font-weight: bold; }
     .vtype-actions { display: flex; gap: 8px; margin-top: 18px; }
     .vtype-actions button { flex: 1; }
+
     .login-screen { text-align: center; padding: 4rem 2rem; }
+    /* ── صفحات الدخول والتسجيل ── */
+    .auth-page { min-height: calc(100vh - 230px); display: flex; align-items: center; justify-content: center; padding: 24px 12px; }
+    .auth-card { width: 100%; max-width: 560px; background: linear-gradient(180deg, #0d1b3a, #09122b); border: 1px solid rgba(212,175,55,0.35); border-radius: 28px; padding: 34px 40px 38px; box-shadow: 0 25px 60px rgba(0,0,0,0.55); }
+    .auth-title { color: #f2c94c; font-size: 32px; font-weight: 800; text-align: center; margin: 0 0 6px; }
+    .auth-sub { color: #a8945a; text-align: center; font-size: 15px; margin-bottom: 26px; letter-spacing: 1px; }
+    .auth-label { display: block; color: #f2c94c; font-weight: 700; font-size: 15px; margin-bottom: 8px; }
+    .auth-input { width: 100%; padding: 16px 18px; border-radius: 14px; border: 1px solid rgba(212,175,55,0.28); background: rgba(255,255,255,0.06); color: #fff; font-size: 16px; margin-bottom: 6px; font-family: inherit; }
+    .auth-input:focus { outline: none; border-color: #f2c94c; box-shadow: 0 0 0 3px rgba(242,201,76,0.15); }
+    .auth-input::placeholder { color: #64748b; }
+    .auth-req { display: block; color: #f87171; font-size: 12px; margin-bottom: 16px; }
+    .auth-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 18px; }
+    .auth-btn { width: 100%; padding: 16px; border: none; border-radius: 999px; background: linear-gradient(90deg, #d9b04f, #f4d27a); color: #111; font-size: 18px; font-weight: 800; cursor: pointer; box-shadow: 0 8px 24px rgba(242,201,76,0.22); font-family: inherit; margin-top: 8px; }
+    .auth-btn:disabled { opacity: 0.6; cursor: wait; }
+    .auth-link { display: block; text-align: center; color: #f2c94c; font-size: 16px; cursor: pointer; margin-top: 4px; }
+    .auth-forgot { display: block; color: #8a7a4d; font-size: 13px; cursor: pointer; margin: 6px 0 16px; }
+    .auth-sep { height: 1px; background: rgba(212,175,55,0.15); margin: 26px 0 22px; }
+    .auth-err { display: none; background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.4); color: #fca5a5; border-radius: 12px; padding: 10px 14px; margin-bottom: 16px; font-size: 14px; text-align: center; }
+    .auth-check { display: flex; align-items: flex-start; gap: 12px; color: #e2e8f0; font-size: 15px; margin-bottom: 14px; line-height: 1.7; cursor: pointer; }
+    .auth-check input { width: 22px; height: 22px; flex-shrink: 0; margin: 4px 0 0; }
+    .auth-done { text-align: center; }
+    .auth-done .ico { font-size: 60px; margin-bottom: 10px; }
+    .auth-done p { color: #cbd5e1; line-height: 1.9; margin-bottom: 20px; }
+    @media (max-width: 560px) { .auth-card { padding: 26px 18px 30px; border-radius: 22px; } .auth-grid { grid-template-columns: 1fr; } .auth-title { font-size: 26px; } }
+    /* ── صفحات الحسابات (لوحة الإدارة) ── */
+    .acc-card .acc-title { font-size: 17px; font-weight: 800; color: var(--gold-soft); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .acc-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); font-size: 13px; }
+    .acc-row span { color: var(--muted); }
+    .acc-row b { font-weight: 600; color: #e2e8f0; text-align: left; word-break: break-all; }
+    .acc-pw { cursor: pointer; direction: ltr; }
+    .acc-tag { font-size: 11px; background: rgba(59,130,246,0.2); border: 1px solid var(--border); border-radius: 20px; padding: 2px 10px; color: var(--gold-soft); font-weight: 600; }
+    .acc-switch { display: flex; gap: 8px; width: 100%; }
+    .acc-sw { flex: 1; padding: 12px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.05); color: #94a3b8; font-weight: 700; cursor: pointer; font-family: inherit; }
+    .acc-sw.on { background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; }
+    .acc-ov { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 4000; display: flex; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 20px 12px; }
+    .acc-modal { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 460px; width: 100%; margin: auto; }
+    .acc-modal h3 { text-align: center; }
+    .acc-check { display: flex; align-items: center; gap: 8px; color: #e2e8f0; }
+    .acc-check input { width: auto; margin: 0; }
     .login-screen h1 { font-size: 3rem; color: #3b82f6; text-shadow: 0 0 20px rgba(59,130,246,0.5); margin-bottom: 10px; }
     footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); font-size: 0.9rem; }
     /* صفحة عرض الصورة بملء الشاشة — نفس أسلوب ديسكورد */
@@ -4523,31 +4804,96 @@ function startBlockedRecheck() {
         } catch (e) {}
     }, 6000);
 }
-function renderLogin() {
+function authShell(inner) {
     document.getElementById('nav-links').innerHTML = '';
     document.getElementById('mobile-menu').innerHTML = '';
-    const loginError = new URLSearchParams(window.location.search).get('loginError');
-    if (loginError && window.history.replaceState) window.history.replaceState({}, '', window.location.pathname);
-    const errorBox = loginError === 'ratelimit'
-        ? \`<div class="card" style="border-color:#f59e0b;max-width:360px;margin:0 auto 20px;">
-            <p style="color:#f59e0b;font-weight:bold;">⏳ ديسكورد مشغول حالياً</p>
-            <p style="color:var(--muted);font-size:13px;margin-top:6px;">في ضغط مؤقت على سيرفر ديسكورد، انتظر شوي (دقيقة أو دقيقتين) وجرب تسجيل الدخول مرة ثانية.</p>
-        </div>\`
-        : loginError === '1'
-        ? \`<div class="card" style="border-color:#f59e0b;max-width:360px;margin:0 auto 20px;">
-            <p style="color:#f59e0b;font-weight:bold;">⚠️ صار خطأ بتسجيل الدخول</p>
-            <p style="color:var(--muted);font-size:13px;margin-top:6px;">جرب مرة ثانية، وتأكد إنك ما تفتح رابط قديم أو مكرر — اضغط الزر تحت من جديد.</p>
-        </div>\`
-        : '';
-    document.getElementById('app').innerHTML = \`
-        <div class="login-screen">
-            <h1>${CONFIG.SITE_NAME}</h1>
-            <p style="color:var(--muted);margin-bottom:28px;">نظام إدارة عسكري لمنسوبي الجهات العسكرية</p>
-            \${errorBox}
-            <a href="/auth/discord" style="display:inline-flex;align-items:center;justify-content:center;gap:10px;background:#5865F2;color:#fff;font-weight:bold;font-size:16px;padding:16px 34px;border-radius:10px;text-decoration:none;box-shadow:0 6px 18px rgba(88,101,242,0.4);">
-                <span>🔒</span><span>تسجيل الدخول عبر ديسكورد</span>
-            </a>
-        </div>\`;
+    document.getElementById('app').innerHTML = '<div class="auth-page"><div class="auth-card">' + inner + '</div></div>';
+}
+function authErr(msg) {
+    const b = document.getElementById('auth-err');
+    if (!b) return;
+    b.textContent = msg || '';
+    b.style.display = msg ? 'block' : 'none';
+}
+function authField(label, id, type, ph, dir) {
+    return '<div><label class="auth-label">' + label + '</label>' +
+        '<input id="' + id + '" class="auth-input" type="' + type + '" placeholder="' + ph + '"' + (dir ? ' dir="' + dir + '"' : '') + ' autocomplete="off">' +
+        '<span class="auth-req">* حقل إجباري</span></div>';
+}
+function renderLogin() {
+    authShell(
+        '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
+        '<div class="auth-sub">Ministry of Interior Server</div>' +
+        '<div id="auth-err" class="auth-err"></div>' +
+        '<label class="auth-label">البريد الإلكتروني :</label>' +
+        '<input id="lg-email" class="auth-input" type="email" dir="ltr" placeholder="example@email.com" autocomplete="username">' +
+        '<label class="auth-label" style="margin-top:14px;">كلمة المرور :</label>' +
+        '<input id="lg-pw" class="auth-input" type="password" dir="ltr" placeholder="••••••••" autocomplete="current-password">' +
+        '<a class="auth-forgot" onclick="authForgot()">هل نسيت كلمة المرور ؟</a>' +
+        '<button class="auth-btn" id="lg-btn" onclick="doLogin()">تسجيل الدخول</button>' +
+        '<div class="auth-sep"></div>' +
+        '<a class="auth-link" onclick="renderRegister()">ليس لديك حساب؟ سجل الآن!</a>'
+    );
+    const enter = function (e) { if (e.key === 'Enter') doLogin(); };
+    document.getElementById('lg-email').onkeydown = enter;
+    document.getElementById('lg-pw').onkeydown = enter;
+}
+function authForgot() { toast('تواصل مع الإدارة لتغيير كلمة المرور'); }
+async function doLogin() {
+    const email = document.getElementById('lg-email').value.trim();
+    const pw = document.getElementById('lg-pw').value;
+    if (!email || !pw) return authErr('اكتب البريد وكلمة المرور');
+    authErr('');
+    try {
+        await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: email, password: pw }) });
+        init();
+    } catch (e) { authErr(e.message); }
+}
+function renderRegister() {
+    authShell(
+        '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
+        '<div class="auth-sub">تسجيل حساب جديد</div>' +
+        '<div id="auth-err" class="auth-err"></div>' +
+        '<div class="auth-grid">' +
+            authField('الاسم الرباعي :', 'rg-name', 'text', 'الاسم كاملاً', '') +
+            authField('العمر :', 'rg-age', 'number', '00', '') +
+            authField('البريد الإلكتروني :', 'rg-email', 'email', 'example@email.com', 'ltr') +
+            authField('الجنسية :', 'rg-nat', 'text', 'سعودي', '') +
+        '</div>' +
+        authField('كلمة المرور :', 'rg-pw', 'password', '••••••••', 'ltr') +
+        '<div class="auth-sep" style="margin:6px 0 20px;"></div>' +
+        '<label class="auth-check"><input type="checkbox" id="rg-avail"><span>هل أنت متفرغ للعمل في سيرفر وزارة الداخلية ؟</span></label>' +
+        '<label class="auth-check"><input type="checkbox" id="rg-capable"><span>هل لديك القدرة علي المشاركة الصوتية والتصوير وتحمل ضغوط العمل ؟</span></label>' +
+        '<label class="auth-check"><input type="checkbox" id="rg-terms"><span>الموافقة علي القوانين والشروط وسياسة سيرفر وزارة الداخلية الواقعي</span></label>' +
+        '<button class="auth-btn" onclick="doRegister()">إنشاء الحساب</button>' +
+        '<div class="auth-sep" style="margin:22px 0 18px;"></div>' +
+        '<a class="auth-link" onclick="renderLogin()">لديك حساب؟ سجل دخولك</a>'
+    );
+}
+async function doRegister() {
+    const v = function (id) { return document.getElementById(id).value.trim(); };
+    const body = {
+        fullName: v('rg-name'), age: v('rg-age'), email: v('rg-email'), nationality: v('rg-nat'),
+        password: document.getElementById('rg-pw').value,
+        available: document.getElementById('rg-avail').checked,
+        capable: document.getElementById('rg-capable').checked,
+        terms: document.getElementById('rg-terms').checked,
+    };
+    if (!body.fullName || !body.age || !body.email || !body.nationality || !body.password) return authErr('عبّي كل الحقول الإجبارية');
+    if (!body.terms) return authErr('لازم توافق على القوانين والشروط وسياسة السيرفر');
+    authErr('');
+    try {
+        await api('/auth/register', { method: 'POST', body: JSON.stringify(body) });
+        renderRegisterDone();
+    } catch (e) { authErr(e.message); }
+}
+function renderRegisterDone() {
+    authShell(
+        '<div class="auth-done"><div class="ico">✅</div>' +
+        '<h1 class="auth-title" style="font-size:26px;">تم إرسال طلبك للإدارة</h1>' +
+        '<p>انتظر القبول — بعد ما تراجع الإدارة طلبك تقدر تسجّل دخولك بالبريد وكلمة المرور اللي سجلتها.</p>' +
+        '<button class="auth-btn" onclick="renderLogin()">الرجوع لتسجيل الدخول</button></div>'
+    );
 }
 function renderBlocked(reason) {
     document.getElementById('nav-links').innerHTML = '';
@@ -4999,7 +5345,9 @@ function renderAdmin() {
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
             <div class="tab" onclick="adminTab('reviewed', this)">✅ المخالفات المقبولة</div>
             <div class="tab" onclick="adminTab('sectors', this)">قادة القطاعات</div>
-            <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
+            <div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div>
+            <div class="tab" onclick="adminTab('accounts', this)">✅ الحسابات المقبولة</div>
+            <div class="tab" onclick="adminTab('personnel', this)">ملفات العسكريين</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
@@ -5009,7 +5357,7 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderAttendanceControl()">🖐️ تحكم البصمة</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
-        </div>\` : '';
+        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div><div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div></div>\` : '');
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
         \${tabsHtml}
@@ -5023,6 +5371,8 @@ function adminTab(name, el) {
     if (name === 'pending') loadPending();
     if (name === 'reviewed') loadReviewedViolations();
     if (name === 'sectors') loadSectors();
+    if (name === 'regs') loadRegs();
+    if (name === 'accounts') loadAccounts();
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
     if (name === 'hire') loadHire();
@@ -6838,14 +7188,181 @@ async function loadVehicleList() {
 function delVehicle(id) {
     api('/api/senior/vehicles/' + id, { method: 'DELETE' }).then(() => { toast('تم الحذف'); loadVehicleList(); });
 }
+let accView_ = 'approved';
+let ACC_LIST = [];
+const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات']];
+function accEsc(t) {
+    return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function accSectorLabel(k) {
+    for (let i = 0; i < ACC_SECTORS.length; i++) if (ACC_SECTORS[i][0] === (k || '')) return ACC_SECTORS[i][1];
+    return 'بدون قطاع';
+}
+function accYN(v) { return v ? '✅ نعم' : '❌ لا'; }
+function accRow(label, val) { return '<div class="acc-row"><span>' + label + '</span><b>' + accEsc(val) + '</b></div>'; }
+function accPwRow(pw) {
+    return '<div class="acc-row"><span>كلمة المرور</span><b class="acc-pw" data-pw="' + accEsc(pw || '') + '" data-shown="0" onclick="togglePw(this)">•••••••• 👁</b></div>';
+}
+function togglePw(el) {
+    if (el.dataset.shown === '1') { el.textContent = '•••••••• 👁'; el.dataset.shown = '0'; }
+    else { el.textContent = el.dataset.pw || '(غير متاح)'; el.dataset.shown = '1'; }
+}
+async function loadRegs() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let list;
+    try { ({ list } = await api('/api/admin/registrations')); }
+    catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; return; }
+    if (currentAdminTab !== 'regs') return;
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات تسجيل جديدة</div>'; return; }
+    box.innerHTML = list.map(function (a) {
+        return '<div class="card acc-card">' +
+            '<div class="acc-title">' + accEsc(a.fullName) + '</div>' +
+            accRow('العمر', a.age) + accRow('الجنسية', a.nationality) + accRow('البريد', a.email) + accPwRow(a.password) +
+            accRow('متفرغ للعمل؟', accYN(a.answers && a.answers.available)) +
+            accRow('قادر على المشاركة الصوتية والتصوير وتحمل الضغط؟', accYN(a.answers && a.answers.capable)) +
+            accRow('تاريخ الطلب', new Date(a.createdAt).toLocaleString('ar')) +
+            '<div class="row" style="gap:8px;margin-top:12px;">' +
+                '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="reject" onclick="decideReg(this)">❌ رفض</button>' +
+                '<button class="btn sm" data-uid="' + a.uid + '" data-act="approve" onclick="decideReg(this)">✅ قبول</button>' +
+            '</div></div>';
+    }).join('');
+}
+async function decideReg(btn) {
+    const uid = btn.dataset.uid, act = btn.dataset.act;
+    let reason = '';
+    if (act === 'reject') {
+        const r = await promptModal('سبب الرفض (اختياري)', '');
+        if (r === null) return;
+        reason = r;
+    } else if (!(await confirmModal('قبول هذا الحساب؟'))) return;
+    try {
+        await api('/api/admin/registrations/' + uid + '/' + act, { method: 'POST', body: JSON.stringify({ reason: reason }) });
+        toast(act === 'approve' ? 'تم قبول الحساب' : 'تم رفض الحساب');
+        loadRegs();
+    } catch (e) { toast(e.message); }
+}
+async function loadAccounts(view) {
+    if (typeof view === 'string') accView_ = view;
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try { ({ list: ACC_LIST } = await api('/api/senior/accounts?status=' + accView_)); }
+    catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; return; }
+    if (currentAdminTab !== 'accounts') return;
+    box.innerHTML =
+        '<div class="card"><div class="acc-switch">' +
+            '<button class="acc-sw' + (accView_ === 'approved' ? ' on' : '') + '" data-v="approved" onclick="loadAccounts(this.dataset.v)">✅ الحسابات المقبولة</button>' +
+            '<button class="acc-sw' + (accView_ === 'rejected' ? ' on' : '') + '" data-v="rejected" onclick="loadAccounts(this.dataset.v)">❌ الحسابات المرفوضة</button>' +
+        '</div></div>' +
+        '<input id="acc-q" placeholder="🔍 بحث بالاسم أو البريد" oninput="renderAccList()">' +
+        '<div id="acc-list"></div>';
+    renderAccList();
+}
+function renderAccList() {
+    const q = ((document.getElementById('acc-q') || {}).value || '').trim().toLowerCase();
+    const box = document.getElementById('acc-list');
+    if (!box) return;
+    const list = ACC_LIST.filter(function (a) { return !q || (a.fullName || '').toLowerCase().indexOf(q) >= 0 || (a.email || '').toLowerCase().indexOf(q) >= 0; });
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">' + (accView_ === 'approved' ? 'لا توجد حسابات مقبولة' : 'لا توجد حسابات مرفوضة') + '</div>'; return; }
+    box.innerHTML = list.map(function (a) {
+        const isRej = accView_ === 'rejected';
+        let btns = '';
+        if (isRej) {
+            btns = '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' +
+                   '<button class="btn sm" data-uid="' + a.uid + '" data-act="approved" onclick="accAction(this)">✅ إعادة قبول</button>';
+        } else {
+            btns = (a.isSenior ? '' :
+                    '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' +
+                    '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="rejected" onclick="accAction(this)">❌ رفض</button>') +
+                   '<button class="btn sm" data-uid="' + a.uid + '" onclick="openAccEdit(this.dataset.uid)">✏️ تعديل</button>';
+        }
+        return '<div class="card acc-card">' +
+            '<div class="acc-title">' + accEsc(a.fullName) + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
+            accRow('البريد', a.email) + accPwRow(a.password) + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
+            accRow('القطاع', accSectorLabel(a.sector)) +
+            accRow('متفرغ للعمل؟', accYN(a.answers && a.answers.available)) +
+            accRow('قادر على المشاركة الصوتية والتصوير وتحمل الضغط؟', accYN(a.answers && a.answers.capable)) +
+            (isRej && a.rejectReason ? accRow('سبب الرفض', a.rejectReason) : '') +
+            (a.reviewedByTag ? accRow(isRej ? 'رفضه' : 'قبله', a.reviewedByTag) : '') +
+            '<div class="row" style="gap:8px;margin-top:12px;">' + btns + '</div></div>';
+    }).join('');
+}
+async function accAction(btn) {
+    const uid = btn.dataset.uid, act = btn.dataset.act;
+    try {
+        if (act === 'delete') {
+            if (!(await confirmModal('حذف الحساب نهائياً مع كل بياناته العسكرية. متأكد؟'))) return;
+            await api('/api/senior/accounts/' + uid, { method: 'DELETE' });
+            toast('تم حذف الحساب');
+        } else if (act === 'rejected') {
+            const r = await promptModal('سبب الرفض (اختياري)', '');
+            if (r === null) return;
+            await api('/api/senior/accounts/' + uid + '/status', { method: 'POST', body: JSON.stringify({ status: 'rejected', reason: r }) });
+            toast('تم نقل الحساب للمرفوضة');
+        } else {
+            if (!(await confirmModal('إعادة قبول هذا الحساب؟'))) return;
+            await api('/api/senior/accounts/' + uid + '/status', { method: 'POST', body: JSON.stringify({ status: 'approved' }) });
+            toast('تم قبول الحساب');
+        }
+        loadAccounts();
+    } catch (e) { toast(e.message); }
+}
+function closeAccEdit() { const o = document.getElementById('acc-edit-ov'); if (o) o.remove(); }
+function openAccEdit(uid) {
+    const a = ACC_LIST.find(function (x) { return x.uid === uid; });
+    if (!a) return;
+    closeAccEdit();
+    let sec = '';
+    ACC_SECTORS.forEach(function (s) { sec += '<option value="' + s[0] + '">' + s[1] + '</option>'; });
+    const ov = document.createElement('div');
+    ov.id = 'acc-edit-ov'; ov.className = 'acc-ov';
+    ov.innerHTML = '<div class="acc-modal"><h3>تعديل الحساب</h3>' +
+        '<label>الاسم الرباعي</label><input id="ae-name">' +
+        '<label>العمر</label><input id="ae-age" type="number">' +
+        '<label>الجنسية</label><input id="ae-nat">' +
+        '<label>البريد الإلكتروني</label><input id="ae-email" type="email" dir="ltr">' +
+        '<label>كلمة المرور</label><input id="ae-pw" type="text" dir="ltr">' +
+        '<label>القطاع</label><select id="ae-sec">' + sec + '</select>' +
+        '<label class="acc-check"><input type="checkbox" id="ae-mp"> من الشرطة العسكرية</label>' +
+        '<div class="row" style="gap:8px;margin-top:14px;"><button class="btn gray" onclick="closeAccEdit()">إلغاء</button>' +
+        '<button class="btn" data-uid="' + a.uid + '" onclick="saveAccEdit(this)">💾 حفظ</button></div></div>';
+    document.body.appendChild(ov);
+    document.getElementById('ae-name').value = a.fullName || '';
+    document.getElementById('ae-age').value = a.age || '';
+    document.getElementById('ae-nat').value = a.nationality || '';
+    document.getElementById('ae-email').value = a.email || '';
+    document.getElementById('ae-pw').value = a.password || '';
+    document.getElementById('ae-sec').value = a.sector || '';
+    document.getElementById('ae-mp').checked = !!a.isMP;
+    ov.onclick = function (e) { if (e.target === ov) closeAccEdit(); };
+}
+async function saveAccEdit(btn) {
+    const body = {
+        fullName: document.getElementById('ae-name').value.trim(),
+        age: document.getElementById('ae-age').value,
+        nationality: document.getElementById('ae-nat').value.trim(),
+        email: document.getElementById('ae-email').value.trim(),
+        password: document.getElementById('ae-pw').value,
+        sector: document.getElementById('ae-sec').value,
+        isMP: document.getElementById('ae-mp').checked,
+    };
+    try {
+        await api('/api/senior/accounts/' + btn.dataset.uid + '/update', { method: 'POST', body: JSON.stringify(body) });
+        toast('تم حفظ التعديلات');
+        closeAccEdit();
+        loadAccounts();
+    } catch (e) { toast(e.message); }
+}
 async function loadHire() {
     const box = document.getElementById('admin-content');
     box.innerHTML = \`
         <div class="card">
             <h3>توظيف إداري</h3>
             <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">الإداري المعيّن يقدر فقط يقبل أو يرفض المخالفات المعلّقة.</p>
-            <label>آيدي الإداري (Discord ID)</label>
-            <input id="hire-id" placeholder="مثال: 123456789012345678">
+            <label>بريد الإداري (لازم يكون حسابه مقبول)</label>
+            <input id="hire-id" placeholder="example@email.com">
             <label>اسمه</label>
             <input id="hire-name" placeholder="اسم الإداري">
             <button class="btn sm" onclick="hireAdmin()">تم</button>
@@ -6856,17 +7373,17 @@ async function loadHire() {
 async function hireAdmin() {
     const discordId = document.getElementById('hire-id').value.trim();
     const name = document.getElementById('hire-name').value.trim();
-    if (!discordId) return toast('حط آيدي الإداري');
+    if (!discordId) return toast('حط بريد الإداري');
     try { await api('/api/senior/hire-admin', { method: 'POST', body: JSON.stringify({ discordId, name }) }); toast('تم التعيين'); loadHire(); }
     catch (e) { toast(e.message); }
 }
 async function loadAdminsList() {
-    const { list } = await api('/api/senior/admins');
+    const { list, info } = await api('/api/senior/admins');
     if (currentAdminTab !== 'hire') return;
     const box = document.getElementById('admins-list');
     if (!box) return;
     box.innerHTML = list.map(id => \`
-        <div class="card row"><span>\${id}</span><button class="btn danger sm" onclick="fireAdmin('\${id}')">فصل</button></div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا يوجد إداريون معيّنون</div>';
+        <div class="card row"><span>\${(info && info[id]) || id}</span><button class="btn danger sm" onclick="fireAdmin('\${id}')">فصل</button></div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا يوجد إداريون معيّنون</div>';
 }
 function fireAdmin(id) {
     api('/api/senior/fire-admin', { method: 'POST', body: JSON.stringify({ discordId: id }) }).then(() => { toast('تم الفصل'); loadHire(); });
