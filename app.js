@@ -1603,8 +1603,14 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid });
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
     if (a.isSenior) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير المسؤولين" });
+    // حذف نهائي شامل: الحساب + الملف العسكري + الحضور والإجازات + طلبات الترقية + إزالته من الإداريين
     await Account.deleteOne({ uid: a.uid });
     await Personnel.deleteOne({ discord: a.uid });
+    await AttendanceStatus.deleteMany({ discord: a.uid });
+    await AttendanceLog.deleteMany({ discord: a.uid });
+    await LeaveRequest.deleteMany({ discord: a.uid });
+    await PromotionRequest.deleteMany({ targetDiscord: a.uid });
+    await Settings.updateMany({}, { $pull: { adminList: a.uid } });
     await logEvent({ action: "حذف حساب نهائي", actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
     res.json({ ok: true });
 });
@@ -7293,7 +7299,7 @@ async function accAction(btn) {
     const uid = btn.dataset.uid, act = btn.dataset.act;
     try {
         if (act === 'delete') {
-            if (!(await confirmModal('حذف الحساب نهائياً مع كل بياناته العسكرية. متأكد؟'))) return;
+            if (!(await confirmModal('⚠️ حذف الحساب نهائياً — بيتحذف الحساب وكل بياناته (النقاط والرتبة والإجازات والحضور) وما يقدر يدخل مرة ثانية. متأكد؟'))) return;
             await api('/api/senior/accounts/' + uid, { method: 'DELETE' });
             toast('تم حذف الحساب');
         } else if (act === 'rejected') {
