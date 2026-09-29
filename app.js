@@ -7430,26 +7430,13 @@ function mcTap(el) {
     const w = el.closest('.mc-wrap');
     if (!w) return;
     const id = w.getAttribute('data-mc');
+    if (el.closest('#mc-page')) { openMcFull(id); return; }
     const card = w.querySelector('.mcard');
-    if (card.classList.contains('locked')) {
-        card.classList.remove('locked');
-        w.classList.add('unlocked');
-        openMcPage(id);
-    } else {
-        openMcFull(id);
-    }
+    card.classList.remove('locked');
+    w.classList.add('unlocked');
+    openMcPage(id);
 }
-function mcHideCard(btn) {
-    const src = btn.closest('.mc-wrap');
-    const id = src ? src.getAttribute('data-mc') : '';
-    const w = document.getElementById(id);
-    if (w) {
-        const card = w.querySelector('.mcard');
-        if (card) card.classList.add('locked');
-        w.classList.remove('unlocked');
-    }
-    closeMcPage();
-}
+function mcHideCard() { closeMcPage(); }
 function mcInfoHtml(id) {
     const p = MC_DATA[id]; const o = MC_OPT[id] || {};
     const f = cardFields(p);
@@ -7463,7 +7450,7 @@ function mcInfoHtml(id) {
         '<div class="mc-hint">اضغط على البطاقة لعرضها كاملة ⤢</div>' + remain +
         '<div class="mc-info open">' + info +
             '<div class="row" style="gap:8px;margin-top:4px;">' +
-                '<button class="btn gray sm" onclick="mcHideCard(this)">🙈 إخفاء البطاقة</button>' +
+                '<button class="btn gray sm" onclick="mcHideCard()">🙈 إخفاء البطاقة</button>' +
                 '<button class="btn sm" onclick="mcCopyAll(this)">📋 نسخ كل المعلومات</button>' +
             '</div>' +
         '</div></div>';
@@ -7481,9 +7468,16 @@ function openMcPage(id) {
 function closeMcPage(skipHistory) {
     const pg = document.getElementById('mc-page');
     if (!pg.classList.contains('open')) return;
+    const id = pg.getAttribute('data-src');
     pg.classList.remove('open');
     pg.removeAttribute('data-src');
     document.getElementById('mc-page-body').innerHTML = '';
+    const w = id ? document.getElementById(id) : null;
+    if (w) {
+        const card = w.querySelector('.mcard');
+        if (card) card.classList.add('locked');
+        w.classList.remove('unlocked');
+    }
     if (!skipHistory && history.state && history.state.mcPage) history.back();
 }
 function openMcFull(id) {
@@ -7501,9 +7495,10 @@ function closeMcFull(skipHistory) {
     document.getElementById('mc-full-card').innerHTML = '';
     if (!skipHistory && history.state && history.state.mcFull) history.back();
 }
-window.addEventListener('popstate', function () {
-    if (document.getElementById('mc-full').classList.contains('open')) { closeMcFull(true); return; }
-    if (document.getElementById('mc-page').classList.contains('open')) closeMcPage(true);
+window.addEventListener('popstate', function (e) {
+    const st = e.state || {};
+    if (!st.mcFull) closeMcFull(true);
+    if (!st.mcFull && !st.mcPage) closeMcPage(true);
 });
 function mcFallbackCopy(txt) {
     const ta = document.createElement('textarea');
