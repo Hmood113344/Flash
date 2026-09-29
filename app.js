@@ -4112,23 +4112,23 @@ app.get("/", (req, res) => {
     @media (max-width: 560px) { .auth-card { padding: 26px 18px 30px; border-radius: 22px; } .auth-grid { grid-template-columns: 1fr; } .auth-title { font-size: 26px; } }
 
     /* ── البطاقة العسكرية ── */
-    .mc-wrap { max-width: 640px; margin: 0 auto; }
-    .mcard { position: relative; width: 100%; aspect-ratio: 857 / 564; border-radius: 16px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; }
+    .mc-wrap { max-width: 340px; margin: 0 auto; }
+    .mcard { position: relative; width: 100%; aspect-ratio: 857 / 564; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; }
     .mc-face { position: absolute; inset: 0; background: #fff url('/card-bg.jpg') center / 100% 100% no-repeat; transition: filter 0.3s, transform 0.3s; }
     .mcard.locked .mc-face { filter: blur(15px); transform: scale(1.08); }
-    .mc-val { position: absolute; left: 3%; text-align: right; color: #111; font-weight: 800; font-size: 3.4cqw; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transform: translateY(-50%); text-shadow: 0 0 5px #fff, 0 0 5px #fff; }
-    .mc-num { position: absolute; left: 6.9%; width: 17.3%; top: 92%; height: 4.5%; display: flex; align-items: center; justify-content: center; direction: ltr; color: #111; font-weight: 800; font-size: 2.3cqw; letter-spacing: 0.1em; }
     .mc-cover { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2cqw; background: rgba(15,30,60,0.28); cursor: pointer; z-index: 2; }
     .mc-cover svg { width: 15cqw; height: 15cqw; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.7)); }
     .mc-cover span { color: #fff; font-weight: 800; font-size: 4.2cqw; text-shadow: 0 2px 8px rgba(0,0,0,0.75); }
     .mcard:not(.locked) .mc-cover { display: none; }
-    .mc-remain { text-align: right; margin-top: 10px; font-size: 14px; font-weight: 700; color: var(--gold-soft); }
-    .mc-info { margin-top: 14px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
-    .mc-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,0.08); font-size: 14px; }
-    .mc-row span { color: var(--muted); min-width: 78px; }
-    .mc-row b { flex: 1; font-weight: 600; color: #e2e8f0; word-break: break-word; user-select: text; }
-    .mc-copy { border: 1px solid var(--border); background: rgba(59,130,246,0.18); color: var(--gold-soft); border-radius: 8px; padding: 4px 12px; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 700; }
-    .mc-modal { width: 100%; max-width: 640px; margin: auto; }
+    .mc-remain { text-align: center; margin-top: 10px; font-size: 13px; font-weight: 700; color: var(--gold-soft); }
+    .mc-info { margin-top: 14px; display: none; }
+    .mc-info.open { display: block; }
+    .mc-row { background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; margin-bottom: 8px; }
+    .mc-row-top { display: flex; align-items: center; justify-content: space-between; }
+    .mc-row span { color: var(--muted); font-size: 12px; }
+    .mc-row b { display: block; margin-top: 4px; font-weight: 700; color: #e2e8f0; font-size: 15px; word-break: break-word; user-select: text; }
+    .mc-copy { border: 1px solid var(--border); background: rgba(59,130,246,0.18); color: var(--gold-soft); border-radius: 8px; padding: 3px 10px; cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 700; flex-shrink: 0; }
+    .mc-modal { width: 100%; max-width: 340px; margin: auto; }
     /* ── صفحات الحسابات (لوحة الإدارة) ── */
     .acc-card .acc-title { font-size: 17px; font-weight: 800; color: var(--gold-soft); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .acc-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); font-size: 13px; }
@@ -7370,25 +7370,19 @@ function cardBlock(p, o) {
     const rows = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['notes', 'الملاحظات']];
     let info = '';
     rows.forEach(function (r) {
-        info += '<div class="mc-row"><span>' + r[1] + '</span><b data-k="' + r[0] + '">' + cardEsc(f[r[0]]) + '</b><button class="mc-copy" onclick="mcCopy(this)">نسخ</button></div>';
+        info += '<div class="mc-row"><div class="mc-row-top"><span>' + r[1] + '</span><button class="mc-copy" onclick="mcCopy(this)">📋 نسخ</button></div><b data-k="' + r[0] + '">' + cardEsc(f[r[0]]) + '</b></div>';
     });
     const remain = o.hasProgress
         ? '<div class="mc-remain"' + (o.remainId ? ' id="' + o.remainId + '"' : '') + '>' + remainText(o.nextRank, o.remaining) + '</div>'
         : '';
     const eye = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/><circle cx="12" cy="12" r="3.2"/></svg>';
     return '<div class="mc-wrap" id="' + id + '">' +
-        '<div class="mcard locked">' +
-            '<div class="mc-face">' +
-                '<div class="mc-val" style="top:23.4%;right:53.3%;" data-k="name">' + cardEsc(f.name) + '</div>' +
-                '<div class="mc-val" style="top:37.6%;right:53.3%;" data-k="rank">' + cardEsc(f.rank) + '</div>' +
-                '<div class="mc-val" style="top:47.5%;right:53.3%;" data-k="unit">' + cardEsc(f.unit) + '</div>' +
-                '<div class="mc-val" style="top:59.4%;right:56.4%;" data-k="note">' + cardEsc(f.note) + '</div>' +
-                '<div class="mc-num" data-k="num">' + cardEsc(f.num) + '</div>' +
-            '</div>' +
-            '<div class="mc-cover" onclick="mcToggle(this)">' + eye + '<span>عرض البطاقة</span></div>' +
+        '<div class="mcard locked" onclick="mcToggle(this)">' +
+            '<div class="mc-face"></div>' +
+            '<div class="mc-cover">' + eye + '<span>عرض البطاقة</span></div>' +
         '</div>' + remain +
-        '<div class="mc-info" style="display:none;">' + info +
-            '<div class="row" style="gap:8px;margin-top:12px;">' +
+        '<div class="mc-info">' + info +
+            '<div class="row" style="gap:8px;margin-top:4px;">' +
                 '<button class="btn gray sm" onclick="mcToggle(this)">🙈 إخفاء البطاقة</button>' +
                 '<button class="btn sm" onclick="mcCopyAll(this)">📋 نسخ كل المعلومات</button>' +
             '</div>' +
@@ -7401,7 +7395,7 @@ function mcToggle(el) {
     const info = w.querySelector('.mc-info');
     const show = card.classList.contains('locked');
     card.classList.toggle('locked', !show);
-    info.style.display = show ? 'block' : 'none';
+    info.classList.toggle('open', show);
 }
 function mcFallbackCopy(txt) {
     const ta = document.createElement('textarea');
@@ -7416,7 +7410,7 @@ function mcCopyText(txt) {
         navigator.clipboard.writeText(txt).then(done).catch(function () { mcFallbackCopy(txt); done(); });
     } else { mcFallbackCopy(txt); done(); }
 }
-function mcCopy(btn) { mcCopyText(btn.parentNode.querySelector('b').textContent); }
+function mcCopy(btn) { mcCopyText(btn.closest('.mc-row').querySelector('b').textContent); }
 function mcCopyAll(btn) {
     const info = btn.closest('.mc-info');
     const lines = [];
