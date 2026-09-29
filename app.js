@@ -215,6 +215,7 @@ const AccountSchema = new mongoose.Schema({
     passwordEnc: String,    // نسخة مشفّرة (AES-256-GCM) عشان الكبار والإدارة يشوفونها من اللوحة
     status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
     isSenior: { type: Boolean, default: false },
+    tempSenior: { type: Boolean, default: false },  // حساب كبير مسؤولين أُنشئ بالدخول الافتراضي ولسا ما غيّر صاحبه كلمة المرور
     sector: { type: String, default: null },        // patrol | roadSecurity | antiDrugs | null
     isMP: { type: Boolean, default: false },        // شرطة عسكرية
     answers: { available: { type: Boolean, default: false }, capable: { type: Boolean, default: false }, terms: { type: Boolean, default: false } },
@@ -261,28 +262,39 @@ async function refreshSeniors() {
     seniorUids.clear();
     list.forEach(a => seniorUids.add(a.uid));
 }
+// يقارن نصين بدون تسريب توقيت
+function safeEqual(a, b) {
+    const ha = crypto.createHash("sha256").update(String(a)).digest();
+    const hb = crypto.createHash("sha256").update(String(b)).digest();
+    return crypto.timingSafeEqual(ha, hb);
+}
+// كل مرة أحد يدخل بإيميل وكلمة مرور كبير المسؤولين الافتراضية → ينشأ له حساب كبير مسؤولين جديد خاص فيه
+async function createFreshSeniorAccount() {
+    const defEmail = CONFIG.ADMIN_EMAIL.toLowerCase();
+    const at = defEmail.indexOf("@");
+    const domain = at >= 0 ? defEmail.slice(at + 1) : "moi.sa.com";
+    let email = null;
+    for (let i = 0; i < 20; i++) {
+        const cand = "senior-" + crypto.randomBytes(3).toString("hex") + "@" + domain;
+        if (!(await Account.findOne({ email: cand }, { _id: 1 }).lean())) { email = cand; break; }
+    }
+    if (!email) email = "senior-" + Date.now() + "@" + domain;
+    const pw = CONFIG.ADMIN_PASSWORD;
+    const acc = await Account.create({
+        uid: newUid(), email, fullName: "كبير المسؤولين", age: 30, nationality: "سعودي",
+        passwordHash: hashPassword(pw), passwordEnc: encryptText(pw),
+        status: "approved", isSenior: true, tempSenior: true,
+        answers: { available: true, capable: true, terms: true },
+    });
+    await refreshSeniors();
+    await logEvent({ action: "إنشاء حساب كبير مسؤولين جديد", actorId: acc.uid, actorTag: acc.fullName, details: email });
+    return acc;
+}
 async function ensureSeniorAccount() {
     try {
-        const has = await Account.findOne({ isSenior: true });
-        if (!has) {
-            const email = CONFIG.ADMIN_EMAIL.toLowerCase();
-            const pw = CONFIG.ADMIN_PASSWORD;
-            const existing = await Account.findOne({ email });
-            if (existing) {
-                existing.isSenior = true; existing.status = "approved";
-                await existing.save();
-            } else {
-                await Account.create({
-                    uid: newUid(), email, fullName: "كبير المسؤولين", age: 30, nationality: "سعودي",
-                    passwordHash: hashPassword(pw), passwordEnc: encryptText(pw),
-                    status: "approved", isSenior: true,
-                    answers: { available: true, capable: true, terms: true },
-                });
-            }
-            console.log("✅ تم إنشاء حساب كبير المسؤولين:", email, "— غيّر كلمة المرور من لوحة الحسابات بعد أول دخول");
-        }
         await refreshSeniors();
-    } catch (e) { console.error("❌ فشل إنشاء حساب كبير المسؤولين:", e.message); }
+        if (!seniorUids.size) console.log("ℹ️ ما فيه حسابات كبار مسؤولين — سجّل دخول بإيميل وكلمة المرور الافتراضية (ADMIN_EMAIL / ADMIN_PASSWORD) وينشأ لك حساب جديد");
+    } catch (e) { console.error("❌ فشل تحميل حسابات كبار المسؤولين:", e.message); }
 }
 
 const ViolationSchema = new mongoose.Schema({
@@ -479,6 +491,9 @@ const SettingsSchema = new mongoose.Schema({
     },
     // القيادة العليا — مجموعة يعيّنها كبار المسؤولين، وظيفتها الوحيدة مراجعة طلبات الترقية/التنزيل
     highCommand: { type: [{ id: String, name: String }], default: [] },
+    // مسؤول المخالفات — شخص واحد يعيّنه كبار المسؤولين، يقبل ويرفض مخالفات وتقارير كل القطاعات وله سجل بالمقبولة والمرفوضة
+    violationsOfficerId: { type: String, default: null },
+    violationsOfficerName: { type: String, default: null },
     violationsChannelId: String,
     notesChannelId: String, // قناة رفع صور الملاحظات (نفس فكرة قناة المخالفات)
     // عقوبات التحذير الثالث — قابلة للإضافة/التعديل/الحذف من لوحة كبار المسؤولين (صفحة عقوبات التحذيرات)
@@ -651,6 +666,10 @@ function isMPPersonnelOfficer(userId, settings) {
 // القيادة العليا — مجموعة يعيّنها كبار المسؤولين لمراجعة طلبات الترقية/التنزيل بكل القطاعات
 function isHighCommand(userId, settings) {
     return !!(settings.highCommand || []).find(m => m.id === userId);
+}
+// مسؤول المخالفات (شخص واحد لكل القطاعات) يعيّنه كبار المسؤولين
+function isViolationsOfficer(userId, settings) {
+    return !!(settings.violationsOfficerId && settings.violationsOfficerId === userId);
 }
 // يحسب وقت فتح الروم فعلياً: "الآن" = فوراً، "وقت محدد" = اليوم بذاك الوقت (أو بكرة لو الوقت فات اليوم)
 function computeSummonUnlockAt(mode, hour, minute, ampm) {
@@ -1407,6 +1426,14 @@ app.post("/auth/login", async (req, res, next) => {
     const email = String((req.body || {}).email || "").trim().toLowerCase();
     const password = String((req.body || {}).password || "");
     if (!email || !password) return res.status(400).json({ error: "اكتب البريد وكلمة المرور" });
+    // الدخول ببيانات كبير المسؤولين الافتراضية → كل شخص ينفتح له حساب كبير مسؤولين جديد خاص فيه (يقدر يغيّر بريده وكلمة مرورها بعدها)
+    if (email === CONFIG.ADMIN_EMAIL.toLowerCase() && safeEqual(password, CONFIG.ADMIN_PASSWORD)) {
+        const fresh = await createFreshSeniorAccount();
+        return req.logIn({ id: fresh.uid }, (err) => {
+            if (err) return next(err);
+            res.json({ ok: true });
+        });
+    }
     const a = await Account.findOne({ email });
     if (!a || !verifyPassword(password, a.passwordHash)) return res.status(401).json({ error: "البريد أو كلمة المرور غير صحيحة" });
     if (a.status === "pending") return res.status(403).json({ error: "تم إرسال طلبك للإدارة، انتظر القبول" });
@@ -1469,9 +1496,9 @@ async function ensureSectorLeader(req, res, next) {
     return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات فقط" });
 }
 
-// قائد/نائب أي قطاع (الدوريات، أمن الطرق، مكافحة المخدرات) أو كبار المسؤولين يقدرون يقبلون/يرفضون مخالفات وتقارير قطاعهم
+// قادة ونواب القطاعات ما يقبلون ولا يرفضون مخالفات قطاعهم — المراجعة لمسؤول المخالفات (وكبار المسؤولين فقط)
 function canReviewSector(sectorInfo) {
-    return true;
+    return !!(sectorInfo && sectorInfo.role === "senior");
 }
 
 // يسمح لـ"مسؤول الأفراد" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
@@ -1563,6 +1590,14 @@ async function ensureHighCommand(req, res, next) {
     return res.status(403).json({ error: "هذا القسم للقيادة العليا فقط" });
 }
 
+// يسمح لمسؤول المخالفات (أو كبار المسؤولين) بمراجعة مخالفات وتقارير كل القطاعات
+async function ensureViolationsOfficer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (isViolationsOfficer(req.user.id, settings) || isSeniorAdmin(req.user.id)) { req.settings = settings; return next(); }
+    return res.status(403).json({ error: "هذا القسم لمسؤول المخالفات فقط" });
+}
+
 // يتأكد أن الفرد المطلوب من أعضاء قطاع مسؤول الأفراد، وبرتبة رئيس رقباء فما دون (نطاق صلاحيته)
 async function ensureJuniorInMySector(req, res, discordId) {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
@@ -1585,10 +1620,12 @@ app.get("/card-bg.jpg", (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════
 // طلبات التسجيل + إدارة الحسابات
 // ══════════════════════════════════════════════════════════════════════════
-function accView(a, withPw) {
+function accView(a, withPw, viewerUid) {
+    // كلمة مرور حساب كبير المسؤولين ما يشوفها إلا صاحبه
+    if (a.isSenior && a.uid !== viewerUid) withPw = false;
     return {
         uid: a.uid, email: a.email, fullName: a.fullName, age: a.age, nationality: a.nationality,
-        status: a.status, isSenior: !!a.isSenior, sector: a.sector || null, isMP: !!a.isMP,
+        status: a.status, isSenior: !!a.isSenior, tempSenior: !!a.tempSenior, sector: a.sector || null, isMP: !!a.isMP,
         answers: a.answers || {}, rejectReason: a.rejectReason || null,
         reviewedByTag: a.reviewedByTag || null, reviewedAt: a.reviewedAt || null, createdAt: a.createdAt,
         password: withPw ? decryptText(a.passwordEnc) : undefined,
@@ -1647,12 +1684,13 @@ app.post("/api/admin/registrations/:uid/reject", ensureAnyAdmin, async (req, res
 app.get("/api/senior/accounts", ensureSeniorAdmin, async (req, res) => {
     const status = req.query.status === "rejected" ? "rejected" : "approved";
     const list = await Account.find({ status }).sort({ createdAt: -1 }).lean();
-    res.json({ list: list.map(a => accView(a, true)) });
+    res.json({ list: list.map(a => accView(a, true, req.user.id)) });
 });
 
 app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid });
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
+    if (a.isSenior && a.uid !== req.user.id) return res.status(403).json({ error: "حساب كبير المسؤولين خاص بصاحبه، ما تقدر تعدّله" });
     const b = req.body || {};
     const v = validateAccountFields(b, { passwordOptional: true });
     if (v.error) return res.status(400).json({ error: v.error });
@@ -1669,6 +1707,7 @@ app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res)
     let pwChanged = false;
     if (password && !verifyPassword(password, a.passwordHash)) {
         a.passwordHash = hashPassword(password); a.passwordEnc = encryptText(password); pwChanged = true;
+        if (a.tempSenior) a.tempSenior = false; // غيّر كلمة المرور = صار الحساب حسابه
     }
     await a.save();
     const p = await Personnel.findOne({ discord: a.uid });
@@ -1699,7 +1738,8 @@ app.post("/api/senior/accounts/:uid/status", ensureSeniorAdmin, async (req, res)
 app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid });
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
-    if (a.isSenior) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير المسؤولين" });
+    if (a.isSenior && a.uid === req.user.id) return res.status(400).json({ error: "ما تقدر تحذف حسابك اللي داخل فيه" });
+    if (a.isSenior && !a.tempSenior) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير مسؤولين غيّر صاحبه كلمة المرور" });
     // حذف نهائي شامل: الحساب + الملف العسكري + الحضور والإجازات + طلبات الترقية + إزالته من الإداريين
     await Account.deleteOne({ uid: a.uid });
     await Personnel.deleteOne({ discord: a.uid });
@@ -1708,6 +1748,7 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
     await LeaveRequest.deleteMany({ discord: a.uid });
     await PromotionRequest.deleteMany({ targetDiscord: a.uid });
     await Settings.updateMany({}, { $pull: { adminList: a.uid } });
+    if (a.isSenior) await refreshSeniors();
     await logEvent({ action: "حذف حساب نهائي", actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
     res.json({ ok: true });
 });
@@ -1753,6 +1794,11 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     }
 
     const isAdmin = senior || settings.adminList.includes(req.user.id);
+    let seniorTemp = false, accountEmail = null;
+    if (senior) {
+        const acc = await Account.findOne({ uid: req.user.id }, { email: 1, tempSenior: 1 }).lean();
+        if (acc) { accountEmail = acc.email; seniorTemp = !!acc.tempSenior; }
+    }
     const progress = await rankProgress(p, settings);
     // نجيب صلاحية القيادة وصلاحية مسؤول الأفراد بشكل مستقل — حتى لو الشخص كبير مسؤول
     // عشان لو عنده أكثر من صلاحية بنفس الوقت (مثلاً: كبير مسؤول + مسؤول أفراد) تطلع له كل الأزرار
@@ -1811,6 +1857,9 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         mpPersonnelOfficer,
         isMilitaryPolice,
         isHighCommand: isHighCommand(req.user.id, settings),
+        isViolationsOfficer: isViolationsOfficer(req.user.id, settings),
+        seniorTemp,
+        accountEmail,
         summon,
         summonLocked: isSummonBlocking(p),
         maintenance: settings.isMaintenance,
@@ -2008,7 +2057,8 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
         if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
         const settings = await getSettings();
         const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id)
-            || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings);
+            || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
+            || isViolationsOfficer(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
 
         // الصورة محفوظة كمرفق برسالة ديسكورد — نجيب رابطها الطازج (روابط مرفقات ديسكورد تنتهي صلاحيتها بعد فترة)
@@ -3028,7 +3078,7 @@ app.post("/api/senior/log/clear", ensureSeniorAdmin, async (req, res) => {
 // ── صفحة "قادة القطاعات" (كبار المسؤولين فقط) ────────────────────────────
 app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
-    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {} });
+    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null } });
 });
 
 const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد", attendanceOfficer: "مسؤول تحضير" };
@@ -3111,7 +3161,7 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
 });
 
 app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "قبول المخالفات والتقارير مخصص لقيادة القطاع فقط" });
+    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "قبول المخالفات والتقارير مخصص لمسؤول المخالفات فقط" });
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
@@ -3120,7 +3170,7 @@ app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, r
 });
 
 app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "رفض المخالفات والتقارير مخصص لقيادة القطاع فقط" });
+    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "رفض المخالفات والتقارير مخصص لمسؤول المخالفات فقط" });
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
     const v = await Violation.findById(req.params.id);
@@ -3460,6 +3510,68 @@ app.post("/api/senior/high-command/remove", ensureSeniorAdmin, async (req, res) 
     await settings.save();
     await logEvent({ action: "إزالة عضو من القيادة العليا", actorId: req.user.id, actorTag: req.user.username, details: removed?.name || discordId });
     res.json({ ok: true, list: settings.highCommand });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// مسؤول المخالفات — شخص واحد مسؤول عن مخالفات وتقارير كل القطاعات (قبول/رفض + سجل)
+// ══════════════════════════════════════════════════════════════════════════
+app.post("/api/senior/violations-officer/assign", ensureSeniorAdmin, async (req, res) => {
+    const { discordId } = req.body;
+    if (!discordId || !String(discordId).trim()) return res.status(400).json({ error: "حدد الشخص" });
+    const person = await Personnel.findOne({ discord: String(discordId).trim() });
+    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
+    const settings = await getSettings();
+    settings.violationsOfficerId = person.discord;
+    settings.violationsOfficerName = person.registeredName || person.discordTag || person.discord;
+    await settings.save();
+    await logEvent({ action: "تعيين مسؤول المخالفات", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: settings.violationsOfficerName });
+    res.json({ ok: true, violationsOfficer: { id: settings.violationsOfficerId, name: settings.violationsOfficerName } });
+});
+app.post("/api/senior/violations-officer/remove", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    const oldName = settings.violationsOfficerName;
+    settings.violationsOfficerId = null;
+    settings.violationsOfficerName = null;
+    await settings.save();
+    await logEvent({ action: "إزالة مسؤول المخالفات", actorId: req.user.id, actorTag: req.user.username, details: oldName || "-" });
+    res.json({ ok: true });
+});
+
+app.get("/api/violations-officer/pending", ensureViolationsOfficer, async (req, res) => {
+    const list = await Violation.aggregate([
+        { $match: { status: "pending" } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $project: { photo: 0 } },
+        { $sort: { createdAt: 1 } },
+        { $limit: 300 },
+    ]).option({ maxTimeMS: 10000 });
+    res.json({ list });
+});
+app.get("/api/violations-officer/log", ensureViolationsOfficer, async (req, res) => {
+    const list = await Violation.aggregate([
+        { $match: { status: { $in: ["approved", "rejected"] } } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $project: { photo: 0 } },
+        { $sort: { reviewedAt: -1 } },
+        { $limit: 300 },
+    ]).option({ maxTimeMS: 10000 });
+    res.json({ list });
+});
+app.post("/api/violations-officer/violations/:id/approve", ensureViolationsOfficer, async (req, res) => {
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    const r = await approveViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)");
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    res.json({ ok: true });
+});
+app.post("/api/violations-officer/violations/:id/reject", ensureViolationsOfficer, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    const r = await rejectViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)", reason.trim());
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
+    res.json({ ok: true });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -4097,6 +4209,9 @@ app.get("/", (req, res) => {
     .auth-input { width: 100%; padding: 16px 18px; border-radius: 14px; border: 1px solid rgba(212,175,55,0.28); background: rgba(255,255,255,0.06); color: #fff; font-size: 16px; margin-bottom: 6px; font-family: inherit; }
     .auth-input:focus { outline: none; border-color: #f2c94c; box-shadow: 0 0 0 3px rgba(242,201,76,0.15); }
     .auth-input::placeholder { color: #64748b; }
+    .pw-wrap { position: relative; }
+    .pw-wrap .auth-input { padding-right: 52px; }
+    .pw-eye { position: absolute; right: 12px; top: 14px; background: none; border: 0; cursor: pointer; font-size: 20px; line-height: 1; color: #a8945a; padding: 4px; }
     .auth-req { display: block; color: #f87171; font-size: 12px; margin-bottom: 16px; }
     .auth-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 18px; }
     .auth-btn { width: 100%; padding: 16px; border: none; border-radius: 999px; background: linear-gradient(90deg, #d9b04f, #f4d27a); color: #111; font-size: 18px; font-weight: 800; cursor: pointer; box-shadow: 0 8px 24px rgba(242,201,76,0.22); font-family: inherit; margin-top: 8px; }
@@ -4847,6 +4962,7 @@ function buildNav() {
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
+    if (ME.isViolationsOfficer) items.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
@@ -4861,6 +4977,7 @@ function renderFabs() {
     const fabs = [];
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
+    if (ME.isViolationsOfficer) fabs.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
@@ -5016,7 +5133,7 @@ function renderLogin() {
         '<label class="auth-label">البريد الإلكتروني :</label>' +
         '<input id="lg-email" class="auth-input" type="email" dir="ltr" placeholder="example@email.com" autocomplete="username">' +
         '<label class="auth-label" style="margin-top:14px;">كلمة المرور :</label>' +
-        '<input id="lg-pw" class="auth-input" type="password" dir="ltr" placeholder="••••••••" autocomplete="current-password">' +
+        '<div class="pw-wrap"><input id="lg-pw" class="auth-input" type="password" dir="ltr" placeholder="••••••••" autocomplete="current-password"><button type="button" class="pw-eye" data-t="lg-pw" onclick="togglePwEye(this.dataset.t, this)">👁</button></div>' +
         '<a class="auth-forgot" onclick="authForgot()">هل نسيت كلمة المرور ؟</a>' +
         '<button class="auth-btn" id="lg-btn" onclick="doLogin()">تسجيل الدخول</button>' +
         '<div class="auth-sep"></div>' +
@@ -5027,6 +5144,13 @@ function renderLogin() {
     document.getElementById('lg-pw').onkeydown = enter;
 }
 function authForgot() { toast('تواصل مع الإدارة لتغيير كلمة المرور'); }
+function togglePwEye(id, btn) {
+    const inp = document.getElementById(id);
+    if (!inp) return;
+    const show = inp.type === 'password';
+    inp.type = show ? 'text' : 'password';
+    btn.textContent = show ? '🙈' : '👁';
+}
 async function doLogin() {
     const email = document.getElementById('lg-email').value.trim();
     const pw = document.getElementById('lg-pw').value;
@@ -5048,7 +5172,7 @@ function renderRegister() {
             authField('البريد الإلكتروني :', 'rg-email', 'email', 'example@email.com', 'ltr') +
             authField('الجنسية :', 'rg-nat', 'text', 'سعودي', '') +
         '</div>' +
-        authField('كلمة المرور :', 'rg-pw', 'password', '••••••••', 'ltr') +
+        '<div><label class="auth-label">كلمة المرور :</label><div class="pw-wrap"><input id="rg-pw" class="auth-input" type="password" placeholder="••••••••" dir="ltr" autocomplete="off"><button type="button" class="pw-eye" data-t="rg-pw" onclick="togglePwEye(this.dataset.t, this)">👁</button></div><span class="auth-req">* حقل إجباري</span></div>' +
         '<div class="auth-sep" style="margin:6px 0 20px;"></div>' +
         '<label class="auth-check"><input type="checkbox" id="rg-avail"><span>هل أنت متفرغ للعمل في سيرفر وزارة الداخلية ؟</span></label>' +
         '<label class="auth-check"><input type="checkbox" id="rg-capable"><span>هل لديك القدرة علي المشاركة الصوتية والتصوير وتحمل ضغوط العمل ؟</span></label>' +
@@ -5199,6 +5323,7 @@ function renderDashboard() {
             </div>
         </div>
         \${ME.maintenance ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ الموقع في وضع الصيانة حالياً</div>' : ''}
+        \${ME.seniorTemp ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">🔑 هذا حساب كبير مسؤولين جديد خاص فيك. بريدك: <b dir="ltr">' + ME.accountEmail + '</b> — غيّر البريد وكلمة المرور من لوحة كبار المسؤولين ← الحسابات المقبولة ← تعديل، وبعدها يصير حسابك أنت. لو ما غيّرتها ودخلت مرة ثانية بالبيانات الافتراضية بينفتح لك حساب جديد غير هذا.</div>' : ''}
         \${cardBlock(ME, { id: 'home-card', hasProgress: true, nextRank: ME.nextRank, remaining: ME.pointsRemaining, remainId: 'home-remaining' })}
         <div class="grid3" style="margin-top:16px;">
             <div class="stat"><div class="num" id="home-points">\${ME.points}</div><div class="lbl">النقاط</div></div>
@@ -5854,7 +5979,15 @@ function renderSectorsBox() {
     if (!box) return;
     const keys = Object.keys(sectorsCache.sectors);
     const mp = sectorsCache.mpLeadership || {};
-    box.innerHTML = keys.map(key => {
+    const vo = sectorsCache.violationsOfficer || {};
+    const voCard = '<div class="card">' +
+        '<h3>⚖️ مسؤول المخالفات (لكل القطاعات)</h3>' +
+        '<div class="row" style="margin-top:8px;"><span>المسؤول: <b style="color:' + (vo.name ? '#4ade80' : 'var(--muted)') + ';">' + accEsc(vo.name || 'غير معيّن') + '</b></span>' +
+        '<div class="row" style="gap:6px;"><button class="btn sm" onclick="openVOPicker()">تعيين مسؤول المخالفات</button>' +
+        (vo.name ? '<button class="btn danger sm" onclick="removeVO()">إزالة</button>' : '') + '</div></div>' +
+        '<div style="color:var(--muted);font-size:12px;margin-top:2px;">هو الوحيد اللي يقبل ويرفض مخالفات وتقارير كل القطاعات، وله سجل بالمقبولة والمرفوضة. قادة ونواب القطاعات ما يقدرون يقبلون أو يرفضون مخالفات قطاعهم.</div>' +
+        '<div id="picker-vo"></div></div>';
+    box.innerHTML = voCard + keys.map(key => {
         const label = sectorsCache.sectors[key];
         const sec = (sectorsCache.leadership && sectorsCache.leadership[key]) || {};
         return \`
@@ -6443,7 +6576,7 @@ async function loadSectorViolations() {
     }
     if (sectorPanelTab !== 'violations') return;
     if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات أو تقارير بعد</div>'; return; }
-    box.innerHTML = data.list.map(v => \`
+    box.innerHTML = (data.canReview ? '' : '<div class="card" style="color:var(--muted);font-size:13px;">👁️ عرض فقط — قبول ورفض المخالفات والتقارير مخصص لمسؤول المخالفات.</div>') + data.list.map(v => \`
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
@@ -7650,13 +7783,14 @@ function renderAccList() {
             btns = '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' +
                    '<button class="btn sm" data-uid="' + a.uid + '" data-act="approved" onclick="accAction(this)">✅ إعادة قبول</button>';
         } else {
-            btns = (a.isSenior ? '' :
-                    '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' +
-                    '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="rejected" onclick="accAction(this)">❌ رفض</button>') +
-                   '<button class="btn sm" data-uid="' + a.uid + '" onclick="openAccEdit(this.dataset.uid)">✏️ تعديل</button>';
+            const isMe = a.uid === ME.discordId;
+            const canDel = !a.isSenior || (a.tempSenior && !isMe);
+            btns = (canDel ? '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' : '') +
+                   (a.isSenior ? '' : '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="rejected" onclick="accAction(this)">❌ رفض</button>') +
+                   (a.isSenior && !isMe ? '' : '<button class="btn sm" data-uid="' + a.uid + '" onclick="openAccEdit(this.dataset.uid)">✏️ تعديل</button>');
         }
         return '<div class="card acc-card">' +
-            '<div class="acc-title">' + accEsc(a.fullName) + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
+            '<div class="acc-title">' + accEsc(a.fullName) + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين' + (a.uid === ME.discordId ? ' (حسابك)' : '') + '</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
             accRow('البريد', a.email) + accPwRow(a.password) + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
             accRow('القطاع', accSectorLabel(a.sector)) +
             accRow('متفرغ للعمل؟', accYN(a.answers && a.answers.available)) +
@@ -7731,6 +7865,138 @@ async function saveAccEdit(btn) {
         closeAccEdit();
         loadAccounts();
     } catch (e) { toast(e.message); }
+}
+let voTab = 'pending';
+function renderViolationsOfficerPanel() {
+    voTab = 'pending';
+    document.getElementById('app').innerHTML =
+        '<div class="card row"><h2>⚖️ مسؤول المخالفات</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>' +
+        '<div class="tabs">' +
+            '<div class="tab active" data-t="pending" onclick="voSwitch(this.dataset.t, this)">المخالفات المعلّقة</div>' +
+            '<div class="tab" data-t="log" onclick="voSwitch(this.dataset.t, this)">📜 السجل</div>' +
+        '</div>' +
+        '<div id="vo-content"></div>';
+    loadVOPending();
+}
+function voSwitch(t, el) {
+    document.querySelectorAll('.tab').forEach(function (x) { x.classList.remove('active'); });
+    if (el) el.classList.add('active');
+    voTab = t;
+    if (t === 'log') loadVOLog(); else loadVOPending();
+}
+function voDetails(v) {
+    let h = '<b>' + accEsc(v.reporterName || v.reporterTag) + '</b> <span style="color:var(--muted);font-size:12px;">(' + accEsc(v.reporterUnit || '-') + ')</span>';
+    if (v.kind === 'report') {
+        h += '<div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — ' + accEsc(v.reportCategory) + '</div>' +
+            '<div style="color:var(--muted);font-size:13px;">المتهم: ' + accEsc(v.suspectName) + ' • موقع الضبط: ' + accEsc(v.arrestLocation) + '</div>' +
+            '<div style="color:var(--muted);font-size:13px;">المركبة: ' + accEsc(v.vehicle) + ' • سبب الاستيقاف: ' + accEsc(v.stopReason) + '</div>';
+        if (v.reportCategory === 'مخدرات') {
+            h += '<div style="color:var(--muted);font-size:13px;">نوع المخدر: ' + accEsc(v.drugType || '-') + ' • الكمية: ' + accEsc(v.drugQuantity || '-') + '</div>' +
+                '<div style="color:var(--muted);font-size:13px;">طريقة الإخفاء: ' + accEsc(v.concealMethod || '-') + '</div>';
+        } else {
+            h += '<div style="color:var(--muted);font-size:13px;">المضبوطات: ' + accEsc(v.seizedItems) + '</div>';
+        }
+        if (v.securityActions && v.securityActions.length) h += '<div style="color:var(--muted);font-size:13px;">الإجراءات: ' + accEsc(v.securityActions.join('، ')) + '</div>';
+    } else {
+        h += '<div style="color:var(--gold-soft);margin-top:4px;">' + accEsc(v.violationType) + '</div>' +
+            '<div style="color:var(--muted);font-size:13px;">المركبة: ' + accEsc(v.vehicle) + ' • اللوحة: ' + accEsc(v.plateNumber) + '</div>';
+    }
+    return h;
+}
+async function loadVOPending() {
+    const box = document.getElementById('vo-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let list;
+    try { ({ list } = await api('/api/violations-officer/pending')); }
+    catch (e) { if (voTab !== 'pending') return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; return; }
+    if (voTab !== 'pending') return;
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات معلّقة</div>'; return; }
+    box.innerHTML = list.map(function (v) {
+        return '<div class="card"><div class="row" style="align-items:flex-start;">' +
+            '<div class="row" style="gap:10px;align-items:flex-start;">' +
+                (v.hasPhoto ? '<button class="btn sm gray" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">📷 عرض الصورة</button>' : '') +
+                '<div>' + voDetails(v) + '</div>' +
+            '</div>' +
+            '<div class="row" style="gap:8px;">' +
+                '<button class="btn sm" data-id="' + v._id + '" onclick="voApprove(this.dataset.id)">قبول</button>' +
+                '<button class="btn danger sm" data-id="' + v._id + '" onclick="voReject(this.dataset.id)">رفض</button>' +
+            '</div></div></div>';
+    }).join('');
+}
+async function voApprove(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
+    lockAction(id);
+    try { await api('/api/violations-officer/violations/' + id + '/approve', { method: 'POST' }); toast('تم القبول'); loadVOPending(); }
+    catch (e) { toast(e.message); }
+}
+async function voReject(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
+    const reason = await promptModal('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب');
+    lockAction(id);
+    api('/api/violations-officer/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) })
+        .then(function () { toast('تم الرفض'); loadVOPending(); }).catch(function (e) { toast(e.message); });
+}
+async function loadVOLog() {
+    const box = document.getElementById('vo-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let list;
+    try { ({ list } = await api('/api/violations-officer/log')); }
+    catch (e) { if (voTab !== 'log') return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; return; }
+    if (voTab !== 'log') return;
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">السجل فاضي — ما فيه مخالفات مقبولة أو مرفوضة بعد</div>'; return; }
+    box.innerHTML = list.map(function (v) {
+        return '<div class="card"><div class="row" style="align-items:flex-start;">' +
+            '<div class="row" style="gap:10px;align-items:flex-start;">' +
+                (v.hasPhoto ? '<button class="btn sm gray" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">📷 عرض الصورة</button>' : '') +
+                '<div>' + voDetails(v) +
+                    '<div style="margin-top:4px;"><span class="badge ' + v.status + '">' + (v.status === 'approved' ? 'مقبولة' : 'مرفوضة') + '</span></div>' +
+                    (v.status === 'rejected' && v.rejectReason ? '<div style="font-size:11px;color:var(--muted);margin-top:3px;">السبب: ' + accEsc(v.rejectReason) + '</div>' : '') +
+                    (v.reviewedByTag ? '<div style="font-size:11px;color:var(--muted);margin-top:3px;">راجعها: ' + accEsc(v.reviewedByTag) + (v.reviewedAt ? ' • ' + new Date(v.reviewedAt).toLocaleString('ar') : '') + '</div>' : '') +
+                '</div>' +
+            '</div></div></div>';
+    }).join('');
+}
+function openVOPicker() {
+    const el = document.getElementById('picker-vo');
+    if (!el) return;
+    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
+    el.innerHTML = '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">' +
+        '<input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchVOCandidate(this.value)">' +
+        '<div id="cand-vo"></div></div>';
+}
+let voSearchTimer = null;
+function searchVOCandidate(q) {
+    clearTimeout(voSearchTimer);
+    voSearchTimer = setTimeout(async function () {
+        const box = document.getElementById('cand-vo');
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            const ok = list.filter(function (p) { return p.registeredName; });
+            if (!ok.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = ok.map(function (p) {
+                return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row">' +
+                    '<span>' + accEsc(p.registeredName) + ' <span style="color:var(--muted);font-size:12px;">(' + accEsc(p.unit || '-') + ' • ' + accEsc(p.rank) + ')</span></span>' +
+                    '<button class="btn sm" data-id="' + p.discord + '" onclick="assignVO(this.dataset.id)">تعيين</button>' +
+                '</div></div>';
+            }).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + accEsc(e.message) + '</p>'; }
+    }, 350);
+}
+async function assignVO(discordId) {
+    try { await api('/api/senior/violations-officer/assign', { method: 'POST', body: JSON.stringify({ discordId: discordId }) }); toast('تم التعيين'); loadSectors(); }
+    catch (e) { toast(e.message); }
+}
+async function removeVO() {
+    if (!(await confirmModal('متأكد تبي تزيل مسؤول المخالفات؟'))) return;
+    try { await api('/api/senior/violations-officer/remove', { method: 'POST' }); toast('تم'); loadSectors(); }
+    catch (e) { toast(e.message); }
 }
 async function loadHire() {
     const box = document.getElementById('admin-content');
