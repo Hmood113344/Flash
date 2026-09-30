@@ -64,13 +64,6 @@ const CONFIG = {
     // ── نظام الإجازات ──
     DEFAULT_LEAVE_BALANCE: 10, // رصيد الإجازات الافتراضي بالأيام لكل عسكري (قابل للتعديل من الإعدادات)
 
-    // ── نظام البصمة/التحضير ──
-    FP_HOLD_SECONDS: 3,   // مدة الضغط المطلوبة على البصمة
-    FP_FAIL_RATE: 0.2,    // احتمال فشل البصمة عشوائياً
-    // لو ما وصلت أي "نبضة" من جهاز العضو (يعني طلع من الموقع/سكر التبويب) خلال هذي المدة وهو مسجّل "حاضر"،
-    // نعتبره منصرف تلقائياً ولازم يبصم من جديد. طالما الموقع مفتوح عنده ما يصير تسجيل خروج تلقائي مهما طالت المدة.
-    ATTENDANCE_TIMEOUT_MS: 60 * 60 * 1000,
-
     VIOLATION_TYPES: [
         "تجاوز السرعة المحددة",
         "القيادة العكسية",
@@ -415,36 +408,6 @@ const MPReportSchema = new mongoose.Schema({
 MPReportSchema.index({ status: 1, createdAt: -1 });
 const MPReport = mongoose.model("MPReport", MPReportSchema);
 
-// ── نظام البصمة/التحضير ──
-const AttendanceStatusSchema = new mongoose.Schema({
-    discord: { type: String, required: true, unique: true },
-    discordTag: String,
-    registeredName: String,
-    unit: String,
-    rank: String,
-    sectorLabel: String,
-    status: { type: String, enum: ["in", "out"], default: "out" },
-    lastCheckInAt: { type: Date, default: null },
-    lastCheckOutAt: { type: Date, default: null },
-    lastHeartbeatAt: { type: Date, default: null }, // آخر نبضة وهو مسجّل حاضر — نستخدمها لكشف طلوعه من الموقع بدون ما يسجل انصراف
-    todayCount: { type: Number, default: 0 },
-    updatedAt: { type: Date, default: Date.now },
-});
-const AttendanceStatus = mongoose.model("AttendanceStatus", AttendanceStatusSchema);
-
-const AttendanceLogSchema = new mongoose.Schema({
-    discord: String,
-    discordTag: String,
-    registeredName: String,
-    unit: String,
-    rank: String,
-    type: { type: String, enum: ["in", "out"] },
-    at: { type: Date, default: Date.now },
-});
-AttendanceLogSchema.index({ at: -1 });
-AttendanceLogSchema.index({ discord: 1, at: -1 });
-const AttendanceLog = mongoose.model("AttendanceLog", AttendanceLogSchema);
-
 // ── نظام الإجازات ──
 const LeaveRequestSchema = new mongoose.Schema({
     discord: String,
@@ -505,19 +468,16 @@ const SettingsSchema = new mongoose.Schema({
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
-            attendanceOfficerId: { type: String, default: null }, attendanceOfficerName: { type: String, default: null },
         },
         roadSecurity: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
-            attendanceOfficerId: { type: String, default: null }, attendanceOfficerName: { type: String, default: null },
         },
         antiDrugs: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
-            attendanceOfficerId: { type: String, default: null }, attendanceOfficerName: { type: String, default: null },
         },
     },
     // قيادة الشرطة العسكرية (قائد/نائب يعيّنهم كبار المسؤولين، ومسؤول أفراد يعيّنه القائد/النائب)
@@ -535,8 +495,6 @@ const SettingsSchema = new mongoose.Schema({
     notesChannelId: String, // قناة رفع صور الملاحظات (نفس فكرة قناة المخالفات)
     // عقوبات التحذير الثالث — قابلة للإضافة/التعديل/الحذف من لوحة كبار المسؤولين (صفحة عقوبات التحذيرات)
     warningPenalties: { type: Array, default: [] },
-    // نظام البصمة/التحضير
-    lockAttendance: { type: Boolean, default: false },
     // نظام الإجازات
     leaveBalanceDefault: { type: Number, default: 10 },
 }, { minimize: false });
@@ -670,16 +628,6 @@ function getPersonnelOfficerSector(userId, settings) {
     for (const key of Object.keys(CONFIG.SECTORS)) {
         const sec = sl[key];
         if (sec && sec.personnelOfficerId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key] };
-    }
-    return null;
-}
-
-// يرجع القطاع اللي هذا الشخص "مسؤول تحضير" فيه، أو null
-function getAttendanceOfficerSector(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
-        if (sec && sec.attendanceOfficerId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key] };
     }
     return null;
 }
@@ -860,7 +808,7 @@ async function getMilitaryPoliceMemberIds() {
     }
 }
 
-// يرجع مفتاح القطاع اللي هذا الشخص عضو فيه حسب رول ديسكورد (للاستخدام بنظام الإجازات والبصمة)
+// يرجع مفتاح القطاع اللي هذا الشخص عضو فيه حسب رول ديسكورد (للاستخدام بنظام الإجازات)
 async function getMemberSectorKey(uid) {
     try {
         const a = await Account.findOne({ uid, status: "approved" }, { sector: 1 }).lean();
@@ -1314,49 +1262,6 @@ client.once("ready", async () => {
     await registerCommands();
 });
 
-// ── قفل/فتح تسجيل الحضور بالبصمة تلقائياً بتوقيت مكة المكرمة (Asia/Riyadh) ──
-// لو محد من كبار المسؤولين قفل تسجيل الحضور يدوياً، يقفل تلقائياً الساعة 12:30 الليل،
-// ويرجع يفتح تلقائياً الساعة 12 الظهر بنفس اليوم — بدون أي تدخل يدوي، ويسجّل بلوق النظام
-function getMeccaTimeParts() {
-    const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone: "Asia/Riyadh", hour: "2-digit", minute: "2-digit", hour12: false,
-        year: "numeric", month: "2-digit", day: "2-digit",
-    }).formatToParts(new Date());
-    const get = (t) => parts.find(p => p.type === t).value;
-    return { hour: parseInt(get("hour"), 10), minute: parseInt(get("minute"), 10), dateKey: `${get("year")}-${get("month")}-${get("day")}` };
-}
-let lastAutoLockDateKey = null;
-let lastAutoUnlockDateKey = null;
-setInterval(async () => {
-    try {
-        const { hour, minute, dateKey } = getMeccaTimeParts();
-        // القفل التلقائي: 12:30 الليل بالضبط (00:30) — مرة وحدة باليوم بس
-        if (hour === 0 && minute === 30 && lastAutoLockDateKey !== dateKey) {
-            lastAutoLockDateKey = dateKey;
-            const settings = await getSettings();
-            if (!settings.lockAttendance) {
-                settings.lockAttendance = true;
-                await settings.save();
-                await logEvent({ action: "قفل تسجيل الحضور تلقائياً", actorId: "system", actorTag: "النظام (جدولة تلقائية)", details: "الساعة 12:30 الليل بتوقيت مكة المكرمة" });
-                console.log("🔒 تم قفل تسجيل الحضور تلقائياً (12:30 الليل بتوقيت مكة)");
-            }
-        }
-        // الفتح التلقائي: 12 الظهر بالضبط بنفس اليوم — مرة وحدة باليوم بس
-        if (hour === 12 && minute === 0 && lastAutoUnlockDateKey !== dateKey) {
-            lastAutoUnlockDateKey = dateKey;
-            const settings = await getSettings();
-            if (settings.lockAttendance) {
-                settings.lockAttendance = false;
-                await settings.save();
-                await logEvent({ action: "فتح تسجيل الحضور تلقائياً", actorId: "system", actorTag: "النظام (جدولة تلقائية)", details: "الساعة 12 الظهر بتوقيت مكة المكرمة" });
-                console.log("🔓 تم فتح تسجيل الحضور تلقائياً (12 الظهر بتوقيت مكة)");
-            }
-        }
-    } catch (e) {
-        console.error("❌ خطأ بجدولة قفل/فتح البصمة التلقائي:", e.message);
-    }
-}, 30 * 1000);
-
 if (CONFIG.BOT_TOKEN) {
     client.login(CONFIG.BOT_TOKEN).catch(e => console.log("❌ فشل تسجيل دخول البوت:", e.message));
 } else {
@@ -1561,39 +1466,6 @@ async function ensurePersonnelOfficer(req, res, next) {
         return next();
     }
     return res.status(403).json({ error: "هذا القسم لمسؤول الأفراد فقط" });
-}
-
-// يسمح لـ"مسؤول التحضير" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
-async function ensureAttendanceOfficer(req, res, next) {
-    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
-    const settings = await getSettings();
-    const realInfo = getAttendanceOfficerSector(req.user.id, settings);
-    if (realInfo) { req.sectorInfo = realInfo; return next(); }
-    if (isSeniorAdmin(req.user.id)) {
-        const q = (req.query.sector || req.body?.sector || "").trim();
-        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
-        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
-        return next();
-    }
-    return res.status(403).json({ error: "هذا القسم لمسؤول التحضير فقط" });
-}
-
-// يسمح بعرض حضور القطاع لأي من: مسؤول التحضير، قائد القطاع، نائب القطاع، أو كبار المسؤولين (عبر ?sector=)
-// هذي الصلاحية "عرض فقط" — تُستخدم بمعزل عن ensureSectorLeader/ensureAttendanceOfficer لأنها تجمع أكثر من دور بنفس الوقت
-async function ensureAttendanceViewer(req, res, next) {
-    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
-    const settings = await getSettings();
-    const leaderInfo = getSectorRole(req.user.id, settings); // قائد أو نائب
-    if (leaderInfo) { req.sectorInfo = leaderInfo; return next(); }
-    const attInfo = getAttendanceOfficerSector(req.user.id, settings);
-    if (attInfo) { req.sectorInfo = attInfo; return next(); }
-    if (isSeniorAdmin(req.user.id)) {
-        const q = (req.query.sector || req.body?.sector || "").trim();
-        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
-        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
-        return next();
-    }
-    return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات ومسؤول التحضير فقط" });
 }
 
 // يسمح لقائد/نائب الشرطة العسكرية (أو كبار المسؤولين) بدخول لوحة الشرطة العسكرية كاملة
@@ -1802,8 +1674,6 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
     // حذف نهائي شامل: الحساب + الملف العسكري + الحضور والإجازات + طلبات الترقية + إزالته من الإداريين
     await Account.deleteOne({ uid: a.uid });
     await Personnel.deleteOne({ discord: a.uid });
-    await AttendanceStatus.deleteMany({ discord: a.uid });
-    await AttendanceLog.deleteMany({ discord: a.uid });
     await LeaveRequest.deleteMany({ discord: a.uid });
     await PromotionRequest.deleteMany({ targetDiscord: a.uid });
     await Settings.updateMany({}, { $pull: { adminList: a.uid } });
@@ -1866,8 +1736,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         const sec = (settings.sectorLeadership && settings.sectorLeadership[sectorInfo.sector]) || {};
         sectorInfo.personnelOfficerId = sec.personnelOfficerId || null;
         sectorInfo.personnelOfficerName = sec.personnelOfficerName || null;
-        sectorInfo.attendanceOfficerId = sec.attendanceOfficerId || null;
-        sectorInfo.attendanceOfficerName = sec.attendanceOfficerName || null;
         if (sectorInfo.role === "commander" || sectorInfo.role === "deputy") {
             const lastCheck = agingNoteCheckThrottle.get(sectorInfo.sector);
             if (!lastCheck || Date.now() - lastCheck > AGING_CHECK_COOLDOWN_MS) {
@@ -1877,7 +1745,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         }
     }
     const personnelOfficerInfo = getPersonnelOfficerSector(req.user.id, settings);
-    const attendanceOfficerInfo = getAttendanceOfficerSector(req.user.id, settings);
 
     // ── الشرطة العسكرية ──
     const mpRole = getMPRole(req.user.id, settings); // "commander" | "deputy" | null
@@ -1911,7 +1778,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isAntiDrugs,
         sectorInfo,
         personnelOfficerInfo,
-        attendanceOfficerInfo,
         mpInfo,
         mpPersonnelOfficer,
         isMilitaryPolice,
@@ -1937,95 +1803,6 @@ app.post("/api/profile/setup", ensureAuth, async (req, res) => {
         { discord: req.user.id }, { registeredName: name, unit }, { new: true, upsert: true }
     );
     res.json({ ok: true, registeredName: p.registeredName, unit: p.unit });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// نظام البصمة/التحضير — بوابة إلزامية بعد تسجيل الدخول
-// ══════════════════════════════════════════════════════════════════════════
-// يفحص هل انقطعت "نبضات" العضو أكثر من ATTENDANCE_TIMEOUT_MS وهو مسجّل حاضر (يعني طلع من الموقع/سكر التبويب
-// بدون تسجيل انصراف يدوي) — إذا صار كذا نسجّله منصرف تلقائياً ونطلب منه يبصم من جديد. غير كذا نجدد نبضته.
-async function checkAttendanceTimeout(st, req) {
-    if (!st || st.status !== "in") return st;
-    const now = new Date();
-    if (st.lastHeartbeatAt && (now - st.lastHeartbeatAt) > CONFIG.ATTENDANCE_TIMEOUT_MS) {
-        st.status = "out";
-        st.lastCheckOutAt = now;
-        st.lastHeartbeatAt = null;
-        await st.save();
-        await AttendanceLog.create({
-            discord: req.user.id, discordTag: st.discordTag,
-            registeredName: st.registeredName, unit: st.unit, rank: st.rank,
-            type: "out", at: now,
-        });
-    } else {
-        st.lastHeartbeatAt = now;
-        await st.save();
-    }
-    return st;
-}
-app.get("/api/attendance/status", ensureAuth, async (req, res) => {
-    const settings = await getSettings();
-    let st = await AttendanceStatus.findOne({ discord: req.user.id });
-    st = await checkAttendanceTimeout(st, req);
-    res.json({
-        status: st ? st.status : "out",
-        lockAttendance: !!settings.lockAttendance,
-    });
-});
-
-// نبضة دورية ترسلها الواجهة كل شوي طالما الموقع مفتوح عند العضو وهو مسجّل حاضر — تجدد مهلة الساعة
-app.post("/api/attendance/heartbeat", ensureAuth, async (req, res) => {
-    let st = await AttendanceStatus.findOne({ discord: req.user.id });
-    st = await checkAttendanceTimeout(st, req);
-    res.json({ status: st ? st.status : "out" });
-});
-
-app.post("/api/attendance/scan", ensureAuth, async (req, res) => {
-    const settings = await getSettings();
-    if (settings.lockAttendance && !isSeniorAdmin(req.user.id)) {
-        return res.status(423).json({ error: "🔒 تسجيل الحضور مقفل حالياً من قبل الإدارة العليا" });
-    }
-    const p = await Personnel.findOne({ discord: req.user.id });
-    if (!isSeniorAdmin(req.user.id) && p && p.isBlocked) {
-        return res.status(403).json({ error: "حسابك موقوف — راجع الإدارة" });
-    }
-
-    // فشل عشوائي بالبصمة — يحاكي بصمة حقيقية أحيانًا ما تنجح من أول مرة
-    if (Math.random() < CONFIG.FP_FAIL_RATE) {
-        return res.json({ success: false });
-    }
-
-    const sectorKey = await getMemberSectorKey(req.user.id);
-    const sectorLabel = sectorKey ? CONFIG.SECTORS[sectorKey] : null;
-
-    let st = await AttendanceStatus.findOne({ discord: req.user.id });
-    if (!st) st = await AttendanceStatus.create({ discord: req.user.id, discordTag: req.user.username });
-
-    const now = new Date();
-    const newType = st.status === "in" ? "out" : "in";
-    st.status = newType;
-    st.discordTag = req.user.username;
-    st.registeredName = p ? p.registeredName : st.registeredName;
-    st.unit = p ? p.unit : st.unit;
-    st.rank = p ? p.rank : st.rank;
-    st.sectorLabel = sectorLabel || st.sectorLabel;
-    if (newType === "in") {
-        const isNewDay = !st.lastCheckInAt || st.lastCheckInAt.toDateString() !== now.toDateString();
-        st.lastCheckInAt = now;
-        st.todayCount = isNewDay ? 1 : st.todayCount + 1;
-    } else {
-        st.lastCheckOutAt = now;
-    }
-    st.updatedAt = now;
-    await st.save();
-
-    await AttendanceLog.create({
-        discord: req.user.id, discordTag: req.user.username,
-        registeredName: st.registeredName, unit: st.unit, rank: st.rank,
-        type: newType, at: now,
-    });
-
-    res.json({ success: true, status: newType, at: now });
 });
 
 app.get("/api/violations/meta", ensureAuth, async (req, res) => {
@@ -2797,68 +2574,6 @@ app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// نظام البصمة/التحضير — لوحة تحكم كبار المسؤولين
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/senior/attendance/dashboard", ensureSeniorAdmin, async (req, res) => {
-    const [total, checkedIn, todayLogs] = await Promise.all([
-        AttendanceStatus.countDocuments({ discord: { $nin: hiddenOwnerIds(req) } }),
-        AttendanceStatus.countDocuments({ status: "in", discord: { $nin: hiddenOwnerIds(req) } }),
-        AttendanceLog.countDocuments({ at: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) }, discord: { $nin: hiddenOwnerIds(req) } }),
-    ]);
-    const settings = await getSettings();
-    res.json({ total, checkedIn, checkedOut: total - checkedIn, todayLogs, lockAttendance: !!settings.lockAttendance });
-});
-
-app.get("/api/senior/attendance/members", ensureSeniorAdmin, async (req, res) => {
-    const list = await AttendanceStatus.find({ discord: { $nin: hiddenOwnerIds(req) } }).sort({ updatedAt: -1 }).limit(300).lean();
-    res.json({ list });
-});
-
-app.post("/api/senior/attendance/members/:discord/force/:type", ensureSeniorAdmin, async (req, res) => {
-    const { discord, type } = req.params;
-    if (!["in", "out"].includes(type)) return res.status(400).json({ error: "نوع غير صحيح" });
-    let st = await AttendanceStatus.findOne({ discord });
-    if (!st) st = await AttendanceStatus.create({ discord });
-    const now = new Date();
-    st.status = type;
-    if (type === "in") st.lastCheckInAt = now; else st.lastCheckOutAt = now;
-    st.updatedAt = now;
-    await st.save();
-    await AttendanceLog.create({ discord, discordTag: st.discordTag, registeredName: st.registeredName, unit: st.unit, rank: st.rank, type, at: now });
-    res.json({ ok: true });
-});
-
-app.get("/api/senior/attendance/log", ensureSeniorAdmin, async (req, res) => {
-    const logs = await AttendanceLog.find({ discord: { $nin: hiddenOwnerIds(req) } }).sort({ at: -1 }).limit(300).maxTimeMS(10000).lean();
-    res.json({ list: logs });
-});
-
-app.post("/api/senior/attendance/settings/toggle", ensureSeniorAdmin, async (req, res) => {
-    const settings = await getSettings();
-    settings.lockAttendance = !settings.lockAttendance;
-    await settings.save();
-    res.json({ ok: true, lockAttendance: settings.lockAttendance });
-});
-
-app.post("/api/senior/attendance/force-checkout-all", ensureSeniorAdmin, async (req, res) => {
-    const now = new Date();
-    const inList = await AttendanceStatus.find({ status: "in" });
-    for (const st of inList) {
-        st.status = "out";
-        st.lastCheckOutAt = now;
-        st.updatedAt = now;
-        await st.save();
-        await AttendanceLog.create({ discord: st.discord, discordTag: st.discordTag, registeredName: st.registeredName, unit: st.unit, rank: st.rank, type: "out", at: now });
-    }
-    res.json({ ok: true, affected: inList.length });
-});
-
-app.post("/api/senior/attendance/reset-today", ensureSeniorAdmin, async (req, res) => {
-    await AttendanceStatus.updateMany({}, { $set: { todayCount: 0 } });
-    res.json({ ok: true });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
 // نظام الإجازات
 // ══════════════════════════════════════════════════════════════════════════
 app.get("/api/leave/mine", ensureAuth, async (req, res) => {
@@ -3144,7 +2859,7 @@ app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null } });
 });
 
-const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد", attendanceOfficer: "مسؤول تحضير" };
+const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد" };
 
 app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, res) => {
     const { sector } = req.params;
@@ -3376,83 +3091,6 @@ app.post("/api/sector/personnel-officer/remove", ensureSectorLeader, async (req,
         details: `${req.sectorInfo.sectorLabel} — ${removedName || "-"}`,
     });
     res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-// ── تعيين/إزالة "مسؤول التحضير" (يقدر عليها قائد/نائب القطاع نفسه، أو كبار المسؤولين عبر ?sector=) ──
-// مسؤول تحضير واحد بس لكل قطاع — يشوف حضور/بصمة أعضاء قطاعه فقط (المسجلين وغير المسجلين، وآخر سجل)
-app.post("/api/sector/attendance-officer/assign", ensureSectorLeader, async (req, res) => {
-    const { discordId } = req.body;
-    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
-    const person = await Personnel.findOne({ discord: discordId.trim() });
-    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
-
-    const settings = await getSettings();
-    if (!settings.sectorLeadership) settings.sectorLeadership = {};
-    if (!settings.sectorLeadership[req.sectorInfo.sector]) settings.sectorLeadership[req.sectorInfo.sector] = {};
-    const displayName = person.registeredName || person.discordTag || person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].attendanceOfficerId = person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].attendanceOfficerName = displayName;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "تعيين مسؤول تحضير", discordId: person.discord, discordTag: person.discordTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${req.sectorInfo.sectorLabel} — ${displayName} (بواسطة ${req.sectorInfo.role === "senior" ? "كبار المسؤولين" : "قيادة القطاع"})`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-app.post("/api/sector/attendance-officer/remove", ensureSectorLeader, async (req, res) => {
-    const settings = await getSettings();
-    const sec = settings.sectorLeadership && settings.sectorLeadership[req.sectorInfo.sector];
-    if (!sec || !sec.attendanceOfficerId) return res.json({ ok: true });
-    const removedName = sec.attendanceOfficerName;
-    sec.attendanceOfficerId = null;
-    sec.attendanceOfficerName = null;
-    settings.markModified("sectorLeadership");
-    await settings.save();
-    await logEvent({
-        action: "إزالة مسؤول تحضير", actorId: req.user.id, actorTag: req.user.username,
-        details: `${req.sectorInfo.sectorLabel} — ${removedName || "-"}`,
-    });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
-});
-
-// قائمة حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) + آخر سجل حضور/انصراف لكل عضو
-// متاحة لـ: مسؤول التحضير، قائد/نائب القطاع، وكبار المسؤولين (عبر ?sector=)
-app.get("/api/sector/attendance", ensureAttendanceViewer, async (req, res) => {
-    const memberIds = await getSectorMemberIds(req.sectorInfo.sector);
-    if (memberIds === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية" });
-
-    const personnelDocs = await Personnel.find({ discord: { $in: memberIds } }, { discord: 1, discordTag: 1, registeredName: 1, unit: 1, rank: 1 }).lean();
-    const personnelMap = new Map(personnelDocs.map(p => [p.discord, p]));
-
-    const statusDocs = await AttendanceStatus.find({ discord: { $in: memberIds } }).lean();
-    const statusMap = new Map(statusDocs.map(s => [s.discord, s]));
-
-    const list = memberIds.map(discord => {
-        const p = personnelMap.get(discord) || null;
-        const st = statusMap.get(discord) || null;
-        return {
-            discord,
-            name: (p && p.registeredName) || (st && st.registeredName) || null,
-            unit: (p && p.unit) || (st && st.unit) || null,
-            rank: (p && p.rank) || (st && st.rank) || null,
-            registeredOnSite: !!(p && p.registeredName),
-            registeredForAttendance: !!st,
-            status: st ? st.status : "out",
-            lastCheckInAt: st ? st.lastCheckInAt : null,
-            lastCheckOutAt: st ? st.lastCheckOutAt : null,
-        };
-    });
-    // نرتب: الحاضرين أولاً، بعدين الأحدث تحديث
-    list.sort((a, b) => {
-        if ((a.status === "in") !== (b.status === "in")) return a.status === "in" ? -1 : 1;
-        const at = Math.max(new Date(a.lastCheckInAt || 0), new Date(a.lastCheckOutAt || 0));
-        const bt = Math.max(new Date(b.lastCheckInAt || 0), new Date(b.lastCheckOutAt || 0));
-        return bt - at;
-    });
-    res.json({ list, sectorLabel: req.sectorInfo.sectorLabel });
 });
 
 // ── طلبات ترقية/تنزيل قطاعه (سجل حالة بس — المراجعة الفعلية صارت عند القيادة العليا) ──
@@ -4169,15 +3807,6 @@ app.get("/", (req, res) => {
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', 'Tahoma', 'Segoe UI', sans-serif; }
     body { background: linear-gradient(135deg, #0a1628 0%, #0d1f3c 40%, #0a2744 70%, #0d3060 100%); color: var(--text); min-height: 100vh; }
     #warn-banner { position: sticky; top: 0; z-index: 1000; width: 100%; background: linear-gradient(90deg,#7f1d1d,#991b1b); color: #fecaca; text-align: center; padding: 10px 14px; font-weight: bold; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,0.4); }
-    .fp-wrap { max-width: 420px; margin: 40px auto; text-align: center; padding: 0 16px; }
-    .fp-circle { width: 160px; height: 160px; border-radius: 50%; border: 4px solid var(--border); background: var(--panel); display: flex; align-items: center; justify-content: center; margin: 20px auto; cursor: pointer; user-select: none; position: relative; overflow: hidden; transition: 0.15s; }
-    .fp-circle .fp-fill { position: absolute; bottom: 0; left: 0; width: 100%; height: 0%; background: linear-gradient(180deg, var(--gold), var(--green)); transition: height linear; opacity: 0.55; }
-    .fp-circle .fp-icon { font-size: 56px; position: relative; z-index: 2; color: var(--gold-soft); }
-    .fp-circle .fp-icon svg { width: 68px; height: 68px; display: block; }
-    .fp-circle.scanning { border-color: var(--gold); box-shadow: 0 0 25px rgba(59,130,246,0.5); }
-    .fp-status { margin-top: 14px; font-size: 14px; min-height: 20px; }
-    .fp-status.ok { color: #4ade80; }
-    .fp-status.fail { color: #f87171; }
     nav { background: rgba(5,15,30,0.95); backdrop-filter: blur(15px); border-bottom: 1px solid rgba(59,130,246,0.3); padding: 0 1.2rem; display: flex; align-items: center; justify-content: space-between; height: 62px; position: sticky; top: 37px; z-index: 900; }
     #fm-overlay { position: fixed; inset: 0; background: rgba(5,10,20,0.72); backdrop-filter: blur(3px); z-index: 5000; display: none; align-items: center; justify-content: center; padding: 16px; }
     #fm-overlay.open { display: flex; }
@@ -4488,7 +4117,6 @@ let reportVehiclePhoto = null;
 let currentAdminTab = null;
 let pollTimer = null;
 let blockedPollTimer = null;
-let attHeartbeatTimer = null;
 
 // يمسك آخر عنصر تم الضغط عليه فعليًا (زر أو تبويب أو أي عنصر onclick) — يشتغل حتى على سفاري آيفون اللي ما يعطي focus تلقائيًا عند اللمس.
 // لازم يشمل عناصر التبويبات (.tab) مو بس <button>، لأن قبل كذا أي ضغط على تبويب كان يفضل ياخذ حالة "busy" من آخر زر حقيقي انضغط (حتى لو خلص طلبه أو ما له علاقة)، فكان يطلع خطأ "طلبك السابق لسا قيد التنفيذ" غلط من أول ضغطة.
@@ -4996,9 +4624,6 @@ async function init() {
     buildNav();
     if (checkSummonGate()) return;
     if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
-    let att;
-    try { att = await api('/api/attendance/status'); } catch (e) { att = { status: 'out' }; }
-    if (att.status !== 'in') { renderFingerprint('checkin'); return; }
     renderDashboard();
     checkPendingWarning();
     checkPromotionAlert();
@@ -5031,7 +4656,6 @@ function buildNav() {
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
-    if (ME.attendanceOfficerInfo) items.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
     mobile.innerHTML = items.map(i => \`<button onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
@@ -5046,7 +4670,6 @@ function renderFabs() {
     else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
-    if (ME.attendanceOfficerInfo) fabs.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
     return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
 }
 function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
@@ -5106,21 +4729,6 @@ async function submitLeaveRequest() {
 function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
-    if (attHeartbeatTimer) clearInterval(attHeartbeatTimer);
-    attHeartbeatTimer = setInterval(sendAttendanceHeartbeat, 5 * 60000);
-    sendAttendanceHeartbeat(); // نبضة فورية عند فتح اللوحة
-}
-// نرسلها كل 5 دقايق طالما اللوحة مفتوحة عنده — لو رجعت الحالة "منصرف" (يعني انقطعت نبضاته أكثر من ساعة
-// بسبب طلوعه من الموقع/سكر التبويب) نوقفه فوراً ونطلب منه يبصم من جديد
-async function sendAttendanceHeartbeat() {
-    try {
-        const att = await api('/api/attendance/heartbeat', { method: 'POST' });
-        if (att.status !== 'in') {
-            clearInterval(pollTimer);
-            clearInterval(attHeartbeatTimer);
-            renderFingerprint('checkin');
-        }
-    } catch (e) { /* تجاهل فشل النبضة المؤقت (انقطاع نت لحظي) */ }
 }
 async function pollTick() {
     if (!ME || ME.blocked) return;
@@ -5129,7 +4737,6 @@ async function pollTick() {
         if (fresh.blocked) {
             // صار حظر/إيقاف/صيانة/إغلاق تسجيل وهو شغّال بالموقع — نوقفه فوراً ونعرض السبب
             clearInterval(pollTimer);
-            clearInterval(attHeartbeatTimer);
             ME = fresh;
             renderBlocked(fresh.reason);
             startBlockedRecheck();
@@ -5188,7 +4795,69 @@ function authField(label, id, type, ph, dir) {
         '<input id="' + id + '" class="auth-input" type="' + type + '" placeholder="' + ph + '"' + (dir ? ' dir="' + dir + '"' : '') + ' autocomplete="off">' +
         '<span class="auth-req">* حقل إجباري</span></div>';
 }
-function renderLogin() {
+var SAVED_LOGIN_KEY = 'moi_saved_login';
+function getSavedLogin() {
+    try {
+        var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
+        if (v && v.email && v.password) return v;
+    } catch (e) { /* تجاهل */ }
+    return null;
+}
+function setSavedLogin(email, password) {
+    try { localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify({ email: email, password: password })); } catch (e) { /* تجاهل */ }
+}
+function renderSavedLogin(saved) {
+    authShell(
+        '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
+        '<div class="auth-sub">Ministry of Interior Server</div>' +
+        '<div id="auth-err" class="auth-err"></div>' +
+        '<label class="auth-label">تبي تدخل حسابك هذا؟</label>' +
+        '<div class="card" style="margin-top:8px;">' +
+            '<div style="font-size:12px;color:var(--muted);">البريد الإلكتروني</div>' +
+            '<div dir="ltr" style="text-align:left;font-weight:700;word-break:break-all;">' + accEsc(saved.email) + '</div>' +
+            '<div style="font-size:12px;color:var(--muted);margin-top:10px;">كلمة المرور</div>' +
+            '<div class="row"><div id="sv-pw" dir="ltr" style="font-weight:700;letter-spacing:2px;">••••••••</div>' +
+            '<button type="button" class="pw-eye" style="position:static;" id="sv-eye" onclick="toggleSavedPw()">👁</button></div>' +
+        '</div>' +
+        '<button class="auth-btn" id="lg-btn" onclick="doSavedLogin()">دخول بهذا الحساب</button>' +
+        '<div class="auth-sep"></div>' +
+        '<a class="auth-link" onclick="renderLogin(true)">الدخول بحساب ثاني</a>'
+    );
+}
+function toggleSavedPw() {
+    var saved = getSavedLogin();
+    var box = document.getElementById('sv-pw');
+    var eye = document.getElementById('sv-eye');
+    if (!saved || !box) return;
+    var hidden = box.textContent.indexOf('•') === 0;
+    box.textContent = hidden ? saved.password : '••••••••';
+    box.style.letterSpacing = hidden ? '0' : '2px';
+    eye.textContent = hidden ? '🙈' : '👁';
+}
+async function doSavedLogin() {
+    var saved = getSavedLogin();
+    if (!saved) return renderLogin(true);
+    authErr('');
+    try {
+        await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: saved.email, password: saved.password }) });
+        init();
+    } catch (e) { authErr(e.message + ' — لو غيّرت كلمة المرور اضغط "الدخول بحساب ثاني" وسجّل من جديد'); }
+}
+// بعد تسجيل الدخول: يسأله يحفظ بياناته بالجهاز أو لا
+async function offerSaveLogin(email, pw) {
+    try {
+        if (ME && ME.seniorTemp) return; // حساب كبار مسؤولين مؤقت (دخول بالبيانات الافتراضية) ما ينحفظ
+        var cur = getSavedLogin();
+        if (cur && cur.email.toLowerCase() === email.toLowerCase() && cur.password === pw) return;
+        var yes = await _fmOpen('هل تريد حفظ بيانات الدخول (البريد وكلمة المرور) في هذا الجهاز؟ بالمرة الجاية يسألك تبي تدخل حسابك هذا مباشرة.', { isPrompt: false, okText: 'نعم، احفظ' });
+        if (yes) { setSavedLogin(email, pw); toast('✅ تم حفظ الحساب بالجهاز'); }
+    } catch (e) { /* تجاهل */ }
+}
+function renderLogin(forceForm) {
+    if (!forceForm) {
+        var saved = getSavedLogin();
+        if (saved) { renderSavedLogin(saved); return; }
+    }
     authShell(
         '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
         '<div class="auth-sub">Ministry of Interior Server</div>' +
@@ -5221,7 +4890,8 @@ async function doLogin() {
     authErr('');
     try {
         await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: email, password: pw }) });
-        init();
+        await init();
+        offerSaveLogin(email, pw);
     } catch (e) { authErr(e.message); }
 }
 function renderRegister() {
@@ -5298,79 +4968,6 @@ async function doSetup() {
     try { await api('/api/profile/setup', { method: 'POST', body: JSON.stringify({ name, unit }) }); init(); }
     catch (e) { toast(e.message); }
 }
-// ── بوابة البصمة/التحضير — تظهر إلزامياً أول ما يسجل دخول (وعند الانصراف) ──
-let fpHoldTimer = null, fpHoldStart = 0, fpScanning = false;
-function renderFingerprint(mode) {
-    document.getElementById('nav-links').innerHTML = '';
-    document.getElementById('mobile-menu').innerHTML = '';
-    document.getElementById('app').innerHTML = \`
-        <div class="fp-wrap">
-            <h2>\${mode === 'checkin' ? '🖐️ سجّل حضورك' : '🖐️ سجّل انصرافك'}</h2>
-            <p style="color:var(--muted);font-size:13px;margin-top:6px;">اضغط مع الاستمرار على البصمة \${${CONFIG.FP_HOLD_SECONDS}} ثوانٍ لتسجيل \${mode === 'checkin' ? 'الحضور' : 'الانصراف'}</p>
-            <div class="fp-circle" id="fp-circle"
-                onmousedown="fpHoldStart_()" onmouseup="fpHoldEnd_()" onmouseleave="fpHoldEnd_()"
-                ontouchstart="fpHoldStart_(event)" ontouchend="fpHoldEnd_()">
-                <div class="fp-fill" id="fp-fill"></div>
-                <div class="fp-icon">
-                    <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round">
-                        <path d="M50 30 C35 30 25 42 25 55 C25 65 28 72 33 80" />
-                        <path d="M50 22 C68 22 82 38 82 56 C82 63 81 70 78 76" />
-                        <path d="M50 38 C41 38 34 46 34 55 C34 68 40 76 46 83" />
-                        <path d="M50 46 C45 46 42 50 42 55 C42 63 45 69 50 74" />
-                        <path d="M58 46 C63 49 66 53 67 60 C68 68 66 75 61 82" />
-                        <path d="M50 22 C32 22 18 37 18 55 C18 60 18.5 65 20 70" />
-                    </svg>
-                </div>
-            </div>
-            <div class="fp-status" id="fp-status"></div>
-            \${mode === 'checkout' ? '<button class="btn gray sm" onclick="renderDashboard()" style="margin-top:10px;">إلغاء</button>' : ''}
-        </div>\`;
-    window.__fpMode = mode;
-}
-function fpHoldStart_(ev) {
-    if (fpScanning) return;
-    if (ev) ev.preventDefault();
-    fpHoldStart = Date.now();
-    const circle = document.getElementById('fp-circle');
-    const fill = document.getElementById('fp-fill');
-    circle.classList.add('scanning');
-    fill.style.transitionDuration = (${CONFIG.FP_HOLD_SECONDS} * 1000) + 'ms';
-    requestAnimationFrame(() => { fill.style.height = '100%'; });
-    fpHoldTimer = setTimeout(() => doFingerprintScan(), ${CONFIG.FP_HOLD_SECONDS} * 1000);
-}
-function fpHoldEnd_() {
-    if (fpScanning) return;
-    clearTimeout(fpHoldTimer);
-    const circle = document.getElementById('fp-circle');
-    const fill = document.getElementById('fp-fill');
-    if (circle) circle.classList.remove('scanning');
-    if (fill) { fill.style.transitionDuration = '150ms'; fill.style.height = '0%'; }
-}
-async function doFingerprintScan() {
-    fpScanning = true;
-    const statusEl = document.getElementById('fp-status');
-    statusEl.textContent = 'جارِ التحقق...';
-    statusEl.className = 'fp-status';
-    try {
-        const data = await api('/api/attendance/scan', { method: 'POST' });
-        if (!data.success) {
-            statusEl.textContent = '❌ فشلت البصمة، حاول مرة ثانية';
-            statusEl.className = 'fp-status fail';
-        } else {
-            statusEl.textContent = data.status === 'in' ? '✅ تم تسجيل الحضور' : '✅ تم تسجيل الانصراف';
-            statusEl.className = 'fp-status ok';
-            setTimeout(() => { data.status === 'in' ? init() : renderFingerprint('checkin'); }, 900);
-        }
-    } catch (e) {
-        statusEl.textContent = 'تعذر الاتصال — ' + e.message;
-        statusEl.className = 'fp-status fail';
-    }
-    const circle = document.getElementById('fp-circle');
-    const fill = document.getElementById('fp-fill');
-    if (circle) circle.classList.remove('scanning');
-    if (fill) { fill.style.transitionDuration = '150ms'; fill.style.height = '0%'; }
-    fpScanning = false;
-}
 function renderDashboard() {
     document.getElementById('app').innerHTML = \`
         <div class="card row">
@@ -5381,7 +4978,6 @@ function renderDashboard() {
             <div class="row" style="gap:8px;">
                 \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
                 \${ME.sectorInfo ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
-                <button class="btn gray sm" onclick="renderFingerprint('checkout')">🚪 تسجيل الانصراف</button>
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
             </div>
         </div>
@@ -5713,7 +5309,6 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
-            <div class="tab" onclick="renderAttendanceControl()">🖐️ تحكم البصمة</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div><div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div></div>\` : '');
     document.getElementById('app').innerHTML = \`
@@ -5819,121 +5414,6 @@ async function rejectLeave(id, senior) {
 async function endLeave(id, senior) {
     if (!(await confirmModal('متأكد تبي تنهي هذي الإجازة الآن؟'))) return;
     try { await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
-    catch (e) { toast(e.message); }
-}
-
-// ── لوحة "تحكم البصمة" لكبار المسؤولين ────────────────────────────────────
-let attTab = 'dash';
-function renderAttendanceControl() {
-    document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>🖐️ تحكم البصمة</h2><button class="btn gray sm" onclick="renderAdmin()">رجوع للوحة الإدارة</button></div>
-        <div class="tabs">
-            <div class="tab active" onclick="attTabSwitch('dash', this)">📊 لوحة التحكم</div>
-            <div class="tab" onclick="attTabSwitch('members', this)">👥 الأعضاء</div>
-            <div class="tab" onclick="attTabSwitch('log', this)">📜 السجل</div>
-            <div class="tab" onclick="attTabSwitch('settings', this)">⚙️ الإعدادات</div>
-        </div>
-        <div id="att-content"></div>\`;
-    attTabSwitch('dash');
-}
-function attTabSwitch(name, el) {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    if (el) el.classList.add('active');
-    attTab = name;
-    if (name === 'dash') loadAttDash();
-    if (name === 'members') loadAttMembers();
-    if (name === 'log') loadAttLog();
-    if (name === 'settings') loadAttSettings();
-}
-async function loadAttDash() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let d;
-    try { d = await api('/api/senior/attendance/dashboard'); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    if (attTab !== 'dash') return;
-    box.innerHTML = \`
-        <div class="grid3">
-            <div class="stat"><div class="num">\${d.total}</div><div class="lbl">إجمالي المسجّلين</div></div>
-            <div class="stat"><div class="num" style="color:#4ade80;">\${d.checkedIn}</div><div class="lbl">حاضرون الآن</div></div>
-            <div class="stat"><div class="num">\${d.checkedOut}</div><div class="lbl">منصرفون</div></div>
-        </div>
-        <div class="card center" style="margin-top:12px;"><div class="num" style="font-size:26px;color:var(--gold-soft);">\${d.todayLogs}</div><div class="lbl">حركات اليوم</div></div>
-        \${d.lockAttendance ? '<div class="card" style="border-color:#f87171;color:#fca5a5;margin-top:12px;">🔒 تسجيل الحضور مقفل حالياً</div>' : ''}\`;
-}
-async function loadAttMembers() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let list;
-    try { ({ list } = await api('/api/senior/attendance/members')); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    if (attTab !== 'members') return;
-    box.innerHTML = list.length === 0 ? '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بعد</div>' : list.map(m => \`
-        <div class="card row">
-            <div>
-                <b>\${m.registeredName || m.discordTag}</b>
-                <div style="font-size:12px;color:var(--muted);">\${m.unit || '-'} • \${m.rank || '-'}</div>
-            </div>
-            <div class="row" style="gap:6px;">
-                <span class="badge \${m.status === 'in' ? 'approved' : 'pending'}">\${m.status === 'in' ? 'حاضر' : 'منصرف'}</span>
-                <button class="btn sm gray" onclick="attForceStatus('\${m.discord}','in')">تحضير</button>
-                <button class="btn sm danger" onclick="attForceStatus('\${m.discord}','out')">انصراف</button>
-            </div>
-        </div>\`).join('');
-}
-async function attForceStatus(discord, type) {
-    try { await api('/api/senior/attendance/members/' + discord + '/force/' + type, { method: 'POST' }); toast('تم التحديث'); loadAttMembers(); }
-    catch (e) { toast(e.message); }
-}
-async function loadAttLog() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let list;
-    try { ({ list } = await api('/api/senior/attendance/log')); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    if (attTab !== 'log') return;
-    box.innerHTML = list.length === 0 ? '<div class="card center" style="color:var(--muted);">لا يوجد سجل بعد</div>' : list.map(l => \`
-        <div class="card row">
-            <div>
-                <b>\${l.registeredName || l.discordTag}</b>
-                <div style="font-size:12px;color:var(--muted);">\${l.unit || '-'} • \${l.rank || '-'}</div>
-            </div>
-            <div style="text-align:left;">
-                <div style="color:\${l.type === 'in' ? '#4ade80' : '#f87171'};font-weight:700;">\${l.type === 'in' ? 'حضور' : 'انصراف'}</div>
-                <div style="color:var(--muted);font-size:11px;">\${new Date(l.at).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' })}</div>
-            </div>
-        </div>\`).join('');
-}
-async function loadAttSettings() {
-    const box = document.getElementById('att-content');
-    if (!box) return;
-    let d;
-    try { d = await api('/api/senior/attendance/dashboard'); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل (\${e.message})</div>\`; return; }
-    box.innerHTML = \`
-        <div class="card">
-            <button class="btn \${d.lockAttendance ? 'danger' : ''}" style="width:100%;margin-bottom:10px;" onclick="attToggleLock()">
-                🔒 \${d.lockAttendance ? 'إلغاء قفل تسجيل الحضور' : 'قفل تسجيل الحضور'}
-            </button>
-            <button class="btn gray" style="width:100%;margin-bottom:10px;" onclick="attForceCheckoutAll()">🚪 تسجيل خروج جماعي فوري للجميع</button>
-            <button class="btn gray" style="width:100%;" onclick="attResetToday()">🔄 تصفير عدّاد حضور اليوم</button>
-        </div>\`;
-}
-async function attToggleLock() {
-    try { await api('/api/senior/attendance/settings/toggle', { method: 'POST' }); toast('تم الحفظ'); loadAttSettings(); }
-    catch (e) { toast(e.message); }
-}
-async function attForceCheckoutAll() {
-    if (!(await confirmModal('متأكد تبي تسجل خروج جميع الحاضرين الآن؟'))) return;
-    try { const r = await api('/api/senior/attendance/force-checkout-all', { method: 'POST' }); toast('تم تسجيل خروج ' + r.affected + ' عضو'); }
-    catch (e) { toast(e.message); }
-}
-async function attResetToday() {
-    if (!(await confirmModal('متأكد تبي تصفّر عدّاد حضور اليوم لجميع الأعضاء؟'))) return;
-    try { await api('/api/senior/attendance/reset-today', { method: 'POST' }); toast('تم التصفير'); }
     catch (e) { toast(e.message); }
 }
 
@@ -6078,18 +5558,9 @@ function renderSectorsBox() {
                 </div>
             </div>
             <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول الأفراد يتحكم بالأعضاء من رتبة رئيس رقباء وتحت فقط (ملاحظات، تحذيرات، ومخالفاتهم) — وطلبات الترقية/التنزيل اللي يسويها تروح لك أو للنائب بصفحة "ترقيات الأفراد" داخل لوحة قيادة القطاع للموافقة عليها.</div>
-            <div class="row" style="margin-top:8px;">
-                <span>مسؤول التحضير: <b style="color:\${sec.attendanceOfficerName ? '#4ade80' : 'var(--muted)'};">\${sec.attendanceOfficerName || 'غير معيّن'}</b></span>
-                <div class="row" style="gap:6px;">
-                    <button class="btn sm gray" onclick="openSectorPicker('\${key}','attendanceOfficer')">مسؤول تحضير \${label}</button>
-                    \${sec.attendanceOfficerName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','attendanceOfficer')">إزالة</button>\` : ''}
-                </div>
-            </div>
-            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول التحضير يشوف حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
             <div id="picker-\${key}-commander"></div>
             <div id="picker-\${key}-deputy"></div>
             <div id="picker-\${key}-personnelOfficer"></div>
-            <div id="picker-\${key}-attendanceOfficer"></div>
         </div>\`;
     }).join('') + \`
         <div class="card">
@@ -6211,7 +5682,7 @@ async function removeMPRole(role) {
     catch (e) { toast(e.message); }
 }
 function openSectorPicker(sectorKey, role) {
-    ['commander', 'deputy', 'personnelOfficer', 'attendanceOfficer'].forEach(r => {
+    ['commander', 'deputy', 'personnelOfficer'].forEach(r => {
         Object.keys(sectorsCache.sectors).forEach(k => {
             const el = document.getElementById('picker-' + k + '-' + r);
             if (el && (k !== sectorKey || r !== role)) el.innerHTML = '';
@@ -6358,23 +5829,11 @@ function renderSectorPanel() {
             <div style="color:var(--muted);font-size:12px;margin-top:6px;">مسؤول الأفراد يتحكم بالأعضاء من رتبة رئيس رقباء وتحت فقط (ملاحظات وتحذيرات ومخالفاتهم). طلبات الترقية والتنزيل اللي يسويها ما تصير مباشرة — تجيك أو للنائب بتبويب "ترقيات الأفراد" تحت للموافقة عليها.</div>
             <div id="po-picker"></div>
         </div>
-        <div class="card">
-            <div class="row">
-                <span>مسؤول التحضير: <b style="color:\${ME.sectorInfo.attendanceOfficerName ? '#4ade80' : 'var(--muted)'};">\${ME.sectorInfo.attendanceOfficerName || 'غير معيّن'}</b></span>
-                <div class="row" style="gap:6px;">
-                    <button class="btn sm gray" onclick="openAttendanceOfficerPicker()">تعيين / تغيير</button>
-                    \${ME.sectorInfo.attendanceOfficerName ? \`<button class="btn danger sm" onclick="removeAttendanceOfficer()">إزالة</button>\` : ''}
-                </div>
-            </div>
-            <div style="color:var(--muted);font-size:12px;margin-top:6px;">مسؤول التحضير يشوف حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
-            <div id="ao-picker"></div>
-        </div>
         <div class="tabs">
             <div class="tab active" onclick="sectorTab('members', this)">أعضاء القطاع</div>
             <div class="tab" onclick="sectorTab('violations', this)">مخالفات القطاع</div>
             <div class="tab" onclick="sectorTab('file', this)">عرض ملف عسكري</div>
             <div class="tab" onclick="sectorTab('promotions', this)">ترقيات الأفراد</div>
-            <div class="tab" onclick="sectorTab('attendance', this)">🖐️ حضور القطاع</div>
             <div class="tab" onclick="sectorTab('leave', this)">🌴 طلبات الإجازات</div>
         </div>
         <div id="sector-content"></div>\`;
@@ -6401,41 +5860,6 @@ async function submitSectorNoticeForm() {
         const { count } = await api('/api/sector/notice-all', { method: 'POST', body: JSON.stringify({ reason }) });
         toast('✅ تم الإرسال لـ ' + count + ' عضو');
         closeWarnForm();
-    } catch (e) { toast(e.message); }
-}
-async function openAttendanceOfficerPicker() {
-    const el = document.getElementById('ao-picker');
-    if (!el) return;
-    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
-    el.innerHTML = '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">جارِ التحميل...</div>';
-    try {
-        const { list } = await api('/api/sector/members');
-        if (list.length === 0) { el.innerHTML = '<p style="color:var(--muted);font-size:13px;margin-top:8px;">لا يوجد أعضاء بالقطاع حالياً</p>'; return; }
-        el.innerHTML = \`<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">\` +
-            list.filter(p => p.registeredName).map(p => \`
-                <div class="card" style="padding:8px 12px;margin-top:6px;">
-                    <div class="row">
-                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
-                        <button class="btn sm" onclick="assignAttendanceOfficer('\${p.discord}')">تعيين</button>
-                    </div>
-                </div>\`).join('') + \`</div>\`;
-    } catch (e) { el.innerHTML = '<p style="color:#f87171;font-size:13px;margin-top:8px;">' + e.message + '</p>'; }
-}
-async function assignAttendanceOfficer(discordId) {
-    try {
-        await api('/api/sector/attendance-officer/assign', { method: 'POST', body: JSON.stringify({ discordId }) });
-        toast('تم التعيين');
-        await refreshMe();
-        renderSectorPanel();
-    } catch (e) { toast(e.message); }
-}
-async function removeAttendanceOfficer() {
-    if (!(await confirmModal('متأكد تبي تزيله من مسؤول التحضير؟'))) return;
-    try {
-        await api('/api/sector/attendance-officer/remove', { method: 'POST' });
-        toast('تم');
-        await refreshMe();
-        renderSectorPanel();
     } catch (e) { toast(e.message); }
 }
 async function openPersonnelOfficerPicker() {
@@ -6481,59 +5905,7 @@ function sectorTab(name, el) {
     if (name === 'violations') loadSectorViolations();
     if (name === 'file') renderSectorFileSearch();
     if (name === 'promotions') loadPromotionRequests();
-    if (name === 'attendance') loadSectorAttendance();
     if (name === 'leave') loadSectorLeavePending();
-}
-async function loadSectorAttendance() {
-    const box = document.getElementById('sector-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let data;
-    try { data = await api('/api/sector/attendance'); }
-    catch (e) {
-        if (sectorPanelTab !== 'attendance') return;
-        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
-        return;
-    }
-    if (sectorPanelTab !== 'attendance') return;
-    if (!data.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بالقطاع</div>'; return; }
-    box.innerHTML = data.list.map(m => \`
-        <div class="card row">
-            <div>
-                <b>\${m.name || 'غير مسجل بالموقع'}</b>
-                <div class="sub" style="font-size:12px;color:var(--muted);">\${m.unit || '-'} • \${m.rank || '-'}</div>
-                \${!m.registeredForAttendance ? '<div style="font-size:12px;color:#fca5a5;margin-top:2px;">لم يبصم من قبل</div>' :
-                    \`<div style="font-size:11px;color:var(--muted);margin-top:2px;">آخر حضور: \${m.lastCheckInAt ? new Date(m.lastCheckInAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'} • آخر انصراف: \${m.lastCheckOutAt ? new Date(m.lastCheckOutAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'}</div>\`}
-            </div>
-            <span class="badge \${m.status === 'in' ? 'approved' : 'pending'}">\${m.status === 'in' ? '✅ حاضر' : '⭕ منصرف'}</span>
-        </div>\`).join('');
-}
-// ── لوحة مستقلة لـ"مسؤول التحضير" (لمن ما يكون بنفس الوقت قائد/نائب قطاع) — نفس بيانات تبويب "حضور القطاع" ──
-function renderAttendanceOfficerPanel() {
-    if (!ME.attendanceOfficerInfo) return renderDashboard();
-    document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>🖐️ لوحة التحضير — \${ME.attendanceOfficerInfo.sectorLabel}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
-        <div style="color:var(--muted);font-size:12px;margin-bottom:6px;">حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
-        <div id="ao-panel-content"><div class="card">جارِ التحميل...</div></div>\`;
-    loadAttendanceOfficerPanel();
-}
-async function loadAttendanceOfficerPanel() {
-    const box = document.getElementById('ao-panel-content');
-    if (!box) return;
-    let data;
-    try { data = await api('/api/sector/attendance'); }
-    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
-    if (!data.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بالقطاع</div>'; return; }
-    box.innerHTML = data.list.map(m => \`
-        <div class="card row">
-            <div>
-                <b>\${m.name || 'غير مسجل بالموقع'}</b>
-                <div class="sub" style="font-size:12px;color:var(--muted);">\${m.unit || '-'} • \${m.rank || '-'}</div>
-                \${!m.registeredForAttendance ? '<div style="font-size:12px;color:#fca5a5;margin-top:2px;">لم يبصم من قبل</div>' :
-                    \`<div style="font-size:11px;color:var(--muted);margin-top:2px;">آخر حضور: \${m.lastCheckInAt ? new Date(m.lastCheckInAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'} • آخر انصراف: \${m.lastCheckOutAt ? new Date(m.lastCheckOutAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'}</div>\`}
-            </div>
-            <span class="badge \${m.status === 'in' ? 'approved' : 'pending'}">\${m.status === 'in' ? '✅ حاضر' : '⭕ منصرف'}</span>
-        </div>\`).join('');
 }
 async function loadSectorLeavePending() {
     const box = document.getElementById('sector-content') || document.getElementById('po-content');
