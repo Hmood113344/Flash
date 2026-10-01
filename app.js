@@ -3921,16 +3921,16 @@ app.get("/", (req, res) => {
 
     /* ── البطاقة العسكرية ── */
     .mc-wrap { max-width: 340px; margin: 0 auto; }
-    .mcard { position: relative; width: 100%; aspect-ratio: 857 / 564; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .mcard { position: relative; width: 100%; aspect-ratio: 943 / 616; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent; }
     .mc-face { position: absolute; inset: 0; background: url('/card-bg.jpg') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3); transition: filter 0.3s, transform 0.3s; }
     .mcard.locked .mc-face { filter: blur(15px); transform: scale(1.08); }
-    /* المعلومات المطبوعة على صورة البطاقة (مواقعها بنسبة من الصورة الأصلية 857x564) */
+    /* المعلومات المطبوعة على صورة البطاقة (مواقعها بنسبة من الصورة الأصلية 943x616) */
     .mc-t { position: absolute; color: #0f172a; font-weight: 800; font-size: 3.5cqw; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; direction: rtl; text-shadow: 0 0 3px rgba(255,255,255,0.95), 0 0 6px rgba(255,255,255,0.8); transform: translateY(-50%); }
-    .mc-t.name { left: 3.5%; right: 52.7%; top: 24.1%; }
-    .mc-t.rank { left: 3.5%; right: 52.7%; top: 38.1%; }
-    .mc-t.unit { left: 3.5%; right: 53.3%; top: 48%; }
-    .mc-t.note { left: 3.5%; right: 56.1%; top: 59.4%; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: 3.1cqw; transform: translateY(-30%); }
-    .mc-t.num { left: 6.9%; width: 17%; top: 93.9%; text-align: center; direction: ltr; font-size: 2.1cqw; letter-spacing: 0.18em; text-shadow: none; }
+    .mc-t.name { left: 51%; right: 11.8%; top: 25.2%; }
+    .mc-t.rank { left: 51%; right: 11.8%; top: 38.6%; }
+    .mc-t.unit { left: 51%; right: 12.5%; top: 50%; }
+    .mc-t.note { left: 51%; right: 16.5%; top: 60.5%; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: 3.1cqw; transform: translateY(-30%); }
+    .mc-t.num { left: 7.4%; width: 17.2%; top: 93.4%; text-align: center; direction: ltr; font-size: 2.1cqw; letter-spacing: 0.18em; text-shadow: none; }
     .mc-cover { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2cqw; background: rgba(15,30,60,0.28); cursor: pointer; z-index: 2; }
     .mc-cover svg { width: 15cqw; height: 15cqw; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.7)); }
     .mc-cover span { color: #fff; font-weight: 800; font-size: 4.2cqw; text-shadow: 0 2px 8px rgba(0,0,0,0.75); }
@@ -3956,9 +3956,9 @@ app.get("/", (req, res) => {
     /* عرض البطاقة كاملة — على الجوال العمودي تنقلب أفقياً وتملأ الشاشة */
     #mc-full { display: none; position: fixed; inset: 0; z-index: 5200; background: rgba(0,0,0,0.95); align-items: center; justify-content: center; overflow: hidden; }
     #mc-full.open { display: flex; }
-    #mc-full .mc-fs { width: min(96vw, calc(92vh * 857 / 564)); flex-shrink: 0; cursor: pointer; }
+    #mc-full .mc-fs { width: min(96vw, calc(92vh * 943 / 616)); flex-shrink: 0; cursor: pointer; }
     #mc-full .mc-fs .mcard { cursor: pointer; border-radius: 14px; }
-    @media (orientation: portrait) { #mc-full .mc-fs { width: min(92vh, calc(96vw * 857 / 564)); transform: rotate(90deg); } }
+    @media (orientation: portrait) { #mc-full .mc-fs { width: min(92vh, calc(96vw * 943 / 616)); transform: rotate(90deg); } }
     #mc-full .mc-x { position: absolute; top: env(safe-area-inset-top,12px); left: 12px; z-index: 2; background: rgba(255,255,255,0.14); color: #fff; border: none; border-radius: 50%; width: 40px; height: 40px; font-size: 18px; cursor: pointer; margin-top: 10px; }
     /* ── صفحات الحسابات (لوحة الإدارة) ── */
     .acc-card .acc-title { font-size: 17px; font-weight: 800; color: var(--gold-soft); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
