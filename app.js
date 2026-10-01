@@ -1527,7 +1527,7 @@ async function ensureJuniorInMySector(req, res, discordId) {
 // خلفية البطاقة العسكرية — ملف card-bg.jpg بجانب هذا الملف (بدون base64 داخل الكود)
 const nodePath = require("path");
 app.get("/card-bg.jpg", (req, res) => {
-    res.sendFile(nodePath.join(__dirname, "card-bg.jpg"), { maxAge: "7d" }, (err) => {
+    res.sendFile(nodePath.join(__dirname, "card-bg.jpg"), { maxAge: "5m" }, (err) => {
         if (err && !res.headersSent) res.status(404).end();
     });
 });
@@ -3922,7 +3922,7 @@ app.get("/", (req, res) => {
     /* ── البطاقة العسكرية ── */
     .mc-wrap { max-width: 340px; margin: 0 auto; }
     .mcard { position: relative; width: 100%; aspect-ratio: 943 / 616; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent; }
-    .mc-face { position: absolute; inset: 0; background: url('/card-bg.jpg') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3); transition: filter 0.3s, transform 0.3s; }
+    .mc-face { position: absolute; inset: 0; background: url('/card-bg.jpg?v=2') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3); transition: filter 0.3s, transform 0.3s; }
     .mcard.locked .mc-face { filter: blur(15px); transform: scale(1.08); }
     /* المعلومات المطبوعة على صورة البطاقة (مواقعها بنسبة من الصورة الأصلية 943x616) */
     .mc-t { position: absolute; color: #0f172a; font-weight: 800; font-size: 3.5cqw; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; direction: rtl; text-shadow: 0 0 3px rgba(255,255,255,0.95), 0 0 6px rgba(255,255,255,0.8); transform: translateY(-50%); }
