@@ -123,7 +123,7 @@ const CONFIG = {
 // 2) قاعدة البيانات والموديلات
 // ══════════════════════════════════════════════════════════════════════════
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); })
+    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 const PersonnelSchema = new mongoose.Schema({
@@ -176,6 +176,7 @@ const PersonnelSchema = new mongoose.Schema({
     isDismissed: { type: Boolean, default: false }, // فصل نهائي (بعد تجاوز حد التحذيرات المسموح)
     leaveBalance: { type: Number, default: 10 }, // رصيد الإجازات المتبقي بالأيام
     cardNumber: { type: String, default: null, index: true }, // رقم البطاقة العسكرية (يتولّد تلقائياً)
+    sector: { type: String, default: null }, // مفتاح القطاع (patrol | roadSecurity | antiDrugs) — نسخة من Account.sector تظهر على البطاقة
     createdAt: { type: Date, default: Date.now }
 });
 const Personnel = mongoose.model("Personnel", PersonnelSchema);
@@ -196,6 +197,18 @@ async function ensureCardNumbers() {
             await Personnel.updateOne({ _id: m._id, ...cond }, { $set: { cardNumber: await genCardNumber() } });
         }
     } catch (e) { console.error("❌ فشل توليد أرقام البطاقات:", e.message); }
+}
+
+// يزامن حقل القطاع بملفات العساكر مع حساباتهم (يشتغل عند التشغيل) — عشان يطلع القطاع على البطاقة
+async function ensureSectorFields() {
+    try {
+        const accs = await Account.find({ status: "approved" }, { uid: 1, sector: 1 }).lean();
+        const bySector = {};
+        for (const a of accs) { const k = a.sector || ""; (bySector[k] = bySector[k] || []).push(a.uid); }
+        for (const [k, uids] of Object.entries(bySector)) {
+            await Personnel.updateMany({ discord: { $in: uids }, sector: { $ne: k || null } }, { $set: { sector: k || null } });
+        }
+    } catch (e) { console.error("❌ فشل مزامنة القطاعات:", e.message); }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1555,7 +1568,7 @@ async function approveAccount(a, actor) {
     await Personnel.findOneAndUpdate(
         { discord: a.uid },
         {
-            $set: { registeredName: a.fullName, discordTag: a.fullName },
+            $set: { registeredName: a.fullName, discordTag: a.fullName, sector: a.sector || null },
             $setOnInsert: {
                 unit: a.sector ? (CONFIG.SECTORS[a.sector] || "غير محدد") : "غير محدد",
                 leaveBalance: settings.leaveBalanceDefault ?? CONFIG.DEFAULT_LEAVE_BALANCE,
@@ -1627,7 +1640,7 @@ app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res)
     await a.save();
     const p = await Personnel.findOne({ discord: a.uid });
     if (p) {
-        p.registeredName = fullName; p.discordTag = fullName;
+        p.registeredName = fullName; p.discordTag = fullName; p.sector = sector;
         const oldLabel = oldSector ? CONFIG.SECTORS[oldSector] : null;
         if (!p.unit || p.unit === "غير محدد" || (oldLabel && p.unit === oldLabel)) {
             p.unit = sector ? CONFIG.SECTORS[sector] : "غير محدد";
@@ -1767,6 +1780,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         avatar: req.user.avatar ? `https://cdn.discordapp.com/avatars/${req.user.id}/${req.user.avatar}.png` : null,
         registeredName: p.registeredName,
         cardNumber: p.cardNumber,
+        sector: (await Account.findOne({ uid: req.user.id }, { sector: 1 }).lean())?.sector || p.sector || null,
         unit: p.unit,
         rank: p.rank,
         points: p.points,
@@ -3921,16 +3935,16 @@ app.get("/", (req, res) => {
 
     /* ── البطاقة العسكرية ── */
     .mc-wrap { max-width: 340px; margin: 0 auto; }
-    .mcard { position: relative; width: 100%; aspect-ratio: 943 / 616; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent; }
-    .mc-face { position: absolute; inset: 0; background: url('/card-bg.jpg?v=2') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3); transition: filter 0.3s, transform 0.3s; }
+    .mcard { position: relative; width: 100%; aspect-ratio: 968 / 609; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .mc-face { position: absolute; inset: 0; background: url('/card-bg.jpg?v=3') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3); transition: filter 0.3s, transform 0.3s; }
     .mcard.locked .mc-face { filter: blur(15px); transform: scale(1.08); }
     /* المعلومات المطبوعة على صورة البطاقة (مواقعها بنسبة من الصورة الأصلية 943x616) */
     .mc-t { position: absolute; color: #0f172a; font-weight: 800; font-size: 3.5cqw; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; direction: rtl; text-shadow: 0 0 3px rgba(255,255,255,0.95), 0 0 6px rgba(255,255,255,0.8); transform: translateY(-50%); }
-    .mc-t.name { left: 51%; right: 11.8%; top: 25.2%; }
-    .mc-t.rank { left: 51%; right: 11.8%; top: 38.6%; }
-    .mc-t.unit { left: 51%; right: 12.5%; top: 50%; }
-    .mc-t.note { left: 51%; right: 16.5%; top: 60.5%; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: 3.1cqw; transform: translateY(-30%); }
-    .mc-t.num { left: 7.4%; width: 17.2%; top: 93.4%; text-align: center; direction: ltr; font-size: 2.1cqw; letter-spacing: 0.18em; text-shadow: none; }
+    .mc-t.name { left: 51.5%; right: 12.2%; top: 25.04%; }
+    .mc-t.rank { left: 51.5%; right: 12.2%; top: 38.59%; }
+    .mc-t.unit { left: 51.5%; right: 12.2%; top: 50.41%; }
+    .mc-t.sector { left: 51.5%; right: 12.2%; top: 62.89%; }
+    .mc-t.num { left: 7.64%; width: 17.25%; top: 95.5%; text-align: center; direction: ltr; font-size: 1.7cqw; letter-spacing: 0.12em; text-shadow: none; }
     .mc-cover { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2cqw; background: rgba(15,30,60,0.28); cursor: pointer; z-index: 2; }
     .mc-cover svg { width: 15cqw; height: 15cqw; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.7)); }
     .mc-cover span { color: #fff; font-weight: 800; font-size: 4.2cqw; text-shadow: 0 2px 8px rgba(0,0,0,0.75); }
@@ -3956,9 +3970,9 @@ app.get("/", (req, res) => {
     /* عرض البطاقة كاملة — على الجوال العمودي تنقلب أفقياً وتملأ الشاشة */
     #mc-full { display: none; position: fixed; inset: 0; z-index: 5200; background: rgba(0,0,0,0.95); align-items: center; justify-content: center; overflow: hidden; }
     #mc-full.open { display: flex; }
-    #mc-full .mc-fs { width: min(96vw, calc(92vh * 943 / 616)); flex-shrink: 0; cursor: pointer; }
+    #mc-full .mc-fs { width: min(96vw, calc(92vh * 968 / 609)); flex-shrink: 0; cursor: pointer; }
     #mc-full .mc-fs .mcard { cursor: pointer; border-radius: 14px; }
-    @media (orientation: portrait) { #mc-full .mc-fs { width: min(92vh, calc(96vw * 943 / 616)); transform: rotate(90deg); } }
+    @media (orientation: portrait) { #mc-full .mc-fs { width: min(92vh, calc(96vw * 968 / 609)); transform: rotate(90deg); } }
     #mc-full .mc-x { position: absolute; top: env(safe-area-inset-top,12px); left: 12px; z-index: 2; background: rgba(255,255,255,0.14); color: #fff; border: none; border-radius: 50%; width: 40px; height: 40px; font-size: 18px; cursor: pointer; margin-top: 10px; }
     /* ── صفحات الحسابات (لوحة الإدارة) ── */
     .acc-card .acc-title { font-size: 17px; font-weight: 800; color: var(--gold-soft); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -4106,6 +4120,7 @@ app.get("/", (req, res) => {
 
 <script>
 const MILITARY_RANKS = ${JSON.stringify(CONFIG.MILITARY_RANKS)};
+const SECTOR_LABELS = ${JSON.stringify(CONFIG.SECTORS)};
 let ME = null;
 let lastKnownRank = null;
 let META = { types: [], vehicles: [] };
@@ -6957,6 +6972,7 @@ function cardFields(p) {
         name: p.registeredName || p.discordTag || '-',
         rank: p.rank || '-',
         unit: p.unit || '-',
+        sector: (p.sector && SECTOR_LABELS[p.sector]) || '-',
         num: p.cardNumber || '--------',
         points: (p.points === undefined || p.points === null) ? '-' : String(p.points),
         note: p.notes === undefined ? '—' : (notes.length ? notes[notes.length - 1] : 'لا توجد ملاحظات'),
@@ -6965,14 +6981,14 @@ function cardFields(p) {
 }
 const MC_DATA = {};
 const MC_OPT = {};
-const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['notes', 'الملاحظات']];
+const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات']];
 // وجه البطاقة: الصورة + المعلومات مطبوعة عليها
 function mcFace(f) {
     return '<div class="mc-face">' +
         '<div class="mc-t name" data-k="name">' + cardEsc(f.name) + '</div>' +
         '<div class="mc-t rank" data-k="rank">' + cardEsc(f.rank) + '</div>' +
         '<div class="mc-t unit" data-k="unit">' + cardEsc(f.unit) + '</div>' +
-        '<div class="mc-t note" data-k="note">' + cardEsc(f.note) + '</div>' +
+        '<div class="mc-t sector" data-k="sector">' + cardEsc(f.sector) + '</div>' +
         '<div class="mc-t num" data-k="num">' + cardEsc(f.num) + '</div>' +
     '</div>';
 }
