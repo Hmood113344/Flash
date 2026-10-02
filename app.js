@@ -1539,8 +1539,13 @@ async function ensureJuniorInMySector(req, res, discordId) {
 
 // خلفية البطاقة العسكرية — ملف card-bg.jpg بجانب هذا الملف (بدون base64 داخل الكود)
 const nodePath = require("path");
+// يختار أول ملف موجود بالترتيب (الجديد أول، والقديم آخر شي) — فلو الاستضافة غيّرت اسم الملف الجديد إلى "card-bg 2" أو "card-bg2" أو "card-bg (2)" يشتغل بدون ما تحتاج تشيل الرقم
+const fsCard = require("fs");
+const CARD_BG_CANDIDATES = ["card-bg2.jpg", "card-bg 2.jpg", "card-bg (2).jpg", "card-bg-2.jpg", "card-bg_2.jpg", "card-bg2.jpeg", "card-bg 2.jpeg", "card-bg.jpg"];
 app.get("/card-bg.jpg", (req, res) => {
-    res.sendFile(nodePath.join(__dirname, "card-bg.jpg"), { maxAge: "5m" }, (err) => {
+    const name = CARD_BG_CANDIDATES.find(n => fsCard.existsSync(nodePath.join(__dirname, n)));
+    if (!name) return res.status(404).end();
+    res.sendFile(nodePath.join(__dirname, name), { maxAge: "5m" }, (err) => {
         if (err && !res.headersSent) res.status(404).end();
     });
 });
