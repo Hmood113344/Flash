@@ -1584,6 +1584,29 @@ app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res)
     res.json({ ok: true });
 });
 
+app.post("/api/senior/accounts/:uid/sector", ensureSeniorAdmin, async (req, res) => {
+    const a = await Account.findOne({ uid: req.params.uid, status: "approved" });
+    if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
+    if (a.isSenior && a.uid !== req.user.id && !isOwnerUid(req.user.id)) return res.status(403).json({ error: "حساب كبير المسؤولين خاص بصاحبه، ما تقدر تعدّله" });
+    const sector = (req.body || {}).sector ? String(req.body.sector) : null;
+    if (sector && !CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير صحيح" });
+    const oldSector = a.sector || null;
+    if (oldSector === sector) return res.json({ ok: true });
+    a.sector = sector;
+    await a.save();
+    const p = await Personnel.findOne({ discord: a.uid });
+    if (p) {
+        p.sector = sector;
+        const oldLabel = oldSector ? CONFIG.SECTORS[oldSector] : null;
+        if (!p.unit || p.unit === "غير محدد" || (oldLabel && p.unit === oldLabel)) {
+            p.unit = sector ? CONFIG.SECTORS[sector] : "غير محدد";
+        }
+        await p.save();
+    }
+    await logEvent({ action: "تغيير قطاع", discordId: a.uid, discordTag: a.fullName, actorId: req.user.id, actorTag: req.user.username, details: `${a.fullName}: ${oldSector ? CONFIG.SECTORS[oldSector] : "بدون قطاع"} ← ${sector ? CONFIG.SECTORS[sector] : "بدون قطاع"}` });
+    res.json({ ok: true });
+});
+
 app.post("/api/owner/accounts/:uid/senior", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
@@ -2019,15 +2042,95 @@ app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) =>
     res.json({ ok: true });
 });
 
+// ===== مطابقة الأسماء (لحماية الحسابات المكررة) =====
+const NAME_STOP = new Set(["بن", "ابن", "جندي", "اول", "عريف", "وكيل", "رقيب", "رئيس", "رقباء", "ملازم", "نقيب", "رائد", "مقدم", "عقيد", "عميد", "لواء", "فريق"]);
+function nameTokens(str) {
+    let t = String(str || "").toLowerCase()
+        .replace(/[\[\(\{][^\]\)\}]*[\]\)\}]/g, " ")
+        .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+        .replace(/[إأآٱ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه").replace(/ؤ/g, "و").replace(/ئ/g, "ي")
+        .replace(/[^a-z\u0621-\u064A]+/g, " ").trim();
+    if (!t) return [];
+    return t.split(/\s+/).map(w => (w.length > 4 && w.startsWith("ال")) ? w.slice(2) : w).filter(w => w.length > 1 && !NAME_STOP.has(w));
+}
+function lev1(a, b) {
+    if (a === b) return true;
+    if (Math.abs(a.length - b.length) > 1) return false;
+    let i = 0, j = 0, diff = 0;
+    while (i < a.length && j < b.length) {
+        if (a[i] === b[j]) { i++; j++; continue; }
+        if (++diff > 1) return false;
+        if (a.length > b.length) i++; else if (a.length < b.length) j++; else { i++; j++; }
+    }
+    return diff + (a.length - i) + (b.length - j) <= 1;
+}
+function tokEq(a, b) { return a === b || (a.length >= 5 && b.length >= 5 && lev1(a, b)); }
+function allIn(small, big) { return small.every(x => big.some(y => tokEq(x, y))); }
+function namesSimilar(m, acc) {
+    if (!m.length || !acc.length) return false;
+    if (m.length === 1 && acc.length === 1) return tokEq(m[0], acc[0]);
+    if (m.length >= 2 && allIn(m, acc)) return true;
+    if (acc.length >= 2 && allIn(acc, m)) return true;
+    return false;
+}
+
 app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
     await ensureCardNumbers();
     const q = (req.query.q || "").trim();
     const qe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const filter = q ? { $or: [{ registeredName: new RegExp(qe, "i") }, { unit: new RegExp(qe, "i") }, { discordTag: new RegExp(qe, "i") }, { cardNumber: new RegExp(qe, "i") }] } : {};
-    const hid = hiddenOwnerIds(req);
-    if (hid.length) filter.discord = { $nin: hid };
-    const list = await Personnel.find(filter, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
+    const base = q ? { $or: [{ registeredName: new RegExp(qe, "i") }, { unit: new RegExp(qe, "i") }, { discordTag: new RegExp(qe, "i") }, { cardNumber: new RegExp(qe, "i") }] } : {};
+    const owners = Array.from(ownerUids);
+    const approvedUids = (await Account.find({ status: "approved" }, { uid: 1 }).lean()).map(a => a.uid);
+    const rest = await Personnel.find({ ...base, discord: { $in: approvedUids, $nin: owners } }, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
+    let list = rest;
+    if (isOwnerUid(req.user.id) && owners.length) {
+        const ownerDocs = await Personnel.find({ ...base, discord: { $in: owners } }, { "notes.image": 0 });
+        list = [...ownerDocs, ...rest];
+    }
     res.json({ list });
+});
+
+app.get("/api/senior/unapproved-members", ensureSeniorAdmin, async (req, res) => {
+    try {
+        const guild = client.guilds.cache.get(CONFIG.GUILD_ID) || await client.guilds.fetch(CONFIG.GUILD_ID).catch(() => null);
+        if (!botReady || !guild) return res.status(503).json({ error: "البوت غير جاهز أو ما لقى السيرفر، حاول بعد شوي" });
+        await ensureGuildMembersFetched(guild);
+        const q = (req.query.q || "").trim().toLowerCase();
+        const owners = new Set(Array.from(ownerUids));
+
+        const accs = await Account.find({ isOwner: { $ne: true } }, { uid: 1, fullName: 1, status: 1 }).lean();
+        const approvedAccs = accs.filter(a => a.status === "approved");
+        const approvedUidSet = new Set(approvedAccs.map(a => a.uid));
+        const pers = await Personnel.find({ registeredName: { $ne: null } }, { discord: 1, registeredName: 1 }).lean();
+        const registeredIds = new Set(pers.filter(p => !owners.has(p.discord)).map(p => p.discord));
+        const approvedTokens = approvedAccs.map(a => nameTokens(a.fullName));
+        pers.forEach(p => { if (approvedUidSet.has(p.discord) && !owners.has(p.discord)) approvedTokens.push(nameTokens(p.registeredName)); });
+        const pendingTokens = accs.filter(a => a.status === "pending").map(a => nameTokens(a.fullName));
+        const rejectedTokens = accs.filter(a => a.status === "rejected").map(a => nameTokens(a.fullName));
+
+        const out = [];
+        for (const m of guild.members.cache.values()) {
+            if (m.user.bot) continue;
+            if (registeredIds.has(m.id)) continue;
+            const names = [m.displayName, m.user.globalName, m.user.username].filter(Boolean);
+            const toks = names.map(nameTokens).filter(t => t.length);
+            if (toks.some(t => approvedTokens.some(at => namesSimilar(t, at)))) continue;
+            let accStatus = null;
+            if (toks.some(t => pendingTokens.some(at => namesSimilar(t, at)))) accStatus = "pending";
+            else if (toks.some(t => rejectedTokens.some(at => namesSimilar(t, at)))) accStatus = "rejected";
+            out.push({
+                id: m.id, username: m.user.username, displayName: m.displayName || m.user.username,
+                avatar: m.user.displayAvatarURL({ size: 64 }), accStatus,
+            });
+        }
+        let list = out;
+        if (q) list = list.filter(m => (m.displayName || "").toLowerCase().includes(q) || (m.username || "").toLowerCase().includes(q) || m.id.includes(q));
+        list.sort((x, y) => (x.displayName || "").localeCompare(y.displayName || "", "ar"));
+        res.json({ list: list.slice(0, 200), total: list.length });
+    } catch (e) {
+        console.error("❌ فشل جلب الحسابات غير المعتمدة:", e.message);
+        res.status(500).json({ error: "تعذر جلب أعضاء السيرفر: " + e.message });
+    }
 });
 
 app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, res) => {
@@ -7801,16 +7904,57 @@ async function enterSummon() {
     }
 }
 
+let personnelView = 'approved';
 async function loadPersonnel() {
     const box = document.getElementById('admin-content');
-    box.innerHTML = \`<div class="card row"><h3 style="margin:0;">الحسابات</h3><button class="btn sm" style="background:#78350f;color:#fff;" onclick="openWarnAllForm()">📢 إشعار للجميع</button></div><div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
+    box.innerHTML = \`<div class="card row"><h3 style="margin:0;">الحسابات</h3><button class="btn sm" style="background:#78350f;color:#fff;" onclick="openWarnAllForm()">📢 إشعار للجميع</button></div>
+        <div class="tabs">
+            <div class="tab \${personnelView === 'approved' ? 'active' : ''}" id="pv-approved" onclick="setPersonnelView('approved')">✅ الحسابات المعتمدة</div>
+            <div class="tab \${personnelView === 'unapproved' ? 'active' : ''}" id="pv-unapproved" onclick="setPersonnelView('unapproved')">⏳ الحسابات غير المعتمدة</div>
+        </div>
+        <div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
     searchPersonnel();
+}
+function setPersonnelView(v) {
+    personnelView = v;
+    document.getElementById('pv-approved').classList.toggle('active', v === 'approved');
+    document.getElementById('pv-unapproved').classList.toggle('active', v === 'unapproved');
+    const s = document.getElementById('p-search');
+    if (s) { s.value = ''; s.placeholder = v === 'approved' ? 'بحث بالاسم / اليونت / التاق' : 'بحث بالاسم / اليوزر / الآيدي'; }
+    searchPersonnel();
+}
+async function searchUnapproved() {
+    const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
+    const pListEl = document.getElementById('p-list');
+    if (pListEl) pListEl.innerHTML = '<div class="card center" style="color:var(--muted);">جاري التحميل...</div>';
+    try {
+        const { list, total } = await api('/api/senior/unapproved-members?q=' + encodeURIComponent(q));
+        if (currentAdminTab !== 'personnel' || personnelView !== 'unapproved') return;
+        const el = document.getElementById('p-list');
+        if (!el) return;
+        const head = \`<div class="card" style="color:var(--muted);font-size:13px;">أعضاء السيرفر اللي ما عندهم حساب معتمد بفلاش: <b>\${total}</b>\${total > list.length ? ' (يعرض أول ' + list.length + ' — استخدم البحث)' : ''}</div>\`;
+        el.innerHTML = head + (list.map(m => \`
+            <div class="card row">
+                <div class="row" style="gap:10px;justify-content:flex-start;">
+                    <img src="\${cardEsc(m.avatar)}" style="width:36px;height:36px;border-radius:50%;" onerror="this.style.display='none'">
+                    <div>
+                        <b>\${cardEsc(m.displayName)}</b> <span style="color:var(--muted);font-size:12px;">@\${cardEsc(m.username)}</span>
+                        <div style="font-size:12px;color:#94a3b8;">ID: \${cardEsc(m.id)}</div>
+                    </div>
+                </div>
+                <div style="font-size:12px;color:\${m.accStatus === 'pending' ? '#fbbf24' : (m.accStatus === 'rejected' ? '#f87171' : 'var(--muted)')};">\${m.accStatus === 'pending' ? '⏳ طلب تسجيل معلّق' : (m.accStatus === 'rejected' ? '❌ طلبه مرفوض' : 'غير مسجّل')}</div>
+            </div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا نتائج</div>');
+    } catch (e) {
+        const el = document.getElementById('p-list');
+        if (el) el.innerHTML = '<div class="card center" style="color:#f87171;">' + cardEsc(e.message) + '</div>';
+    }
 }
 let personnelCache = [];
 async function searchPersonnel() {
+    if (personnelView === 'unapproved') return searchUnapproved();
     const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
     const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
-    if (currentAdminTab !== 'personnel') return;
+    if (currentAdminTab !== 'personnel' || personnelView !== 'approved') return;
     personnelCache = list;
     cardRemember(list);
     const pListEl = document.getElementById('p-list');
@@ -7821,6 +7965,7 @@ async function searchPersonnel() {
                 <div>
                     <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
                     <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''} • رقم البطاقة: \${p.cardNumber || '-'}</div>
+                    <div style="display:flex;align-items:center;gap:6px;margin-top:6px;"><span style="font-size:12px;color:var(--muted);">القطاع:</span><select style="width:auto;margin:0;padding:4px 8px;font-size:12px;" data-uid="\${p.discord}" onchange="changeSector(this.dataset.uid, this.value)">\${ACC_SECTORS.map(x => '<option value="' + x[0] + '"' + (x[0] === (p.sector || '') ? ' selected' : '') + '>' + x[1] + '</option>').join('')}</select></div>
                 </div>
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
@@ -7844,6 +7989,14 @@ async function searchPersonnel() {
                 <button class="btn sm" onclick="saveEdit('\${p.discord}', \${i})">حفظ التعديلات</button>
             </div>
         </div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا نتائج</div>';
+}
+async function changeSector(uid, sector) {
+    try {
+        await api('/api/senior/accounts/' + uid + '/sector', { method: 'POST', body: JSON.stringify({ sector }) });
+        toast('✅ تم تغيير القطاع');
+        if (currentAdminTab === 'personnel') searchPersonnel();
+        else if (currentAdminTab === 'accounts') loadAccounts();
+    } catch (e) { toast(e.message); if (currentAdminTab === 'personnel') searchPersonnel(); else if (currentAdminTab === 'accounts') loadAccounts(); }
 }
 function toggleEdit(i) {
     document.getElementById('pedit-' + i).classList.toggle('hidden');
@@ -8214,7 +8367,9 @@ function renderAccList() {
         return '<div class="card acc-card">' +
             '<div class="acc-title">' + accEsc(a.fullName) + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين' + (a.uid === ME.discordId ? ' (حسابك)' : '') + '</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
             accRow('البريد', a.email) + accPwRow(a.password) + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
-            accRow('القطاع', accSectorLabel(a.sector)) +
+            (isRej || (a.isSenior && !(a.uid === ME.discordId || ME.isOwner)) ? accRow('القطاع', accSectorLabel(a.sector)) :
+                '<div class="acc-row"><span>القطاع</span><select data-uid="' + a.uid + '" style="width:auto;margin:0;padding:4px 8px;font-size:13px;" onchange="changeSector(this.dataset.uid, this.value)">' +
+                ACC_SECTORS.map(function (x) { return '<option value="' + x[0] + '"' + (x[0] === (a.sector || '') ? ' selected' : '') + '>' + x[1] + '</option>'; }).join('') + '</select></div>') +
             accRow('متفرغ للعمل؟', accYN(a.answers && a.answers.available)) +
             accRow('قادر على المشاركة الصوتية والتصوير وتحمل الضغط؟', accYN(a.answers && a.answers.capable)) +
             (isRej && a.rejectReason ? accRow('سبب الرفض', a.rejectReason) : '') +
