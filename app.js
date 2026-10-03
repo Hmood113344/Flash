@@ -3863,7 +3863,6 @@ app.get("/api/bank/personnel-ranks", async (req, res) => {
 // خدمة العملاء (تكت) — مساعد ذكي أول، وبعدها عضو حقيقي من الإدارة، تحديث فوري بدون ريفرش
 // ══════════════════════════════════════════════════════════════════════════
 const SUPPORT_CATEGORIES = ["مشكلة في الموقع", "مشكلة في حسابي", "مخالفة / نقاط / رتبة", "إجازة", "البطاقة العسكرية", "اقتراح", "أخرى"];
-const SUPPORT_PLACES = ["تسجيل الدخول / التسجيل", "الرئيسية", "تسجيل مخالفة", "مخالفاتي", "الإجازات", "بطاقتي", "لوحة الإدارة", "لوحة القطاع", "الشرطة العسكرية", "مكان ثاني"];
 
 const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
     no: { type: Number, index: true },
@@ -4213,7 +4212,7 @@ app.post("/api/support/tickets", async (req, res) => {
     if (open >= 1) return res.status(400).json({ error: "عندك تكت مفتوح على هذا الجهاز، لازم تسكّره أول عشان تقدر تفتح تكت جديد" });
     const last = await SupportTicket.findOne().sort({ no: -1 }).select("no").lean();
     const category = SUPPORT_CATEGORIES.includes(b.category) ? b.category : "أخرى";
-    const place = SUPPORT_PLACES.includes(b.place) ? b.place : "";
+    const place = category === "أخرى" ? "" : String(b.place || "").replace(/[<>]/g, "").trim().slice(0, 60);
     const t = await SupportTicket.create({
         no: ((last && last.no) || 1000) + 1,
         uid, guestToken: uid ? null : gt, deviceToken: gt, name, category, place,
@@ -4516,6 +4515,7 @@ app.get("/", (req, res) => {
     .btn.gray { background: rgba(255,255,255,0.08); border: 1px solid rgba(59,130,246,0.25); color: #94a3b8; }
     .btn.gold { background: linear-gradient(135deg, #1d4ed8, #60a5fa); color: #fff; }
     .btn.sm { padding: 0.4rem 0.9rem; font-size: 0.8rem; }
+    input[type="hidden"] { display: none !important; }
     input, select, textarea { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: rgba(255,255,255,0.06); color: #fff; margin-bottom: 10px; font-size: 14px; }
     label { display: block; margin-bottom: 6px; color: var(--gold-soft); font-size: 13px; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: space-between; }
@@ -4945,22 +4945,52 @@ function csToggle(baseId) {
     document.querySelectorAll('.cs-menu.open').forEach(m => m.classList.remove('open'));
     if (willOpen) menu.classList.add('open');
 }
-function csPick(baseId, value) {
+// يضبط القيمة المختارة (للمخفي + عنوان الزر + علامة ✓) بدون ما يشغّل أي حدث
+function csSet(baseId, value) {
     const hidden = document.getElementById(baseId);
     const trigger = document.getElementById(baseId + '-trigger');
     const menu = document.getElementById(baseId + '-menu');
-    if (hidden) hidden.value = value;
-    if (trigger) trigger.textContent = value;
-    if (menu) {
-        menu.querySelectorAll('.cs-option').forEach(o => {
-            const isSel = o.dataset.val === value;
-            o.classList.toggle('selected', isSel);
-            const existingCheck = o.querySelector('.cs-check');
-            if (isSel && !existingCheck) o.insertAdjacentHTML('beforeend', ' <span class="cs-check">✓</span>');
-            if (!isSel && existingCheck) existingCheck.remove();
-        });
-        menu.classList.remove('open');
+    const opts = menu ? Array.prototype.slice.call(menu.querySelectorAll('.cs-option')) : [];
+    let hit = null;
+    opts.forEach(o => { if (o.dataset.val === value) hit = o; });
+    if (!hit && opts.length && hidden && hidden.type === 'hidden') hit = opts[0];
+    if (hit) {
+        if (hidden) hidden.value = hit.dataset.val;
+        if (trigger) trigger.textContent = hit.dataset.label || hit.dataset.val;
+    } else {
+        if (hidden) hidden.value = value;
+        if (trigger) trigger.textContent = value;
     }
+    opts.forEach(o => {
+        const isSel = o === hit;
+        o.classList.toggle('selected', isSel);
+        const existingCheck = o.querySelector('.cs-check');
+        if (isSel && !existingCheck) o.insertAdjacentHTML('beforeend', ' <span class="cs-check">✓</span>');
+        if (!isSel && existingCheck) existingCheck.remove();
+    });
+}
+function csPick(baseId, value) {
+    csSet(baseId, value);
+    const menu = document.getElementById(baseId + '-menu');
+    if (menu) menu.classList.remove('open');
+    const hidden = document.getElementById(baseId);
+    if (hidden && hidden.dataset && hidden.dataset.onpick) { try { new Function('value', hidden.dataset.onpick)(hidden.value); } catch (e) {} }
+}
+// يبني قائمة اختيار بتصميم الموقع. options = [[القيمة, النص], ...] — القيمة تنقرا من عنصر مخفي بنفس الـ id
+function csHtml(id, options, current, opts) {
+    opts = opts || {};
+    let cur = options.length ? options[0][0] : '';
+    options.forEach(o => { if (o[0] === current) cur = o[0]; });
+    let curLabel = '';
+    const items = options.map(o => {
+        const sel = o[0] === cur;
+        if (sel) curLabel = o[1];
+        return '<div class="cs-option' + (sel ? ' selected' : '') + '" data-val="' + spEsc(o[0]) + '" data-label="' + spEsc(o[1]) + '" onclick="csPick(' + "'" + id + "'" + ', this.dataset.val)">' + spEsc(o[1]) + (sel ? ' <span class="cs-check">✓</span>' : '') + '</div>';
+    }).join('');
+    return '<div class="cs-wrap"' + (opts.style ? ' style="' + opts.style + '"' : '') + '>' +
+        '<input type="hidden" id="' + id + '" value="' + spEsc(cur) + '"' + (opts.onpick ? ' data-onpick="' + spEsc(opts.onpick) + '"' : '') + '>' +
+        '<button type="button" class="cs-trigger" id="' + id + '-trigger" onclick="csToggle(' + "'" + id + "'" + ')">' + spEsc(curLabel) + '</button>' +
+        '<div class="cs-menu" id="' + id + '-menu">' + items + '</div></div>';
 }
 document.addEventListener('click', (e) => {
     if (!e.target.closest('.cs-wrap')) document.querySelectorAll('.cs-menu.open').forEach(m => m.classList.remove('open'));
@@ -5206,7 +5236,7 @@ function summonPickMode(mode) {
         <div class="row" style="gap:8px;">
             <input type="number" id="sf-hour" placeholder="الساعة (1-12)" min="1" max="12" style="width:33%;">
             <input type="number" id="sf-minute" placeholder="الدقيقة" min="0" max="59" style="width:33%;">
-            <select id="sf-ampm" style="width:33%;"><option value="صباح">صباح</option><option value="مساء">مساء</option></select>
+            \${csHtml('sf-ampm', [['صباح', 'صباح'], ['مساء', 'مساء']], 'صباح', { style: 'width:33%;margin-bottom:0;' })}
         </div>
         <div class="wf-actions">
             <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
@@ -5371,7 +5401,31 @@ async function refreshMe() {
 // ══════════════════════════════════════════════════════════════════════════
 var SP = { cur: null, es: null, esOk: false, img: null, lastLive: 0, liveT: null, badgeT: null, loading: false, again: false, atab: 'waiting' };
 var SP_CATS = ['مشكلة في الموقع', 'مشكلة في حسابي', 'مخالفة / نقاط / رتبة', 'إجازة', 'البطاقة العسكرية', 'اقتراح', 'أخرى'];
-var SP_PLACES = ['تسجيل الدخول / التسجيل', 'الرئيسية', 'تسجيل مخالفة', 'مخالفاتي', 'الإجازات', 'بطاقتي', 'لوحة الإدارة', 'لوحة القطاع', 'الشرطة العسكرية', 'مكان ثاني'];
+// وين المشكلة؟ — تتغير الخيارات حسب نوع المشكلة اللي اختاره العضو. نوع "أخرى" ما فيه سؤال مكان.
+var SP_PLACE_MAP = {
+    'مشكلة في الموقع': ['تسجيل الدخول / التسجيل', 'الرئيسية', 'تسجيل مخالفة', 'مخالفاتي', 'الإجازات', 'بطاقتي', 'لوحة الإدارة', 'لوحة القطاع', 'الشرطة العسكرية', 'أخرى'],
+    'مشكلة في حسابي': ['تسجيل الدخول', 'كلمة المرور', 'طلب التسجيل / الموافقة على الحساب', 'الاسم أو البريد', 'القطاع أو الرتبة', 'أخرى'],
+    'مخالفة / نقاط / رتبة': ['مخالفة مسجّلة عليّ', 'النقاط', 'الرتبة', 'الترقية / التنزيل', 'التحذيرات', 'صورة المخالفة', 'أخرى'],
+    'إجازة': ['طلب إجازة جديد', 'حالة الطلب', 'مدة الإجازة', 'إلغاء أو تمديد الإجازة', 'أخرى'],
+    'البطاقة العسكرية': ['الاسم', 'القطاع', 'اليونت', 'الرتبة', 'الصورة', 'عرض البطاقة / تحميلها', 'أخرى'],
+    'اقتراح': ['الرئيسية', 'المخالفات', 'الإجازات', 'البطاقة العسكرية', 'لوحة الإدارة', 'أخرى']
+};
+var SP_PLACE_Q = {
+    'مشكلة في الموقع': 'وين المشكلة في الموقع؟',
+    'مشكلة في حسابي': 'وين المشكلة في حسابك؟',
+    'مخالفة / نقاط / رتبة': 'وين المشكلة في المخالفات والنقاط؟',
+    'إجازة': 'وين المشكلة في الإجازة؟',
+    'البطاقة العسكرية': 'وين المشكلة في البطاقة العسكرية؟',
+    'اقتراح': 'لأي قسم الاقتراح؟'
+};
+function spCatChanged(cat) {
+    var wrap = document.getElementById('spn-place-wrap'); if (!wrap) return;
+    var list = SP_PLACE_MAP[cat];
+    if (!list) { wrap.style.display = 'none'; document.getElementById('spn-place-box').innerHTML = ''; return; }
+    wrap.style.display = '';
+    document.getElementById('spn-place-q').textContent = SP_PLACE_Q[cat] || 'وين المشكلة؟';
+    document.getElementById('spn-place-box').innerHTML = csHtml('spn-place', list.map(function (x) { return [x, x]; }), list[0]);
+}
 var SP_ST = { ai: '🤖 مساعد ذكي', waiting: '⏳ بانتظار إداري', active: '✅ مع إداري', closed: '🔒 مغلق' };
 function spEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function spTime(d) { try { return new Date(d).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
@@ -5538,11 +5592,12 @@ function spShowNew() {
     document.getElementById('sp-body').innerHTML =
         '<button class="sp-link" onclick="spShowList()" style="align-self:flex-start;margin-bottom:8px;">‹ رجوع</button>' +
         (guest ? '<label class="sp-lbl">اسمك</label><input id="spn-name" class="sp-field" maxlength="40" placeholder="اكتب اسمك">' : '') +
-        '<label class="sp-lbl">نوع المشكلة</label><select id="spn-cat" class="sp-field">' + SP_CATS.map(function (c) { return '<option>' + c + '</option>'; }).join('') + '</select>' +
-        '<label class="sp-lbl">وين المشكلة بالموقع؟</label><select id="spn-place" class="sp-field">' + SP_PLACES.map(function (c) { return '<option>' + c + '</option>'; }).join('') + '</select>' +
+        '<label class="sp-lbl">نوع المشكلة</label>' + csHtml('spn-cat', SP_CATS.map(function (c) { return [c, c]; }), SP_CATS[0], { onpick: 'spCatChanged(value)' }) +
+        '<div id="spn-place-wrap"><label class="sp-lbl" id="spn-place-q"></label><div id="spn-place-box"></div></div>' +
         '<label class="sp-lbl">اشرح المشكلة</label><textarea id="spn-text" class="sp-field" rows="4" maxlength="1500" placeholder="وش اللي صار؟ وش الزر اللي ضغطته؟ وش الخطأ اللي ظهر؟"></textarea>' +
         '<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;"><label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label><div id="spn-prev" class="sp-prev" style="margin:0;"></div></div>' +
         '<button class="sp-btn" id="spn-go" onclick="spCreate()">فتح التكت</button>';
+    spCatChanged(SP_CATS[0]);
 }
 async function spCreate() {
     var b = document.getElementById('spn-go');
@@ -5555,7 +5610,7 @@ async function spCreate() {
         var d = await spApi('/api/support/tickets', { method: 'POST', body: JSON.stringify({
             name: nm ? nm.value.trim() : undefined,
             category: document.getElementById('spn-cat').value,
-            place: document.getElementById('spn-place').value,
+            place: (document.getElementById('spn-place-wrap').style.display !== 'none' && document.getElementById('spn-place')) ? document.getElementById('spn-place').value : '',
             text: text, image: SP.img
         }) });
         SP.img = null;
@@ -7986,10 +8041,7 @@ function renderMPReportNotesList() {
         <div class="card" style="margin-top:8px;padding:10px 14px;">
             <div class="row" style="gap:6px;">
                 <input placeholder="اسم/آيدي العسكري" value="\${n.name}" oninput="mpReportNotes[\${i}].name=this.value" style="flex:2;">
-                <select onchange="mpReportNotes[\${i}].kind=this.value" style="flex:1;">
-                    <option value="note" \${n.kind === 'note' ? 'selected' : ''}>ملاحظة</option>
-                    <option value="warning" \${n.kind === 'warning' ? 'selected' : ''}>تحذير</option>
-                </select>
+                \${csHtml('mpk-' + i, [['note', 'ملاحظة'], ['warning', 'تحذير']], n.kind, { style: 'flex:1;margin-bottom:0;', onpick: 'mpReportNotes[' + i + '].kind=value' })}
                 <button class="btn danger sm" onclick="removeMPReportNoteRow(\${i})">حذف</button>
             </div>
             <textarea placeholder="السبب" oninput="mpReportNotes[\${i}].reason=this.value" style="margin-top:6px;">\${n.reason}</textarea>
@@ -8514,8 +8566,7 @@ function openAccEdit(uid) {
     const a = ACC_LIST.find(function (x) { return x.uid === uid; });
     if (!a) return;
     closeAccEdit();
-    let sec = '';
-    ACC_SECTORS.forEach(function (s) { sec += '<option value="' + s[0] + '">' + s[1] + '</option>'; });
+    const sec = csHtml('ae-sec', ACC_SECTORS, a.sector || '');
     const ov = document.createElement('div');
     ov.id = 'acc-edit-ov'; ov.className = 'acc-ov';
     ov.innerHTML = '<div class="acc-modal"><h3>تعديل الحساب</h3>' +
@@ -8524,7 +8575,7 @@ function openAccEdit(uid) {
         '<label>الجنسية</label><input id="ae-nat">' +
         '<label>البريد الإلكتروني</label><input id="ae-email" type="email" dir="ltr">' +
         '<label>كلمة المرور</label><input id="ae-pw" type="text" dir="ltr">' +
-        '<label>القطاع</label><select id="ae-sec">' + sec + '</select>' +
+        '<label>القطاع</label>' + sec +
         '<label class="acc-check"><input type="checkbox" id="ae-mp"> من الشرطة العسكرية</label>' +
         '<div class="row" style="gap:8px;margin-top:14px;"><button class="btn gray" onclick="closeAccEdit()">إلغاء</button>' +
         '<button class="btn" data-uid="' + a.uid + '" onclick="saveAccEdit(this)">💾 حفظ</button></div></div>';
@@ -8534,7 +8585,7 @@ function openAccEdit(uid) {
     document.getElementById('ae-nat').value = a.nationality || '';
     document.getElementById('ae-email').value = a.email || '';
     document.getElementById('ae-pw').value = a.password || '';
-    document.getElementById('ae-sec').value = a.sector || '';
+    csSet('ae-sec', a.sector || '');
     document.getElementById('ae-mp').checked = !!a.isMP;
     ov.onclick = function (e) { if (e.target === ov) closeAccEdit(); };
 }
@@ -8964,15 +9015,7 @@ function renderPenaltiesPage(list) {
         <div class="card" id="penalty-form-card">
             <h3 id="penalty-form-title" style="margin-bottom:10px;">➕ إضافة عقوبة جديدة</h3>
             <input id="pn-label" placeholder="اسم العقوبة (مثال: إيقاف 4 أيام)">
-            <select id="pn-type" onchange="togglePenaltyFields()">
-                <option value="points">خصم نقاط</option>
-                <option value="resetPoints">تصفير النقاط بالكامل</option>
-                <option value="demote">تنزيل رتبة</option>
-                <option value="demoteToFirst">تنزيل لأول رتبة (جندي)</option>
-                <option value="suspend">إيقاف مؤقت (أيام)</option>
-                <option value="combo">عقوبة مركّبة (نقاط + رتبة + إيقاف)</option>
-                <option value="dismiss">فصل نهائي</option>
-            </select>
+            \${csHtml('pn-type', [['points', 'خصم نقاط'], ['resetPoints', 'تصفير النقاط بالكامل'], ['demote', 'تنزيل رتبة'], ['demoteToFirst', 'تنزيل لأول رتبة (جندي)'], ['suspend', 'إيقاف مؤقت (أيام)'], ['combo', 'عقوبة مركّبة (نقاط + رتبة + إيقاف)'], ['dismiss', 'فصل نهائي']], 'points', { onpick: 'togglePenaltyFields()' })}
             <input id="pn-value" type="number" min="1" placeholder="عدد النقاط المخصومة">
             <input id="pn-ranks" type="number" min="1" placeholder="عدد الرتب المُنزّلة">
             <input id="pn-days" type="number" min="1" placeholder="عدد أيام الإيقاف">
@@ -9010,7 +9053,7 @@ function editPenalty(p) {
     editingPenaltyId = p.id;
     document.getElementById('penalty-form-title').textContent = '✏️ تعديل العقوبة';
     document.getElementById('pn-label').value = p.label || '';
-    document.getElementById('pn-type').value = p.type || 'points';
+    csSet('pn-type', p.type || 'points');
     document.getElementById('pn-value').value = p.value || '';
     document.getElementById('pn-ranks').value = p.ranks || '';
     document.getElementById('pn-days').value = p.days || '';
@@ -9022,7 +9065,7 @@ function resetPenaltyForm() {
     editingPenaltyId = null;
     document.getElementById('penalty-form-title').textContent = '➕ إضافة عقوبة جديدة';
     document.getElementById('pn-label').value = '';
-    document.getElementById('pn-type').value = 'points';
+    csSet('pn-type', 'points');
     document.getElementById('pn-value').value = '';
     document.getElementById('pn-ranks').value = '';
     document.getElementById('pn-days').value = '';
