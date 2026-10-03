@@ -1,6 +1,3 @@
-// ══════════════════════════════════════════════════════════════════════════
-// فلاش — الموقع العسكري (ملف واحد شامل: إعدادات + موقع + بوت)
-// ══════════════════════════════════════════════════════════════════════════
 
 const express = require("express");
 const session = require("express-session");
@@ -26,9 +23,6 @@ const {
     AttachmentBuilder,
 } = require("discord.js");
 
-// ══════════════════════════════════════════════════════════════════════════
-// 1) الإعدادات — تُقرأ من Environment Variables بلوحة الاستضافة (Render → Environment)
-// ══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || "",
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
@@ -38,37 +32,30 @@ const CONFIG = {
     MONGO_URI: process.env.MONGO_URI || "",
 
     SITE_NAME: "فلاش",
-    // رابط الموقع (يُستخرج من رابط الكولباك تلقائياً، أو يُحدَّد يدوياً عبر SITE_URL بمتغيرات البيئة)
     SITE_URL: process.env.SITE_URL || (process.env.DISCORD_CALLBACK_URL ? process.env.DISCORD_CALLBACK_URL.replace(/\/auth\/discord\/callback.*$/, "") : "https://flash1-gtsp.onrender.com"),
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7700,
 
-    // ── حساب كبير المسؤولين (يُنشأ تلقائياً أول مرة) — تقدر تغيّر الإيميل وكلمة المرور من لوحة الكبار بعد الدخول ──
     ADMIN_EMAIL: process.env.ADMIN_EMAIL || "admin@moi.sa.com",
     ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "Admin@12345",
-    // ── حساب المالك (سري — ما يظهر لأحد حتى كبار المسؤولين). كلمة مرور المالك من متغير البيئة OWNER_PASSWORD (Environment) ──
     OWNER_EMAIL: (process.env.OWNER_EMAIL || "hmood@admin.moi").toLowerCase(),
     OWNER_PASSWORD: process.env.OWNER_PASSWORD || "",
-    // (اختياري) آيديات ديسكورد المسموح لها بأوامر البوت الخاصة بالكبار — لا علاقة لها بالموقع
     BOT_ADMIN_IDS: (process.env.BOT_ADMIN_IDS || "").split(",").map(x => x.trim()).filter(Boolean),
 
-    // ── خدمة العملاء (تكت) ──
-    SUPPORT_CHANNEL_ID: process.env.SUPPORT_CHANNEL_ID || "",       // روم ديسكورد اللي توصله رسالة "تحدث مع عضو حقيقي"
-    SUPPORT_PING_ROLE_ID: process.env.SUPPORT_PING_ROLE_ID || "",   // (اختياري) رتبة تُمنشن عند وصول تكت
-    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",         // مفتاح المساعد الآلي (Claude)
+    SUPPORT_CHANNEL_ID: process.env.SUPPORT_CHANNEL_ID || "",
+    SUPPORT_PING_ROLE_ID: process.env.SUPPORT_PING_ROLE_ID || "",
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
     SUPPORT_AI_MODEL: process.env.SUPPORT_AI_MODEL || "claude-sonnet-4-6",
 
-    // الرتب العسكرية الرسمية بالترتيب من الأدنى للأعلى
     MILITARY_RANKS: [
     "جندي", "جندي اول", "عريف", "وكيل رقيب", "رقيب", "رقيب اول", "رئيس رقباء",
     "ملازم", "ملازم اول", "نقيب", "رائد",
     "مقدم", "عقيد", "عميد",
     "لواء", "فريق", "فريق اول",
 ],
-    DEFAULT_POINTS_PER_RANK: 20, // النقاط الافتراضية المطلوبة للترقية للرتبة التالية (قابلة للتعديل من لوحة كبار المسؤولين)
+    DEFAULT_POINTS_PER_RANK: 20,
 
-    // ── نظام الإجازات ──
-    DEFAULT_LEAVE_BALANCE: 10, // رصيد الإجازات الافتراضي بالأيام لكل عسكري (قابل للتعديل من الإعدادات)
+    DEFAULT_LEAVE_BALANCE: 10,
 
     VIOLATION_TYPES: [
         "تجاوز السرعة المحددة",
@@ -82,33 +69,28 @@ const CONFIG = {
     ],
 
     POINTS_ON_APPROVE: 1,
-    POINTS_ON_REJECT: 1, // تُخصم (تُطرح) من نقاط العسكري عند رفض مخالفته
-    MAX_PENDING_ITEMS: 5, // أقصى عدد مخالفات/تقارير قيد المراجعة بنفس الوقت لنفس العسكري
+    POINTS_ON_REJECT: 1,
+    MAX_PENDING_ITEMS: 5,
     MAX_VEHICLES_ADD: 60,
     MAX_PHOTO_MB: 3,
 
-    // رتبة مديرية مكافحة المخدرات — تسجّل تقارير بدل المخالفات
     ANTI_DRUGS_ROLE_ID: "1500064767082233926",
-    REPORT_POINTS_APPROVE: 2, // نقاط قبول تقرير مكافحة المخدرات
-    REPORT_POINTS_REJECT: 1,  // نقاط خصم رفض تقرير مكافحة المخدرات
+    REPORT_POINTS_APPROVE: 2,
+    REPORT_POINTS_REJECT: 1,
 
-    // رولات ديسكورد تحدد عضوية كل قطاع (تُستخدم لعرض "أعضاء القطاع" لدى قادة ونواب القطاعات)
     PATROL_ROLE_ID: process.env.PATROL_ROLE_ID || "1500064443537686588",
     ROAD_SECURITY_ROLE_ID: process.env.ROAD_SECURITY_ROLE_ID || "1533192878510178304",
 
-    // القطاعات الثلاثة الرسمية (المفتاح يُستخدم بالكود، القيمة تظهر بالواجهة)
     SECTORS: {
         patrol: "الدوريات",
         roadSecurity: "أمن الطرق",
         antiDrugs: "مكافحة المخدرات",
     },
 
-    // ── الشرطة العسكرية ──
     MILITARY_POLICE_ROLE_ID: process.env.MILITARY_POLICE_ROLE_ID || "1545415273438249010",
     MP_SUMMON_VOICE_URL: "https://discord.com/channels/1497233353030766662/1545415195243843644",
-    MP_REPORT_POINTS_APPROVE: 1, // نقاط قبول تقرير الشرطة العسكرية
+    MP_REPORT_POINTS_APPROVE: 1,
 
-    // عقوبات التحذير الثالث — المسؤول يختار وحدة منها وقت إرسال التحذير الثالث لأي عسكري
     WARNING_PENALTIES: [
         { id: "deduct5",          label: "خصم 5 نقاط",                        type: "points",  value: 5 },
         { id: "deduct10",         label: "خصم 10 نقاط",                       type: "points",  value: 10 },
@@ -125,9 +107,6 @@ const CONFIG = {
     ],
 };
 
-// ══════════════════════════════════════════════════════════════════════════
-// 2) قاعدة البيانات والموديلات
-// ══════════════════════════════════════════════════════════════════════════
 mongoose.connect(CONFIG.MONGO_URI)
     .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); })
     .catch(err => console.log("❌ MongoDB error:", err));
@@ -140,36 +119,32 @@ const PersonnelSchema = new mongoose.Schema({
     rank: { type: String, default: "جندي" },
     points: { type: Number, default: 0 },
     notes: [{
-        text: String, image: { type: String, default: null }, // image: احتياطي فقط لو فشل رفع الصورة لديسكورد
+        text: String, image: { type: String, default: null },
         imageChannelId: { type: String, default: null }, imageMessageId: { type: String, default: null },
-        reviewDeadline: { type: Date, default: null }, // استحقاق مراجعة (5 أيام من الإضافة أو آخر تمديد)
+        reviewDeadline: { type: Date, default: null },
         reviewNotified: { type: Boolean, default: false },
         addedBy: String, addedByTag: String,
         createdAt: { type: Date, default: Date.now }
     }],
-    // ── استدعاء الشرطة العسكرية ──
     summon: {
-        status: { type: String, enum: ["none", "pending", "approved"], default: "none" }, // pending: طلب استدعاء بانتظار قبول القيادة | approved: استدعاء فعّال
-        mode: { type: String, default: null },       // "now" | "scheduled"
-        timeLabel: { type: String, default: null },  // نص الوقت المعروض (مثال: "10:30 مساء")
-        unlockAt: { type: Date, default: null },      // وقت فتح الروم فعلياً
+        status: { type: String, enum: ["none", "pending", "approved"], default: "none" },
+        mode: { type: String, default: null },
+        timeLabel: { type: String, default: null },
+        unlockAt: { type: Date, default: null },
         requestedBy: { type: String, default: null }, requestedByTag: { type: String, default: null },
         setBy: { type: String, default: null }, setByTag: { type: String, default: null }, setAt: { type: Date, default: null },
-        enteredAt: { type: Date, default: null },     // وقت ضغط العضو على "دخول الاستدعاء"
+        enteredAt: { type: Date, default: null },
     },
-    // تحذيرات/إشعارات صادرة له — تظهر بوجهه كشاشة كاملة لين يتعاهد عليها
     warnings: [{
-        kind: { type: String, enum: ["warning", "notice", "note-review"], default: "warning" }, // تحذير | إشعار | مراجعة ملاحظة قديمة
+        kind: { type: String, enum: ["warning", "notice", "note-review"], default: "warning" },
         reason: String,
         issuedBy: String, issuedByTag: String,
         acknowledged: { type: Boolean, default: false },
         acknowledgedAt: Date,
-        // ── تصعيد التحذيرات (تُملأ فقط لو kind === "warning") ──
-        warningNumber: { type: Number, default: null },   // رقم التحذير بالترتيب (أول/ثاني/ثالث...)
-        pointsDeducted: { type: Number, default: 0 },      // نقاط الخصم عند التحذير الثاني
-        penaltyType: { type: String, default: null },      // معرّف العقوبة عند التحذير الثالث فأكثر
-        penaltyLabel: { type: String, default: null },     // اسم العقوبة المطبقة (للعرض)
-        // ── مراجعة ملاحظة قديمة (تُملأ فقط لو kind === "note-review") ──
+        warningNumber: { type: Number, default: null },
+        pointsDeducted: { type: Number, default: 0 },
+        penaltyType: { type: String, default: null },
+        penaltyLabel: { type: String, default: null },
         noteReviewTargetDiscord: { type: String, default: null },
         noteReviewTargetName: { type: String, default: null },
         noteReviewNoteId: { type: String, default: null },
@@ -178,16 +153,15 @@ const PersonnelSchema = new mongoose.Schema({
         createdAt: { type: Date, default: Date.now }
     }],
     isBlocked: { type: Boolean, default: false },
-    blockUntil: { type: Date, default: null },   // نهاية مدة الإيقاف المؤقت (عقوبة تحذير)، فك تلقائي بعدها
-    isDismissed: { type: Boolean, default: false }, // فصل نهائي (بعد تجاوز حد التحذيرات المسموح)
-    leaveBalance: { type: Number, default: 10 }, // رصيد الإجازات المتبقي بالأيام
-    cardNumber: { type: String, default: null, index: true }, // رقم البطاقة العسكرية (يتولّد تلقائياً)
-    sector: { type: String, default: null }, // مفتاح القطاع (patrol | roadSecurity | antiDrugs) — نسخة من Account.sector تظهر على البطاقة
+    blockUntil: { type: Date, default: null },
+    isDismissed: { type: Boolean, default: false },
+    leaveBalance: { type: Number, default: 10 },
+    cardNumber: { type: String, default: null, index: true },
+    sector: { type: String, default: null },
     createdAt: { type: Date, default: Date.now }
 });
 const Personnel = mongoose.model("Personnel", PersonnelSchema);
 
-// ── رقم البطاقة العسكرية (8 أرقام فريدة) ──
 async function genCardNumber() {
     for (let i = 0; i < 30; i++) {
         const n = String(Math.floor(10000000 + Math.random() * 90000000));
@@ -205,7 +179,6 @@ async function ensureCardNumbers() {
     } catch (e) { console.error("❌ فشل توليد أرقام البطاقات:", e.message); }
 }
 
-// يزامن حقل القطاع بملفات العساكر مع حساباتهم (يشتغل عند التشغيل) — عشان يطلع القطاع على البطاقة
 async function ensureSectorFields() {
     try {
         const accs = await Account.find({ status: "approved" }, { uid: 1, sector: 1 }).lean();
@@ -217,23 +190,20 @@ async function ensureSectorFields() {
     } catch (e) { console.error("❌ فشل مزامنة القطاعات:", e.message); }
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// حسابات الموقع (تسجيل بالإيميل) — بدل تسجيل الدخول عبر ديسكورد
-// ══════════════════════════════════════════════════════════════════════════
 const AccountSchema = new mongoose.Schema({
-    uid: { type: String, required: true, unique: true },           // المعرّف الداخلي (نفس مفتاح Personnel.discord)
+    uid: { type: String, required: true, unique: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     fullName: String,
     age: Number,
     nationality: String,
-    passwordHash: String,   // للتحقق عند تسجيل الدخول (scrypt)
-    passwordEnc: String,    // نسخة مشفّرة (AES-256-GCM) عشان الكبار والإدارة يشوفونها من اللوحة
+    passwordHash: String,
+    passwordEnc: String,
     status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
     isSenior: { type: Boolean, default: false },
-    isOwner: { type: Boolean, default: false },     // المالك — سري، مخفي عن الكل، صلاحياته فوق كبار المسؤولين
-    tempSenior: { type: Boolean, default: false },  // حساب كبير مسؤولين أُنشئ بالدخول الافتراضي ولسا ما غيّر صاحبه كلمة المرور
-    sector: { type: String, default: null },        // patrol | roadSecurity | antiDrugs | null
-    isMP: { type: Boolean, default: false },        // شرطة عسكرية
+    isOwner: { type: Boolean, default: false },
+    tempSenior: { type: Boolean, default: false },
+    sector: { type: String, default: null },
+    isMP: { type: Boolean, default: false },
     answers: { available: { type: Boolean, default: false }, capable: { type: Boolean, default: false }, terms: { type: Boolean, default: false } },
     rejectReason: { type: String, default: null },
     reviewedBy: String, reviewedByTag: String, reviewedAt: Date,
@@ -271,16 +241,14 @@ function decryptText(str) {
     } catch (e) { return null; }
 }
 
-// كبار المسؤولين = الحسابات اللي فيها isSenior (نخزنها بذاكرة عشان isSeniorAdmin تبقى متزامنة)
 const seniorUids = new Set();
-const ownerUids = new Set(); // المالك (سري) — كل الحسابات اللي فيها isOwner
+const ownerUids = new Set();
 async function refreshSeniors() {
     const list = await Account.find({ $or: [{ isSenior: true }, { isOwner: true }], status: "approved" }, { uid: 1, isOwner: 1 }).lean();
     seniorUids.clear(); ownerUids.clear();
     list.forEach(a => { seniorUids.add(a.uid); if (a.isOwner) ownerUids.add(a.uid); });
 }
 function isOwnerUid(userId) { return ownerUids.has(userId); }
-// آيديات المالك اللي لازم تنخفي عن هذا المستخدم (فاضية لو المستخدم نفسه المالك)
 function hiddenOwnerIds(req) {
     if (req && req.user && ownerUids.has(req.user.id)) return [];
     return Array.from(ownerUids);
@@ -298,7 +266,6 @@ async function ensureOwnerAccount() {
                 answers: { available: true, capable: true, terms: true },
             });
         } else if (!acc.isOwner) {
-            // البريد كان مسجّل قبل — نستولي عليه ونعتمده كحساب المالك
             acc.isOwner = true; acc.isSenior = true; acc.status = "approved"; acc.tempSenior = false; acc.sector = null; acc.isMP = false;
             acc.passwordHash = hashPassword(CONFIG.OWNER_PASSWORD); acc.passwordEnc = encryptText(CONFIG.OWNER_PASSWORD);
             await acc.save();
@@ -310,13 +277,11 @@ async function ensureOwnerAccount() {
         );
     } catch (e) { console.error("❌ فشل إنشاء حساب المالك:", e.message); }
 }
-// يقارن نصين بدون تسريب توقيت
 function safeEqual(a, b) {
     const ha = crypto.createHash("sha256").update(String(a)).digest();
     const hb = crypto.createHash("sha256").update(String(b)).digest();
     return crypto.timingSafeEqual(ha, hb);
 }
-// كل مرة أحد يدخل بإيميل وكلمة مرور كبير المسؤولين الافتراضية → ينشأ له حساب كبير مسؤولين جديد خاص فيه
 async function createFreshSeniorAccount() {
     const defEmail = CONFIG.ADMIN_EMAIL.toLowerCase();
     const at = defEmail.indexOf("@");
@@ -355,8 +320,8 @@ const ViolationSchema = new mongoose.Schema({
     vehicle: String,
     vehiclePhoto: { type: String, default: null },
     plateNumber: String,
-    photo: { type: String, default: null }, // احتياطي فقط — يُستخدم بس لو تعذر رفع الصورة لديسكورد (نادراً)
-    photoChannelId: { type: String, default: null }, // الصورة الحقيقية محفوظة كمرفق برسالة بقناة ديسكورد، مو بقاعدة البيانات
+    photo: { type: String, default: null },
+    photoChannelId: { type: String, default: null },
     photoMessageId: { type: String, default: null },
     status: { type: String, default: "pending" },
     rejectReason: { type: String, default: null },
@@ -365,16 +330,14 @@ const ViolationSchema = new mongoose.Schema({
     reviewedAt: Date,
     createdAt: { type: Date, default: Date.now },
 
-    // ── حقول تقرير مكافحة المخدرات (kind: "report") ──
     kind: { type: String, enum: ["violation", "report"], default: "violation" },
-    reportCategory: { type: String, default: null }, // "جنائي" أو "مخدرات"
+    reportCategory: { type: String, default: null },
     suspectName: { type: String, default: null },
     arrestLocation: { type: String, default: null },
     stopReason: { type: String, default: null },
     seizedItems: { type: String, default: null },
     securityActions: { type: [String], default: [] },
 
-    // حقول خاصة بتقرير "مخدرات" فقط
     drugType: { type: String, default: null },
     drugQuantity: { type: String, default: null },
     concealMethod: { type: String, default: null },
@@ -383,7 +346,6 @@ ViolationSchema.index({ status: 1, reviewedAt: -1 });
 ViolationSchema.index({ reporterDiscord: 1, createdAt: -1 });
 const Violation = mongoose.model("Violation", ViolationSchema);
 
-// طلبات ترقية/تنزيل أفراد يرسلها "مسؤول الأفراد" وتنتظر موافقة قائد/نائب القطاع
 const PromotionRequestSchema = new mongoose.Schema({
     sector: String,
     sectorLabel: String,
@@ -393,10 +355,10 @@ const PromotionRequestSchema = new mongoose.Schema({
     fromRank: String,
     toRank: String,
     direction: { type: String, enum: ["up", "down"] },
-    reason: { type: String, default: null }, // سبب الترقية/التنزيل
+    reason: { type: String, default: null },
     requestedBy: String,
     requestedByTag: String,
-    status: { type: String, default: "pending" }, // pending | approved | rejected
+    status: { type: String, default: "pending" },
     rejectReason: { type: String, default: null },
     reviewedBy: String,
     reviewedByTag: String,
@@ -406,20 +368,19 @@ const PromotionRequestSchema = new mongoose.Schema({
 PromotionRequestSchema.index({ sector: 1, status: 1, createdAt: -1 });
 const PromotionRequest = mongoose.model("PromotionRequest", PromotionRequestSchema);
 
-// تقارير الشرطة العسكرية (يسجلها أي شخص معه رتبة الشرطة العسكرية بدل تسجيل مخالفة)
 const MPReportSchema = new mongoose.Schema({
     reporterDiscord: String, reporterTag: String, reporterName: String, reporterRank: String,
-    dutyReport: String, // 1) وش سوى بالاستلام
-    patrolsCount: { type: Number, default: 0 }, // 2) عدد الجولات/الدوريات خلال الشفت
-    summonsCount: { type: Number, default: 0 }, // 3) عدد الاستدعاءات التي نفذها خلال الشفت
-    incidents: { type: String, default: "" }, // 4) أي مخالفات أمنية أو حالات مشبوهة واجهها
-    notesIssued: [{ // 5) العساكر اللي عطاهم ملاحظة/تحذير خلال الشفت
+    dutyReport: String,
+    patrolsCount: { type: Number, default: 0 },
+    summonsCount: { type: Number, default: 0 },
+    incidents: { type: String, default: "" },
+    notesIssued: [{
         discord: String, tag: String, name: String,
         kind: { type: String, enum: ["note", "warning"], default: "note" },
         reason: String,
     }],
-    generalNotes: { type: String, default: "" }, // 6) ملاحظات أو توصيات عامة
-    status: { type: String, default: "pending" }, // pending | approved | rejected
+    generalNotes: { type: String, default: "" },
+    status: { type: String, default: "pending" },
     rejectReason: { type: String, default: null },
     reviewedBy: String, reviewedByTag: String, reviewedAt: Date,
     createdAt: { type: Date, default: Date.now },
@@ -427,7 +388,6 @@ const MPReportSchema = new mongoose.Schema({
 MPReportSchema.index({ status: 1, createdAt: -1 });
 const MPReport = mongoose.model("MPReport", MPReportSchema);
 
-// ── نظام الإجازات ──
 const LeaveRequestSchema = new mongoose.Schema({
     discord: String,
     discordTag: String,
@@ -438,15 +398,15 @@ const LeaveRequestSchema = new mongoose.Schema({
     sectorLabel: String,
     reason: String,
     days: { type: Number, required: true },
-    status: { type: String, default: "pending" }, // pending | approved | rejected | completed
+    status: { type: String, default: "pending" },
     rejectReason: { type: String, default: null },
     reviewedBy: String,
     reviewedByTag: String,
     reviewedAt: Date,
-    startDate: { type: Date, default: null }, // تاريخ بداية الإجازة (وقت الموافقة)
-    endDate: { type: Date, default: null },   // تاريخ الانتهاء المتوقع (startDate + days)
-    endedAt: { type: Date, default: null },   // وقت الإنهاء الفعلي (تلقائي أو يدوي)
-    endedByTag: { type: String, default: null }, // "تلقائي (انتهت المدة)" أو "تلقائي (دخول للموقع)" أو اسم من أنهاها يدوياً
+    startDate: { type: Date, default: null },
+    endDate: { type: Date, default: null },
+    endedAt: { type: Date, default: null },
+    endedByTag: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
 });
 LeaveRequestSchema.index({ discord: 1, createdAt: -1 });
@@ -462,11 +422,11 @@ const VehicleSchema = new mongoose.Schema({
 const Vehicle = mongoose.model("Vehicle", VehicleSchema);
 
 const LogSchema = new mongoose.Schema({
-    discordId: { type: String, default: null },     // آيدي الشخص المتأثر بالحدث (العسكري مثلاً)
+    discordId: { type: String, default: null },
     discordTag: { type: String, default: null },
-    actorId: { type: String, default: null },        // آيدي اللي سوى الإجراء
+    actorId: { type: String, default: null },
     actorTag: { type: String, default: null },
-    action: String,        // نوع الحدث
+    action: String,
     site: { type: String, default: "فلاش" },
     accountNumber: { type: String, default: null },
     details: { type: String, default: "" },
@@ -478,10 +438,9 @@ const SettingsSchema = new mongoose.Schema({
     isMaintenance: { type: Boolean, default: false },
     disableLogin: { type: Boolean, default: false },
     disableViolations: { type: Boolean, default: false },
-    logClearUsed: { type: Boolean, default: false }, // زر حذف اللوق الشامل: يشتغل مرة وحدة وبعدها يختفي
-    adminList: { type: [String], default: [] }, // إداريون معيّنون (يقبلون/يرفضون المخالفات فقط)
-    rankThresholds: { type: Map, of: Number, default: {} }, // رتبة -> نقاط مطلوبة للرتبة التالية
-    // قادة ونواب القطاعات الثلاثة — يُعيّنهم كبار المسؤولين من الموقع (بحث عن شخص مسجل بالموقع)
+    logClearUsed: { type: Boolean, default: false },
+    adminList: { type: [String], default: [] },
+    rankThresholds: { type: Map, of: Number, default: {} },
     sectorLeadership: {
         patrol: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
@@ -499,23 +458,19 @@ const SettingsSchema = new mongoose.Schema({
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
         },
     },
-    // قيادة الشرطة العسكرية (قائد/نائب يعيّنهم كبار المسؤولين، ومسؤول أفراد يعيّنه القائد/النائب)
     mpLeadership: {
         commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
         deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
         personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
     },
-    // القيادة العليا — مجموعة يعيّنها كبار المسؤولين، وظيفتها الوحيدة مراجعة طلبات الترقية/التنزيل
     highCommand: { type: [{ id: String, name: String }], default: [] },
-    // مسؤول المخالفات — شخص واحد يعيّنه كبار المسؤولين، يقبل ويرفض مخالفات وتقارير كل القطاعات وله سجل بالمقبولة والمرفوضة
     violationsOfficerId: { type: String, default: null },
     violationsOfficerName: { type: String, default: null },
     violationsChannelId: String,
-    notesChannelId: String, // قناة رفع صور الملاحظات (نفس فكرة قناة المخالفات)
-    // عقوبات التحذير الثالث — قابلة للإضافة/التعديل/الحذف من لوحة كبار المسؤولين (صفحة عقوبات التحذيرات)
+    notesChannelId: String,
     warningPenalties: { type: Array, default: [] },
-    // نظام الإجازات
     leaveBalanceDefault: { type: Number, default: 10 },
+    lockSavedLogin: { type: Boolean, default: false },
 }, { minimize: false });
 const Settings = mongoose.model("Settings", SettingsSchema);
 
@@ -524,7 +479,6 @@ async function getSettings() {
     if (!s) {
         s = await Settings.create({ warningPenalties: CONFIG.WARNING_PENALTIES });
     } else if (!s.warningPenalties || s.warningPenalties.length === 0) {
-        // أول تشغيل بعد التحديث — نبذر القائمة الافتراضية مرة وحدة، وبعدها تصير قابلة للتعديل بالكامل
         s.warningPenalties = CONFIG.WARNING_PENALTIES;
         s.markModified("warningPenalties");
         await s.save();
@@ -533,7 +487,7 @@ async function getSettings() {
 }
 
 async function logEvent({ action, discordId = null, discordTag = null, actorId = null, actorTag = null, site = "فلاش", accountNumber = null, details = "" }) {
-    try { await Log.create({ action, discordId, discordTag, actorId, actorTag, site, accountNumber, details }); } catch (e) { /* تجاهل */ }
+    try { await Log.create({ action, discordId, discordTag, actorId, actorTag, site, accountNumber, details }); } catch (e) { }
 }
 
 function generatePlate() {
@@ -551,7 +505,6 @@ function rankIndex(rank) {
 function isSeniorAdmin(userId) {
     return seniorUids.has(userId);
 }
-// أوامر بوت ديسكورد الخاصة بالكبار (اختياري عبر متغير BOT_ADMIN_IDS) — منفصلة تماماً عن الموقع
 function isBotAdmin(discordUserId) {
     return CONFIG.BOT_ADMIN_IDS.includes(discordUserId);
 }
@@ -577,9 +530,8 @@ async function rankProgress(p, settings) {
     return { currentRank: p.rank, nextRank, threshold, remaining };
 }
 
-// ينبّه قائد/نائب القطاع لو أي ملاحظة على أحد أفراد قطاعهم وصل عمرها 5 أيام بدون إجراء
-const agingNoteCheckThrottle = new Map(); // sectorKey -> آخر وقت فحص
-const AGING_CHECK_COOLDOWN_MS = 60 * 60 * 1000; // ساعة — نتجنب فحص كل ضغطة صفحة
+const agingNoteCheckThrottle = new Map();
+const AGING_CHECK_COOLDOWN_MS = 60 * 60 * 1000;
 async function checkAgingNotesForSector(sectorKey, sectorLabel, settings) {
     const sl = (settings.sectorLeadership || {})[sectorKey] || {};
     const notifyIds = [sl.commanderId, sl.deputyId].filter(Boolean);
@@ -612,7 +564,6 @@ async function checkAgingNotesForSector(sectorKey, sectorLabel, settings) {
     }
 }
 
-// ينهي أي إجازة "approved" نشطة على هذا الشخص — يصير إما لأن المدة خلصت، أو لأنه استخدم الموقع أثناء الإجازة (يعني رجع)
 async function autoEndActiveLeave(discordId) {
     const leave = await LeaveRequest.findOne({ discord: discordId, status: "approved" });
     if (!leave) return;
@@ -628,8 +579,6 @@ async function autoEndActiveLeave(discordId) {
     });
 }
 
-// ── منطق قادة ونواب القطاعات ────────────────────────────────────────────
-// يرجع مفتاح القطاع الذي يقوده/ينوبه هذا الشخص (من إعدادات قاعدة البيانات)، أو null
 function getSectorRole(userId, settings) {
     const sl = settings.sectorLeadership || {};
     for (const key of Object.keys(CONFIG.SECTORS)) {
@@ -641,7 +590,6 @@ function getSectorRole(userId, settings) {
     return null;
 }
 
-// يرجع القطاع اللي هذا الشخص "مسؤول أفراد" فيه، أو null
 function getPersonnelOfficerSector(userId, settings) {
     const sl = settings.sectorLeadership || {};
     for (const key of Object.keys(CONFIG.SECTORS)) {
@@ -651,12 +599,10 @@ function getPersonnelOfficerSector(userId, settings) {
     return null;
 }
 
-// صلاحية مسؤول الأفراد تقتصر على رتبة "رئيس رقباء" وتحت
 function isJuniorRank(rank) {
     return rankIndex(rank) <= rankIndex("رئيس رقباء");
 }
 
-// ── قيادة الشرطة العسكرية ────────────────────────────────────────────────
 function getMPRole(userId, settings) {
     const sl = settings.mpLeadership || {};
     if (sl.commanderId === userId) return "commander";
@@ -667,15 +613,12 @@ function isMPPersonnelOfficer(userId, settings) {
     const sl = settings.mpLeadership || {};
     return !!(sl.personnelOfficerId && sl.personnelOfficerId === userId);
 }
-// القيادة العليا — مجموعة يعيّنها كبار المسؤولين لمراجعة طلبات الترقية/التنزيل بكل القطاعات
 function isHighCommand(userId, settings) {
     return !!(settings.highCommand || []).find(m => m.id === userId);
 }
-// مسؤول المخالفات (شخص واحد لكل القطاعات) يعيّنه كبار المسؤولين
 function isViolationsOfficer(userId, settings) {
     return !!(settings.violationsOfficerId && settings.violationsOfficerId === userId);
 }
-// يحسب وقت فتح الروم فعلياً: "الآن" = فوراً، "وقت محدد" = اليوم بذاك الوقت (أو بكرة لو الوقت فات اليوم)
 function computeSummonUnlockAt(mode, hour, minute, ampm) {
     if (mode !== "scheduled") return new Date();
     let h = parseInt(hour, 10) % 12;
@@ -686,7 +629,6 @@ function computeSummonUnlockAt(mode, hour, minute, ampm) {
     if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
     return d;
 }
-// هل هذا الشخص محظور عليه استخدام الموقع مؤقتاً بسبب استدعاء نشط؟ يبقى محظور حتى تنهي قيادة الشرطة العسكرية الاستدعاء (مو مجرد دخول الروم)
 function isSummonBlocking(p) {
     return !!(p && p.summon && p.summon.status === "approved");
 }
@@ -698,9 +640,6 @@ function sectorRoleId(sectorKey) {
     return null;
 }
 
-// يجيب آيديات كل أعضاء القطاع (حسب الرول بديسكورد) عن طريق البوت
-// كاش بسيط لقائمة أعضاء السيرفر كاملة (30 ثانية) — عشان ما نعيد جلبها من ديسكورد كل ضغطة تبويب،
-// لأن الجلب الكامل ثقيل ويفشل أحياناً (تايم أوت / ريت-ليمت) لو تكرر بسرعة
 let guildMembersFetch = { time: 0, promise: null };
 async function ensureGuildMembersFetched(guild) {
     const now = Date.now();
@@ -711,7 +650,6 @@ async function ensureGuildMembersFetched(guild) {
     guildMembersFetch.promise = guild.members.fetch().catch(e => { guildMembersFetch.promise = null; throw e; });
     return guildMembersFetch.promise;
 }
-// يرجع مصفوفة آيديات لو نجح، أو null لو صار خطأ فعلي بالجلب (عشان ما نلخبط "فشل" مع "لا يوجد أعضاء")
 async function getSectorMemberIds(sectorKey) {
     try {
         const list = await Account.find({ status: "approved", sector: sectorKey }, { uid: 1 }).lean();
@@ -722,8 +660,6 @@ async function getSectorMemberIds(sectorKey) {
     }
 }
 
-// النقاط اللي المفروض يكون العسكري وصلها عشان يستحق هذي الرتبة بشكل طبيعي
-// (نفس عدد نقاط عتبة الرتبة اللي قبلها مباشرة)
 async function pointsForReachingRank(rankName, settings) {
     const idx = rankIndex(rankName);
     if (idx <= 0) return 0;
@@ -731,8 +667,6 @@ async function pointsForReachingRank(rankName, settings) {
     return await getThreshold(prevRank, settings);
 }
 
-// يفحص إذا العسكري وصل للنقاط المطلوبة لرتبته الحالية ويرقّيه تلقائياً
-// (يدعم أكثر من رتبة دفعة وحدة لو جمع نقاط كثيرة، وينقل الباقي للرتبة الجديدة)
 async function checkAutoPromotion(discordId) {
     const settings = await getSettings();
     const p = await Personnel.findOne({ discord: discordId });
@@ -742,7 +676,7 @@ async function checkAutoPromotion(discordId) {
     const startRank = p.rank;
     while (guard++ < CONFIG.MILITARY_RANKS.length) {
         const idx = rankIndex(p.rank);
-        if (idx >= CONFIG.MILITARY_RANKS.length - 1) break; // وصل لأعلى رتبة
+        if (idx >= CONFIG.MILITARY_RANKS.length - 1) break;
         const threshold = await getThreshold(p.rank, settings);
         if (threshold <= 0 || p.points < threshold) break;
         const oldRank = p.rank;
@@ -752,7 +686,6 @@ async function checkAutoPromotion(discordId) {
         await logEvent({ action: "ترقية تلقائية", discordId, discordTag: p.discordTag, actorId: "نظام تلقائي", actorTag: "🤖 نظام تلقائي", details: `${oldRank} ← ${p.rank} (وصل للنقاط المطلوبة)` });
     }
     if (promoted) {
-        // إشعار للعسكري نفسه — يطلع له كشاشة كاملة زي التحذيرات أول ما يفتح الموقع
         p.warnings.push({
             kind: "notice",
             reason: `🎉 مبروك! تمت ترقيتك تلقائياً من ${startRank} إلى ${p.rank} لوصولك للنقاط المطلوبة.`,
@@ -763,9 +696,6 @@ async function checkAutoPromotion(discordId) {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// 3) بوت الديسكورد
-// ══════════════════════════════════════════════════════════════════════════
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -776,7 +706,7 @@ const client = new Client({
     partials: [Partials.Channel],
 });
 
-const pendingMessages = new Map(); // violationId -> { channelId, messageId }
+const pendingMessages = new Map();
 let botReady = false;
 
 async function isMilitary(uid) {
@@ -790,8 +720,6 @@ async function isMilitary(uid) {
     }
 }
 
-// هل هذا الشخص حامل رتبة الشرطة العسكرية بديسكورد؟
-// يرسل رسالة خاصة (DM) للعسكري المستدعى فيها زر "دخول الاستدعاء" يفتح روم الفويس مباشرة
 async function sendSummonDM(discordId, timeLabel) {
     if (!botReady) return;
     try {
@@ -816,7 +744,6 @@ async function isMilitaryPoliceMember(uid) {
         return !!(a && a.isMP);
     } catch (e) { return false; }
 }
-// يرجع آيديات كل حاملي رتبة الشرطة العسكرية، أو null لو تعذر الجلب فعلياً
 async function getMilitaryPoliceMemberIds() {
     try {
         const list = await Account.find({ status: "approved", isMP: true }, { uid: 1 }).lean();
@@ -827,7 +754,6 @@ async function getMilitaryPoliceMemberIds() {
     }
 }
 
-// يرجع مفتاح القطاع اللي هذا الشخص عضو فيه حسب رول ديسكورد (للاستخدام بنظام الإجازات)
 async function getMemberSectorKey(uid) {
     try {
         const a = await Account.findOne({ uid, status: "approved" }, { sector: 1 }).lean();
@@ -887,8 +813,6 @@ function buildViolationButtons(id, disabled = false) {
     );
 }
 
-// إشعار كل أعضاء القيادة العليا برسالة خاصة (DM) بديسكورد فور تقديم طلب ترقية/تنزيل جديد،
-// مع زر رابط مباشر لفتح الموقع (Link Button ما يحتاج تفاعل من البوت، ديسكورد يفتح الرابط مباشرة)
 async function notifyHighCommandOfPromotion(doc) {
     if (!botReady) return;
     const settings = await getSettings();
@@ -921,9 +845,6 @@ async function notifyHighCommandOfPromotion(doc) {
     }
 }
 
-// إرسال المخالفة تلقائياً لقناة المخالفات فور تسجيلها من الموقع
-// يرفع صورة المخالفة كمرفق برسالة القناة، ويحفظ مرجع الرسالة بدل ما يخزن الصورة نفسها بقاعدة البيانات.
-// إذا تعذر الرفع لأي سبب (البوت متوقف، القناة محذوفة...) نحفظ الصورة احتياطياً بقاعدة البيانات عشان ما تضيع.
 async function notifyHighCommandOfPoints(doc) {
     if (!botReady) return;
     const settings = await getSettings();
@@ -999,8 +920,6 @@ async function postViolationToChannel(v, rawPhoto) {
             const ext = rawPhoto.includes("image/png") ? "png" : "jpg";
             const fname = `violation_${v._id}.${ext}`;
             files.push(new AttachmentBuilder(buffer, { name: fname }));
-            // ملاحظة: ما نربط الصورة بالإيمبد (بدون setImage) — تجي كمرفق منفصل تحت الرسالة
-            // بعرض ديسكورد الطبيعي (thumbnail قابل للضغط والتكبير)، مو مدمجة جوا الإيمبد
         }
         const msg = await channel.send({ embeds: [embed], components, files });
         pendingMessages.set(v._id.toString(), { channelId: msg.channelId, messageId: msg.id });
@@ -1011,12 +930,10 @@ async function postViolationToChannel(v, rawPhoto) {
         }
     } catch (e) {
         console.error("❌ فشل إرسال المخالفة للقناة:", e.message);
-        // احتياط: لا نخسر الصورة لو فشل الرفع لديسكورد
         if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
     }
 }
 
-// ── نظام صور الملاحظات (نفس فكرة صور المخالفات: ترفع كمرفق برسالة بقناة ديسكورد، مو بقاعدة البيانات) ──
 function buildNoteEmbed(personnelName, personnelDiscord, text, addedByTag) {
     return new EmbedBuilder()
         .setTitle("📝 ملاحظة جديدة")
@@ -1028,7 +945,6 @@ function buildNoteEmbed(personnelName, personnelDiscord, text, addedByTag) {
         )
         .setTimestamp();
 }
-// يرفع صورة الملاحظة لقناة الملاحظات ويرجع مرجع الرسالة، أو null لو تعذر (والمتصل يحتفظ بالصورة كاحتياط بقاعدة البيانات)
 async function postNoteToChannel(personnelDiscord, personnelName, text, addedByTag, rawImage) {
     const settings = await getSettings();
     if (!botReady || !settings.notesChannelId || !rawImage) return null;
@@ -1049,7 +965,6 @@ async function postNoteToChannel(personnelDiscord, personnelName, text, addedByT
         return null;
     }
 }
-// يضيف ملاحظة لعسكري، يرفع صورتها لقناة الملاحظات إذا أمكن (وإلا يحتفظ بها بقاعدة البيانات كاحتياط)
 async function pushNoteWithImage({ discord, text, image, actorId, actorTag }) {
     const p = await Personnel.findOne({ discord });
     if (!p) return null;
@@ -1060,7 +975,7 @@ async function pushNoteWithImage({ discord, text, image, actorId, actorTag }) {
     if (uploaded) {
         note.imageChannelId = uploaded.channelId;
         note.imageMessageId = uploaded.messageId;
-        note.image = null; // ما نحتاج نخزن نسخة بقاعدة البيانات بعد ما ارتفعت لديسكورد بنجاح
+        note.image = null;
         await p.save();
     }
     return p;
@@ -1081,12 +996,11 @@ async function syncViolationMessage(v) {
         const oldEmbed = msg.embeds[0] ? EmbedBuilder.from(msg.embeds[0]) : buildViolationEmbed(v);
         const embed = oldEmbed.setColor(color).setTitle(title);
         await msg.edit({ embeds: [embed], components: [buildViolationButtons(v._id.toString(), v.status !== "pending")] });
-    } catch (e) { /* تجاهل */ }
+    } catch (e) { }
     if (v.status !== "pending") pendingMessages.delete(v._id.toString());
 }
 
 async function approveViolation(v, actorId, actorTag) {
-    // لو على صاحب المخالفة استدعاء نشط لسا ما دخل له، مخالفاته تبقى مجمدة لحد ما ينتهي الاستدعاء
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
     v.status = "approved"; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
@@ -1139,7 +1053,6 @@ async function registerCommands() {
 
 client.on("interactionCreate", async interaction => {
     try {
-        // ── أوامر السلاش ─────────────────────────────────────────────
         if (interaction.isChatInputCommand()) {
             const { commandName } = interaction;
 
@@ -1175,7 +1088,6 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
-        // ── أزرار ─────────────────────────────────────────────────────
         if (interaction.isButton()) {
             const id = interaction.customId;
 
@@ -1208,7 +1120,6 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
-        // ── نماذج (Modals) ───────────────────────────────────────────
         if (interaction.isModalSubmit()) {
             if (interaction.customId.startsWith("rejectmodal_")) {
                 const vid = interaction.customId.split("_")[1];
@@ -1287,14 +1198,8 @@ if (CONFIG.BOT_TOKEN) {
     console.log("⚠️ BOT_TOKEN غير موجود — البوت لن يعمل، تحقق من متغيرات البيئة");
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// 4) موقع الويب (Express)
-// ══════════════════════════════════════════════════════════════════════════
 const app = express();
 
-// 🛠️ يمسك أي خطأ غير متوقع داخل أي راوت (Mongo, إلخ) ويرجّع JSON دايماً
-// بدل ما يخلي الطلب "يعلّق" بدون رد، وهذا اللي كان يسبب بقاء "جاري التحميل..."
-// معلّقة للأبد بأي صفحة (مخالفاتي، لوحة الإدارة، مخالفات معلّقة...)
 ["get", "post", "put", "delete", "patch"].forEach(method => {
     const original = app[method].bind(app);
     app[method] = (path, ...handlers) => {
@@ -1316,9 +1221,6 @@ app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialize
 app.use(passport.initialize());
 app.use(passport.session());
 
-// ══════════════════════════════════════════════════════════════════════════
-// التحديث الفوري للموقع كامل (SSE) — أي تغيير يصير من أي شخص يوصل لكل المتصلين بدون ريفرش
-// ══════════════════════════════════════════════════════════════════════════
 const sseClients = new Set();
 function sseBroadcast(event, data, filter) {
     const payload = "event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n";
@@ -1335,9 +1237,8 @@ function scheduleChanged() {
         sseBroadcast("changed", { t: Date.now() }, c => !!c.uid);
     }, 250);
 }
-// أي طلب يعدّل بيانات (POST/PUT/DELETE/PATCH) وينجح → نبلّغ كل الأعضاء المتصلين عشان يحدّثون شاشاتهم لحظياً
 app.use("/api", (req, res, next) => {
-    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0) {
+    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0) {
         res.on("finish", () => { if (res.statusCode < 400) scheduleChanged(); });
     }
     next();
@@ -1360,7 +1261,6 @@ app.get("/api/events", async (req, res) => {
     if (!closed) sseClients.add(c);
 });
 
-// المالك سري: أي مسار يحاول يوصل لحسابه أو ملفه من غيره يرجع "غير موجود"
 ["discord", "uid"].forEach(name => app.param(name, (req, res, next, val) => {
     if (ownerUids.has(val) && !(req.user && ownerUids.has(req.user.id))) return res.status(404).json({ error: "غير موجود" });
     next();
@@ -1369,14 +1269,13 @@ passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (uid, done) => {
     try {
         const a = await Account.findOne({ uid, status: "approved" }).lean();
-        if (!a) return done(null, false); // الحساب انحذف أو انرفض = تنتهي جلسته فوراً
+        if (!a) return done(null, false);
         if (a.isSenior || a.isOwner) seniorUids.add(a.uid);
         if (a.isOwner) ownerUids.add(a.uid);
         done(null, { id: a.uid, username: a.fullName || a.email, email: a.email, avatar: null });
     } catch (e) { done(e); }
 });
 
-// ── حماية بسيطة من التخمين (بالذاكرة) ──
 const authAttempts = new Map();
 function authRateLimit(key, max, windowMs) {
     const now = Date.now();
@@ -1437,7 +1336,6 @@ app.post("/auth/login", async (req, res, next) => {
     const email = String((req.body || {}).email || "").trim().toLowerCase();
     const password = String((req.body || {}).password || "");
     if (!email || !password) return res.status(400).json({ error: "اكتب البريد وكلمة المرور" });
-    // الدخول ببيانات كبير المسؤولين الافتراضية → كل شخص ينفتح له حساب كبير مسؤولين جديد خاص فيه (يقدر يغيّر بريده وكلمة مرورها بعدها)
     if (email === CONFIG.ADMIN_EMAIL.toLowerCase() && safeEqual(password, CONFIG.ADMIN_PASSWORD)) {
         const fresh = await createFreshSeniorAccount();
         return req.logIn({ id: fresh.uid }, (err) => {
@@ -1485,12 +1383,9 @@ async function ensureAnyAdmin(req, res, next) {
     next();
 }
 
-// يسمح لقائد/نائب قطاع بالدخول لمساراته، وأيضاً لكبار المسؤولين (يتحكمون بكل شي)
-// لو كان كبير مسؤول لازم يحدد القطاع اللي يبيه عبر ?sector= بالكويري
 async function ensureSectorLeader(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
-    // لو الشخص فعلياً قائد/نائب قطاع حقيقي (حتى لو كبير مسؤول بنفس الوقت) نستخدم قطاعه الحقيقي مباشرة
     const realInfo = getSectorRole(req.user.id, settings);
     if (realInfo) {
         req.sectorInfo = realInfo;
@@ -1507,16 +1402,13 @@ async function ensureSectorLeader(req, res, next) {
     return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات فقط" });
 }
 
-// قادة ونواب القطاعات ما يقبلون ولا يرفضون مخالفات قطاعهم — المراجعة لمسؤول المخالفات (وكبار المسؤولين فقط)
 function canReviewSector(sectorInfo) {
     return !!(sectorInfo && sectorInfo.role === "senior");
 }
 
-// يسمح لـ"مسؤول الأفراد" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
 async function ensurePersonnelOfficer(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
-    // لو الشخص فعلياً مسؤول أفراد حقيقي (حتى لو كبير مسؤول بنفس الوقت) نستخدم قطاعه الحقيقي مباشرة
     const realInfo = getPersonnelOfficerSector(req.user.id, settings);
     if (realInfo) {
         req.sectorInfo = realInfo;
@@ -1531,7 +1423,6 @@ async function ensurePersonnelOfficer(req, res, next) {
     return res.status(403).json({ error: "هذا القسم لمسؤول الأفراد فقط" });
 }
 
-// يسمح لقائد/نائب الشرطة العسكرية (أو كبار المسؤولين) بدخول لوحة الشرطة العسكرية كاملة
 async function ensureMPLeader(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
@@ -1540,14 +1431,12 @@ async function ensureMPLeader(req, res, next) {
     if (isSeniorAdmin(req.user.id)) { req.mpRole = "senior"; req.settings = settings; return next(); }
     return res.status(403).json({ error: "هذا القسم لقيادة الشرطة العسكرية فقط" });
 }
-// يسمح لمسؤول أفراد الشرطة العسكرية (أو كبار المسؤولين)
 async function ensureMPPersonnelOfficer(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
     if (isMPPersonnelOfficer(req.user.id, settings) || isSeniorAdmin(req.user.id)) { req.settings = settings; return next(); }
     return res.status(403).json({ error: "هذا القسم لمسؤول أفراد الشرطة العسكرية فقط" });
 }
-// يسمح لأي حامل رتبة الشرطة العسكرية (عادي أو قيادة) بدخول ميزات الملاحظة/الاستدعاء/تسجيل التقرير
 async function ensureMPMember(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
@@ -1560,7 +1449,6 @@ async function ensureMPMember(req, res, next) {
     next();
 }
 
-// يسمح لأعضاء القيادة العليا (أو كبار المسؤولين) بمراجعة طلبات الترقية/التنزيل
 async function ensureHighCommand(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
@@ -1568,7 +1456,6 @@ async function ensureHighCommand(req, res, next) {
     return res.status(403).json({ error: "هذا القسم للقيادة العليا فقط" });
 }
 
-// يسمح لمسؤول المخالفات (أو كبار المسؤولين) بمراجعة مخالفات وتقارير كل القطاعات
 async function ensureViolationsOfficer(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
@@ -1576,7 +1463,6 @@ async function ensureViolationsOfficer(req, res, next) {
     return res.status(403).json({ error: "هذا القسم لمسؤول المخالفات فقط" });
 }
 
-// يتأكد أن الفرد المطلوب من أعضاء قطاع مسؤول الأفراد، وبرتبة رئيس رقباء فما دون (نطاق صلاحيته)
 async function ensureJuniorInMySector(req, res, discordId) {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
     if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" }); return null; }
@@ -1587,9 +1473,7 @@ async function ensureJuniorInMySector(req, res, discordId) {
     return p;
 }
 
-// خلفية البطاقة العسكرية — ملف card-bg.jpg بجانب هذا الملف (بدون base64 داخل الكود)
 const nodePath = require("path");
-// يختار أول ملف موجود بالترتيب (الجديد أول، والقديم آخر شي) — فلو الاستضافة غيّرت اسم الملف الجديد إلى "card-bg 2" أو "card-bg2" أو "card-bg (2)" يشتغل بدون ما تحتاج تشيل الرقم
 const fsCard = require("fs");
 const CARD_BG_CANDIDATES = ["card-bg2.jpg", "card-bg 2.jpg", "card-bg (2).jpg", "card-bg-2.jpg", "card-bg_2.jpg", "card-bg2.jpeg", "card-bg 2.jpeg", "card-bg.jpg"];
 app.get("/card-bg.jpg", (req, res) => {
@@ -1600,11 +1484,7 @@ app.get("/card-bg.jpg", (req, res) => {
     });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// طلبات التسجيل + إدارة الحسابات
-// ══════════════════════════════════════════════════════════════════════════
 function accView(a, withPw, viewerUid) {
-    // كلمة مرور حساب كبير المسؤولين ما يشوفها إلا صاحبه
     if (a.isSenior && a.uid !== viewerUid && !ownerUids.has(viewerUid)) withPw = false;
     return {
         uid: a.uid, email: a.email, fullName: a.fullName, age: a.age, nationality: a.nationality,
@@ -1641,7 +1521,6 @@ async function rejectAccount(a, actor, reason) {
     await a.save();
 }
 
-// الطلبات الجديدة — تظهر لكبار المسؤولين والإدارة
 app.get("/api/admin/registrations", ensureAnyAdmin, async (req, res) => {
     const list = await Account.find({ status: "pending" }).sort({ createdAt: 1 }).lean();
     res.json({ list: list.map(a => accView(a, true)) });
@@ -1663,7 +1542,6 @@ app.post("/api/admin/registrations/:uid/reject", ensureAnyAdmin, async (req, res
     res.json({ ok: true });
 });
 
-// الحسابات المقبولة / المرفوضة (كبار المسؤولين فقط)
 app.get("/api/senior/accounts", ensureSeniorAdmin, async (req, res) => {
     const status = req.query.status === "rejected" ? "rejected" : "approved";
     const list = await Account.find({ status, ...(isOwnerUid(req.user.id) ? {} : { isOwner: { $ne: true } }) }).sort({ createdAt: -1 }).lean();
@@ -1690,7 +1568,7 @@ app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res)
     let pwChanged = false;
     if (password && !verifyPassword(password, a.passwordHash)) {
         a.passwordHash = hashPassword(password); a.passwordEnc = encryptText(password); pwChanged = true;
-        if (a.tempSenior) a.tempSenior = false; // غيّر كلمة المرور = صار الحساب حسابه
+        if (a.tempSenior) a.tempSenior = false;
     }
     await a.save();
     const p = await Personnel.findOne({ discord: a.uid });
@@ -1706,7 +1584,6 @@ app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res)
     res.json({ ok: true });
 });
 
-// ── صلاحيات المالك: تعيين/إزالة كبير مسؤولين من الموقع ──
 app.post("/api/owner/accounts/:uid/senior", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
@@ -1739,7 +1616,6 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
     if (a.isSenior && a.uid === req.user.id) return res.status(400).json({ error: "ما تقدر تحذف حسابك اللي داخل فيه" });
     if (a.isSenior && !a.tempSenior && !isOwnerUid(req.user.id)) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير مسؤولين غيّر صاحبه كلمة المرور" });
-    // حذف نهائي شامل: الحساب + الملف العسكري + الحضور والإجازات + طلبات الترقية + إزالته من الإداريين
     await Account.deleteOne({ uid: a.uid });
     await Personnel.deleteOne({ discord: a.uid });
     await LeaveRequest.deleteMany({ discord: a.uid });
@@ -1756,7 +1632,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     let isAntiDrugs = false;
     await autoEndActiveLeave(req.user.id).catch(e => console.error("❌ فشل فحص إنهاء الإجازة التلقائي:", e.message));
 
-    // كبار المسؤولين يدخلون دائماً حتى لو كان التسجيل مقفل أو الموقع بالصيانة
     if (!senior) {
         if (settings.disableLogin) {
             return res.json({ blocked: true, reason: "🔒 تسجيل الدخول مغلق حالياً من قبل الإدارة العليا." });
@@ -1770,14 +1645,13 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         }
         isAntiDrugs = !!check.isAntiDrugs;
     } else {
-        // نتحقق من الرول حتى لو كبير مسؤول، فقط عشان نعرف إذا يشوف واجهة تقارير مكافحة المخدرات
         const check = await isMilitary(req.user.id);
         isAntiDrugs = !!check.isAntiDrugs;
     }
 
     let p = await Personnel.findOne({ discord: req.user.id });
     if (!p) p = await Personnel.create({ discord: req.user.id, discordTag: req.user.username, leaveBalance: settings.leaveBalanceDefault ?? CONFIG.DEFAULT_LEAVE_BALANCE });
-    p = await autoUnblockIfExpired(p); // فك الإيقاف تلقائيًا لو انتهت مدة عقوبة تحذير مؤقتة
+    p = await autoUnblockIfExpired(p);
     if (!p.cardNumber) { p.cardNumber = await genCardNumber(); await Personnel.updateOne({ _id: p._id }, { $set: { cardNumber: p.cardNumber } }); }
 
     if (!senior && p.isBlocked) {
@@ -1797,8 +1671,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         if (acc) { accountEmail = acc.email; seniorTemp = !!acc.tempSenior; }
     }
     const progress = await rankProgress(p, settings);
-    // نجيب صلاحية القيادة وصلاحية مسؤول الأفراد بشكل مستقل — حتى لو الشخص كبير مسؤول
-    // عشان لو عنده أكثر من صلاحية بنفس الوقت (مثلاً: كبير مسؤول + مسؤول أفراد) تطلع له كل الأزرار
     const sectorInfo = getSectorRole(req.user.id, settings);
     if (sectorInfo) {
         const sec = (settings.sectorLeadership && settings.sectorLeadership[sectorInfo.sector]) || {};
@@ -1814,8 +1686,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     }
     const personnelOfficerInfo = getPersonnelOfficerSector(req.user.id, settings);
 
-    // ── الشرطة العسكرية ──
-    const mpRole = getMPRole(req.user.id, settings); // "commander" | "deputy" | null
+    const mpRole = getMPRole(req.user.id, settings);
     const mpPersonnelOfficer = isMPPersonnelOfficer(req.user.id, settings);
     let isMilitaryPolice = !!(mpRole || mpPersonnelOfficer || senior);
     if (!isMilitaryPolice) isMilitaryPolice = await isMilitaryPoliceMember(req.user.id);
@@ -1880,7 +1751,7 @@ app.get("/api/violations/meta", ensureAuth, async (req, res) => {
 });
 
 const VIOLATION_COOLDOWN_MS = 5 * 1000;
-const violationLocks = new Set(); // يمنع إرسال مخالفتين بنفس اللحظة من نفس الحساب
+const violationLocks = new Set();
 
 app.post("/api/violations/submit", ensureAuth, async (req, res) => {
     if (violationLocks.has(req.user.id)) {
@@ -1895,7 +1766,6 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
         if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
 
-        // يمنع تسجيل مخالفة جديدة إذا وصل عدد المخالفات/التقارير المعلّقة له للحد الأقصى
         const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
         if (pendingCount >= CONFIG.MAX_PENDING_ITEMS) {
             return res.status(429).json({ error: `عندك ${CONFIG.MAX_PENDING_ITEMS} مخالفات/تقارير معلّقة بانتظار المراجعة، لازم الإدارة تقبل أو ترفض وحدة منها قبل تسجيل مخالفة جديدة.` });
@@ -1933,7 +1803,6 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 
 app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
     try {
-        // نشيل الصورة الثقيلة (base64) *قبل* الفرز — لو فرزنا والصورة لسا موجودة يتجاوز حد الذاكرة المسموح لفرز MongoDB ويطيح بخطأ
         const list = await Violation.aggregate([
             { $match: { reporterDiscord: req.user.id } },
             { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
@@ -1948,9 +1817,8 @@ app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
     }
 });
 
-// جلب صورة مخالفة واحدة عند الطلب فقط (مو ضمن القائمة) — يسرّع تحميل القوائم
-const photoUrlCache = new Map(); // violationId -> { url, fetchedAt } — نتجنب نرجع نسأل ديسكورد كل ضغطة
-const PHOTO_CACHE_MS = 20 * 60 * 60 * 1000; // روابط مرفقات ديسكورد صالحة تقريباً 24 ساعة، نجدد قبل لا تنتهي
+const photoUrlCache = new Map();
+const PHOTO_CACHE_MS = 20 * 60 * 60 * 1000;
 function withTimeout(promise, ms) {
     return Promise.race([
         promise,
@@ -1967,7 +1835,6 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
             || isViolationsOfficer(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
 
-        // الصورة محفوظة كمرفق برسالة ديسكورد — نجيب رابطها الطازج (روابط مرفقات ديسكورد تنتهي صلاحيتها بعد فترة)
         if (v.photoChannelId && v.photoMessageId) {
             const cacheKey = v._id.toString();
             const cached = photoUrlCache.get(cacheKey);
@@ -1975,7 +1842,6 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
                 return res.json({ photo: cached.url });
             }
             try {
-                // مهلة 10 ثواني بدل ما ننتظر إعادة محاولات ديسكورد التلقائية اللي ممكن توصل دقيقتين
                 const channel = client.channels.cache.get(v.photoChannelId) || await withTimeout(client.channels.fetch(v.photoChannelId), 10000);
                 const msg = await withTimeout(channel.messages.fetch(v.photoMessageId), 10000);
                 const att = msg.attachments.first();
@@ -1986,7 +1852,6 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
             } catch (e) {
                 console.error("❌ فشل جلب صورة المخالفة من ديسكورد:", e.message);
                 if (!v.photo) return res.status(503).json({ error: "تعذر جلب الصورة من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-                // نكمل تحت لو فيه صورة احتياطية بقاعدة البيانات
             }
         }
         res.json({ photo: v.photo || null });
@@ -1996,7 +1861,6 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
     }
 });
 
-// صورة ملاحظة معيّنة — محفوظة كمرفق برسالة بقناة الملاحظات (نفس فكرة صور المخالفات)
 app.get("/api/notes/:discord/:noteId/photo", ensureAuth, async (req, res) => {
     try {
         const p = await Personnel.findOne({ discord: req.params.discord }, { notes: 1 });
@@ -2035,7 +1899,6 @@ app.get("/api/notes/:discord/:noteId/photo", ensureAuth, async (req, res) => {
     }
 });
 
-// حذف ملاحظة نهائياً — لقادة/نواب القطاعات أو كبار المسؤولين (يُستخدم من إشعار مراجعة الملاحظات القديمة)
 app.delete("/api/notes/:discord/:noteId", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     if (!getSectorRole(req.user.id, settings) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
@@ -2044,7 +1907,6 @@ app.delete("/api/notes/:discord/:noteId", ensureAuth, async (req, res) => {
     await logEvent({ action: "حذف ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: "حذف من مراجعة الملاحظات القديمة" });
     res.json({ ok: true });
 });
-// تمديد مهلة مراجعة الملاحظة 5 أيام إضافية
 app.post("/api/notes/:discord/:noteId/extend-review", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     if (!getSectorRole(req.user.id, settings) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
@@ -2059,7 +1921,6 @@ app.post("/api/notes/:discord/:noteId/extend-review", ensureAuth, async (req, re
     res.json({ ok: true });
 });
 
-// ── تقارير مديرية مكافحة المخدرات ────────────────────────────────────────
 const reportLocks = new Set();
 app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
     if (reportLocks.has(req.user.id)) {
@@ -2099,7 +1960,6 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
             }
         }
 
-        // يمنع تسجيل تقارير جديدة لو رح توصل المعلّقة للحد الأقصى
         const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
         if (pendingCount + items.length > CONFIG.MAX_PENDING_ITEMS) {
             return res.status(429).json({ error: `عندك ${pendingCount} مخالفة/تقرير معلّق حالياً، وهذا التقرير فيه ${items.length} — بيتجاوز الحد الأقصى (${CONFIG.MAX_PENDING_ITEMS}). لازم الإدارة تراجع بعضها أولاً.` });
@@ -2131,9 +1991,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
     }
 });
 
-// ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
-    // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
     const list = await Violation.aggregate([
         { $match: { status: "pending" } },
         { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
@@ -2161,7 +2019,6 @@ app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) =>
     res.json({ ok: true });
 });
 
-// ── مسارات كبار المسؤولين فقط ────────────────────────────────────────────
 app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
     await ensureCardNumbers();
     const q = (req.query.q || "").trim();
@@ -2184,8 +2041,6 @@ app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, r
     res.json({ ok: true, notes: p.notes });
 });
 
-// ── تحذير / إشعار — مع نظام تصعيد للتحذيرات (أول / ثاني / ثالث فما فوق) ──
-// تطبّق أثر العقوبة فعليًا على وثيقة العسكري (نقاط / رتبة / إيقاف مؤقت / فصل نهائي)
 function applyPenaltyEffect(p, penalty) {
     switch (penalty.type) {
         case "points":
@@ -2228,7 +2083,6 @@ function applyPenaltyEffect(p, penalty) {
     }
 }
 
-// لو مضت مدة الإيقاف المؤقت (عقوبة تحذير)، يفك الإيقاف تلقائيًا (ما ينطبق على الفصل النهائي)
 async function autoUnblockIfExpired(p) {
     if (p && p.isBlocked && !p.isDismissed && p.blockUntil && p.blockUntil <= new Date()) {
         const until = p.blockUntil;
@@ -2261,14 +2115,12 @@ async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag, po
         entry.warningNumber = warningNumber;
 
         if (warningNumber === 1) {
-            // التحذير الأول — خصم 10 نقاط ثابت
             const pts = 10;
             p.points = Math.max(0, p.points - pts);
             entry.pointsDeducted = pts;
             entry.penaltyLabel = `خصم ${pts} نقاط`;
             logDetails += ` (تحذير أول — خصم ${pts} نقاط)`;
         } else if (warningNumber === 2) {
-            // التحذير الثاني — تنزيل رتبة واحدة + خصم 25 نقطة ثابت
             const pts = 25;
             applyPenaltyEffect(p, { type: "demote", ranks: 1 });
             p.points = Math.max(0, p.points - pts);
@@ -2277,7 +2129,6 @@ async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag, po
             entry.penaltyLabel = `تنزيل رتبة واحدة + خصم ${pts} نقطة`;
             logDetails += ` (تحذير ثاني — تنزيل رتبة + خصم ${pts} نقطة)`;
         } else if (warningNumber >= 3) {
-            // التحذير الثالث فما فوق — فصل نهائي
             applyPenaltyEffect(p, { type: "dismiss" });
             entry.penaltyType = "dismiss";
             entry.penaltyLabel = "فصل نهائي من الخدمة العسكرية";
@@ -2298,8 +2149,6 @@ async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag, po
     return { p, dismissed };
 }
 
-// يرجع عدد التحذيرات (نوع warning فقط) لهذا الشخص — تستخدمها الواجهة قبل فتح فورم التحذير
-// عشان تعرف تعرض الفورم المناسب (أول / ثاني / ثالث / فصل تلقائي)
 app.get("/api/senior/personnel/:discord/warning-info", ensureSeniorAdmin, async (req, res) => {
     const p = await Personnel.findOne({ discord: req.params.discord }, { warnings: 1 });
     if (!p) return res.status(404).json({ error: "غير موجود" });
@@ -2307,13 +2156,11 @@ app.get("/api/senior/personnel/:discord/warning-info", ensureSeniorAdmin, async 
     res.json({ count });
 });
 
-// عقوبات التحذيرات (تُستخدم عند إصدار التحذير الثالث) — يستخدمها أي شخص عنده صلاحية إرسال تحذير
 app.get("/api/warn-penalties", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     res.json({ list: settings.warningPenalties || [] });
 });
 
-// ── إدارة عقوبات التحذيرات (صفحة كبار المسؤولين — إضافة/تعديل/حذف) ──────
 app.get("/api/senior/penalties", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ list: settings.warningPenalties || [] });
@@ -2376,7 +2223,6 @@ app.post("/api/senior/personnel/:discord/warn", ensureSeniorAdmin, async (req, r
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// إشعار جماعي لكل الأعضاء المسجلين بالموقع
 app.post("/api/senior/personnel/warn-all", ensureSeniorAdmin, async (req, res) => {
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
@@ -2389,7 +2235,6 @@ app.post("/api/senior/personnel/warn-all", ensureSeniorAdmin, async (req, res) =
     res.json({ ok: true, count: result.modifiedCount });
 });
 
-// إشعار جماعي لكل أعضاء قطاع معيّن (حسب رول ديسكورد الخاص بالقطاع) — لقائد ونائب القطاع فقط
 app.post("/api/sector/notice-all", ensureSectorLeader, async (req, res) => {
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
@@ -2408,7 +2253,6 @@ app.post("/api/sector/notice-all", ensureSectorLeader, async (req, res) => {
     res.json({ ok: true, count: result.modifiedCount });
 });
 
-// أقرب تحذير/إشعار لهذا المستخدم لسّه ما اتعاهد عليه — تستخدمها الواجهة للبولينج تعرضه بوجهه
 app.get("/api/warnings/pending", async (req, res) => {
     if (!req.isAuthenticated()) return res.json({ warning: null });
     const p = await Personnel.findOne({ discord: req.user.id }, { warnings: 1 });
@@ -2428,7 +2272,6 @@ app.get("/api/warnings/pending", async (req, res) => {
     } });
 });
 
-// اتعاهد وأقر بعدم تكرار ذلك
 app.post("/api/warnings/:id/ack", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const p = await Personnel.findOne({ discord: req.user.id });
@@ -2448,7 +2291,6 @@ app.post("/api/warnings/:id/ack", async (req, res) => {
     res.json({ ok: true });
 });
 
-// يجيب كل الملاحظات المضافة على كل العساكر بصفحة وحدة (لكبار المسؤولين)
 app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
     const list = await Personnel.find({ "notes.0": { $exists: true }, discord: { $nin: hiddenOwnerIds(req) } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
     const flat = [];
@@ -2464,7 +2306,6 @@ app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
     res.json({ list: flat });
 });
 
-// ── حذف ملاحظات قطاع كامل (بالجملة أو باستثناء محدد) — كبار المسؤولين فقط ──
 app.get("/api/senior/notes/by-sector/:sector", ensureSeniorAdmin, async (req, res) => {
     const sector = req.params.sector;
     if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
@@ -2497,7 +2338,7 @@ app.post("/api/senior/notes/by-sector/:sector/delete-all", ensureSeniorAdmin, as
 app.post("/api/senior/notes/by-sector/:sector/delete-except", ensureSeniorAdmin, async (req, res) => {
     const sector = req.params.sector;
     if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
-    const { keepNoteIds } = req.body; // الملاحظات المستثناة (تبقى)
+    const { keepNoteIds } = req.body;
     const keep = Array.isArray(keepNoteIds) ? keepNoteIds : [];
     const ids = await getSectorMemberIds(sector);
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
@@ -2538,8 +2379,6 @@ app.post("/api/senior/personnel/:discord/block", ensureSeniorAdmin, async (req, 
     res.json({ ok: true, isBlocked: p.isBlocked });
 });
 
-// حذف نهائي لحساب عسكري — يحذف السجل بالكامل من قاعدة البيانات (يختفي من الصفحة نهائياً)
-// العسكري يقدر يقدم/يسجل من جديد بعدها عادي لأنه يصير كأنه ما سجل قبل
 app.delete("/api/senior/personnel/:discord", ensureSeniorAdmin, async (req, res) => {
     const p = await Personnel.findOneAndDelete({ discord: req.params.discord });
     if (!p) return res.status(404).json({ error: "غير موجود" });
@@ -2547,7 +2386,6 @@ app.delete("/api/senior/personnel/:discord", ensureSeniorAdmin, async (req, res)
     res.json({ ok: true });
 });
 
-// تعديل شامل لملف عسكري: الاسم، اليونت، الرتبة، النقاط — من لوحة كبار المسؤولين مباشرة
 app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req, res) => {
     const { name, unit, rank, points } = req.body;
     const update = {};
@@ -2563,12 +2401,11 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
         if (!CONFIG.MILITARY_RANKS.includes(newRank)) return res.status(400).json({ error: "رتبة غير موجودة" });
         update.rank = newRank;
 
-        // إذا ما حط الأدمن نقاط يدوياً مع الرتبة، نعطيه تلقائياً النقاط المناسبة لرتبته الجديدة
         const explicitPoints = points !== undefined && points !== "" && !isNaN(parseInt(points));
         if (!explicitPoints) {
             const newIdx = rankIndex(newRank);
             if (newIdx > oldIdx) update.points = await pointsForReachingRank(newRank, settings);
-            else if (newIdx < oldIdx) update.points = 0; // تنزيل الرتبة يصفّر النقاط عشان ما يترقى تلقائي بنفس النقاط القديمة
+            else if (newIdx < oldIdx) update.points = 0;
         }
     }
     if (points !== undefined && points !== "" && !isNaN(parseInt(points))) update.points = Math.max(0, parseInt(points));
@@ -2580,8 +2417,6 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
     res.json({ ok: true, personnel: p });
 });
 
-// ── تعديل نقاط الأعضاء — متاح لكبار المسؤولين، قادة/نواب القطاعات، ومسؤول الأفراد (بنطاق صلاحيته) ──
-// مسؤول الأفراد يقدر يعدّل نقاط رتبة "رئيس رقباء" وتحت فقط ضمن قطاعه، وقيادة القطاع تعدّل أي فرد بقطاعها
 async function ensurePointsEditor(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     if (isSeniorAdmin(req.user.id)) return next();
@@ -2596,7 +2431,7 @@ async function ensurePointsEditor(req, res, next) {
     const poInfo = getPersonnelOfficerSector(req.user.id, settings);
     if (poInfo) {
         const p = await ensureJuniorInMySector({ sectorInfo: poInfo }, res, req.params.discord);
-        if (!p) return; // ensureJuniorInMySector already sent the error response
+        if (!p) return;
         return next();
     }
     return res.status(403).json({ error: "ليست لديك صلاحية تعديل النقاط" });
@@ -2620,9 +2455,6 @@ app.post("/api/points/edit/:discord", ensurePointsEditor, async (req, res) => {
     res.json({ ok: true, personnel: p });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// أرشيف المخالفات المقبولة/المرفوضة (كبار المسؤولين) + حذف نهائي
-// ══════════════════════════════════════════════════════════════════════════
 app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: { $in: ["approved", "rejected"] } } },
@@ -2634,7 +2466,6 @@ app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) =
     res.json({ list });
 });
 
-// حذف نهائي لمخالفة — تختفي من لوحة كبار المسؤولين، وصفحة "مخالفاتي" عند العضو، وصفحة قائد القطاع
 app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req, res) => {
     const v = await Violation.findByIdAndDelete(req.params.id);
     if (!v) return res.status(404).json({ error: "غير موجود" });
@@ -2642,9 +2473,6 @@ app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req
     res.json({ ok: true });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// نظام الإجازات
-// ══════════════════════════════════════════════════════════════════════════
 app.get("/api/leave/mine", ensureAuth, async (req, res) => {
     const p = await Personnel.findOne({ discord: req.user.id }, { leaveBalance: 1 });
     const list = await LeaveRequest.find({ discord: req.user.id }).sort({ createdAt: -1 }).limit(50).lean();
@@ -2669,7 +2497,6 @@ app.post("/api/leave/request", ensureAuth, async (req, res) => {
     const active = await LeaveRequest.findOne({ discord: req.user.id, status: "approved" });
     if (active) return res.status(400).json({ error: "عندك إجازة نشطة حالياً، ما تقدر تطلب إجازة جديدة إلا بعد ما تنتهي" });
 
-    // بعد ما تنتهي إجازته (تلقائي أو يدوي)، ما يقدر يطلب إجازة جديدة إلا بعد 3 أيام من انتهائها
     const lastCompleted = await LeaveRequest.findOne({ discord: req.user.id, status: "completed" }).sort({ endedAt: -1 });
     if (lastCompleted && lastCompleted.endedAt) {
         const cooldownMs = 3 * 24 * 60 * 60 * 1000;
@@ -2691,9 +2518,6 @@ app.post("/api/leave/request", ensureAuth, async (req, res) => {
     res.json({ ok: true, leave });
 });
 
-// طلبات الإجازة المعلّقة اللي يراجعها هذا الشخص:
-// - قائد/نائب القطاع: كل طلبات قطاعه
-// - مسؤول الأفراد: طلبات رتبة رئيس رقباء وتحت بقطاعه فقط (والقائد/النائب يشوفونها بعد الموافقة كـ"علم" فقط)
 app.get("/api/leave/pending", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const leaderInfo = getSectorRole(req.user.id, settings);
@@ -2702,7 +2526,6 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
 
     let query = { status: { $in: ["pending", "approved"] } };
     if (isSeniorAdmin(req.user.id) && !leaderInfo && !poInfo) {
-        // كبار المسؤولين بدون دور قطاعي حقيقي يحتاجون تحديد قطاع
         const q = (req.query.sector || "").trim();
         if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
         query.sector = q;
@@ -2713,14 +2536,12 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
     }
 
     let list = await LeaveRequest.find(query).sort({ createdAt: -1 }).limit(100).lean();
-    // مسؤول الأفراد يشوف بس طلبات رئيس رقباء وتحت
     if (poInfo && !leaderInfo) {
         list = list.filter(l => isJuniorRank(l.rank));
     }
     res.json({ list });
 });
 
-// كبار المسؤولين يشوفون كل طلبات الإجازات المعلّقة من كل القطاعات بصفحة وحدة
 app.get("/api/senior/leave/pending", ensureSeniorAdmin, async (req, res) => {
     const list = await LeaveRequest.find({ status: { $in: ["pending", "approved"] } }).sort({ createdAt: -1 }).limit(200).lean();
     res.json({ list });
@@ -2763,7 +2584,6 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
     res.json({ ok: true, leave });
 });
 
-// إنهاء إجازة نشطة يدوياً — نفس صلاحية قبول/رفض هذا الطلب
 app.post("/api/leave/:id/end", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const leave = await LeaveRequest.findById(req.params.id);
@@ -2811,7 +2631,33 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
 
 app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
-    res.json({ settings });
+    const out = settings.toObject();
+    delete out.lockSavedLogin;
+    res.json({ settings: out });
+});
+
+app.get("/api/public/login-lock", async (req, res) => {
+    try {
+        const s = await getSettings();
+        res.set("Cache-Control", "no-store");
+        res.json({ locked: !!s.lockSavedLogin });
+    } catch (e) {
+        res.status(500).json({ error: "تعذر التحقق" });
+    }
+});
+
+app.get("/api/owner/saved-login-lock", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const s = await getSettings();
+    res.json({ locked: !!s.lockSavedLogin });
+});
+
+app.post("/api/owner/saved-login-lock", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const locked = !!(req.body && req.body.locked);
+    await getSettings();
+    await Settings.updateOne({}, { $set: { lockSavedLogin: locked } });
+    res.json({ ok: true, locked });
 });
 
 app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
@@ -2911,7 +2757,6 @@ app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
     res.json({ list, logClearAvailable: !settings.logClearUsed });
 });
 
-// حذف اللوق الشامل — مرة وحدة بس، وبعدها الزر يختفي (نرجّعه يدوياً لو طلبت: logClearUsed = false)
 app.post("/api/senior/log/clear", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     if (settings.logClearUsed) return res.status(403).json({ error: "تم استخدام زر حذف اللوق من قبل" });
@@ -2922,7 +2767,6 @@ app.post("/api/senior/log/clear", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true });
 });
 
-// ── صفحة "قادة القطاعات" (كبار المسؤولين فقط) ────────────────────────────
 app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null } });
@@ -2979,7 +2823,6 @@ app.post("/api/senior/sectors/:sector/remove", ensureSeniorAdmin, async (req, re
     res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
 });
 
-// ── مسارات لوحة قيادة القطاع (لقادة/نواب القطاعات، وكبار المسؤولين عبر ?sector=) ──
 app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
     await ensureCardNumbers();
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
@@ -2992,7 +2835,6 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     try {
         const ids = await getSectorMemberIds(req.sectorInfo.sector);
         if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-        // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
         const list = ids.length ? await Violation.aggregate([
             { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
             { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
@@ -3027,7 +2869,6 @@ app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, re
     res.json({ ok: true });
 });
 
-// يتأكد أن الشخص المطلوب فعلاً من ضمن أعضاء قطاع هذا القائد قبل أي تعديل عليه
 async function ensureInMySector(req, res, discordId) {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
     if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" }); return false; }
@@ -3035,7 +2876,6 @@ async function ensureInMySector(req, res, discordId) {
     return true;
 }
 
-// عرض ملف عسكري كامل لعضو داخل القطاع (الصفحة الثالثة: عرض ملف عسكري في القطاع)
 app.get("/api/sector/personnel/:discord", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     await ensureCardNumbers();
@@ -3045,11 +2885,9 @@ app.get("/api/sector/personnel/:discord", ensureSectorLeader, async (req, res) =
     res.json({ personnel: p, progress });
 });
 
-// ترقية أو تنزيل عضو من القطاع رتبة واحدة
-// طلب ترقية/تنزيل من قائد/نائب القطاع — ما ينفّذ مباشرة، يروح كطلب معلّق للقيادة العليا (لازم سبب)
 app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const { direction, reason } = req.body; // 'up' | 'down'
+    const { direction, reason } = req.body;
     if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
     if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الترقية/التنزيل" });
     const p = await Personnel.findOne({ discord: req.params.discord });
@@ -3077,7 +2915,6 @@ app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, 
     res.json({ ok: true, request: doc });
 });
 
-// تعيين يونت لعضو القطاع (نفس صلاحية كبار المسؤولين على نفس الحقل)
 app.post("/api/sector/personnel/:discord/unit", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     const { unit } = req.body;
@@ -3088,7 +2925,6 @@ app.post("/api/sector/personnel/:discord/unit", ensureSectorLeader, async (req, 
     res.json({ ok: true, personnel: p });
 });
 
-// إصدار تحذير/إشعار لعضو القطاع
 app.post("/api/sector/personnel/:discord/warn", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     try {
@@ -3101,7 +2937,6 @@ app.post("/api/sector/personnel/:discord/warn", ensureSectorLeader, async (req, 
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// عدد التحذيرات لعضو القطاع — تستخدمها الواجهة لتحديد شكل فورم التحذير
 app.get("/api/sector/personnel/:discord/warning-info", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     const p = await Personnel.findOne({ discord: req.params.discord }, { warnings: 1 });
@@ -3110,7 +2945,6 @@ app.get("/api/sector/personnel/:discord/warning-info", ensureSectorLeader, async
     res.json({ count });
 });
 
-// إضافة ملاحظة على عضو القطاع
 app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     const { text, image } = req.body;
@@ -3122,8 +2956,6 @@ app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, 
     res.json({ ok: true, notes: p.notes });
 });
 
-// ── تعيين/إزالة "مسؤول الأفراد" (يقدر عليها قائد/نائب القطاع نفسه، أو كبار المسؤولين عبر ?sector=) ──
-// مسؤول أفراد واحد بس لكل قطاع — التعيين الجديد يستبدل القديم تلقائياً
 app.post("/api/sector/personnel-officer/assign", ensureSectorLeader, async (req, res) => {
     const { discordId } = req.body;
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
@@ -3162,21 +2994,15 @@ app.post("/api/sector/personnel-officer/remove", ensureSectorLeader, async (req,
     res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
 });
 
-// ── طلبات ترقية/تنزيل قطاعه (سجل حالة بس — المراجعة الفعلية صارت عند القيادة العليا) ──
 app.get("/api/sector/promotion-requests", ensureSectorLeader, async (req, res) => {
     const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// 4.4.1) القيادة العليا — تراجع كل طلبات الترقية/التنزيل من كل القطاعات
-// ══════════════════════════════════════════════════════════════════════════
 app.get("/api/high-command/promotion-requests", ensureHighCommand, async (req, res) => {
     const list = await PromotionRequest.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
     res.json({ list });
 });
-// تنبيه فوري (شاشة كاملة زي نظام التحذيرات) لأي عضو بالقيادة العليا بأقدم طلب ترقية/تنزيل بانتظار المراجعة
-// يُستدعى بالبولينج — أول من يقبل/يرفض يسوي الطلب يختفي تلقائياً عند الجميع لأن حالته ما عادت "pending"
 app.get("/api/high-command/promotion-alert", ensureHighCommand, async (req, res) => {
     const r = await PromotionRequest.findOne({ status: "pending" }).sort({ createdAt: 1 });
     if (!r) return res.json({ alert: null });
@@ -3215,7 +3041,6 @@ app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, 
             issuedBy: req.user.id, issuedByTag: req.user.username,
         } } });
     }
-    // لو الطلب من مسؤول أفراد (مو قائد/نائب)، لازم قائد القطاع يعرف كمان
     const sl = (settings.sectorLeadership || {})[r.sector];
     if (sl && sl.commanderId && sl.commanderId !== r.requestedBy) {
         await Personnel.findOneAndUpdate({ discord: sl.commanderId }, { $push: { warnings: {
@@ -3252,7 +3077,6 @@ app.post("/api/high-command/promotion-requests/:id/reject", ensureHighCommand, a
     res.json({ ok: true });
 });
 
-// إدارة أعضاء القيادة العليا — كبار المسؤولين فقط
 app.get("/api/senior/high-command", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ list: settings.highCommand || [] });
@@ -3282,9 +3106,6 @@ app.post("/api/senior/high-command/remove", ensureSeniorAdmin, async (req, res) 
     res.json({ ok: true, list: settings.highCommand });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// مسؤول المخالفات — شخص واحد مسؤول عن مخالفات وتقارير كل القطاعات (قبول/رفض + سجل)
-// ══════════════════════════════════════════════════════════════════════════
 app.post("/api/senior/violations-officer/assign", ensureSeniorAdmin, async (req, res) => {
     const { discordId } = req.body;
     if (!discordId || !String(discordId).trim()) return res.status(400).json({ error: "حدد الشخص" });
@@ -3344,9 +3165,6 @@ app.post("/api/violations-officer/violations/:id/reject", ensureViolationsOffice
     res.json({ ok: true });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// 4.4) مسارات "مسؤول الأفراد" — صلاحيته على رتبة رئيس رقباء وتحت فقط بقطاعه
-// ══════════════════════════════════════════════════════════════════════════
 
 app.get("/api/personnel-officer/members", ensurePersonnelOfficer, async (req, res) => {
     await ensureCardNumbers();
@@ -3394,7 +3212,6 @@ app.post("/api/personnel-officer/personnel/:discord/warn", ensurePersonnelOffice
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// طلب ترقية/تنزيل — ما يصير مباشر، يروح كطلب معلّق لقائد/نائب القطاع
 app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePersonnelOfficer, async (req, res) => {
     const p = await ensureJuniorInMySector(req, res, req.params.discord);
     if (!p) return;
@@ -3421,19 +3238,16 @@ app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePe
     res.json({ ok: true, request: doc });
 });
 
-// طلباته السابقة (يشوف حالتها: معلّق/موافق عليه/مرفوض)
 app.get("/api/personnel-officer/requests", ensurePersonnelOfficer, async (req, res) => {
     const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
 });
 
-// مخالفات الأفراد (رئيس رقباء وتحت فقط) — عرض + قبول + رفض
 app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req, res) => {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
     const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
     const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
-    // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
     const list = juniorIds.length ? await Violation.aggregate([
         { $match: { reporterDiscord: { $in: juniorIds }, status: "pending" } },
         { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
@@ -3464,17 +3278,13 @@ app.post("/api/personnel-officer/violations/:id/reject", ensurePersonnelOfficer,
     res.json({ ok: true });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// 4.5) الشرطة العسكرية
-// ══════════════════════════════════════════════════════════════════════════
 
-// ── تعيين/إزالة قائد ونائب الشرطة العسكرية (كبار المسؤولين فقط) ──
 app.get("/api/senior/mp/leadership", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ mpLeadership: settings.mpLeadership || {} });
 });
 app.post("/api/senior/mp/assign", ensureSeniorAdmin, async (req, res) => {
-    const { role, discordId } = req.body; // role: commander | deputy
+    const { role, discordId } = req.body;
     if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
     const person = await Personnel.findOne({ discord: discordId.trim() });
@@ -3507,7 +3317,6 @@ app.post("/api/senior/mp/remove", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true, mpLeadership: settings.mpLeadership });
 });
 
-// ── تعيين/إزالة مسؤول أفراد الشرطة العسكرية (قائد/نائب الشرطة العسكرية أو كبار المسؤولين) ──
 app.post("/api/mp/personnel-officer/assign", ensureMPLeader, async (req, res) => {
     const { discordId } = req.body;
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
@@ -3534,7 +3343,6 @@ app.post("/api/mp/personnel-officer/remove", ensureMPLeader, async (req, res) =>
     res.json({ ok: true, mpLeadership: settings.mpLeadership });
 });
 
-// ── "العساكر" — كل العساكر المسجلين بالموقع، من أعلى رتبة لأقل رتبة (لأي حامل رتبة شرطة عسكرية) ──
 app.get("/api/mp/members", ensureMPMember, async (req, res) => {
     await ensureCardNumbers();
     const list = await Personnel.find({ registeredName: { $ne: null }, discord: { $nin: hiddenOwnerIds(req) } }, { notes: 0 });
@@ -3542,7 +3350,6 @@ app.get("/api/mp/members", ensureMPMember, async (req, res) => {
     res.json({ list });
 });
 
-// عرض ملف عسكري كامل لأي عسكري مسجل بالموقع — لقائد ونائب الشرطة العسكرية (نفس صلاحية قادة القطاعات)
 app.get("/api/mp/personnel/:discord", ensureMPLeader, async (req, res) => {
     await ensureCardNumbers();
     const p = await Personnel.findOne({ discord: req.params.discord });
@@ -3552,7 +3359,6 @@ app.get("/api/mp/personnel/:discord", ensureMPLeader, async (req, res) => {
     res.json({ personnel: p, progress });
 });
 
-// إصدار تحذير/إشعار لأي عسكري — لقائد ونائب الشرطة العسكرية (نفس فورم التحذير حق كبار المسؤولين وقادة القطاعات)
 app.post("/api/mp/personnel/:discord/warn", ensureMPLeader, async (req, res) => {
     try {
         const { p, dismissed } = await issueWarning({
@@ -3570,7 +3376,6 @@ app.get("/api/mp/personnel/:discord/warning-info", ensureMPLeader, async (req, r
     res.json({ count });
 });
 
-// قائمة أفراد الشرطة العسكرية أنفسهم (حاملي الرتبة) — صفحة مخصصة لقيادة الشرطة العسكرية
 app.get("/api/mp/force-members", ensureMPLeader, async (req, res) => {
     const ids = await getMilitaryPoliceMemberIds();
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
@@ -3578,7 +3383,6 @@ app.get("/api/mp/force-members", ensureMPLeader, async (req, res) => {
     res.json({ list });
 });
 
-// إشعار جماعي لكل أفراد الشرطة العسكرية (نفس فكرة إشعار القطاعات)
 app.post("/api/mp/notice-all", ensureMPLeader, async (req, res) => {
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
@@ -3594,7 +3398,6 @@ app.post("/api/mp/notice-all", ensureMPLeader, async (req, res) => {
     res.json({ ok: true, count: result.modifiedCount });
 });
 
-// ── ملاحظة على أي عسكري (فورم: سبب + صورة إجبارية) ──
 app.post("/api/mp/personnel/:discord/note", ensureMPMember, async (req, res) => {
     const { text, image } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
@@ -3606,9 +3409,6 @@ app.post("/api/mp/personnel/:discord/note", ensureMPMember, async (req, res) => 
     res.json({ ok: true, notes: p.notes });
 });
 
-// ── الاستدعاء ──
-// أي حامل رتبة شرطة عسكرية يقدر يرسل استدعاء: لو كان قائد/نائب/كبير مسؤول يصير فعّال فوراً،
-// لو عضو عادي يصير "طلب استدعاء" بانتظار قبول القيادة
 app.post("/api/mp/personnel/:discord/summon", ensureMPMember, async (req, res) => {
     const { mode, hour, minute, ampm } = req.body;
     if (!["now", "scheduled"].includes(mode)) return res.status(400).json({ error: "حدد نوع وقت الاستدعاء" });
@@ -3645,7 +3445,6 @@ app.post("/api/mp/personnel/:discord/summon/stop", ensureMPLeader, async (req, r
     await logEvent({ action: "إيقاف استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
     res.json({ ok: true });
 });
-// طلبات الاستدعاء المعلّقة (المرسلة من أعضاء عاديين) — تحتاج قبول القيادة
 app.get("/api/mp/summon-requests", ensureMPLeader, async (req, res) => {
     const list = await Personnel.find({ "summon.status": "pending" }, "discord discordTag registeredName rank summon");
     res.json({ list });
@@ -3665,7 +3464,6 @@ app.post("/api/mp/summon-requests/:discord/reject", ensureMPLeader, async (req, 
     await logEvent({ action: "رفض طلب استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
     res.json({ ok: true });
 });
-// دخول الاستدعاء — يستخدمها العضو نفسه لما يجيه إشعار "لديك استدعاء"
 app.post("/api/summon/enter", ensureAuth, async (req, res) => {
     const p = await Personnel.findOne({ discord: req.user.id });
     if (!p || !p.summon || p.summon.status !== "approved") return res.status(400).json({ error: "لا يوجد استدعاء نشط عليك" });
@@ -3677,13 +3475,12 @@ app.post("/api/summon/enter", ensureAuth, async (req, res) => {
     res.json({ ok: true, url: CONFIG.MP_SUMMON_VOICE_URL });
 });
 
-// ── تقارير الشرطة العسكرية ──
 app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
     const { dutyReport, patrolsCount, summonsCount, incidents, notesIssued, generalNotes } = req.body;
     if (!dutyReport || !dutyReport.trim()) return res.status(400).json({ error: "اكتب وش سويت بالاستلام" });
     const settings = req.settings;
     const p = await Personnel.findOne({ discord: req.user.id });
-    const mpRole = getMPRole(req.user.id, settings); // "commander" | "deputy" | null
+    const mpRole = getMPRole(req.user.id, settings);
     const isLeader = !!mpRole;
     const doc = await MPReport.create({
         reporterDiscord: req.user.id, reporterTag: req.user.username,
@@ -3705,7 +3502,6 @@ app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
     if (isLeader) {
         await Personnel.findOneAndUpdate({ discord: req.user.id }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
         await checkAutoPromotion(req.user.id);
-        // لو النائب هو اللي قدّم، يوصل إشعار للقائد بتقريره
         if (mpRole === "deputy" && settings.mpLeadership?.commanderId) {
             await Personnel.findOneAndUpdate({ discord: settings.mpLeadership.commanderId }, { $push: { warnings: {
                 kind: "notice",
@@ -3721,7 +3517,6 @@ app.get("/api/mp/reports/pending", ensureMPLeader, async (req, res) => {
     const list = await MPReport.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
     res.json({ list });
 });
-// كل التقارير بجميع حالاتها (معلّقة/مقبولة/مرفوضة) — قائد ونائب الشرطة العسكرية يشوفون تقارير بعض حتى لو انقبلت من قبل
 app.get("/api/mp/reports/all", ensureMPLeader, async (req, res) => {
     const list = await MPReport.find({}).sort({ createdAt: -1 }).limit(300);
     res.json({ list });
@@ -3747,7 +3542,6 @@ app.post("/api/mp/reports/:id/reject", ensureMPLeader, async (req, res) => {
     await logEvent({ action: "رفض تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: reason.trim() });
     res.json({ ok: true });
 });
-// حذف تقرير نهائياً — قائد ونائب الشرطة العسكرية فقط
 app.delete("/api/mp/reports/:id", ensureMPLeader, async (req, res) => {
     const r = await MPReport.findByIdAndDelete(req.params.id);
     if (!r) return res.status(404).json({ error: "غير موجود" });
@@ -3755,23 +3549,16 @@ app.delete("/api/mp/reports/:id", ensureMPLeader, async (req, res) => {
     res.json({ ok: true });
 });
 
-// ── لوق القطاعات (كل شي يسويه القادة/النواب/مسؤولي الأفراد بكل القطاعات — بدون كبار المسؤولين) ──
 app.get("/api/mp/sector-log", ensureMPLeader, async (req, res) => {
-    // بعض إجراءات قادة/نواب القطاعات تحط "(قيادة ...)" أو "(مسؤول أفراد ...)" داخل actorTag، وبعضها داخل details بس — نبحث بالاثنين
     const rx = /قيادة|مسؤول أفراد/;
     const list = await Log.find({ $or: [{ actorTag: { $regex: rx } }, { details: { $regex: rx } }] }).sort({ createdAt: -1 }).limit(300);
     res.json({ list });
 });
-// سجل كامل لكل طلبات الترقية/التنزيل (معلّقة ومقبولة ومرفوضة) — علم دائم لقيادة الشرطة العسكرية:
-// مين قدّم الطلب ومتى، وأي قيادي عليا وافق/رفض ومتى، وكل التفاصيل — بدون أي تعديل، عرض فقط
 app.get("/api/mp/promotion-log", ensureMPLeader, async (req, res) => {
     const list = await PromotionRequest.find({}).sort({ createdAt: -1 }).limit(300);
     res.json({ list });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// 4.6) مسارات مسؤول أفراد الشرطة العسكرية — نطاقه: أعضاء الشرطة العسكرية أنفسهم (ما عدا القائد والنائب)
-// ══════════════════════════════════════════════════════════════════════════
 app.get("/api/mp/po/members", ensureMPPersonnelOfficer, async (req, res) => {
     const ids = await getMilitaryPoliceMemberIds();
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
@@ -3797,7 +3584,6 @@ app.post("/api/mp/po/personnel/:discord/note", ensureMPPersonnelOfficer, async (
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `على ${p.registeredName || p.discord}` });
     res.json({ ok: true, notes: p.notes });
 });
-// تقارير الشرطة العسكرية بنظر مسؤول الأفراد — تستثني تقارير القائد والنائب
 app.get("/api/mp/po/reports/pending", ensureMPPersonnelOfficer, async (req, res) => {
     const settings = req.settings;
     const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
@@ -3830,17 +3616,11 @@ app.post("/api/mp/po/reports/:id/reject", ensureMPPersonnelOfficer, async (req, 
     res.json({ ok: true });
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// 4.7) APIs مخصصة لموقع البنك (ربط رواتب العساكر) — بدون تسجيل دخول ديسكورد
-//      يستخدمها البنك فقط للحصول على قائمة الرتب ورتبة كل عسكري مسجل
-// ══════════════════════════════════════════════════════════════════════════
 
-// قائمة الرتب العسكرية الرسمية (يستخدمها البنك لبناء جدول تحديد الرواتب)
 app.get("/api/bank/ranks", async (req, res) => {
     res.json({ success: true, ranks: CONFIG.MILITARY_RANKS });
 });
 
-// رتبة كل عسكري مسجل (يستخدمها البنك وقت توزيع الرواتب لمطابقة كل حساب برتبته)
 app.get("/api/bank/personnel-ranks", async (req, res) => {
     try {
         const list = await Personnel.find({ isBlocked: false, discord: { $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
@@ -3856,42 +3636,35 @@ app.get("/api/bank/personnel-ranks", async (req, res) => {
     }
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// 5) الواجهة (صفحة واحدة SPA)
-// ══════════════════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════════════════
-// خدمة العملاء (تكت) — مساعد ذكي أول، وبعدها عضو حقيقي من الإدارة، تحديث فوري بدون ريفرش
-// ══════════════════════════════════════════════════════════════════════════
 const SUPPORT_CATEGORIES = ["مشكلة في الموقع", "مشكلة في حسابي", "مخالفة / نقاط / رتبة", "إجازة", "البطاقة العسكرية", "اقتراح", "أخرى"];
 
 const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
     no: { type: Number, index: true },
-    uid: { type: String, default: null, index: true },          // حساب الموقع (null = زائر من صفحة الدخول)
-    guestToken: { type: String, default: null, index: true },   // هوية الزائر (سرّية، محفوظة بمتصفحه)
-    deviceToken: { type: String, default: null, index: true },  // هوية الجهاز (تنحفظ لكل التكتات حتى لو العضو مسجّل دخول) — تكت واحد مفتوح لكل جهاز
+    uid: { type: String, default: null, index: true },
+    guestToken: { type: String, default: null, index: true },
+    deviceToken: { type: String, default: null, index: true },
     name: String,
     category: String,
-    place: String,       // وين المشكلة بالموقع
+    place: String,
     subject: String,
     ua: String,
-    status: { type: String, default: "ai" }, // ai (مساعد ذكي) | waiting (بانتظار إداري) | active (إداري معاه) | closed
+    status: { type: String, default: "ai" },
     adminUid: { type: String, default: null },
     adminName: { type: String, default: null },
     discordMsgId: { type: String, default: null },
     unreadUser: { type: Number, default: 0 },
     unreadAdmin: { type: Number, default: 0 },
     messages: [{
-        sender: String,      // user | ai | admin | system
+        sender: String,
         name: String,
         text: String,
-        image: String,       // data URL (مضغوطة من المتصفح)
-        suggest: Boolean,    // المساعد يقترح يتواصل مع عضو حقيقي
-        role: String,        // رتبة الإداري الراسل: senior (كبار المسؤولين) | admin (إداري)
+        image: String,
+        suggest: Boolean,
+        role: String,
         createdAt: { type: Date, default: Date.now },
     }],
 }, { timestamps: true }));
 
-// حظر من الدعم الفني — يشمل حساب الموقع + الأجهزة اللي استخدمها (هوية الجهاز المحفوظة بالمتصفح)
 const SupportBan = mongoose.model("SupportBan", new mongoose.Schema({
     uid: { type: String, default: null, index: true },
     deviceTokens: { type: [String], default: [], index: true },
@@ -3942,7 +3715,6 @@ async function supportLoad(req, res) {
     if ((uid && t.uid === uid) || (!t.uid && gt && t.guestToken === gt) || (gt && t.deviceToken && t.deviceToken === gt)) role = "owner";
     else if (uid && await isSupportAdmin(uid)) {
         role = "admin";
-        // الإداري العادي: بس التكتات اللي بانتظار الإدارة أو اللي استلمها هو — الكبار يشوفون كل شي
         if (!isSeniorAdmin(uid) && !(t.status === "waiting" || t.adminUid === uid)) { res.status(403).json({ error: "هذا التكت مو من صلاحياتك" }); return null; }
     }
     if (!role) { res.status(403).json({ error: "ما عندك صلاحية على هذا التكت" }); return null; }
@@ -3954,7 +3726,6 @@ function supportPubMsg(m, i) {
 function supportPubTicket(t) {
     return { id: String(t._id), no: t.no, name: t.name, category: t.category, place: t.place, subject: t.subject, status: t.status, adminName: t.adminName, guest: !t.uid, updatedAt: t.updatedAt, createdAt: t.createdAt };
 }
-// يرسل حدث لحظي لصاحب التكت + كل الإداريين
 function supportEvent(t, from, extra) {
     const payload = Object.assign({ id: String(t._id), status: t.status, n: t.messages.length, from }, extra || {});
     sseBroadcast("ticket", payload, c => c.isAdmin || (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt) || (c.gt && t.deviceToken && t.deviceToken === c.gt));
@@ -4006,7 +3777,6 @@ async function supportAskAi(t) {
     } finally { clearTimeout(timer); }
 }
 
-// ── المساعد الآلي (مجاني بدون ذكاء اصطناعي): ردود جاهزة حسب كلمات مفتاحية ──
 function supportNorm(s) {
     return String(s || "").toLowerCase().replace(/[\u064B-\u065F\u0640]/g, "").replace(/[أإآ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه").replace(/[^\u0600-\u06FFa-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -4052,7 +3822,6 @@ const SUPPORT_FAQ = [
     { id: "complaint", keys: ["شكوى", "شكويه", "اشتكي", "ظلم", "ظلمني", "تعدي", "تجاوز"], human: true,
       a: "نأسف لهذا الشي، الشكاوى تتابعها الإدارة مباشرة. اضغط «🧑‍💼 تحدث مع عضو حقيقي» ووضّح لهم القصة وأرفق أي إثبات عندك." },
 ];
-// وين المشكلة (من نموذج فتح التكت) → نفس الإجابة لو الرسالة ما فيها كلمات واضحة
 const SUPPORT_HINT = { "تسجيل الدخول / التسجيل": "login", "تسجيل مخالفة": "violation", "مخالفاتي": "violation_status", "الإجازات": "leave", "بطاقتي": "card", "إجازة": "leave", "البطاقة العسكرية": "card", "اقتراح": "suggest", "مخالفة / نقاط / رتبة": "points" };
 
 function supportFaqReply(t) {
@@ -4066,7 +3835,6 @@ function supportFaqReply(t) {
     if (!text) {
         return out(users.length > 1 && aiCount >= 1 ? "وصلتنا الصورة 👍 إذا ما قدرت توصف لي المشكلة بكلام، اضغط «تحدث مع عضو حقيقي» وبيشوفها الإداري." : "وصلتنا الصورة 👍 اكتب لي الحين وش المشكلة بالضبط وفي أي صفحة صارت؟", users.length > 1 && aiCount >= 1);
     }
-    // نحسب نقاط كل سؤال حسب الكلمات المطابقة (العبارات الطويلة أقوى)
     let best = null, bestScore = 0;
     for (const f of SUPPORT_FAQ) {
         let sc = 0;
@@ -4075,10 +3843,9 @@ function supportFaqReply(t) {
             const nk = supportNorm(k);
             if (nk && text.indexOf(nk) !== -1) sc += nk.indexOf(" ") !== -1 ? 2 : 1;
         }
-        if (f.bare && text.split(" ").length > 6) sc = 0; // السلام/الشكر داخل رسالة طويلة ما يعتبر
+        if (f.bare && text.split(" ").length > 6) sc = 0;
         if (sc > bestScore) { best = f; bestScore = sc; }
     }
-    // لو ما فيه كلمات واضحة: نعتمد على اللي اختاره بالنموذج (أول رسالة بس)
     if (!best && users.length === 1) {
         const hid = SUPPORT_HINT[t.place] || SUPPORT_HINT[t.category];
         if (hid) best = SUPPORT_FAQ.find(f => f.id === hid) || null;
@@ -4091,7 +3858,6 @@ function supportFaqReply(t) {
         }
         return out(ans + tail, !!best.human);
     }
-    // ما فهمنا: نسأل مرة، وبعدها نحوّل للإدارة
     if (aiCount >= 2 || (prevAi && (prevAi.suggest || String(prevAi.text || "").indexOf("ما فهمت مشكلتك") === 0))) {
         return out("ما قدرت أحدد مشكلتك بالضبط 🙏 اضغط «تحدث مع عضو حقيقي» وبيساعدك أحد من الإدارة.", true);
     }
@@ -4174,14 +3940,13 @@ async function supportDiscordJoined(t) {
         if (!m || !m.embeds[0]) return;
         const e = EmbedBuilder.from(m.embeds[0]).setColor(0x22c55e).addFields({ name: "✅ المستلم", value: t.adminName || "-" });
         await m.edit({ embeds: [e] });
-    } catch (e) { /* تجاهل */ }
+    } catch (e) { }
 }
 
 const supportGuestThrottle = new Map();
 const supportCreateLock = new Set();
 function supportClientIp(req) { return String((req.headers["x-forwarded-for"] || req.ip || "")).split(",")[0].trim(); }
 
-// إنشاء تكت (عضو مسجّل أو زائر من صفحة الدخول)
 app.post("/api/support/tickets", async (req, res) => {
     const uid = req.user ? req.user.id : null;
     const gt = supportGuestToken(req);
@@ -4200,7 +3965,6 @@ app.post("/api/support/tickets", async (req, res) => {
         if (arr.length >= 5) return res.status(429).json({ error: "فتحت تكتات كثير، جرّب بعد شوي" });
         arr.push(Date.now()); supportGuestThrottle.set(ip, arr);
     }
-    // تكت واحد مفتوح لكل جهاز (وكذلك لكل حساب) — لازم يتقفل عشان تقدر تفتح جديد
     const lockKey = (uid || "") + "|" + (gt || "");
     if (supportCreateLock.has(lockKey)) return res.status(429).json({ error: "لحظة، طلبك السابق قيد التنفيذ" });
     supportCreateLock.add(lockKey);
@@ -4227,7 +3991,6 @@ app.post("/api/support/tickets", async (req, res) => {
     } finally { supportCreateLock.delete(lockKey); }
 });
 
-// تكتاتي
 app.get("/api/support/tickets", async (req, res) => {
     const uid = req.user ? req.user.id : null;
     const gt = supportGuestToken(req);
@@ -4240,7 +4003,6 @@ app.get("/api/support/tickets", async (req, res) => {
     res.json({ banned, tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadUser || 0, last: ((t.messages[t.messages.length - 1] || {}).text || "").slice(0, 60) })) });
 });
 
-// شارات التنبيه (غير المقروء)
 app.get("/api/support/badges", async (req, res) => {
     const uid = req.user ? req.user.id : null;
     const gt = supportGuestToken(req);
@@ -4265,7 +4027,6 @@ app.get("/api/support/badges", async (req, res) => {
     res.json(out);
 });
 
-// قراءة تكت (after = عدد الرسائل اللي عند العميل أصلاً)
 app.get("/api/support/tickets/:id", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const after = Math.max(0, parseInt(req.query.after, 10) || 0);
@@ -4276,7 +4037,6 @@ app.get("/api/support/tickets/:id", async (req, res) => {
     res.json({ ticket: supportPubTicket(t), role, msgs, n: t.messages.length });
 });
 
-// صورة داخل رسالة
 app.get("/api/support/tickets/:id/img/:i", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const m = x.t.messages[parseInt(req.params.i, 10)];
@@ -4286,7 +4046,6 @@ app.get("/api/support/tickets/:id/img/:i", async (req, res) => {
     res.send(Buffer.from(mm[2], "base64"));
 });
 
-// إرسال رسالة (صاحب التكت أو الإداري)
 const supportMsgThrottle = new Map();
 app.post("/api/support/tickets/:id/messages", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
@@ -4312,10 +4071,9 @@ app.post("/api/support/tickets/:id/messages", async (req, res) => {
         if (t.status === "ai") supportRunAi(String(t._id));
     } else {
         const senior = isSeniorAdmin(uid);
-        // الكبار يكتبون بأي تكت مفتوح بدون استلام — الإداري العادي لازم يستلم أول
         if (!senior && t.status !== "active") return res.status(400).json({ error: "استلم التكت أول عشان تقدر ترد" });
         if (!senior && t.adminUid !== uid) return res.status(403).json({ error: "هذا التكت مستلمه " + (t.adminName || "إداري ثاني") });
-        if (senior && t.status === "ai") t.status = "waiting"; // دخل إداري → نوقف المساعد الآلي
+        if (senior && t.status === "ai") t.status = "waiting";
         supportAddMsg(t, { sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text, image });
         t.unreadUser += 1;
         await t.save();
@@ -4324,7 +4082,6 @@ app.post("/api/support/tickets/:id/messages", async (req, res) => {
     }
 });
 
-// العضو يطلب إداري حقيقي
 app.post("/api/support/tickets/:id/human", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const { t, role } = x;
@@ -4339,7 +4096,6 @@ app.post("/api/support/tickets/:id/human", async (req, res) => {
     supportNotifyDiscord(t);
 });
 
-// الإداري يستلم التكت
 app.post("/api/support/admin/tickets/:id/join", async (req, res) => {
     if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
     const x = await supportLoad(req, res); if (!x) return;
@@ -4358,7 +4114,6 @@ app.post("/api/support/admin/tickets/:id/join", async (req, res) => {
     supportDiscordJoined(t);
 });
 
-// إغلاق التكت (الإدارة فقط — العضو ما يقدر يقفله)
 app.post("/api/support/tickets/:id/close", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const { t, role } = x;
@@ -4372,10 +4127,8 @@ app.post("/api/support/tickets/:id/close", async (req, res) => {
     supportEvent(t, "system", { kind: "close" });
 });
 
-// قائمة التكتات للإدارة
 app.get("/api/support/admin/tickets", async (req, res) => {
     if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    // الكبار: كل التابات — الإداري العادي: بس بانتظار الإدارة (+ التكتات اللي استلمها هو عشان ما يفقد الوصول لها)
     const q = isSeniorAdmin(req.user.id)
         ? { status: ["ai", "waiting", "active", "closed"].includes(req.query.status) ? req.query.status : "waiting" }
         : { $or: [{ status: "waiting" }, { status: "active", adminUid: req.user.id }] };
@@ -4383,7 +4136,6 @@ app.get("/api/support/admin/tickets", async (req, res) => {
     res.json({ tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadAdmin || 0, last: ((t.messages[t.messages.length - 1] || {}).text || "").slice(0, 60) })) });
 });
 
-// حظر المستخدم من الدعم الفني (كبار المسؤولين فقط) — حسابه + أجهزته
 app.post("/api/support/admin/tickets/:id/ban", async (req, res) => {
     if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "الحظر لكبار المسؤولين فقط" });
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
@@ -4408,7 +4160,6 @@ app.post("/api/support/admin/tickets/:id/ban", async (req, res) => {
     } else {
         ban = await SupportBan.create({ uid: t.uid || null, deviceTokens, name: t.name, reason, bannedBy: req.user.id, bannedByName: req.user.username });
     }
-    // نقفل كل تكتاته المفتوحة
     const q = { status: { $ne: "closed" }, $or: [...(t.uid ? [{ uid: t.uid }] : []), { deviceToken: { $in: deviceTokens } }, { guestToken: { $in: deviceTokens } }] };
     const opens = await SupportTicket.find(q);
     for (const o of opens) {
@@ -4435,7 +4186,6 @@ app.delete("/api/support/admin/bans/:id", async (req, res) => {
     res.json({ ok: true });
 });
 
-// حذف تكت مغلق (كبار المسؤولين فقط)
 app.delete("/api/support/admin/tickets/:id", async (req, res) => {
     if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا الإجراء لكبار المسؤولين فقط" });
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
@@ -4448,7 +4198,6 @@ app.delete("/api/support/admin/tickets/:id", async (req, res) => {
     sseBroadcast("ticket", { id: String(t._id), status: "closed", n: 0, from: "system", kind: "deleted" },
         c => c.isAdmin || (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt) || (c.gt && t.deviceToken && t.deviceToken === c.gt));
 });
-// حذف كل التكتات المغلقة دفعة وحدة (كبار المسؤولين فقط)
 app.delete("/api/support/admin/closed", async (req, res) => {
     if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا الإجراء لكبار المسؤولين فقط" });
     const r = await SupportTicket.deleteMany({ status: "closed" });
@@ -4548,7 +4297,6 @@ app.get("/", (req, res) => {
     .vcard img { width: 100%; height: 54px; object-fit: cover; border-radius: 6px; margin-bottom: 4px; }
 
 
-    /* ── فورم اختيار نوع/أنواع المخالفة (بدل القائمة المنسدلة) ─────────────── */
     #vtype-overlay { display: none; position: fixed; inset: 0; z-index: 2600; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
     #vtype-overlay.open { display: flex; }
     .vtype-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 460px; width: 100%; max-height: 85vh; overflow-y: auto; margin: auto; }
@@ -4560,7 +4308,6 @@ app.get("/", (req, res) => {
     .vtype-actions button { flex: 1; }
 
     .login-screen { text-align: center; padding: 4rem 2rem; }
-    /* ── صفحات الدخول والتسجيل ── */
     .auth-page { min-height: calc(100vh - 230px); display: flex; align-items: center; justify-content: center; padding: 24px 12px; }
     .auth-card { width: 100%; max-width: 560px; background: linear-gradient(180deg, #0d1b3a, #09122b); border: 1px solid rgba(212,175,55,0.35); border-radius: 28px; padding: 34px 40px 38px; box-shadow: 0 25px 60px rgba(0,0,0,0.55); }
     .auth-title { color: #f2c94c; font-size: 32px; font-weight: 800; text-align: center; margin: 0 0 6px; }
@@ -4587,12 +4334,10 @@ app.get("/", (req, res) => {
     .auth-done p { color: #cbd5e1; line-height: 1.9; margin-bottom: 20px; }
     @media (max-width: 560px) { .auth-card { padding: 26px 18px 30px; border-radius: 22px; } .auth-grid { grid-template-columns: 1fr; } .auth-title { font-size: 26px; } }
 
-    /* ── البطاقة العسكرية ── */
     .mc-wrap { max-width: 340px; margin: 0 auto; }
     .mcard { position: relative; width: 100%; aspect-ratio: 968 / 609; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent; }
     .mc-face { position: absolute; inset: 0; background: url('/card-bg.jpg?v=3') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3); transition: filter 0.3s, transform 0.3s; }
     .mcard.locked .mc-face { filter: blur(15px); transform: scale(1.08); }
-    /* المعلومات المطبوعة على صورة البطاقة (مواقعها بنسبة من الصورة الأصلية 943x616) */
     .mc-t { position: absolute; color: #0f172a; font-weight: 800; font-size: 3.5cqw; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; direction: rtl; text-shadow: 0 0 3px rgba(255,255,255,0.95), 0 0 6px rgba(255,255,255,0.8); transform: translateY(-50%); }
     .mc-t.name { left: 51.5%; right: 12.2%; top: 25.04%; }
     .mc-t.rank { left: 51.5%; right: 12.2%; top: 38.59%; }
@@ -4614,21 +4359,18 @@ app.get("/", (req, res) => {
     .mc-row b { display: block; margin-top: 4px; font-weight: 700; color: #e2e8f0; font-size: 15px; word-break: break-word; user-select: text; }
     .mc-copy { border: 1px solid var(--border); background: rgba(59,130,246,0.18); color: var(--gold-soft); border-radius: 8px; padding: 3px 10px; cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 700; flex-shrink: 0; }
     .mc-modal { width: 100%; max-width: 340px; margin: auto; }
-    /* صفحة معلومات البطاقة — تفتح كصفحة ثانية فوق الموقع (نفس أسلوب صفحة الصورة) */
     #mc-page { display: none; position: fixed; inset: 0; z-index: 5000; background: #0a1628; flex-direction: column; }
     #mc-page.open { display: flex; }
     #mc-page .pp-bar { display: flex; align-items: center; padding: env(safe-area-inset-top,14px) 8px 10px; background: rgba(0,0,0,0.35); flex-shrink: 0; }
     #mc-page .pp-back { background: none; border: none; color: #fff; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 10px 14px; -webkit-tap-highlight-color: transparent; font-family: inherit; }
     #mc-page .mcp-body { flex: 1; overflow-y: auto; padding: 8px 14px 30px; }
     #mc-page .mc-wrap { margin-top: 6px; }
-    /* عرض البطاقة كاملة — على الجوال العمودي تنقلب أفقياً وتملأ الشاشة */
     #mc-full { display: none; position: fixed; inset: 0; z-index: 5200; background: rgba(0,0,0,0.95); align-items: center; justify-content: center; overflow: hidden; }
     #mc-full.open { display: flex; }
     #mc-full .mc-fs { width: min(96vw, calc(92vh * 968 / 609)); flex-shrink: 0; cursor: pointer; }
     #mc-full .mc-fs .mcard { cursor: pointer; border-radius: 14px; }
     @media (orientation: portrait) { #mc-full .mc-fs { width: min(92vh, calc(96vw * 968 / 609)); transform: rotate(90deg); } }
     #mc-full .mc-x { position: absolute; top: env(safe-area-inset-top,12px); left: 12px; z-index: 2; background: rgba(255,255,255,0.14); color: #fff; border: none; border-radius: 50%; width: 40px; height: 40px; font-size: 18px; cursor: pointer; margin-top: 10px; }
-    /* ── صفحات الحسابات (لوحة الإدارة) ── */
     .acc-card .acc-title { font-size: 17px; font-weight: 800; color: var(--gold-soft); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .acc-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); font-size: 13px; }
     .acc-row span { color: var(--muted); }
@@ -4645,7 +4387,6 @@ app.get("/", (req, res) => {
     .acc-check input { width: auto; margin: 0; }
     .login-screen h1 { font-size: 3rem; color: #3b82f6; text-shadow: 0 0 20px rgba(59,130,246,0.5); margin-bottom: 10px; }
     footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); font-size: 0.9rem; }
-    /* صفحة عرض الصورة بملء الشاشة — نفس أسلوب ديسكورد */
     #photo-page { display: none; position: fixed; inset: 0; z-index: 5000; background: #000; flex-direction: column; }
     #photo-page.open { display: flex; }
     #photo-page .pp-bar { display: flex; align-items: center; padding: env(safe-area-inset-top,14px) 8px 10px; background: rgba(0,0,0,0.55); flex-shrink: 0; }
@@ -4654,7 +4395,6 @@ app.get("/", (req, res) => {
     #photo-page .pp-body img { max-width: 100%; max-height: 100%; object-fit: contain; }
     #photo-page .pp-loading { color: #cbd5e1; font-size: 14px; text-align: center; padding: 20px; }
 
-    /* ── تحذير / إشعار (شاشة كاملة) ────────────────────────────────── */
     #warn-overlay { display: none; position: fixed; inset: 0; z-index: 3000; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 20px; text-align: center; }
     #warn-overlay.open { display: flex; }
     #warn-overlay.k-warning { background: radial-gradient(circle at center, #7a1a1a, #3d0d0d); }
@@ -4669,7 +4409,6 @@ app.get("/", (req, res) => {
     .warn-ack-btn { margin-top: 26px; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.5); color: #fff; padding: 12px 22px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; }
     .warn-ack-btn:hover { background: rgba(255,255,255,0.2); }
 
-    /* ── تنبيه القيادة العليا بطلب ترقية/تنزيل جديد (شاشة كاملة زي نظام التحذيرات) ─── */
     #promo-alert-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: radial-gradient(circle at center, #14532d, #052e16); color: #fff; text-align: center; flex-direction: column; align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
     #promo-alert-overlay.open { display: flex; }
     .promo-box { border: 2px dashed rgba(255,255,255,0.55); border-radius: 10px; padding: 26px 40px; max-width: 480px; }
@@ -4683,7 +4422,6 @@ app.get("/", (req, res) => {
     .promo-reject-btn { background: rgba(248,113,113,0.25); }
     .promo-reject-btn:hover { background: rgba(248,113,113,0.45); }
 
-    /* ── فورم إرسال تحذير/إشعار (بديل عن prompt/confirm) ─────────────── */
     #wf-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
     #wf-overlay.open { display: flex; }
     .wf-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 380px; width: 100%; text-align: center; max-height: 85vh; overflow-y: auto; margin: auto; }
@@ -4695,7 +4433,6 @@ app.get("/", (req, res) => {
     .wf-box textarea { width: 100%; min-height: 90px; margin-top: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 8px; color: #fff; padding: 10px; font-family: inherit; font-size: 14px; resize: vertical; }
     .wf-actions { display: flex; gap: 8px; margin-top: 14px; }
     .wf-actions button { flex: 1; }
-    /* ── خدمة العملاء (تكت) ── */
     #sp-fab { position: fixed; bottom: 22px; left: 22px; z-index: 997; width: 54px; height: 54px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.2); background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; font-size: 24px; cursor: pointer; box-shadow: 0 6px 22px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; }
     #sp-fab:active { transform: scale(0.94); }
     .sp-badge { background: #ef4444; color: #fff; border-radius: 10px; min-width: 18px; height: 18px; padding: 0 5px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; justify-content: center; margin-inline-start: 6px; }
@@ -4867,16 +4604,12 @@ let currentAdminTab = null;
 let pollTimer = null;
 let blockedPollTimer = null;
 
-// يمسك آخر عنصر تم الضغط عليه فعليًا (زر أو تبويب أو أي عنصر onclick) — يشتغل حتى على سفاري آيفون اللي ما يعطي focus تلقائيًا عند اللمس.
-// لازم يشمل عناصر التبويبات (.tab) مو بس <button>، لأن قبل كذا أي ضغط على تبويب كان يفضل ياخذ حالة "busy" من آخر زر حقيقي انضغط (حتى لو خلص طلبه أو ما له علاقة)، فكان يطلع خطأ "طلبك السابق لسا قيد التنفيذ" غلط من أول ضغطة.
 let __lastClickedBtn = null;
 document.addEventListener('click', function (e) {
     const b = e.target.closest('button, .tab, [onclick]');
     if (b) __lastClickedBtn = b;
 }, true);
 
-// كل الأزرار اللي تستدعي api() توقف فورًا (تعتيم + تعطيل) لحظة الضغط وترجع بعد الرد —
-// يمنع إحساس "تعليق" الزر ويمنع إرسال نفس الطلب مرتين لو ضغط المستخدم أكثر من مرة
 async function api(url, opts) {
     const btn = __lastClickedBtn;
     if (btn) {
@@ -4906,7 +4639,6 @@ function toast(msg) {
     t.textContent = msg; t.style.display = 'block';
     setTimeout(() => t.style.display = 'none', 2800);
 }
-// فورم موحد يبدّل عن prompt()/confirm() الأصلية بالمتصفح — نفس تصميم الموقع
 function _fmOpen(msg, opts) {
     return new Promise(resolve => {
         const overlay = document.getElementById('fm-overlay');
@@ -4937,7 +4669,6 @@ function promptModal(msg, defaultValue) {
 function confirmModal(msg) {
     return _fmOpen(msg, { isPrompt: false, okText: 'متأكد' });
 }
-// قائمة اختيار مخصصة (بديل عن <select> الأصلي بالمتصفح/الجوال) — بنفس تصميم الموقع
 function csToggle(baseId) {
     const menu = document.getElementById(baseId + '-menu');
     if (!menu) return;
@@ -4945,7 +4676,6 @@ function csToggle(baseId) {
     document.querySelectorAll('.cs-menu.open').forEach(m => m.classList.remove('open'));
     if (willOpen) menu.classList.add('open');
 }
-// يضبط القيمة المختارة (للمخفي + عنوان الزر + علامة ✓) بدون ما يشغّل أي حدث
 function csSet(baseId, value) {
     const hidden = document.getElementById(baseId);
     const trigger = document.getElementById(baseId + '-trigger');
@@ -4976,7 +4706,6 @@ function csPick(baseId, value) {
     const hidden = document.getElementById(baseId);
     if (hidden && hidden.dataset && hidden.dataset.onpick) { try { new Function('value', hidden.dataset.onpick)(hidden.value); } catch (e) {} }
 }
-// يبني قائمة اختيار بتصميم الموقع. options = [[القيمة, النص], ...] — القيمة تنقرا من عنصر مخفي بنفس الـ id
 function csHtml(id, options, current, opts) {
     opts = opts || {};
     let cur = options.length ? options[0][0] : '';
@@ -4995,7 +4724,6 @@ function csHtml(id, options, current, opts) {
 document.addEventListener('click', (e) => {
     if (!e.target.closest('.cs-wrap')) document.querySelectorAll('.cs-menu.open').forEach(m => m.classList.remove('open'));
 });
-// صفحة عرض الصورة بملء الشاشة (نفس أسلوب ديسكورد) — تفتح كصفحة ثانية فوق الموقع بدل نافذة منبثقة صغيرة
 function openPhotoPage() {
     const loading = document.getElementById('photo-page-loading');
     const img = document.getElementById('photo-page-img');
@@ -5024,7 +4752,6 @@ window.addEventListener('popstate', () => {
     const pp = document.getElementById('photo-page');
     if (pp.classList.contains('open')) closePhotoPage(true);
 });
-// يجيب صورة المخالفة عند الضغط فقط (بدل تحميلها كلها مع القائمة) — يسرّع تحميل الصفحة
 async function viewViolationPhoto(id) {
     openPhotoPage();
     try {
@@ -5033,7 +4760,6 @@ async function viewViolationPhoto(id) {
         setPhotoPageImage(photo);
     } catch (e) { setPhotoPageError(e.message); }
 }
-// يجيب صورة الملاحظة عند الضغط فقط (نفس أسلوب صورة المخالفة)
 async function viewNotePhoto(discord, noteId) {
     openPhotoPage();
     try {
@@ -5043,7 +4769,6 @@ async function viewNotePhoto(discord, noteId) {
     } catch (e) { setPhotoPageError(e.message); }
 }
 
-// ── فورم إرسال تحذير/إشعار (فورم مخصص للموقع، مو نوافذ نظام الجهاز الافتراضية) ──
 function openWarnForm(discord, apiBase) {
     const box = document.getElementById('wf-box');
     box.innerHTML = \`
@@ -5068,7 +4793,6 @@ async function warnFormReason(discord, apiBase, kind) {
         return;
     }
 
-    // تحذير: نحدد أول شي رقم التحذير (أول/ثاني/ثالث/فصل تلقائي) عشان نعرض الفورم المناسب
     box.innerHTML = '<h3>⚠️ جارِ التحقق من عدد التحذيرات...</h3>';
     let wn = 1;
     try {
@@ -5118,7 +4842,6 @@ async function submitWarnForm(discord, apiBase, kind) {
     } catch (e) { toast(e.message); }
 }
 
-// ── فورم ملاحظة موحّد (سبب + صورة إجبارية) — يستخدمه كبار المسؤولين/قادة القطاعات/مسؤولي الأفراد/الشرطة العسكرية ──
 let noteFormCtx = null;
 let noteImageData = null;
 function openNoteForm(discord, apiBase, reloadCall) {
@@ -5163,7 +4886,6 @@ async function submitNoteForm() {
     } catch (e) { toast(e.message); }
 }
 
-// ── فورم ملاحظة القطاعات — يسأل "هل لديك دليل؟" أولاً، والصورة تظهر بس لو "نعم" ──
 function openSectorNoteForm(discord, apiBase, reloadCall) {
     noteFormCtx = { discord, apiBase, reloadCall };
     noteImageData = null;
@@ -5205,7 +4927,6 @@ async function submitSectorNoteForm(hasEvidence) {
     } catch (e) { toast(e.message); }
 }
 
-// ── فورم الاستدعاء (الآن / وقت محدد + صباح أو مساء) ──
 let summonFormCtx = null;
 function openSummonForm(discord, apiPath, reloadCall) {
     summonFormCtx = { discord, apiPath, reloadCall };
@@ -5259,7 +4980,6 @@ async function submitSummonForm(mode) {
     } catch (e) { toast(e.message); }
 }
 
-// ── إشعار للجميع (لكل الأعضاء المسجلين بالموقع) ─────────────────────────
 function openWarnAllForm() {
     const box = document.getElementById('wf-box');
     box.innerHTML = \`
@@ -5282,10 +5002,9 @@ async function submitWarnAllForm() {
     } catch (e) { toast(e.message); }
 }
 
-// ── عرض التحذير/الإشعار بوجه المستقبِل (شاشة كاملة، تُفتح تلقائياً بالبولينج) ──
 let currentWarningId = null;
 async function checkPendingWarning() {
-    if (document.getElementById('warn-overlay').classList.contains('open')) return; // فيه وحدة معروضة أصلاً
+    if (document.getElementById('warn-overlay').classList.contains('open')) return;
     try {
         const { warning } = await api('/api/warnings/pending');
         if (warning) showWarningOverlay(warning);
@@ -5344,11 +5063,10 @@ async function ackCurrentWarning() {
         await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
         document.getElementById('warn-overlay').classList.remove('open');
         currentWarningId = null;
-        checkPendingWarning(); // لو فيه تحذير ثاني بالطابور
+        checkPendingWarning();
     } catch (e) { toast(e.message); }
     btn.disabled = false;
 }
-// ── تنبيه القيادة العليا بطلب ترقية/تنزيل جديد (شاشة كاملة، تُفتح تلقائياً بالبولينج) ──
 let currentPromoAlertId = null;
 async function checkPromotionAlert() {
     if (!ME || !ME.isHighCommand) return;
@@ -5394,14 +5112,10 @@ async function promoAlertReject() {
     } catch (e) { toast(e.message); }
 }
 async function refreshMe() {
-    try { ME = await api('/api/me'); } catch (e) { /* تجاهل */ }
+    try { ME = await api('/api/me'); } catch (e) { }
 }
-// ══════════════════════════════════════════════════════════════════════════
-// خدمة العملاء (تكت) + التحديث الفوري بدون ريفرش
-// ══════════════════════════════════════════════════════════════════════════
 var SP = { cur: null, es: null, esOk: false, img: null, lastLive: 0, liveT: null, badgeT: null, loading: false, again: false, atab: 'waiting' };
 var SP_CATS = ['مشكلة في الموقع', 'مشكلة في حسابي', 'مخالفة / نقاط / رتبة', 'إجازة', 'البطاقة العسكرية', 'اقتراح', 'أخرى'];
-// وين المشكلة؟ — تتغير الخيارات حسب نوع المشكلة اللي اختاره العضو. نوع "أخرى" ما فيه سؤال مكان.
 var SP_PLACE_MAP = {
     'مشكلة في الموقع': ['تسجيل الدخول / التسجيل', 'الرئيسية', 'تسجيل مخالفة', 'مخالفاتي', 'الإجازات', 'بطاقتي', 'لوحة الإدارة', 'لوحة القطاع', 'الشرطة العسكرية', 'أخرى'],
     'مشكلة في حسابي': ['تسجيل الدخول', 'كلمة المرور', 'طلب التسجيل / الموافقة على الحساب', 'الاسم أو البريد', 'القطاع أو الرتبة', 'أخرى'],
@@ -5439,7 +5153,6 @@ function spGuestToken() {
     }
     return t;
 }
-// نستخدم fetch مباشر (مو api()) عشان ما يتعطل زر الإرسال ولا يطلع "طلبك السابق قيد التنفيذ"
 async function spApi(url, opts) {
     var o = Object.assign({ headers: { 'Content-Type': 'application/json', 'x-guest-token': spGuestToken() } }, opts || {});
     var r = await fetch(url, o);
@@ -5448,7 +5161,6 @@ async function spApi(url, opts) {
     return d;
 }
 
-// ── الاتصال اللحظي (SSE) ──
 function spConnect() {
     if (SP.es || typeof EventSource === 'undefined') return;
     try {
@@ -5464,7 +5176,6 @@ function spConnect() {
     } catch (e) {}
 }
 function spReconnect() { if (SP.es) { try { SP.es.close(); } catch (e) {} SP.es = null; SP.esOk = false; } spConnect(); }
-// أي تغيير بالموقع → نحدّث الشاشة الحالية (بدون ريفرش)
 function spLiveRefresh() {
     var now = Date.now();
     if (now - SP.lastLive < 1500) {
@@ -5479,7 +5190,6 @@ function spDoLive() {
         if (document.getElementById('leave-mine-list') && typeof loadMyLeave === 'function') loadMyLeave();
     } catch (e) {}
 }
-// احتياط: لو انقطع الاتصال اللحظي نرجع نسأل السيرفر كل 4 ثواني
 setInterval(function () {
     if (SP.esOk) return;
     if (SP.cur) spLoadNew();
@@ -5495,7 +5205,6 @@ function spOnTicket(d) {
     if (ME && ME.isAdmin && d.kind === 'human') toast('🎧 تكت جديد بانتظار إداري');
 }
 
-// ── الشارات ──
 function spBadges() {
     if (SP.badgeT) return;
     SP.badgeT = setTimeout(async function () {
@@ -5517,8 +5226,6 @@ function spPaintBadges() {
     document.querySelectorAll('.sp-nav-admin').forEach(function (el) { el.querySelectorAll('.sp-badge').forEach(function (x) { x.remove(); }); if (SP.na) el.insertAdjacentHTML('beforeend', '<span class="sp-badge">' + SP.na + '</span>'); });
 }
 
-// ── نافذة العضو ──
-// يضبط النافذة على الجزء المرئي فعلاً من الشاشة (الكيبورد يصغّره بالجوال) عشان ما تنكسر ولا تنزاح
 function spFitViewport() {
     var m = document.getElementById('sp-modal');
     if (!m || !m.classList.contains('open')) return;
@@ -5542,7 +5249,6 @@ function spOpen(tid) {
     document.documentElement.classList.add('sp-lock');
     if (!SP.focusBound) {
         SP.focusBound = true;
-        // بعد ما يخلص من الكتابة ويسكّر الكيبورد: نرجّع الصفحة لمكانها بدون زوم/إزاحة
         m.addEventListener('focusout', function () {
             setTimeout(function () { window.scrollTo(0, SP.scrollY || 0); spFitViewport(); }, 120);
         });
@@ -5618,7 +5324,6 @@ async function spCreate() {
     } catch (e) { toast(e.message); b.disabled = false; }
 }
 
-// ── الصور ──
 function spPick(inp) {
     var f = inp.files && inp.files[0]; inp.value = '';
     if (!f) return;
@@ -5651,7 +5356,6 @@ function spViewImg(src) {
     document.getElementById('sp-lightbox').style.display = 'flex';
 }
 
-// ── المحادثة (تستخدمها نافذة العضو وصفحة الإدارة) ──
 async function spOpenTicket(id, mode, box) {
     SP.cur = { id: id, mode: mode, box: box, n: 0, t: null, role: null, typing: false };
     SP.img = null;
@@ -5751,7 +5455,6 @@ function spPaintState() {
     if (banBtn) banBtn.style.display = (adm && isSen) ? 'inline' : 'none';
     var delBtn = document.getElementById('sp-del');
     if (delBtn) delBtn.style.display = (closed && adm && ME && ME.isSeniorAdmin) ? 'inline' : 'none';
-    // لو المساعد اقترح عضو حقيقي نخلي الزر ينبض
     var hb = document.getElementById('sp-human');
     if (hb && c.suggest) hb.classList.add('pulse');
 }
@@ -5829,7 +5532,6 @@ async function spDeleteAllClosed() {
     try { var d = await spApi('/api/support/admin/closed', { method: 'DELETE' }); toast('🗑️ انحذف ' + (d.deleted || 0) + ' تكت'); spaLoadList(); }
     catch (e) { toast(e.message); }
 }
-// تاب "خدمة العملاء" داخل لوحة الكبار ولوحة الإدارة
 function loadSupportTab() {
     var box = document.getElementById('admin-content'); if (!box) return;
     SP.cur = null; SP.img = null;
@@ -5839,7 +5541,6 @@ function loadSupportTab() {
     spaShowList();
 }
 
-// ── صفحة الإدارة: تذاكر الدعم ──
 function renderSupportAdmin() {
     SP.cur = null;
     document.getElementById('app').innerHTML =
@@ -5876,7 +5577,6 @@ async function spaLoadList() {
         }).join('');
     } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
 }
-// رابط مباشر من ديسكورد: /?ticket=ID — نحفظ الرقم لين يكتمل الدخول (حتى لو انعرضت شاشة تسجيل الدخول)
 function spPendingTicket() {
     var id = null;
     try {
@@ -5898,9 +5598,10 @@ function spDeepLink() {
 }
 async function init() {
     spConnect();
+    var lockLoad = loadSavedLock();
     try { ME = await api('/api/me'); } catch (e) {
+        await lockLoad;
         spBadges();
-        // جاي من رسالة ديسكورد (رابط تكت) وعنده حساب محفوظ بالجهاز → ندخله فيه مباشرة بدون ما يسأله
         var pendTicket = spPendingTicket();
         var savedAcc = pendTicket ? getSavedLogin() : null;
         if (pendTicket && savedAcc && !SP.autoLoginTried) {
@@ -6033,7 +5734,6 @@ async function pollTick() {
     try {
         const fresh = await api('/api/me');
         if (fresh.blocked) {
-            // صار حظر/إيقاف/صيانة/إغلاق تسجيل وهو شغّال بالموقع — نوقفه فوراً ونعرض السبب
             clearInterval(pollTimer);
             ME = fresh;
             renderBlocked(fresh.reason);
@@ -6067,7 +5767,6 @@ async function pollTick() {
         checkPromotionAlert();
     } catch (e) {}
 }
-// لو صار عليه حظر/صيانة وهو شغّال، نفضل نتابعه بهدوء، وأول ما يرجع الوضع طبيعي نحدّث الصفحة تلقائياً
 function startBlockedRecheck() {
     if (blockedPollTimer) clearInterval(blockedPollTimer);
     blockedPollTimer = setInterval(async () => {
@@ -6094,15 +5793,30 @@ function authField(label, id, type, ph, dir) {
         '<span class="auth-req">* حقل إجباري</span></div>';
 }
 var SAVED_LOGIN_KEY = 'moi_saved_login';
+var SAVED_LOCK = null;
+function wipeSavedLogin() {
+    try { localStorage.removeItem(SAVED_LOGIN_KEY); } catch (e) {}
+}
+async function loadSavedLock() {
+    var d = null;
+    try {
+        var r = await fetch('/api/public/login-lock', { cache: 'no-store' });
+        if (!r.ok) throw new Error('x');
+        d = await r.json();
+    } catch (e) { SAVED_LOCK = true; return; }
+    SAVED_LOCK = !!(d && d.locked);
+    if (SAVED_LOCK) wipeSavedLogin();
+}
 function getSavedLogin() {
+    if (SAVED_LOCK !== false) return null;
     try {
         var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
         if (v && v.email && v.password) return v;
-    } catch (e) { /* تجاهل */ }
+    } catch (e) { }
     return null;
 }
 function setSavedLogin(email, password) {
-    try { localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify({ email: email, password: password })); } catch (e) { /* تجاهل */ }
+    try { localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify({ email: email, password: password })); } catch (e) { }
 }
 function renderSavedLogin(saved) {
     authShell(
@@ -6141,15 +5855,15 @@ async function doSavedLogin() {
         init();
     } catch (e) { authErr(e.message + ' — لو غيّرت كلمة المرور اضغط "الدخول بحساب ثاني" وسجّل من جديد'); }
 }
-// بعد تسجيل الدخول: يسأله يحفظ بياناته بالجهاز أو لا
 async function offerSaveLogin(email, pw) {
     try {
-        if (ME && ME.seniorTemp) return; // حساب كبار مسؤولين مؤقت (دخول بالبيانات الافتراضية) ما ينحفظ
+        if (SAVED_LOCK !== false) return;
+        if (ME && ME.seniorTemp) return;
         var cur = getSavedLogin();
         if (cur && cur.email.toLowerCase() === email.toLowerCase() && cur.password === pw) return;
         var yes = await _fmOpen('هل تريد حفظ بيانات الدخول (البريد وكلمة المرور) في هذا الجهاز؟ بالمرة الجاية يسألك تبي تدخل حسابك هذا مباشرة.', { isPrompt: false, okText: 'نعم، احفظ' });
         if (yes) { setSavedLogin(email, pw); toast('✅ تم حفظ الحساب بالجهاز'); }
-    } catch (e) { /* تجاهل */ }
+    } catch (e) { }
 }
 function renderLogin(forceForm) {
     if (!forceForm) {
@@ -6358,7 +6072,6 @@ async function renderNewViolation() {
         </div>\`;
     if (meta.vehicles.length) pickVehicle(0);
 }
-// ── فورم اختيار نوع/أنواع المخالفة (بطاقات تتلوّن أخضر عند التحديد، تدعم اختيار أكثر من نوع) ──
 function openVTypeOverlay() {
     const grid = document.getElementById('vtype-grid');
     grid.innerHTML = META.types.map(function (t, i) {
@@ -6402,7 +6115,7 @@ function previewPhoto() {
 }
 let violationSubmitting = false;
 async function submitViolation() {
-    if (violationSubmitting) return; // يمنع الدبل-كليك من إرسال الطلب مرتين
+    if (violationSubmitting) return;
     if (!vtypeSelected.length) return toast('اختر نوع مخالفة واحد على الأقل');
     const violationType = vtypeSelected.join('، ');
     if (!selectedVehicle) return toast('اختر المركبة');
@@ -6475,7 +6188,7 @@ async function renderReportForm(category) {
             </div>
         </div>\`;
     if (meta.vehicles.length) pickReportVehicle(0);
-    addReportItem(category); // مخالفة أولى إجبارية
+    addReportItem(category);
 }
 function addReportItem(category) {
     const box = document.getElementById('rp-items-box');
@@ -6532,7 +6245,6 @@ function addSecurityAction() {
 function removeSecurityAction(btn) {
     const box = document.getElementById('rp-actions-box');
     if (box.querySelectorAll('.rp-action-row').length <= 1) {
-        // لازم يبقى إجراء واحد على الأقل بالفورم
         btn.closest('.rp-action-row').querySelector('.rp-action').value = '';
         return;
     }
@@ -6731,7 +6443,7 @@ async function loadPending() {
         box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر تحميل المخالفات المعلّقة، حاول تحدّث الصفحة. (\${e.message})</div>\`;
         return;
     }
-    if (currentAdminTab !== 'pending') return; // المستخدم غيّر التبويب أثناء التحميل
+    if (currentAdminTab !== 'pending') return;
     box.id = 'admin-content'; box.dataset.loaded = '1';
     box.innerHTML = '<div id="pending-box"></div>';
     const pbox = document.getElementById('pending-box');
@@ -6802,7 +6514,6 @@ async function rejectV(id) {
         .then(() => { toast('تم الرفض'); loadPending(); }).catch(e => toast(e.message));
 }
 
-// ── قادة القطاعات (كبار المسؤولين) ───────────────────────────────────────
 let sectorsCache = { sectors: {}, leadership: {} };
 async function loadSectors() {
     const box = document.getElementById('admin-content');
@@ -7036,12 +6747,8 @@ async function removeSectorRole(sectorKey, role) {
     } catch (e) { toast(e.message); }
 }
 
-// ── لوحة قيادة القطاع (لقادة/نواب القطاعات) ──────────────────────────────
 let sectorPanelTab = 'members';
 let sectorMembersCache = [];
-// ══════════════════════════════════════════════════════════════════════════
-// القيادة العليا — مراجعة طلبات الترقية/التنزيل من كل القطاعات
-// ══════════════════════════════════════════════════════════════════════════
 let hcTab = 'pending';
 function renderHighCommandPanel() {
     if (!ME.isHighCommand) return renderDashboard();
@@ -7141,7 +6848,6 @@ function renderSectorPanel() {
         <div id="sector-content"></div>\`;
     sectorTab('members');
 }
-// ── إشعار لكل أعضاء القطاع (حسب رول ديسكورد) — لقائد ونائب القطاع فقط ─────────
 function openSectorNoticeForm() {
     if (!ME.sectorInfo) return;
     const box = document.getElementById('wf-box');
@@ -7389,7 +7095,6 @@ async function viewSectorFile(discord) {
     } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
 }
 
-// ── لوحة "مسؤول الأفراد" — صلاحيته على رتبة رئيس رقباء وتحت فقط بقطاعه ────
 let poTab = 'members';
 function renderPersonnelOfficerPanel() {
     if (!ME.personnelOfficerInfo) return renderDashboard();
@@ -7444,7 +7149,6 @@ async function loadPoMembers() {
             </div>
         </div>\`).join('');
 }
-// تعديل نقاط عضو — متاح لقيادة القطاع ومسؤول الأفراد (بنطاق صلاحيته) بنفس أسلوب كبار المسؤولين
 async function editMemberPoints(discord, currentPoints) {
     const val = await promptModal('عدد النقاط الجديد:', currentPoints);
     if (val === null) return;
@@ -7513,9 +7217,6 @@ async function poReject(id) {
         .then(() => { toast('تم الرفض'); loadPoViolations(); }).catch(e => toast(e.message));
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// لوحة الشرطة العسكرية — قائد/نائب (3 صفحات: العساكر، التقارير، لوق القطاعات)
-// ══════════════════════════════════════════════════════════════════════════
 let mpTab = 'members';
 function renderMPPanel() {
     if (!ME.mpInfo) return renderDashboard();
@@ -7803,7 +7504,6 @@ async function loadMPSectorLog() {
             <div style="font-size:11px;color:var(--muted);margin-top:4px;">\${new Date(l.createdAt).toLocaleString('ar')}</div>
         </div>\`).join('');
 }
-// سجل كامل ودائم لكل طلبات الترقية/التنزيل — لعلم قيادة الشرطة العسكرية: مين قدّم ومتى، ومين وافق/رفض ومتى
 async function loadMPPromotionLog() {
     const box = document.getElementById('mp-content');
     if (!box) return;
@@ -7828,7 +7528,6 @@ async function loadMPPromotionLog() {
         </div>\`;
     }).join('');
 }
-// صندوق تعيين/إزالة مسؤول أفراد الشرطة العسكرية داخل لوحة القيادة نفسها
 async function loadMPPOBox() {
     const box = document.getElementById('mp-content');
     if (!box) return;
@@ -7871,9 +7570,6 @@ async function mpRemovePO() {
         .then(() => { toast('تم'); loadMPPOBox(); }).catch(e => toast(e.message));
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// لوحة مسؤول أفراد الشرطة العسكرية — نطاقه: أعضاء الشرطة العسكرية (ما عدا القائد والنائب)
-// ══════════════════════════════════════════════════════════════════════════
 let mpPoTab = 'members';
 function renderMPPOPanel() {
     if (!ME.mpPersonnelOfficer && !ME.isSeniorAdmin) return renderDashboard();
@@ -7935,9 +7631,6 @@ async function mpPoReportDecide(id, action) {
         .then(() => { toast('✅ تم قبول التقرير'); loadMPPOReports(); }).catch(e => toast(e.message));
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// بوابة عضو الشرطة العسكرية العادي — العساكر (ملاحظة + طلب استدعاء) + تسجيل تقرير
-// ══════════════════════════════════════════════════════════════════════════
 let mpMemberTab = 'members';
 let mpMemberListCache = [];
 function renderMPMemberPanel() {
@@ -7995,7 +7688,6 @@ function renderMPMemberList(list) {
             </div>
         </div>\`).join('');
 }
-// ── فورم تسجيل تقرير الشرطة العسكرية ──
 let mpReportNotes = [];
 let mpReportReturnFn = 'renderMPMemberPanel()';
 function openMPReportForm(returnFn) {
@@ -8069,15 +7761,11 @@ async function submitMPReport() {
     } catch (e) { toast(e.message); }
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// بوابة "لديك استدعاء" — تظهر فور تسجيل الدخول لو عليه استدعاء نشط
-// ══════════════════════════════════════════════════════════════════════════
 function checkSummonGate() {
     if (!ME || !ME.summon || ME.summon.status !== 'approved') return false;
     const box = document.getElementById('app');
     const locked = ME.summon.unlockAt && new Date(ME.summon.unlockAt).getTime() > Date.now();
     if (ME.summon.enteredAt) {
-        // دخل الروم فعلاً، لكن يبقى ممنوع من استخدام الموقع لين قيادة الشرطة العسكرية تنهي الاستدعاء
         box.innerHTML = \`
             <div class="card center" style="margin-top:60px;border-color:#f59e0b;">
                 <h2 style="color:#f59e0b;">⏳ بانتظار إنهاء الاستدعاء</h2>
@@ -8122,7 +7810,7 @@ let personnelCache = [];
 async function searchPersonnel() {
     const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
     const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
-    if (currentAdminTab !== 'personnel') return; // المستخدم غيّر التبويب أثناء التحميل
+    if (currentAdminTab !== 'personnel') return;
     personnelCache = list;
     cardRemember(list);
     const pListEl = document.getElementById('p-list');
@@ -8167,7 +7855,6 @@ async function saveEdit(discordId, i) {
         name: document.getElementById('pe-name-' + i).value,
         unit: document.getElementById('pe-unit-' + i).value,
         rank: document.getElementById('pe-rank-' + i).value,
-        // نرسل النقاط بس إذا الأدمن عدّلها فعلاً بنفسه، عشان النظام يقدر يحسبها تلقائياً وقت تغيير الرتبة بدون ما تظل "معلّقة" على القيمة القديمة
         points: pointsChanged ? pointsInput.value : '',
     };
     try {
@@ -8266,7 +7953,6 @@ function cardFields(p) {
 const MC_DATA = {};
 const MC_OPT = {};
 const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات']];
-// وجه البطاقة: الصورة + المعلومات مطبوعة عليها
 function mcFace(f) {
     return '<div class="mc-face">' +
         '<div class="mc-t name" data-k="name">' + cardEsc(f.name) + '</div>' +
@@ -8293,7 +7979,6 @@ function cardBlock(p, o) {
         '<div class="mc-hint">اضغط على البطاقة لعرضها كاملة ⤢</div>' +
     '</div>';
 }
-// أول ضغطة: تنفتح البطاقة وتطلع صفحة المعلومات — الضغطة الثانية: البطاقة كاملة
 function mcTap(el) {
     const w = el.closest('.mc-wrap');
     if (!w) return;
@@ -8983,7 +8668,6 @@ async function deleteNote(discord, noteId) {
     try { await api('/api/senior/personnel/' + discord + '/note/' + noteId, { method: 'DELETE' }); toast('تم الحذف'); loadNotesPage(); }
     catch (e) { toast(e.message); }
 }
-// صفحة إدارة عقوبات التحذيرات بلوحة كبار المسؤولين — إضافة / تعديل / حذف
 let editingPenaltyId = null;
 async function loadPenaltiesPage() {
     const box = document.getElementById('admin-content');
@@ -9116,6 +8800,28 @@ async function loadSettings() {
             <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>\`;
+    if (ME && ME.isOwner) {
+        let locked = false;
+        try { locked = !!(await api('/api/owner/saved-login-lock')).locked; } catch (e) {}
+        if (currentAdminTab === 'settings' && document.getElementById('admin-content') === box) box.insertAdjacentHTML('beforeend', ownerLockCardHtml(locked));
+    }
+}
+function ownerLockCardHtml(locked) {
+    return '<div class="card" id="owner-lock-card" style="margin-top:12px;">' +
+        '<div class="row"><span>🔒 قفل حفظ الحساب بالجهاز</span><span style="color:' + (locked ? '#fca5a5' : '#86efac') + ';font-weight:700;">' + (locked ? 'مقفول' : 'مفتوح') + '</span></div>' +
+        '<button class="btn" style="margin-top:10px;" onclick="toggleSavedLock(' + (locked ? 'false' : 'true') + ')">' + (locked ? '🔓 فتح حفظ الحساب' : '🔒 قفل حفظ الحساب') + '</button></div>';
+}
+async function toggleSavedLock(lock) {
+    const ok = await confirmModal(lock ? 'تبي تقفل حفظ الحساب بالجهاز؟ ما بيطلع لأحد "تبي تدخل هذا الحساب" وكل واحد يسجل يدوي، وتنمسح الحسابات المحفوظة بالأجهزة.' : 'تبي تفتح حفظ الحساب بالجهاز؟');
+    if (!ok) return;
+    try {
+        await api('/api/owner/saved-login-lock', { method: 'POST', body: JSON.stringify({ locked: lock }) });
+        SAVED_LOCK = lock;
+        if (lock) wipeSavedLogin();
+        const c = document.getElementById('owner-lock-card');
+        if (c) c.outerHTML = ownerLockCardHtml(lock);
+        toast(lock ? '🔒 تم القفل' : '🔓 تم الفتح');
+    } catch (e) { toast(e.message); }
 }
 async function saveSettings() {
     const body = {
@@ -9134,8 +8840,6 @@ init();
 </html>`);
 });
 
-// معالج أخطاء عام: أي خطأ غير متوقع بأي راوت (بدل ما يرجع صفحة HTML فاضية تسبب "خطأ" عامة بالواجهة)
-// نطبعه بالسجل ونرجع JSON واضح للمتصفح عشان يقدر يعرض الرسالة الحقيقية
 app.use((err, req, res, next) => {
     console.error("❌ خطأ غير متوقع بالسيرفر:", err);
     if (res.headersSent) return next(err);
@@ -9146,8 +8850,6 @@ process.on("unhandledRejection", (err) => {
     console.error("❌ Unhandled Rejection:", err);
 });
 
-// حماية أخيرة: لو صار خطأ متزامن غير متوقع بأي مكان (مثلاً بأحداث البوت)، نسجّله فقط
-// بدل ما نخلي نود.js يوقف السيرفر كامل ويسبب صفحة بيضاء لكل الزوار لين يعيد Render تشغيله
 process.on("uncaughtException", (err) => {
     console.error("❌ Uncaught Exception:", err);
 });
