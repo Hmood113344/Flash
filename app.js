@@ -3869,6 +3869,7 @@ const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
     no: { type: Number, index: true },
     uid: { type: String, default: null, index: true },          // حساب الموقع (null = زائر من صفحة الدخول)
     guestToken: { type: String, default: null, index: true },   // هوية الزائر (سرّية، محفوظة بمتصفحه)
+    deviceToken: { type: String, default: null, index: true },  // هوية الجهاز (تنحفظ لكل التكتات حتى لو العضو مسجّل دخول) — تكت واحد مفتوح لكل جهاز
     name: String,
     category: String,
     place: String,       // وين المشكلة بالموقع
@@ -3919,8 +3920,12 @@ async function supportLoad(req, res) {
     const uid = req.user ? req.user.id : null;
     const gt = supportGuestToken(req);
     let role = null;
-    if ((uid && t.uid === uid) || (!t.uid && gt && t.guestToken === gt)) role = "owner";
-    else if (uid && await isSupportAdmin(uid)) role = "admin";
+    if ((uid && t.uid === uid) || (!t.uid && gt && t.guestToken === gt) || (gt && t.deviceToken && t.deviceToken === gt)) role = "owner";
+    else if (uid && await isSupportAdmin(uid)) {
+        role = "admin";
+        // الإداري العادي: بس التكتات اللي بانتظار الإدارة أو اللي استلمها هو — الكبار يشوفون كل شي
+        if (!isSeniorAdmin(uid) && !(t.status === "waiting" || t.adminUid === uid)) { res.status(403).json({ error: "هذا التكت مو من صلاحياتك" }); return null; }
+    }
     if (!role) { res.status(403).json({ error: "ما عندك صلاحية على هذا التكت" }); return null; }
     return { t, role, uid };
 }
@@ -3933,10 +3938,10 @@ function supportPubTicket(t) {
 // يرسل حدث لحظي لصاحب التكت + كل الإداريين
 function supportEvent(t, from, extra) {
     const payload = Object.assign({ id: String(t._id), status: t.status, n: t.messages.length, from }, extra || {});
-    sseBroadcast("ticket", payload, c => c.isAdmin || (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt));
+    sseBroadcast("ticket", payload, c => c.isAdmin || (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt) || (c.gt && t.deviceToken && t.deviceToken === c.gt));
 }
 function supportTyping(t, on) {
-    sseBroadcast("typing", { id: String(t._id), on }, c => (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt));
+    sseBroadcast("typing", { id: String(t._id), on }, c => (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt) || (c.gt && t.deviceToken && t.deviceToken === c.gt));
 }
 function supportAddMsg(t, m) {
     t.messages.push(Object.assign({ createdAt: new Date() }, m));
@@ -4154,6 +4159,7 @@ async function supportDiscordJoined(t) {
 }
 
 const supportGuestThrottle = new Map();
+const supportCreateLock = new Set();
 function supportClientIp(req) { return String((req.headers["x-forwarded-for"] || req.ip || "")).split(",")[0].trim(); }
 
 // إنشاء تكت (عضو مسجّل أو زائر من صفحة الدخول)
@@ -4174,14 +4180,22 @@ app.post("/api/support/tickets", async (req, res) => {
         if (arr.length >= 5) return res.status(429).json({ error: "فتحت تكتات كثير، جرّب بعد شوي" });
         arr.push(Date.now()); supportGuestThrottle.set(ip, arr);
     }
-    const open = await SupportTicket.countDocuments({ status: { $ne: "closed" }, ...(uid ? { uid } : { guestToken: gt, uid: null }) });
-    if (open >= 3) return res.status(400).json({ error: "عندك 3 تكتات مفتوحة، سكّر واحد قبل ما تفتح جديد" });
+    // تكت واحد مفتوح لكل جهاز (وكذلك لكل حساب) — لازم يتقفل عشان تقدر تفتح جديد
+    const lockKey = (uid || "") + "|" + (gt || "");
+    if (supportCreateLock.has(lockKey)) return res.status(429).json({ error: "لحظة، طلبك السابق قيد التنفيذ" });
+    supportCreateLock.add(lockKey);
+    try {
+    const idOr = [];
+    if (uid) idOr.push({ uid });
+    if (gt) idOr.push({ deviceToken: gt }, { guestToken: gt });
+    const open = await SupportTicket.countDocuments({ status: { $ne: "closed" }, $or: idOr });
+    if (open >= 1) return res.status(400).json({ error: "عندك تكت مفتوح على هذا الجهاز، لازم تسكّره أول عشان تقدر تفتح تكت جديد" });
     const last = await SupportTicket.findOne().sort({ no: -1 }).select("no").lean();
     const category = SUPPORT_CATEGORIES.includes(b.category) ? b.category : "أخرى";
     const place = SUPPORT_PLACES.includes(b.place) ? b.place : "";
     const t = await SupportTicket.create({
         no: ((last && last.no) || 1000) + 1,
-        uid, guestToken: uid ? null : gt, name, category, place,
+        uid, guestToken: uid ? null : gt, deviceToken: gt, name, category, place,
         subject: (text || "صورة").slice(0, 60),
         ua: String(req.get("user-agent") || "").slice(0, 160),
         status: "ai",
@@ -4190,6 +4204,7 @@ app.post("/api/support/tickets", async (req, res) => {
     res.json({ ok: true, id: String(t._id) });
     supportEvent(t, "user", { kind: "new" });
     supportRunAi(String(t._id));
+    } finally { supportCreateLock.delete(lockKey); }
 });
 
 // تكتاتي
@@ -4198,7 +4213,7 @@ app.get("/api/support/tickets", async (req, res) => {
     const gt = supportGuestToken(req);
     const or = [];
     if (uid) or.push({ uid });
-    if (gt) or.push({ guestToken: gt, uid: null });
+    if (gt) or.push({ guestToken: gt, uid: null }, { deviceToken: gt });
     if (!or.length) return res.json({ tickets: [] });
     const list = await SupportTicket.find({ $or: or }).sort({ updatedAt: -1 }).limit(50).select("-messages.image").lean();
     res.json({ tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadUser || 0, last: ((t.messages[t.messages.length - 1] || {}).text || "").slice(0, 60) })) });
@@ -4210,14 +4225,21 @@ app.get("/api/support/badges", async (req, res) => {
     const gt = supportGuestToken(req);
     const or = [];
     if (uid) or.push({ uid });
-    if (gt) or.push({ guestToken: gt, uid: null });
+    if (gt) or.push({ guestToken: gt, uid: null }, { deviceToken: gt });
     const out = { user: 0, admin: null };
     if (or.length) out.user = await SupportTicket.countDocuments({ $or: or, unreadUser: { $gt: 0 } });
     if (uid && await isSupportAdmin(uid)) {
-        out.admin = {
-            waiting: await SupportTicket.countDocuments({ status: "waiting" }),
-            unread: await SupportTicket.countDocuments({ status: { $in: ["waiting", "active"] }, unreadAdmin: { $gt: 0 } }),
-        };
+        if (isSeniorAdmin(uid)) {
+            out.admin = {
+                waiting: await SupportTicket.countDocuments({ status: "waiting" }),
+                unread: await SupportTicket.countDocuments({ status: { $in: ["waiting", "active"] }, unreadAdmin: { $gt: 0 } }),
+            };
+        } else {
+            out.admin = {
+                waiting: await SupportTicket.countDocuments({ status: "waiting" }),
+                unread: await SupportTicket.countDocuments({ status: "active", adminUid: uid, unreadAdmin: { $gt: 0 } }),
+            };
+        }
     }
     res.json(out);
 });
@@ -4327,9 +4349,34 @@ app.post("/api/support/tickets/:id/close", async (req, res) => {
 // قائمة التكتات للإدارة
 app.get("/api/support/admin/tickets", async (req, res) => {
     if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    const st = ["ai", "waiting", "active", "closed"].includes(req.query.status) ? req.query.status : "waiting";
-    const list = await SupportTicket.find({ status: st }).sort({ updatedAt: -1 }).limit(100).select("-messages.image").lean();
+    // الكبار: كل التابات — الإداري العادي: بس بانتظار الإدارة (+ التكتات اللي استلمها هو عشان ما يفقد الوصول لها)
+    const q = isSeniorAdmin(req.user.id)
+        ? { status: ["ai", "waiting", "active", "closed"].includes(req.query.status) ? req.query.status : "waiting" }
+        : { $or: [{ status: "waiting" }, { status: "active", adminUid: req.user.id }] };
+    const list = await SupportTicket.find(q).sort({ updatedAt: -1 }).limit(100).select("-messages.image").lean();
     res.json({ tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadAdmin || 0, last: ((t.messages[t.messages.length - 1] || {}).text || "").slice(0, 60) })) });
+});
+
+// حذف تكت مغلق (كبار المسؤولين فقط)
+app.delete("/api/support/admin/tickets/:id", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا الإجراء لكبار المسؤولين فقط" });
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
+    const t = await SupportTicket.findById(req.params.id).select("no name status uid guestToken deviceToken");
+    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
+    if (t.status !== "closed") return res.status(400).json({ error: "تقدر تحذف التكتات المغلقة فقط" });
+    await SupportTicket.deleteOne({ _id: t._id, status: "closed" });
+    await logEvent({ action: "حذف تكت دعم", actorId: req.user.id, actorTag: req.user.username, details: "#" + t.no + " — " + (t.name || "-") });
+    res.json({ ok: true });
+    sseBroadcast("ticket", { id: String(t._id), status: "closed", n: 0, from: "system", kind: "deleted" },
+        c => c.isAdmin || (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt) || (c.gt && t.deviceToken && t.deviceToken === c.gt));
+});
+// حذف كل التكتات المغلقة دفعة وحدة (كبار المسؤولين فقط)
+app.delete("/api/support/admin/closed", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا الإجراء لكبار المسؤولين فقط" });
+    const r = await SupportTicket.deleteMany({ status: "closed" });
+    await logEvent({ action: "حذف التكتات المغلقة", actorId: req.user.id, actorTag: req.user.username, details: "عدد المحذوف: " + (r.deletedCount || 0) });
+    res.json({ ok: true, deleted: r.deletedCount || 0 });
+    sseBroadcast("ticket", { id: "", status: "closed", n: 0, from: "system", kind: "deleted" }, c => c.isAdmin);
 });
 
 app.get("/", (req, res) => {
@@ -5342,7 +5389,7 @@ function spClose() {
 function spShowList() {
     SP.cur = null; SP.img = null;
     document.getElementById('sp-body').innerHTML =
-        '<button class="sp-btn" onclick="spShowNew()" style="margin-bottom:12px;">+ تكت جديد</button>' +
+        '<button class="sp-btn" id="sp-newbtn" onclick="spShowNew()" style="margin-bottom:12px;">+ تكت جديد</button>' +
         '<div id="sp-list"><div style="color:var(--muted);text-align:center;padding:20px;">جارِ التحميل...</div></div>';
     spLoadList();
 }
@@ -5350,6 +5397,12 @@ async function spLoadList() {
     var box = document.getElementById('sp-list'); if (!box) return;
     try {
         var d = await spApi('/api/support/tickets');
+        var hasOpen = d.tickets.some(function (t) { return t.status !== 'closed'; });
+        var nb = document.getElementById('sp-newbtn');
+        if (nb) {
+            nb.disabled = hasOpen; nb.style.opacity = hasOpen ? '0.55' : '';
+            nb.textContent = hasOpen ? '🔒 سكّر تكتك المفتوح عشان تفتح تكت جديد' : '+ تكت جديد';
+        }
         if (!d.tickets.length) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما عندك تكتات، افتح تكت جديد وبنساعدك 👌</div>'; return; }
         box.innerHTML = d.tickets.map(function (t) {
             return '<div class="sp-row" onclick="spOpenTicket(&quot;' + t.id + '&quot;,&quot;user&quot;,&quot;sp-body&quot;)">' +
@@ -5429,7 +5482,7 @@ async function spOpenTicket(id, mode, box) {
     var el = document.getElementById(box);
     el.innerHTML =
         '<div class="sp-chat">' +
-        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button></div>' +
+        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button></div>' +
         '<div class="sp-state" id="sp-state"></div>' +
         '<div class="sp-msgs" id="sp-msgs"></div>' +
         '<div id="sp-prev" class="sp-prev"></div>' +
@@ -5471,6 +5524,7 @@ async function spLoadNew(first) {
         if (d.msgs.length) spBadges();
     } catch (e) {
         if (first) { var el = document.getElementById(c.box); if (el) el.innerHTML = '<div style="color:#fca5a5;padding:14px;">' + spEsc(e.message) + '</div>'; }
+        else if (SP.cur === c && /غير موجود/.test(e.message)) { toast('هذا التكت انحذف'); spBack(); }
     } finally {
         SP.loading = false;
         if (SP.again) { SP.again = false; spLoadNew(); }
@@ -5515,6 +5569,8 @@ function spPaintState() {
     var canWrite = !closed && (!adm || t.status === 'active');
     document.getElementById('sp-compose').style.display = canWrite ? 'flex' : 'none';
     document.getElementById('sp-close').style.display = closed ? 'none' : 'inline';
+    var delBtn = document.getElementById('sp-del');
+    if (delBtn) delBtn.style.display = (closed && adm && ME && ME.isSeniorAdmin) ? 'inline' : 'none';
     // لو المساعد اقترح عضو حقيقي نخلي الزر ينبض
     var hb = document.getElementById('sp-human');
     if (hb && c.suggest) hb.classList.add('pulse');
@@ -5553,6 +5609,32 @@ async function spCloseTicket() {
     catch (e) { toast(e.message); }
 }
 
+async function spDeleteTicket() {
+    var c = SP.cur; if (!c) return;
+    if (!(await confirmModal('تبي تحذف هذا التكت نهائياً؟ ما يرجع بعد الحذف.'))) return;
+    try { await spApi('/api/support/admin/tickets/' + c.id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spBack(); }
+    catch (e) { toast(e.message); }
+}
+async function spDeleteRow(id) {
+    if (!(await confirmModal('تبي تحذف هذا التكت نهائياً؟ ما يرجع بعد الحذف.'))) return;
+    try { await spApi('/api/support/admin/tickets/' + id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spaLoadList(); }
+    catch (e) { toast(e.message); }
+}
+async function spDeleteAllClosed() {
+    if (!(await confirmModal('تبي تحذف كل التكتات المغلقة نهائياً؟ ما ترجع بعد الحذف.'))) return;
+    try { var d = await spApi('/api/support/admin/closed', { method: 'DELETE' }); toast('🗑️ انحذف ' + (d.deleted || 0) + ' تكت'); spaLoadList(); }
+    catch (e) { toast(e.message); }
+}
+// تاب "خدمة العملاء" داخل لوحة الكبار ولوحة الإدارة
+function loadSupportTab() {
+    var box = document.getElementById('admin-content'); if (!box) return;
+    SP.cur = null; SP.img = null;
+    box.innerHTML = '<div class="card"><h2>🎧 خدمة العملاء</h2>' +
+        '<div class="sp-tabs" id="spa-tabs"></div>' +
+        '<div id="spa-body" style="display:flex;flex-direction:column;min-height:420px;"></div></div>';
+    spaShowList();
+}
+
 // ── صفحة الإدارة: تذاكر الدعم ──
 function renderSupportAdmin() {
     SP.cur = null;
@@ -5564,7 +5646,9 @@ function renderSupportAdmin() {
 }
 function spaShowList() {
     SP.cur = null; SP.img = null;
-    var tabs = [['waiting', '⏳ بانتظار إداري'], ['active', '✅ قيد المتابعة'], ['ai', '🤖 عند المساعد'], ['closed', '🔒 مغلقة']];
+    var senior = !!(ME && ME.isSeniorAdmin);
+    var tabs = senior ? [['waiting', '⏳ انتظار الإدارة'], ['active', '✅ قيد المتابعة'], ['ai', '🤖 عند المساعد'], ['closed', '🔒 مغلقة']] : [['waiting', '⏳ انتظار الإدارة']];
+    if (!senior) SP.atab = 'waiting';
     document.getElementById('spa-tabs').innerHTML = tabs.map(function (t) {
         return '<button class="sp-tab ' + (SP.atab === t[0] ? 'on' : '') + '" onclick="SP.atab=&quot;' + t[0] + '&quot;;spaShowList()">' + t[1] + '</button>';
     }).join('');
@@ -5576,27 +5660,53 @@ async function spaLoadList() {
     try {
         var d = await spApi('/api/support/admin/tickets?status=' + SP.atab);
         if (!d.tickets.length) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه تكتات هنا</div>'; return; }
-        box.innerHTML = d.tickets.map(function (t) {
+        var canDel = !!(ME && ME.isSeniorAdmin) && SP.atab === 'closed';
+        box.innerHTML = (canDel ? '<button class="sp-btn" style="margin-bottom:12px;background:#b91c1c;" onclick="spDeleteAllClosed()">🗑️ حذف كل التكتات المغلقة</button>' : '') + d.tickets.map(function (t) {
             return '<div class="sp-row" onclick="spOpenTicket(&quot;' + t.id + '&quot;,&quot;admin&quot;,&quot;spa-body&quot;)">' +
                 '<div class="t1"><span>#' + t.no + ' — ' + spEsc(t.name) + (t.guest ? ' (زائر)' : '') + (t.unread ? '<span class="sp-badge">' + t.unread + '</span>' : '') + '</span><span class="sp-chip ' + t.status + '">' + SP_ST[t.status] + (t.adminName ? ' — ' + spEsc(t.adminName) : '') + '</span></div>' +
                 '<div class="t2">' + spEsc(t.category) + (t.place ? ' • ' + spEsc(t.place) : '') + '</div>' +
-                '<div class="t2">' + spEsc(t.last || '') + '</div></div>';
+                '<div class="t2">' + spEsc(t.last || '') + '</div>' +
+                (canDel ? '<div style="margin-top:8px;"><button class="sp-link" style="color:#fca5a5;" onclick="event.stopPropagation();spDeleteRow(&quot;' + t.id + '&quot;)">🗑️ حذف</button></div>' : '') +
+                '</div>';
         }).join('');
     } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
 }
-// رابط مباشر من ديسكورد: /?ticket=ID
+// رابط مباشر من ديسكورد: /?ticket=ID — نحفظ الرقم لين يكتمل الدخول (حتى لو انعرضت شاشة تسجيل الدخول)
+function spPendingTicket() {
+    var id = null;
+    try {
+        id = new URLSearchParams(location.search).get('ticket');
+        if (id && /^[a-f0-9]{24}$/.test(id)) { sessionStorage.setItem('sp_pending_ticket', id); history.replaceState(null, '', location.pathname); }
+        else id = null;
+    } catch (e) { id = null; }
+    if (id) return id;
+    try { var v = sessionStorage.getItem('sp_pending_ticket'); return v && /^[a-f0-9]{24}$/.test(v) ? v : null; } catch (e) { return null; }
+}
 function spDeepLink() {
     try {
-        var id = new URLSearchParams(location.search).get('ticket');
+        var id = spPendingTicket();
         if (!id) return;
-        history.replaceState(null, '', location.pathname);
-        if (ME && ME.isAdmin) { renderSupportAdmin(); spOpenTicket(id, 'admin', 'spa-body'); }
+        try { sessionStorage.removeItem('sp_pending_ticket'); } catch (e) {}
+        if (ME && ME.isAdmin) { renderAdmin('support'); spOpenTicket(id, 'admin', 'spa-body'); }
         else spOpen(id);
     } catch (e) {}
 }
 async function init() {
     spConnect();
-    try { ME = await api('/api/me'); } catch (e) { spBadges(); renderLogin(); return; }
+    try { ME = await api('/api/me'); } catch (e) {
+        spBadges();
+        // جاي من رسالة ديسكورد (رابط تكت) وعنده حساب محفوظ بالجهاز → ندخله فيه مباشرة بدون ما يسأله
+        var pendTicket = spPendingTicket();
+        var savedAcc = pendTicket ? getSavedLogin() : null;
+        if (pendTicket && savedAcc && !SP.autoLoginTried) {
+            SP.autoLoginTried = true;
+            try {
+                var lr = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: savedAcc.email, password: savedAcc.password }) });
+                if (lr.ok) { spReconnect(); return init(); }
+            } catch (e2) {}
+        }
+        renderLogin(); return;
+    }
     spReconnect(); spBadges();
     if (ME.blocked) { renderBlocked(ME.reason); return; }
     lastKnownRank = ME.rank;
@@ -6276,7 +6386,8 @@ function renderCard() {
         cardBlock(ME, { id: 'me-card', hasProgress: true, nextRank: ME.nextRank, remaining: ME.pointsRemaining }) +
         '<div class="center" style="margin-top:16px;"><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div></div>';
 }
-function renderAdmin() {
+function renderAdmin(startTab) {
+    if (typeof startTab !== 'string') startTab = null;
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
@@ -6291,19 +6402,22 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
+            <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
-        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div><div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div></div>\` : '');
+        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div><div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
         \${tabsHtml}
         <div id="admin-content"></div>\`;
-    adminTab('pending');
+    if (startTab) adminTab(startTab, document.getElementById('tab-' + startTab)); else adminTab('pending');
 }
 function adminTab(name, el) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     if (el) el.classList.add('active');
+    if (name !== 'support' && SP.cur && SP.cur.box === 'spa-body') SP.cur = null;
     currentAdminTab = name;
+    if (name === 'support') loadSupportTab();
     if (name === 'pending') loadPending();
     if (name === 'reviewed') loadReviewedViolations();
     if (name === 'sectors') loadSectors();
