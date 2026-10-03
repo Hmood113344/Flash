@@ -4700,17 +4700,19 @@ app.get("/", (req, res) => {
     #sp-fab:active { transform: scale(0.94); }
     .sp-badge { background: #ef4444; color: #fff; border-radius: 10px; min-width: 18px; height: 18px; padding: 0 5px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; justify-content: center; margin-inline-start: 6px; }
     #sp-fab .sp-badge { position: absolute; top: -4px; right: -4px; margin: 0; }
-    #sp-modal { position: fixed; top: 0; left: 0; right: 0; height: 100%; background: rgba(5,10,20,0.88); z-index: 4000; display: none; align-items: flex-end; justify-content: center; overscroll-behavior: contain; }
+    #sp-modal { position: fixed; top: 0; left: 0; right: 0; height: 100%; background: #060d1a; z-index: 4000; display: none; align-items: flex-end; justify-content: center; overscroll-behavior: contain; }
     html.sp-lock, html.sp-lock body { overflow: hidden !important; }
     html.sp-lock #sp-fab { display: none !important; }
+    html.sp-lock #warn-banner, html.sp-lock nav, html.sp-lock .mobile-menu, html.sp-lock #app, html.sp-lock footer, html.sp-lock #photo-page, html.sp-lock #mc-page { visibility: hidden !important; }
+    html.sp-lock body { background: #0a1628 !important; }
     #sp-modal.kb { align-items: stretch; }
     #sp-modal.kb #sp-box { height: 100%; border-radius: 0; }
     #sp-modal.open { display: flex; }
-    #sp-box { background: linear-gradient(160deg, #0d1f3c, #0a1628); border: 1px solid var(--border); border-radius: 16px 16px 0 0; width: 100%; max-width: 560px; height: min(86%, 720px); display: flex; flex-direction: column; box-shadow: 0 -10px 40px rgba(0,0,0,0.6); padding-bottom: env(safe-area-inset-bottom, 0px); }
+    #sp-box { background-color: #0a1628; background-image: linear-gradient(160deg, #0d1f3c, #0a1628); transform: translateZ(0); -webkit-transform: translateZ(0); isolation: isolate; border: 1px solid var(--border); border-radius: 16px 16px 0 0; width: 100%; max-width: 560px; height: min(86%, 720px); display: flex; flex-direction: column; box-shadow: 0 -10px 40px rgba(0,0,0,0.6); padding-bottom: env(safe-area-inset-bottom, 0px); }
     @media (min-width: 700px) { #sp-modal { align-items: center; } #sp-box { border-radius: 16px; } }
     #sp-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); font-weight: bold; color: var(--gold-soft); }
     #sp-head button { background: rgba(255,255,255,0.08); border: none; color: var(--text); width: 32px; height: 32px; border-radius: 8px; cursor: pointer; font-size: 16px; }
-    #sp-body { flex: 1; min-height: 0; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+    #sp-body { flex: 1; min-height: 0; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; overscroll-behavior: contain; }
     .sp-btn { background: linear-gradient(135deg, var(--green), var(--green2)); color: #fff; border: none; border-radius: 8px; padding: 10px 16px; font-size: 14px; font-weight: bold; cursor: pointer; font-family: inherit; }
     .sp-btn.alt { background: rgba(255,255,255,0.08); color: var(--text); }
     .sp-btn.warn { background: linear-gradient(135deg, #b45309, #f59e0b); }
@@ -4718,10 +4720,10 @@ app.get("/", (req, res) => {
     .sp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .sp-btn.pulse { animation: spPulse 1.4s infinite; }
     @keyframes spPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.6); } 50% { box-shadow: 0 0 0 8px rgba(245,158,11,0); } }
-    .sp-field { width: 100%; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 16px; margin-bottom: 10px; font-family: inherit; }
+    .sp-field { width: 100%; background: #14223d; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 16px; margin-bottom: 10px; font-family: inherit; }
     .sp-field:focus { outline: none; border-color: var(--gold-soft); }
     .sp-lbl { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
-    .sp-row { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 10px; cursor: pointer; }
+    .sp-row { background: #101d36; border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 10px; cursor: pointer; }
     .sp-row:hover { border-color: var(--gold-soft); }
     .sp-row .t1 { display: flex; justify-content: space-between; gap: 8px; font-weight: bold; font-size: 14px; }
     .sp-row .t2 { color: var(--muted); font-size: 12px; margin-top: 4px; }
@@ -4731,14 +4733,14 @@ app.get("/", (req, res) => {
     .sp-chip.active { background: rgba(34,197,94,0.2); color: #86efac; }
     .sp-chip.closed { background: rgba(148,163,184,0.2); color: #cbd5e1; }
     .sp-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
-    .sp-tab { background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text); border-radius: 18px; padding: 6px 14px; font-size: 13px; cursor: pointer; font-family: inherit; }
+    .sp-tab { background: #16243f; border: 1px solid var(--border); color: var(--text); border-radius: 18px; padding: 6px 14px; font-size: 13px; cursor: pointer; font-family: inherit; }
     .sp-tab.on { background: var(--green2); border-color: var(--green2); color: #fff; font-weight: bold; }
     .sp-chat { display: flex; flex-direction: column; flex: 1; min-height: 0; }
     .sp-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
     .sp-link { background: none; border: none; color: var(--gold-soft); cursor: pointer; font-size: 14px; font-family: inherit; padding: 4px; }
     .sp-title { font-weight: bold; font-size: 14px; text-align: center; flex: 1; }
-    .sp-state { background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 13px; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
-    .sp-msgs { flex: 1; min-height: 120px; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+    .sp-state { background: #121f38; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 13px; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .sp-msgs { flex: 1; min-height: 120px; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
     .sp-msg { display: flex; flex-direction: column; max-width: 82%; }
     .sp-msg.me { align-self: flex-start; }
     .sp-msg.other { align-self: flex-end; }
@@ -4746,21 +4748,21 @@ app.get("/", (req, res) => {
     .sp-who { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
     .sp-b { padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
     .sp-msg.me .sp-b { background: linear-gradient(135deg, var(--green), var(--green2)); color: #fff; border-top-right-radius: 4px; }
-    .sp-msg.other .sp-b { background: rgba(255,255,255,0.09); border-top-left-radius: 4px; }
-    .sp-msg.ai .sp-b { background: rgba(124,58,237,0.18); border: 1px solid rgba(167,139,250,0.35); }
-    .sp-msg.admin .sp-b { background: rgba(34,197,94,0.16); border: 1px solid rgba(34,197,94,0.35); }
-    .sp-msg.sys .sp-b { background: rgba(245,158,11,0.12); color: #fcd34d; font-size: 12.5px; text-align: center; border-radius: 10px; }
+    .sp-msg.other .sp-b { background: #1c2b48; border-top-left-radius: 4px; }
+    .sp-msg.ai .sp-b { background: #2a1f52; border: 1px solid #5b4a99; }
+    .sp-msg.admin .sp-b { background: #12402c; border: 1px solid #1f7a4d; }
+    .sp-msg.sys .sp-b { background: #33290f; color: #fcd34d; font-size: 12.5px; text-align: center; border-radius: 10px; }
     .sp-time { font-size: 10px; color: var(--muted); margin-top: 2px; }
     .sp-role { display: inline-block; font-size: 10px; font-weight: bold; padding: 1px 7px; border-radius: 8px; margin-inline-start: 6px; vertical-align: middle; }
-    .sp-role.senior { background: rgba(234,179,8,0.2); color: #fde047; border: 1px solid rgba(234,179,8,0.45); }
-    .sp-role.admin { background: rgba(59,130,246,0.2); color: #93c5fd; border: 1px solid rgba(59,130,246,0.45); }
+    .sp-role.senior { background: #3d3410; color: #fde047; border: 1px solid #8a7414; }
+    .sp-role.admin { background: #12294d; color: #93c5fd; border: 1px solid #2b5aa8; }
     .sp-img { max-width: 220px; max-height: 220px; border-radius: 10px; margin-top: 6px; display: block; cursor: zoom-in; background: rgba(255,255,255,0.05); }
     .sp-dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px; border-radius: 50%; background: #a78bfa; animation: spDot 1s infinite; }
     .sp-dots span:nth-child(2) { animation-delay: 0.15s; } .sp-dots span:nth-child(3) { animation-delay: 0.3s; }
     @keyframes spDot { 0%,60%,100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
     .sp-compose { display: flex; align-items: flex-end; gap: 8px; margin-top: 10px; }
     .sp-compose textarea { flex: 1; resize: none; max-height: 110px; margin: 0; }
-    .sp-attach { background: rgba(255,255,255,0.08); border-radius: 8px; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; flex-shrink: 0; }
+    .sp-attach { background: #1c2b48; border-radius: 8px; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; flex-shrink: 0; }
     .sp-prev { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--muted); }
     .sp-prev img { height: 46px; border-radius: 6px; }
     #sp-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 6000; display: none; align-items: center; justify-content: center; padding: 14px; }
