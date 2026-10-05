@@ -4274,6 +4274,7 @@ const OfficerAppSchema = new mongoose.Schema({
     name: String,
     prevExperience: String,
     discordUser: String,
+    age: { type: Number, default: null },
     answers: [String],
     stage: { type: String, enum: ["pending", "interview", "training", "officer", "rejected"], default: "pending" },
     rejectedAt: { type: String, default: null },
@@ -4419,6 +4420,42 @@ async function offDiscordLookup(raw) {
     return { ok: true, inServer: false, discordName: null, username: q, id: null };
 }
 
+const OFF_AGE_WORDS = {
+    "واحد": 1, "احد": 1, "اثنين": 2, "اثنان": 2, "اثنا": 2, "اثني": 2, "ثلاثه": 3, "ثلاث": 3, "اربعه": 4, "اربع": 4,
+    "خمسه": 5, "خمس": 5, "سته": 6, "ست": 6, "سبعه": 7, "سبع": 7, "ثمانيه": 8, "ثماني": 8, "ثمان": 8, "تسعه": 9, "تسع": 9,
+    "عشره": 10, "عشر": 10,
+    "احدعش": 11, "اطنعش": 12, "اثنعش": 12, "ثلطعش": 13, "ثلاثطعش": 13, "اربعطعش": 14, "اربعتعش": 14,
+    "خمسطعش": 15, "خمستعش": 15, "ستطعش": 16, "سطعش": 16, "ستعش": 16, "سبعطعش": 17, "سبعتعش": 17,
+    "ثمنطعش": 18, "ثمانطعش": 18, "تسعطعش": 19, "تسعتعش": 19,
+    "عشرين": 20, "عشرون": 20, "ثلاثين": 30, "ثلاثون": 30, "اربعين": 40, "اربعون": 40, "خمسين": 50, "خمسون": 50,
+    "ستين": 60, "ستون": 60, "سبعين": 70, "ثمانين": 80, "تسعين": 90,
+    one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
+    thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+    twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+};
+function offParseAge(raw) {
+    let t = String(raw || "").trim().toLowerCase();
+    if (!t) return null;
+    t = t.replace(/[٠-٩]/g, c => String(c.charCodeAt(0) - 0x0660)).replace(/[۰-۹]/g, c => String(c.charCodeAt(0) - 0x06F0));
+    const m = t.match(/[0-9]+/);
+    if (m) {
+        const n = parseInt(m[0], 10);
+        return n >= 5 && n <= 99 ? n : null;
+    }
+    t = t.replace(/[\u064B-\u065F\u0670\u0640]/g, "").replace(/[أإآ]/g, "ا").replace(/ة/g, "ه").replace(/ى/g, "ي");
+    const tokens = t.split(/[^a-z\u0621-\u064A]+/).filter(Boolean).map(w => (OFF_AGE_WORDS[w] === undefined && w.length > 2 && w[0] === "و") ? w.slice(1) : w);
+    let total = 0, seen = false;
+    for (let i = 0; i < tokens.length; i++) {
+        const v = OFF_AGE_WORDS[tokens[i]];
+        if (v === undefined) continue;
+        seen = true;
+        const nx = tokens[i + 1];
+        if (v >= 1 && v <= 9 && (nx === "عشر" || nx === "عشره")) { total += 10 + v; i++; }
+        else total += v;
+    }
+    return seen && total >= 5 && total <= 99 ? total : null;
+}
+
 // ---------- التقديم (للجميع) ----------
 app.get("/api/officers/me", ensureAuth, async (req, res) => {
     const a = await OfficerApp.findOne({ uid: req.user.id }).lean();
@@ -4434,6 +4471,8 @@ app.post("/api/officers/apply", ensureAuth, async (req, res) => {
     if (name.length < 2) return res.status(400).json({ error: "اكتب اسمك" });
     if (!prev) return res.status(400).json({ error: "اكتب خبراتك السابقة (وإذا ما عندك اكتب: لا يوجد)" });
     if (discordUser.length < 2) return res.status(400).json({ error: "اكتب يوزرك في الديسكورد" });
+    const age = offParseAge(b.age);
+    if (age === null) return res.status(400).json({ error: "اكتب عمرك الحقيقي بشكل صحيح (بالأرقام أو بالحروف)" });
     const answers = Array.isArray(b.answers) ? b.answers.map(x => clean(x, 1500)) : [];
     if (answers.length !== OFFICER_QUESTIONS.length) return res.status(400).json({ error: "الاستبيان ناقص، أعد تحميل الصفحة" });
     const miss = answers.findIndex(x => !x);
@@ -4441,20 +4480,24 @@ app.post("/api/officers/apply", ensureAuth, async (req, res) => {
     const exists = await OfficerApp.findOne({ uid: req.user.id }).lean();
     if (exists) return res.status(409).json({ error: "عندك تقديم سابق في سلك الضباط" });
     try {
-        await OfficerApp.create({ uid: req.user.id, name, prevExperience: prev, discordUser, answers });
+        await OfficerApp.create({ uid: req.user.id, name, prevExperience: prev, discordUser, age, answers });
     } catch (e) {
         if (e && e.code === 11000) return res.status(409).json({ error: "عندك تقديم سابق في سلك الضباط" });
         throw e;
     }
-    await logEvent({ action: "تقديم سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: name });
-    res.json({ ok: true });
+    await logEvent({ action: "تقديم سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: name + " — العمر " + age });
+    const adult = age >= 17;
+    res.json({
+        ok: true, age, ageLevel: adult ? "ok" : "warn",
+        ageNote: adult ? "إذا كذبت في عمرك راح تنفصل وتنرفض." : "ممكن ينرفض تقديمك بسبب عمرك.",
+    });
 });
 
 // ---------- الكبار: التقديمات ----------
 app.get("/api/officers/admin/applications", ensureSeniorAdmin, async (req, res) => {
     const all = await OfficerApp.find({}).sort({ createdAt: 1 }).lean();
     const pending = all.filter(a => a.stage === "pending").map(a => ({
-        id: String(a._id), name: a.name, prevExperience: a.prevExperience, discordUser: a.discordUser,
+        id: String(a._id), name: a.name, prevExperience: a.prevExperience, discordUser: a.discordUser, age: a.age || null,
         answers: a.answers, createdAt: a.createdAt,
     }));
     const history = all.filter(a => a.stage !== "pending").reverse().map(a => ({
@@ -4534,6 +4577,71 @@ app.post("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
     if (n > 999) return res.status(400).json({ error: "وصلت الحد الأعلى للرومات" });
     await OfficerRoom.create({ n });
     res.json({ ok: true, n });
+});
+
+app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res) => {
+    const since = new Date(Date.now() - 60 * 24 * 3600 * 1000);
+    const logs = await OfficerRoomLog.find({ at: { $gte: since } }).sort({ at: 1 }).limit(8000).maxTimeMS(10000).lean();
+    const byRoom = new Map();
+    for (const l of logs) {
+        if (!byRoom.has(l.n)) byRoom.set(l.n, []);
+        byRoom.get(l.n).push(l);
+    }
+    const GAP = 6 * 3600 * 1000;
+    const sessions = [];
+    for (const [n, evs] of byRoom) {
+        const liveNow = offLive.get(n) || new Map();
+        const open = new Map();
+        let cur = null;
+        let lastAt = 0;
+        for (const l of evs) {
+            const t = new Date(l.at).getTime();
+            if (cur && open.size && t - lastAt > GAP) {
+                for (const st of open.values()) st.lost = true;
+                open.clear();
+                cur.end = lastAt;
+                sessions.push(cur);
+                cur = null;
+            }
+            if (l.action === "join") {
+                if (!cur) cur = { room: n, start: t, end: null, live: false, stays: [] };
+                const prev = open.get(l.uid);
+                if (prev) { prev.lost = true; open.delete(l.uid); }
+                const st = { uid: l.uid, name: l.name, isSenior: !!l.isSenior, start: t, end: null, lost: false, ongoing: false };
+                open.set(l.uid, st);
+                cur.stays.push(st);
+            } else if (l.action === "leave") {
+                const st = open.get(l.uid);
+                if (st) { st.end = t; open.delete(l.uid); }
+                if (cur && open.size === 0) { cur.end = t; sessions.push(cur); cur = null; }
+            }
+            lastAt = t;
+        }
+        if (cur) {
+            let anyLive = false;
+            for (const st of open.values()) {
+                if (liveNow.has(st.uid)) { st.ongoing = true; anyLive = true; } else st.lost = true;
+            }
+            if (anyLive) cur.live = true; else cur.end = lastAt;
+            sessions.push(cur);
+        }
+    }
+    sessions.sort((a, b) => b.start - a.start);
+    const top = sessions.slice(0, 40);
+    const uids = new Set();
+    top.forEach(s => s.stays.forEach(st => { if (!st.isSenior) uids.add(st.uid); }));
+    const apps = uids.size ? await OfficerApp.find({ uid: { $in: Array.from(uids) } }).select("uid stage rejectedAt age").lean() : [];
+    const byUid = new Map(apps.map(a => [a.uid, a]));
+    top.forEach(s => s.stays.forEach(st => {
+        if (st.isSenior) return;
+        const a = byUid.get(st.uid);
+        if (!a) return;
+        st.age = a.age || null;
+        if (a.stage === "interview") st.result = "wait";
+        else if (a.stage === "training" || a.stage === "officer" || (a.stage === "rejected" && a.rejectedAt === "training")) st.result = "pass";
+        else if (a.stage === "rejected" && a.rejectedAt === "interview") st.result = "fail";
+    }));
+    res.json({ sessions: top });
 });
 
 app.post("/api/officers/admin/applications/:id/interview-result", ensureSeniorAdmin, async (req, res) => {
@@ -4736,8 +4844,11 @@ app.get("/", (req, res) => {
     .nav-links button { background: transparent; border: 1px solid transparent; color: #94a3b8; padding: 0.4rem 0.8rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-size: 0.85rem; transition: all 0.2s; }
     .nav-links button:hover { background: rgba(59,130,246,0.2); border-color: #3b82f6; color: #60a5fa; }
     .hamburger-btn { display: none; background: rgba(59,130,246,0.15); border: 1px solid #3b82f6; color: #60a5fa; padding: 0.4rem 0.7rem; border-radius: 8px; cursor: pointer; font-size: 1.2rem; }
-    .mobile-menu { display: none; position: fixed; top: 99px; left: 0; width: 230px; background: rgba(5,15,30,0.98); border: 1px solid rgba(59,130,246,0.35); border-radius: 0 0 14px 0; z-index: 950; padding: 8px 0; box-shadow: 4px 8px 30px rgba(0,0,0,0.7); }
+    .mobile-menu { display: none; position: fixed; top: 99px; left: 0; width: 230px; background: rgba(5,15,30,0.98); border: 1px solid rgba(59,130,246,0.35); border-radius: 0 0 14px 0; z-index: 950; padding: 8px 0; box-shadow: 4px 8px 30px rgba(0,0,0,0.7); max-height: calc(100vh - 110px); max-height: calc(100dvh - 110px); overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .mobile-menu.open { display: block; }
+    #menu-backdrop { display: none; position: fixed; inset: 0; z-index: 940; background: rgba(0,0,0,0.3); touch-action: none; }
+    html.menu-open, html.menu-open body { overflow: hidden; }
+    html.menu-open #menu-backdrop { display: block; }
     .mobile-menu button { display: block; width: 100%; background: transparent; border: none; border-bottom: 1px solid rgba(59,130,246,0.08); color: #94a3b8; padding: 12px 20px; text-align: right; font-family: inherit; font-size: 0.9rem; cursor: pointer; }
     .mobile-menu button:hover { background: rgba(59,130,246,0.18); color: #60a5fa; }
     @media (max-width: 760px) { .nav-links { display: none !important; } .hamburger-btn { display: inline-block; } }
@@ -5007,6 +5118,25 @@ app.get("/", (req, res) => {
     .off-chip.sen { border-color: #eab308; color: #fbbf24; }
     .off-logrow { font-size: 12px; color: var(--muted); padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); }
     .off-res { font-size: 13px; margin-top: 8px; padding: 8px 12px; border-radius: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); }
+    .off-gantt { margin: 10px 0; }
+    .off-grow { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+    .off-gname { width: 92px; flex-shrink: 0; font-size: 11px; color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .off-gtrack { position: relative; flex: 1; height: 14px; background: rgba(255,255,255,0.05); border-radius: 7px; overflow: hidden; }
+    .off-gbar { position: absolute; top: 0; bottom: 0; background: #3b82f6; border-radius: 7px; }
+    .off-gbar.sen { background: #eab308; }
+    .off-gbar.live { background: #22c55e; }
+    .off-gbar.lost { background: repeating-linear-gradient(45deg, #64748b, #64748b 4px, #475569 4px, #475569 8px); }
+    .off-gaxis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .off-stay { padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,0.08); font-size: 13px; line-height: 1.9; }
+    .off-stayt { color: var(--muted); font-size: 12px; }
+    .rp-clock { font-size: 26px; font-weight: 800; text-align: center; color: var(--gold-soft); direction: ltr; }
+    .rp-prog { height: 6px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; margin: 8px 0 12px; }
+    .rp-prog div { height: 100%; width: 0; background: var(--green2); }
+    .rp-row { display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; margin-bottom: 6px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.04); font-size: 13px; transition: background 0.2s, opacity 0.2s; }
+    .rp-row.wait { opacity: 0.4; }
+    .rp-row.in { background: rgba(34,197,94,0.16); border-color: #22c55e; }
+    .rp-row.out { background: rgba(100,116,139,0.18); opacity: 0.75; }
+    .rp-feed { max-height: 120px; overflow-y: auto; font-size: 12px; color: #cbd5e1; margin-top: 8px; line-height: 1.9; }
     #off-voice { position: fixed; inset: 0; z-index: 4000; background: linear-gradient(160deg, #060e1c, #0a1628); overflow-y: auto; padding: 14px 14px 110px; }
     .ov-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
     .ov-head b { color: var(--gold-soft); font-size: 17px; }
@@ -5079,6 +5209,7 @@ app.get("/", (req, res) => {
     <ul class="nav-links" id="nav-links"></ul>
     <button class="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
 </nav>
+<div id="menu-backdrop" onclick="closeMobileMenu()"></div>
 <div class="mobile-menu" id="mobile-menu"></div>
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
@@ -6182,7 +6313,6 @@ function buildNav() {
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
-    if (ME.isSeniorAdmin) items.push({ label: '🎖️ إدارة سلك الضباط', fn: 'renderOfficerAdmin()' });
     items.push({ label: '🎧 الدعم', fn: 'spOpen()', cls: 'sp-nav-user' });
     if (ME.isAdmin) items.push({ label: '🎧 تذاكر الدعم', fn: 'renderSupportAdmin()', cls: 'sp-nav-admin' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
@@ -6202,8 +6332,23 @@ function renderFabs() {
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
 }
-function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
-function closeMobileMenu() { document.getElementById('mobile-menu').classList.remove('open'); }
+function toggleMobileMenu() {
+    var m = document.getElementById('mobile-menu');
+    if (m.classList.contains('open')) { closeMobileMenu(); return; }
+    m.classList.add('open');
+    m.scrollTop = 0;
+    document.documentElement.classList.add('menu-open');
+}
+function closeMobileMenu() {
+    document.getElementById('mobile-menu').classList.remove('open');
+    document.documentElement.classList.remove('menu-open');
+}
+document.addEventListener('touchmove', function (e) {
+    if (!document.documentElement.classList.contains('menu-open')) return;
+    var m = document.getElementById('mobile-menu');
+    if (m && m.contains(e.target) && m.scrollHeight > m.clientHeight + 1) return;
+    e.preventDefault();
+}, { passive: false });
 function renderMinePage() {
     document.getElementById('app').innerHTML = \`<div class="card"><h2>📋 مخالفاتي</h2><div id="mine-list">جارِ التحميل...</div></div>\`;
     loadMine();
@@ -6849,6 +6994,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
+            <div class="tab" id="tab-officers" onclick="adminTab('officers', this)">🎖️ إدارة سلك الضباط</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
@@ -6880,6 +7026,7 @@ function adminTab(name, el) {
     if (name === 'log') loadLog();
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
+    if (name === 'officers') renderOfficerAdmin();
 }
 async function loadReviewedViolations() {
     const box = document.getElementById('admin-content');
@@ -9372,13 +9519,6 @@ async function saveSettings() {
 var OFF = { my: null, questions: [], offset: 0, sig: '', tick: null };
 var OFFA = { tab: 'apps', sig: '', timer: null, data: null, checks: {} };
 var VC = null;
-var OFF_MODES = [
-    { k: 'private', t: '🔒 خاص (الكبار والمتحدث فقط)' },
-    { k: 'listen', t: '👂 الكل يسمع المتحدث' },
-    { k: 'open', t: '🗣️ الكل يتكلم ويسمع' },
-    { k: 'mute', t: '🔇 ما أحد يتكلم' }
-];
-
 function offNow() { return Date.now() + OFF.offset; }
 async function offFetch(url, opts) {
     var o = Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {});
@@ -9479,6 +9619,7 @@ function offPaintApplicant() {
 function offFormHtml() {
     var h = '<div class="card"><h2>🎖️ سلك الضباط | استبيان التقديم</h2>';
     h += '<label>الاسم:</label><input id="off-f-name" maxlength="60" value="' + spEsc((ME && ME.registeredName) || '') + '">';
+    h += '<label>كم عمرك الحقيقي؟ (بالأرقام أو بالحروف):</label><input id="off-f-age" maxlength="30" placeholder="مثال: 17 أو سبعة عشر">';
     h += '<label>خبراتك السابقة في سلك الضباط:</label><textarea id="off-f-exp" rows="2" maxlength="400" placeholder="اكتب خبراتك، وإذا ما عندك اكتب: لا يوجد"></textarea>';
     h += '<label>يوزرك في الديسكورد:</label><input id="off-f-ds" maxlength="60" dir="ltr" placeholder="username">';
     h += '<div style="text-align:center;color:var(--muted);margin:14px 0;">━━━━━━━━━━━━━━━━━━</div>';
@@ -9492,16 +9633,20 @@ async function offSubmitApply() {
     var name = document.getElementById('off-f-name').value.trim();
     var exp = document.getElementById('off-f-exp').value.trim();
     var ds = document.getElementById('off-f-ds').value.trim();
+    var age = document.getElementById('off-f-age').value.trim();
     var answers = Array.prototype.map.call(document.querySelectorAll('.off-f-q'), function (t) { return t.value.trim(); });
     if (name.length < 2) return toast('اكتب اسمك');
     if (!exp) return toast('اكتب خبراتك السابقة (أو اكتب: لا يوجد)');
     if (ds.length < 2) return toast('اكتب يوزرك في الديسكورد');
+    if (!age) return toast('اكتب عمرك الحقيقي');
     var miss = answers.findIndex(function (x) { return !x; });
     if (miss >= 0) return toast('جاوب على السؤال رقم ' + (miss + 1));
     try {
-        await api('/api/officers/apply', { method: 'POST', body: JSON.stringify({ name: name, prevExperience: exp, discordUser: ds, answers: answers }) });
+        var r = await api('/api/officers/apply', { method: 'POST', body: JSON.stringify({ name: name, prevExperience: exp, discordUser: ds, age: age, answers: answers }) });
         toast('✅ تم إرسال تقديمك');
-        offLoadMe(false);
+        if (r && r.ageNote) {
+            offModalOpen('<h3>' + (r.ageLevel === 'warn' ? '⚠️' : '📌') + ' تنبيه بخصوص العمر</h3><p style="line-height:1.9;margin:10px 0 16px;">' + spEsc(r.ageNote) + '</p><button class="btn" onclick="offModalClose();offLoadMe(false)">فهمت</button>');
+        } else offLoadMe(false);
     } catch (e) { toast(e.message); }
 }
 function offPendingHtml() {
@@ -9583,17 +9728,8 @@ function offAllowed(st, from, to) {
     if (from === to) return false;
     var f = offFindP(st, from), t = offFindP(st, to);
     if (!f || !t) return false;
-    if (f.isSenior && t.isSenior) return true;
-    var sp = st.speakerUid, mode = st.mode;
-    if (f.isSenior) {
-        if (mode === 'private') return to === sp;
-        return true;
-    }
-    if (mode === 'open') return true;
-    if (mode === 'mute') return false;
-    if (from !== sp) return false;
-    if (t.isSenior) return true;
-    return mode === 'listen';
+    if (f.isSenior) return true;
+    return t.isSenior && from === st.speakerUid;
 }
 function offCanSpeak() {
     if (!VC) return false;
@@ -9602,12 +9738,6 @@ function offCanSpeak() {
 function offCanShare() {
     if (!VC) return false;
     return VC.isSenior || offCanSpeak();
-}
-function offModeDesc(m) {
-    if (m === 'private') return 'المتحدث يسمعه الكبار فقط، وما يسمع إلا الكبار.';
-    if (m === 'listen') return 'الكل يسمع المتحدث والكبار، والمتقدمين الباقين ما يتكلمون.';
-    if (m === 'open') return 'الكل يتكلم ويسمع.';
-    return 'المتقدمين ما يتكلمون ولا أحد يسمعهم، والكبار يسمعون بس.';
 }
 function offSignal(uid, data) {
     if (!VC) return;
@@ -9688,7 +9818,8 @@ function offMakePeer(uid, initiator) {
             P.videoEl.autoplay = true; P.videoEl.muted = true;
             P.videoEl.setAttribute('playsinline', '');
             P.videoEl.srcObject = new MediaStream([e.track]);
-            P.videoEl.ondblclick = function () { if (this.requestFullscreen) this.requestFullscreen(); };
+            P.videoEl.onclick = function () { offFullscreen(this); };
+            e.track.onunmute = function () { if (VC === v) offPaintStage(); };
             offPaintStage();
         }
         offApplyPerms();
@@ -9796,6 +9927,7 @@ function offApplyPerms() {
     if (VC.screenTrack && !offCanShare()) offStopShare();
     Object.keys(VC.peers).forEach(function (uid) {
         var P = VC.peers[uid];
+        if (!P.aSender || !P.vSender) offBindSenders(P);
         var okSend = offAllowed(st, me, uid);
         var audio = (okSend && VC.micOn) ? VC.mic : null;
         var video = (okSend && VC.screenTrack) ? VC.screenTrack : null;
@@ -9835,17 +9967,13 @@ function offWatch(uid, stream, P) {
 function offPaintAll() { offPaintModes(); offPaintNote(); offPaintStage(); offPaintGrid(); offPaintBar(); }
 function offPaintModes() {
     var box = document.getElementById('ov-modes');
-    if (!box || !VC) return;
-    if (!VC.isSenior) { box.innerHTML = ''; return; }
-    box.innerHTML = OFF_MODES.map(function (m) {
-        return '<button class="ov-mode' + (VC.state.mode === m.k ? ' on' : '') + '" data-m="' + m.k + '" onclick="offSetMode(this.dataset.m)">' + m.t + '</button>';
-    }).join('');
+    if (box) box.innerHTML = '';
 }
 function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
-    if (VC.isSenior) box.textContent = offModeDesc(VC.state.mode) + ' — اضغط زر فتح المايك تحت اسم المتقدم.';
-    else box.textContent = offCanSpeak() ? '🎙️ المايك مفتوح لك، تكلم.' : '🔇 مايكك مقفل — انتظر الكبير يفتحه لك.';
+    if (VC.isSenior) box.textContent = 'الكبار فقط الي يتكلمون، والمتقدمين يسمعون بس. إذا تبي متقدم يرد عليكم اضغط فتح المايك تحت اسمه (يسمعه الكبار فقط).';
+    else box.textContent = offCanSpeak() ? '🎙️ فتحوا لك المايك — يسمعك الكبار فقط.' : '🔇 أنت مستمع فقط، الكبار هم الي يتكلمون.';
 }
 function offPaintGrid() {
     var box = document.getElementById('ov-grid');
@@ -9887,7 +10015,7 @@ function offPaintStage() {
             w.className = 'ov-vwrap';
             var cap = document.createElement('div');
             cap.className = 'ov-vcap';
-            cap.textContent = '🖥️ شاشة ' + (p ? p.name : '');
+            cap.textContent = '🖥️ شاشة ' + (p ? p.name : '') + ' — اضغط على الشاشة للتكبير';
             w.appendChild(P.videoEl); w.appendChild(cap);
             P.wrap = w;
         }
@@ -9917,7 +10045,7 @@ function offPaintBar() {
 }
 function offToggleMic() {
     if (!VC) return;
-    if (!offCanSpeak()) { toast('المايك مقفل، انتظر الكبير يفتحه لك'); return; }
+    if (!offCanSpeak()) { toast('أنت مستمع فقط، الكبار هم الي يتكلمون'); return; }
     VC.micOn = !VC.micOn;
     offApplyPerms(); offPaintBar();
 }
@@ -9925,16 +10053,34 @@ async function offToggleShare() {
     if (!VC) return;
     if (VC.sharing) { offStopShare(); return; }
     if (!offCanShare()) { toast('ما يمديك تشارك الشاشة الحين'); return; }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) { toast('جهازك لا يدعم مشاركة الشاشة'); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) { toast('مشاركة الشاشة ما تشتغل على الجوال، استخدم الكمبيوتر'); return; }
+    var ds;
     try {
-        var ds = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-        if (!VC) { ds.getTracks().forEach(function (t) { t.stop(); }); return; }
-        VC.screenStream = ds;
-        VC.screenTrack = ds.getVideoTracks()[0];
-        VC.screenTrack.onended = function () { offStopShare(); };
-        VC.sharing = true;
-        offSignalAll({ share: true });
-        offApplyPerms(); offPaintStage(); offPaintGrid(); offPaintBar();
+        ds = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 15, max: 30 } }, audio: false });
+    } catch (e) {
+        toast('ما تمت مشاركة الشاشة — تأكد إنك سمحت للمتصفح');
+        return;
+    }
+    if (!VC) { ds.getTracks().forEach(function (t) { t.stop(); }); return; }
+    var tr = ds.getVideoTracks()[0];
+    if (!tr) { ds.getTracks().forEach(function (t) { t.stop(); }); toast('ما وصل فيديو من الشاشة'); return; }
+    try { tr.contentHint = 'detail'; } catch (e) {}
+    VC.screenStream = ds;
+    VC.screenTrack = tr;
+    tr.onended = function () { offStopShare(); };
+    VC.sharing = true;
+    offSignalAll({ share: true });
+    offApplyPerms(); offPaintStage(); offPaintGrid(); offPaintBar();
+}
+function offFullscreen(el) {
+    try {
+        if (document.fullscreenElement || document.webkitFullscreenElement) {
+            (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+            return;
+        }
+        if (el.requestFullscreen) el.requestFullscreen();
+        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+        else if (el.webkitEnterFullscreen) el.webkitEnterFullscreen();
     } catch (e) {}
 }
 function offStopShare() {
@@ -9943,10 +10089,6 @@ function offStopShare() {
     VC.screenStream = null; VC.screenTrack = null; VC.sharing = false;
     offSignalAll({ share: false });
     offApplyPerms(); offPaintStage(); offPaintGrid(); offPaintBar();
-}
-function offSetMode(mode) {
-    if (!VC) return;
-    offPost('/api/officers/rooms/' + VC.n + '/mode', { mode: mode }).catch(function (e) { toast(e.message); });
 }
 function offSetSpeaker(uid) {
     if (!VC) return;
@@ -9980,13 +10122,15 @@ window.addEventListener('pagehide', function () {
 
 /* ---------------------------- صفحة الكبار ---------------------------- */
 function renderOfficerAdmin(tab) {
+    if (!ME || !ME.isSeniorAdmin) return;
+    if (!document.getElementById('admin-content')) { renderAdmin('officers'); return; }
     offStopTimers();
     OFFA.tab = (typeof tab === 'string') ? tab : 'apps';
     OFFA.sig = '';
-    var tabs = [['apps', '📥 التقديمات'], ['rooms', '🎙️ المقابلة'], ['train', '🏋️ التدريب']];
-    document.getElementById('app').innerHTML =
-        '<div class="card row"><h2>🎖️ إدارة سلك الضباط</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>' +
-        '<div class="tabs" id="offa-tabs">' + tabs.map(function (t) {
+    OFFA.data = null;
+    var tabs = [['apps', '📥 التقديمات'], ['rooms', '🎙️ المقابلة'], ['log', '📼 تسجيل المقابلة'], ['train', '🏋️ التدريب']];
+    document.getElementById('admin-content').innerHTML =
+        '<div class="tabs" id="offa-tabs" style="margin-top:4px;">' + tabs.map(function (t) {
             return '<div class="tab' + (t[0] === OFFA.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="offaTab(this.dataset.t)">' + t[1] + '</div>';
         }).join('') + '</div><div id="offa-content"><div class="card">جارِ التحميل...</div></div>';
     offaReload(false);
@@ -10002,11 +10146,11 @@ function offaTab(name) {
     offaReload(false);
 }
 async function offaReload(silent) {
-    if (silent && VC) return;
+    if (silent && (VC || OFFA.tab === 'log')) return;
     var tab = OFFA.tab;
-    var url = tab === 'apps' ? '/api/officers/admin/applications' : (tab === 'rooms' ? '/api/officers/admin/rooms' : '/api/officers/admin/training');
+    var urls = { apps: '/api/officers/admin/applications', rooms: '/api/officers/admin/rooms', log: '/api/officers/admin/interview-log', train: '/api/officers/admin/training' };
     try {
-        var d = await offFetch(url);
+        var d = await offFetch(urls[tab]);
         if (tab !== OFFA.tab) return;
         var sig = tab + JSON.stringify(d);
         if (silent && sig === OFFA.sig) return;
@@ -10019,6 +10163,7 @@ function offaPaint() {
     if (!box || !OFFA.data) return;
     if (OFFA.tab === 'apps') box.innerHTML = offaAppsHtml(OFFA.data);
     else if (OFFA.tab === 'rooms') box.innerHTML = offaRoomsHtml(OFFA.data);
+    else if (OFFA.tab === 'log') box.innerHTML = offaLogHtml(OFFA.data);
     else box.innerHTML = offaTrainHtml(OFFA.data);
 }
 function offaStageText(a) {
@@ -10034,6 +10179,7 @@ function offaAppsHtml(d) {
     d.pending.forEach(function (a) {
         var chk = OFFA.checks[a.id];
         h += '<div class="card"><div class="row"><h3>' + spEsc(a.name) + '</h3><span class="badge pending">بانتظار القرار</span></div>';
+        h += '<div class="acc-row"><span>العمر</span><b>' + (a.age ? spEsc(String(a.age)) : 'غير مسجل') + '</b></div>';
         h += '<div class="acc-row"><span>الخبرات السابقة</span><b>' + spEsc(a.prevExperience) + '</b></div>';
         h += '<div class="acc-row"><span>يوزر الديسكورد</span><b dir="ltr">' + spEsc(a.discordUser) + '</b></div>';
         h += '<div style="margin:8px 0;"><button class="btn sm gold" data-id="' + a.id + '" onclick="offaCheck(this.dataset.id)">🔍 فحص اليوزر</button></div>';
@@ -10138,6 +10284,170 @@ function offaRoomsHtml(d) {
         h += '</div></div>';
     });
     return h;
+}
+function offFmtTimeS(d) {
+    try { return new Date(d).toLocaleTimeString('ar-SA', { timeZone: 'Asia/Riyadh', hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true }); }
+    catch (e) { return String(d); }
+}
+function offFmtDay(d) {
+    try { return new Date(d).toLocaleDateString('ar-SA', { timeZone: 'Asia/Riyadh', weekday: 'long', day: 'numeric', month: 'long' }); }
+    catch (e) { return String(d); }
+}
+function offDur(ms) {
+    var sec = Math.max(0, Math.round(ms / 1000));
+    var h = Math.floor(sec / 3600); sec -= h * 3600;
+    var m = Math.floor(sec / 60); sec -= m * 60;
+    if (h > 0) return h + ' س ' + m + ' د';
+    if (m > 0) return m + ' د ' + sec + ' ث';
+    return sec + ' ث';
+}
+function offResultChip(r) {
+    if (r === 'pass') return ' <span class="badge approved">مقبول بالمقابلة</span>';
+    if (r === 'fail') return ' <span class="badge rejected">مرفوض بالمقابلة</span>';
+    if (r === 'wait') return ' <span class="badge pending">بانتظار النتيجة</span>';
+    return '';
+}
+function offaLogHtml(d) {
+    var list = d.sessions || [];
+    var h = '<div class="card"><h3>📼 تسجيل المقابلة</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">سجل كل جلسة مقابلة صارت بالرومات: من أول واحد دخل الروم إلى آخر واحد طلع، مع وقت دخول وخروج كل شخص، وفيديو توضيحي يعيد لك الجلسة خطوة بخطوة.</p></div>';
+    if (!list.length) return h + '<div class="card center" style="color:var(--muted);">ما فيه جلسات مسجلة</div>';
+    list.forEach(function (s, i) {
+        var E = s.end || Date.now();
+        var span = Math.max(1000, E - s.start);
+        var uniq = {};
+        s.stays.forEach(function (st) { uniq[st.uid] = 1; });
+        var first = s.stays[0];
+        var lastOut = null;
+        s.stays.forEach(function (st) { if (st.end && (!lastOut || st.end >= lastOut.end)) lastOut = st; });
+        h += '<div class="card"><div class="row"><h3>🎙️ مقابلة ' + s.room + '</h3>' + (s.live ? '<span class="badge approved">🟢 جارية الحين</span>' : '<span class="badge pending">انتهت</span>') + '</div>';
+        h += '<div class="acc-row"><span>اليوم</span><b>' + spEsc(offFmtDay(s.start)) + '</b></div>';
+        h += '<div class="acc-row"><span>أول واحد دخل</span><b>' + spEsc(first.name) + ' — ' + spEsc(offFmtTimeS(first.start)) + '</b></div>';
+        if (s.live) h += '<div class="acc-row"><span>آخر واحد طلع</span><b>الجلسة جارية</b></div>';
+        else h += '<div class="acc-row"><span>آخر واحد طلع</span><b>' + (lastOut ? spEsc(lastOut.name) + ' — ' + spEsc(offFmtTimeS(lastOut.end)) : spEsc(offFmtTimeS(s.end))) + '</b></div>';
+        h += '<div class="acc-row"><span>مدة الجلسة</span><b>' + spEsc(offDur(span)) + '</b></div>';
+        h += '<div class="acc-row"><span>عدد الحضور</span><b>' + Object.keys(uniq).length + '</b></div>';
+        h += '<div class="off-gantt">';
+        s.stays.forEach(function (st) {
+            var en = st.end || (st.ongoing ? Date.now() : E);
+            var right = Math.min(99, Math.max(0, (st.start - s.start) / span * 100));
+            var w = Math.max(1.2, (en - st.start) / span * 100);
+            if (right + w > 100) w = 100 - right;
+            var cls = 'off-gbar' + (st.isSenior ? ' sen' : '') + (st.ongoing ? ' live' : '') + (st.lost ? ' lost' : '');
+            h += '<div class="off-grow"><div class="off-gname">' + (st.isSenior ? '🎖️ ' : '') + spEsc(st.name) + '</div><div class="off-gtrack"><div class="' + cls + '" style="right:' + right.toFixed(2) + '%;width:' + w.toFixed(2) + '%;"></div></div></div>';
+        });
+        h += '<div class="off-gaxis"><span>' + spEsc(offFmtTimeS(s.start)) + '</span><span>' + (s.live ? 'الحين' : spEsc(offFmtTimeS(E))) + '</span></div></div>';
+        h += '<div style="margin:8px 0;"><b style="color:var(--gold-soft);font-size:13px;">الدخول والخروج بالترتيب</b>';
+        s.stays.forEach(function (st, k) {
+            var tail;
+            if (st.end) tail = '⬅️ طلع: ' + offFmtTimeS(st.end) + ' — مدة البقاء: ' + offDur(st.end - st.start);
+            else if (st.ongoing) tail = '🟢 داخل الروم الحين';
+            else tail = '⚠️ انقطع اتصاله (وقت الخروج غير مسجل)';
+            h += '<div class="off-stay"><div><b>' + (k + 1) + '- ' + spEsc(st.name) + '</b> <span class="off-chip' + (st.isSenior ? ' sen' : '') + '">' + (st.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</span>' +
+                (st.age ? ' <span style="color:var(--muted);font-size:12px;">عمره ' + spEsc(String(st.age)) + '</span>' : '') + offResultChip(st.result) + '</div>' +
+                '<div class="off-stayt">➡️ دخل: ' + spEsc(offFmtTimeS(st.start)) + ' — ' + spEsc(tail) + '</div></div>';
+        });
+        h += '</div>';
+        h += '<button class="btn gold sm" data-i="' + i + '" onclick="offaReplay(this.dataset.i)">▶️ فيديو توضيحي للجلسة</button></div>';
+    });
+    return h;
+}
+
+var REP = null;
+function offaReplayShell(s) {
+    var h = '<h3>🎬 فيديو توضيحي — مقابلة ' + s.room + '</h3>';
+    h += '<div class="rp-clock" id="rp-clock">--</div>';
+    h += '<div style="text-align:center;font-size:12px;color:var(--muted);">مضى: <span id="rp-elapsed">0 ث</span> — داخل الروم: <b id="rp-count">0</b></div>';
+    h += '<div class="rp-prog"><div id="rp-bar"></div></div>';
+    s.stays.forEach(function (st, k) {
+        h += '<div class="rp-row wait" id="rp-r' + k + '"><span>' + (st.isSenior ? '🎖️ ' : '') + spEsc(st.name) + '</span><span id="rp-s' + k + '">لم يدخل</span></div>';
+    });
+    h += '<div class="rp-feed" id="rp-feed"></div>';
+    h += '<div style="display:flex;gap:8px;justify-content:center;margin-top:12px;"><button class="btn sm" id="rp-pp" onclick="offaReplayToggle()">⏸️ إيقاف</button><button class="btn gray sm" id="rp-sp" onclick="offaReplaySpeed()">×1</button><button class="btn danger sm" onclick="offaReplayClose()">✖ إغلاق</button></div>';
+    return h;
+}
+function offaReplay(i) {
+    var s = OFFA.data && OFFA.data.sessions ? OFFA.data.sessions[parseInt(i, 10)] : null;
+    if (!s) return;
+    offaReplayStop();
+    var E = s.end || Date.now();
+    var span = Math.max(1000, E - s.start);
+    var evs = [];
+    s.stays.forEach(function (st, k) {
+        evs.push({ t: st.start, k: k, a: 'join' });
+        if (st.end) evs.push({ t: st.end, k: k, a: 'leave' });
+    });
+    evs.sort(function (x, y) { return x.t - y.t; });
+    REP = { s: s, E: E, span: span, evs: evs, T: 0, mult: 1, playing: true, timer: null, base: Math.max(1, span / 30000), states: {}, passed: -1 };
+    offModalOpen(offaReplayShell(s));
+    REP.timer = setInterval(offaReplayTick, 100);
+    offaReplayTick(true);
+}
+function offaReplayTick(first) {
+    if (!REP) return;
+    if (!document.getElementById('rp-clock')) { offaReplayStop(); return; }
+    if (REP.playing && first !== true) {
+        REP.T += 100 * REP.base * REP.mult;
+        if (REP.T >= REP.span) { REP.T = REP.span; REP.playing = false; offaReplayPaintBtn(); }
+    }
+    var now = REP.s.start + REP.T;
+    document.getElementById('rp-clock').textContent = offFmtTimeS(now);
+    document.getElementById('rp-elapsed').textContent = offDur(REP.T);
+    document.getElementById('rp-bar').style.width = (REP.T / REP.span * 100) + '%';
+    var inCount = 0;
+    REP.s.stays.forEach(function (st, k) {
+        var state = 'wait';
+        if (now >= st.start) {
+            if (st.end) state = now >= st.end ? 'out' : 'in';
+            else if (REP.T >= REP.span && !st.ongoing) state = 'out';
+            else state = 'in';
+        }
+        if (state === 'in') inCount++;
+        if (REP.states[k] !== state) {
+            REP.states[k] = state;
+            var row = document.getElementById('rp-r' + k);
+            var lab = document.getElementById('rp-s' + k);
+            if (row) row.className = 'rp-row ' + state;
+            if (lab) lab.textContent = state === 'in' ? '🟢 داخل الروم' : (state === 'out' ? (st.end ? '⚫ طلع ' + offFmtTimeS(st.end) : '⚠️ انقطع') : 'لم يدخل');
+        }
+    });
+    document.getElementById('rp-count').textContent = inCount;
+    var passed = 0;
+    for (var i = 0; i < REP.evs.length; i++) { if (REP.evs[i].t <= now) passed++; }
+    if (passed !== REP.passed) {
+        REP.passed = passed;
+        var lines = [];
+        for (var j = passed - 1; j >= 0 && lines.length < 8; j--) {
+            var ev = REP.evs[j];
+            var st2 = REP.s.stays[ev.k];
+            lines.push('<div>' + (ev.a === 'join' ? '➡️ دخل ' : '⬅️ طلع ') + spEsc(st2.name) + ' — ' + spEsc(offFmtTimeS(ev.t)) + '</div>');
+        }
+        document.getElementById('rp-feed').innerHTML = lines.join('');
+    }
+}
+function offaReplayPaintBtn() {
+    var b = document.getElementById('rp-pp');
+    if (!b || !REP) return;
+    b.textContent = REP.playing ? '⏸️ إيقاف' : (REP.T >= REP.span ? '🔄 إعادة' : '▶️ تشغيل');
+}
+function offaReplayToggle() {
+    if (!REP) return;
+    if (!REP.playing && REP.T >= REP.span) { REP.T = 0; REP.passed = -1; REP.states = {}; REP.playing = true; }
+    else REP.playing = !REP.playing;
+    offaReplayPaintBtn();
+}
+function offaReplaySpeed() {
+    if (!REP) return;
+    REP.mult = REP.mult === 1 ? 2 : (REP.mult === 2 ? 4 : 1);
+    var b = document.getElementById('rp-sp');
+    if (b) b.textContent = '×' + REP.mult;
+}
+function offaReplayStop() {
+    if (REP && REP.timer) clearInterval(REP.timer);
+    REP = null;
+}
+function offaReplayClose() {
+    offaReplayStop();
+    offModalClose();
 }
 function offaEnterRoom(n) { offJoinVoice(parseInt(n, 10)); }
 async function offaNewRoom() {
