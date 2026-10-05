@@ -473,6 +473,7 @@ const SettingsSchema = new mongoose.Schema({
     warningPenalties: { type: Array, default: [] },
     leaveBalanceDefault: { type: Number, default: 10 },
     lockSavedLogin: { type: Boolean, default: false },
+    officersLocked: { type: Boolean, default: false },
 }, { minimize: false });
 const Settings = mongoose.model("Settings", SettingsSchema);
 
@@ -2694,6 +2695,14 @@ app.post("/api/owner/saved-login-lock", ensureAuth, async (req, res) => {
     res.json({ ok: true, locked });
 });
 
+app.post("/api/senior/officers-lock", ensureSeniorAdmin, async (req, res) => {
+    const locked = !!(req.body && req.body.locked);
+    await getSettings();
+    await Settings.updateOne({}, { $set: { officersLocked: locked } });
+    await logEvent({ action: locked ? "قفل سلك الضباط" : "فتح سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: "" });
+    res.json({ ok: true, locked });
+});
+
 app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
     const { isMaintenance, disableLogin, disableViolations, violationsChannelId, notesChannelId } = req.body;
     const s = await getSettings();
@@ -4310,7 +4319,7 @@ const offLive = new Map();   // n -> Map(uid -> { uid, name, isSenior, joinedAt 
 const offCfg = new Map();    // n -> { mode, speakerUid }
 function offGetCfg(n) {
     let c = offCfg.get(n);
-    if (!c) { c = { mode: "private", speakerUid: null }; offCfg.set(n, c); }
+    if (!c) { c = { mode: "listen", speakerUid: null }; offCfg.set(n, c); }
     return c;
 }
 function offState(n) {
@@ -4459,7 +4468,8 @@ function offParseAge(raw) {
 // ---------- التقديم (للجميع) ----------
 app.get("/api/officers/me", ensureAuth, async (req, res) => {
     const a = await OfficerApp.findOne({ uid: req.user.id }).lean();
-    res.json({ app: offPublicApp(a), questions: OFFICER_QUESTIONS, serverNow: Date.now() });
+    const st = await getSettings();
+    res.json({ app: offPublicApp(a), locked: !a && !!st.officersLocked, questions: OFFICER_QUESTIONS, serverNow: Date.now() });
 });
 
 app.post("/api/officers/apply", ensureAuth, async (req, res) => {
@@ -4479,6 +4489,8 @@ app.post("/api/officers/apply", ensureAuth, async (req, res) => {
     if (miss >= 0) return res.status(400).json({ error: "جاوب على السؤال رقم " + (miss + 1) });
     const exists = await OfficerApp.findOne({ uid: req.user.id }).lean();
     if (exists) return res.status(409).json({ error: "عندك تقديم سابق في سلك الضباط" });
+    const lockSt = await getSettings();
+    if (lockSt.officersLocked) return res.status(403).json({ error: "تم قفل سلك الضباط، شكراً لكم" });
     try {
         await OfficerApp.create({ uid: req.user.id, name, prevExperience: prev, discordUser, age, answers });
     } catch (e) {
@@ -4778,6 +4790,19 @@ app.post("/api/officers/rooms/:n/mode", ensureSeniorAdmin, async (req, res) => {
     if (!n || !OFFICER_ROOM_MODES.includes(mode)) return res.status(400).json({ error: "وضع غير صحيح" });
     offGetCfg(n).mode = mode;
     offPushState(n);
+    res.json({ ok: true });
+});
+
+app.post("/api/officers/rooms/:n/kick", ensureSeniorAdmin, async (req, res) => {
+    const n = offParseN(req.params.n);
+    const uid = String((req.body || {}).uid || "");
+    const m = n ? offLive.get(n) : null;
+    const p = m ? m.get(uid) : null;
+    if (!p) return res.status(404).json({ error: "هذا الشخص مو داخل الروم" });
+    if (p.isSenior) return res.status(400).json({ error: "ما يمديك تطرد أحد من الكبار" });
+    offSendTo(uid, { t: "kicked", n });
+    offRemove(uid, n);
+    await logEvent({ action: "طرد من روم المقابلة", actorId: req.user.id, actorTag: req.user.username, details: p.name + " — روم " + n });
     res.json({ ok: true });
 });
 
@@ -9481,11 +9506,28 @@ async function loadSettings() {
             <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>\`;
+    box.insertAdjacentHTML('beforeend', officersLockCardHtml(!!settings.officersLocked));
     if (ME && ME.isOwner) {
         let locked = false;
         try { locked = !!(await api('/api/owner/saved-login-lock')).locked; } catch (e) {}
         if (currentAdminTab === 'settings' && document.getElementById('admin-content') === box) box.insertAdjacentHTML('beforeend', ownerLockCardHtml(locked));
     }
+}
+function officersLockCardHtml(locked) {
+    return '<div class="card" id="officers-lock-card" style="margin-top:12px;">' +
+        '<div class="row"><span>🎖️ قفل سلك الضباط</span><span style="color:' + (locked ? '#fca5a5' : '#86efac') + ';font-weight:700;">' + (locked ? 'مقفول' : 'مفتوح') + '</span></div>' +
+        '<p style="color:var(--muted);font-size:12px;line-height:1.8;margin-top:6px;">إذا انقفل، اللي قدموا قبل (بالتقديم أو المقابلة أو التدريب) يكملون عادي، واللي ما قدموا يطلع لهم أن سلك الضباط مقفول.</p>' +
+        '<button class="btn' + (locked ? '' : ' danger') + '" style="margin-top:10px;" onclick="toggleOfficersLock(' + (locked ? 'false' : 'true') + ')">' + (locked ? '🔓 فتح سلك الضباط' : '🔒 قفل سلك الضباط') + '</button></div>';
+}
+async function toggleOfficersLock(lock) {
+    var ok = await confirmModal(lock ? 'تبي تقفل سلك الضباط؟ اللي ما قدموا ما يقدرون يقدمون.' : 'تبي تفتح سلك الضباط للتقديم؟');
+    if (!ok) return;
+    try {
+        await api('/api/senior/officers-lock', { method: 'POST', body: JSON.stringify({ locked: lock }) });
+        var c = document.getElementById('officers-lock-card');
+        if (c) c.outerHTML = officersLockCardHtml(lock);
+        toast(lock ? '🔒 تم قفل سلك الضباط' : '🔓 تم فتح سلك الضباط');
+    } catch (e) { toast(e.message); }
 }
 function ownerLockCardHtml(locked) {
     return '<div class="card" id="owner-lock-card" style="margin-top:12px;">' +
@@ -9516,9 +9558,15 @@ async function saveSettings() {
     catch (e) { toast(e.message); }
 }
 /* ============================ 🎖️ سلك الضباط ============================ */
-var OFF = { my: null, questions: [], offset: 0, sig: '', tick: null };
+var OFF = { my: null, locked: false, questions: [], offset: 0, sig: '', tick: null };
 var OFFA = { tab: 'apps', sig: '', timer: null, data: null, checks: {} };
 var VC = null;
+var OFF_MODES = [
+    { k: 'private', t: '🔒 خاص (الكبار والمتحدث فقط)' },
+    { k: 'listen', t: '👂 الكبار يتكلمون والباقي يسمعون' },
+    { k: 'open', t: '🗣️ الكل يتكلم ويسمع' },
+    { k: 'mute', t: '🔇 ما أحد يتكلم' }
+];
 function offNow() { return Date.now() + OFF.offset; }
 async function offFetch(url, opts) {
     var o = Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {});
@@ -9574,9 +9622,9 @@ async function offLoadMe(silent) {
         var d = await offFetch('/api/officers/me');
         OFF.offset = d.serverNow - Date.now();
         OFF.questions = d.questions;
-        var sig = JSON.stringify(d.app || null);
+        var sig = JSON.stringify(d.app || null) + (d.locked ? '|locked' : '');
         if (silent && sig === OFF.sig) return;
-        OFF.sig = sig; OFF.my = d.app;
+        OFF.sig = sig; OFF.my = d.app; OFF.locked = !!d.locked;
         if (document.getElementById('off-root')) offPaintApplicant();
     } catch (e) { if (!silent) toast(e.message); }
 }
@@ -9605,8 +9653,9 @@ function offPaintApplicant() {
     if (!root) return;
     var a = OFF.my;
     var h = '<div class="card row"><h2>🎖️ سلك الضباط</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>';
-    h += offStepsHtml(a);
-    if (!a) h += offFormHtml();
+    if (!(OFF.locked && !a)) h += offStepsHtml(a);
+    if (!a && OFF.locked) h += offLockedHtml();
+    else if (!a) h += offFormHtml();
     else if (a.stage === 'pending') h += offPendingHtml();
     else if (a.stage === 'interview') h += offInterviewHtml(a);
     else if (a.stage === 'training') h += offTrainingHtml(a);
@@ -9615,6 +9664,10 @@ function offPaintApplicant() {
     root.innerHTML = h;
     if (OFF.tick) { clearInterval(OFF.tick); OFF.tick = null; }
     if (a && a.stage === 'interview') { OFF.tick = setInterval(offTick, 1000); offTick(); }
+}
+function offLockedHtml() {
+    return '<div class="card center"><div style="font-size:54px;">🔒</div><h3>تم قفل سلك الضباط</h3>' +
+        '<p style="color:var(--muted);line-height:1.9;">شكراً لكم على اهتمامكم.</p></div>';
 }
 function offFormHtml() {
     var h = '<div class="card"><h2>🎖️ سلك الضباط | استبيان التقديم</h2>';
@@ -9728,8 +9781,16 @@ function offAllowed(st, from, to) {
     if (from === to) return false;
     var f = offFindP(st, from), t = offFindP(st, to);
     if (!f || !t) return false;
-    if (f.isSenior) return true;
-    return t.isSenior && from === st.speakerUid;
+    if (f.isSenior && t.isSenior) return true;
+    var sp = st.speakerUid, mode = st.mode;
+    if (f.isSenior) {
+        if (mode === 'private') return to === sp;
+        return true;
+    }
+    if (mode === 'open') return true;
+    if (mode === 'mute') return false;
+    if (from !== sp) return false;
+    return t.isSenior;
 }
 function offCanSpeak() {
     if (!VC) return false;
@@ -9738,6 +9799,12 @@ function offCanSpeak() {
 function offCanShare() {
     if (!VC) return false;
     return VC.isSenior || offCanSpeak();
+}
+function offModeDesc(m) {
+    if (m === 'private') return 'الكبار والمتحدث بس يسمعون بعض، وباقي المتقدمين ما يسمعون شي.';
+    if (m === 'listen') return 'الكبار فقط الي يتكلمون، والمتقدمين يسمعونهم بس. والمتقدم الي تفتح له المايك يسمعه الكبار فقط.';
+    if (m === 'open') return 'الكل يتكلم ويسمع.';
+    return 'المتقدمين ما يتكلمون، والكبار يتكلمون ويسمعهم الكل.';
 }
 function offSignal(uid, data) {
     if (!VC) return;
@@ -9896,6 +9963,7 @@ function offClosePeer(uid) {
 function offOnVsig(d) {
     if (!VC || !d) return;
     if (d.t === 'state') offApplyState(d.state);
+    else if (d.t === 'kicked' && d.n === VC.n) { toast('🚫 تم طردك من الروم'); offLeaveVoice(true); }
     else if (d.t === 'signal' && d.n === VC.n) offQueue(d.from, function () { return offOnSignal(d.from, d.data); });
 }
 function offApplyState(st) {
@@ -9967,13 +10035,17 @@ function offWatch(uid, stream, P) {
 function offPaintAll() { offPaintModes(); offPaintNote(); offPaintStage(); offPaintGrid(); offPaintBar(); }
 function offPaintModes() {
     var box = document.getElementById('ov-modes');
-    if (box) box.innerHTML = '';
+    if (!box || !VC) return;
+    if (!VC.isSenior) { box.innerHTML = ''; return; }
+    box.innerHTML = OFF_MODES.map(function (m) {
+        return '<button class="ov-mode' + (VC.state.mode === m.k ? ' on' : '') + '" data-m="' + m.k + '" onclick="offSetMode(this.dataset.m)">' + m.t + '</button>';
+    }).join('');
 }
 function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
-    if (VC.isSenior) box.textContent = 'الكبار فقط الي يتكلمون، والمتقدمين يسمعون بس. إذا تبي متقدم يرد عليكم اضغط فتح المايك تحت اسمه (يسمعه الكبار فقط).';
-    else box.textContent = offCanSpeak() ? '🎙️ فتحوا لك المايك — يسمعك الكبار فقط.' : '🔇 أنت مستمع فقط، الكبار هم الي يتكلمون.';
+    if (VC.isSenior) box.textContent = offModeDesc(VC.state.mode) + ' — اضغط زر فتح المايك تحت اسم المتقدم.';
+    else box.textContent = offCanSpeak() ? '🎙️ المايك مفتوح لك، تكلم.' : '🔇 أنت مستمع فقط — انتظر الكبير يفتح لك المايك.';
 }
 function offPaintGrid() {
     var box = document.getElementById('ov-grid');
@@ -9992,6 +10064,7 @@ function offPaintGrid() {
         h += '<div class="ov-ic">' + (canTalk ? '🎙️' : '🔇') + (sharing ? ' 🖥️' : '') + '</div>';
         if (VC.isSenior && !p.isSenior) {
             h += '<button class="btn sm' + (sel ? ' danger' : '') + '" data-u="' + p.uid + '" onclick="offSetSpeaker(this.dataset.u)">' + (sel ? '🔇 إسكات' : '🎙️ فتح المايك') + '</button>';
+            h += '<button class="btn sm danger" data-u="' + p.uid + '" onclick="offKick(this.dataset.u)">🚫 طرد</button>';
         }
         return h + '</div>';
     }).join('');
@@ -10089,6 +10162,16 @@ function offStopShare() {
     VC.screenStream = null; VC.screenTrack = null; VC.sharing = false;
     offSignalAll({ share: false });
     offApplyPerms(); offPaintStage(); offPaintGrid(); offPaintBar();
+}
+function offSetMode(mode) {
+    if (!VC) return;
+    offPost('/api/officers/rooms/' + VC.n + '/mode', { mode: mode }).catch(function (e) { toast(e.message); });
+}
+async function offKick(uid) {
+    if (!VC) return;
+    var p = offFindP(VC.state, uid);
+    if (!(await confirmModal('تطرد ' + (p ? p.name : 'هذا الشخص') + ' من الروم؟'))) return;
+    offPost('/api/officers/rooms/' + VC.n + '/kick', { uid: uid }).then(function () { toast('🚫 تم الطرد'); }).catch(function (e) { toast(e.message); });
 }
 function offSetSpeaker(uid) {
     if (!VC) return;
