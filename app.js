@@ -204,6 +204,8 @@ const AccountSchema = new mongoose.Schema({
     tempSenior: { type: Boolean, default: false },
     sector: { type: String, default: null },
     isMP: { type: Boolean, default: false },
+    isOfficer: { type: Boolean, default: false },
+    officerRank: { type: String, default: null },
     answers: { available: { type: Boolean, default: false }, capable: { type: Boolean, default: false }, terms: { type: Boolean, default: false } },
     rejectReason: { type: String, default: null },
     reviewedBy: String, reviewedByTag: String, reviewedAt: Date,
@@ -1238,7 +1240,7 @@ function scheduleChanged() {
     }, 250);
 }
 app.use("/api", (req, res, next) => {
-    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0) {
+    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0 && !/^\/officers\/rooms\/\d+\/(signal|mode|speaker)/.test(req.path)) {
         res.on("finish", () => { if (res.statusCode < 400) scheduleChanged(); });
     }
     next();
@@ -1256,7 +1258,7 @@ app.get("/api/events", async (req, res) => {
     let closed = false;
     const c = { res, uid: req.user ? req.user.id : null, gt: /^[a-f0-9]{32}$/.test(String(req.query.gt || "")) ? String(req.query.gt) : null, isAdmin: false };
     const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch (e) {} }, 25000);
-    req.on("close", () => { closed = true; clearInterval(hb); sseClients.delete(c); });
+    req.on("close", () => { closed = true; clearInterval(hb); sseClients.delete(c); offOnSseClose(c.uid); });
     c.isAdmin = c.uid ? await isSupportAdmin(c.uid) : false;
     if (!closed) sseClients.add(c);
 });
@@ -4238,6 +4240,458 @@ app.delete("/api/support/admin/closed", async (req, res) => {
     sseBroadcast("ticket", { id: "", status: "closed", n: 0, from: "system", kind: "deleted" }, c => c.isAdmin);
 });
 
+// ============================================================================
+// 🎖️ سلك الضباط — تقديم + مقابلة (روم صوتي WebRTC) + تدريب
+// ============================================================================
+const OFFICER_QUESTIONS = [
+    "لماذا تريد الانضمام إلى سلك الضباط؟",
+    "ما الفرق بين الضابط والقائد؟",
+    "ما أهم صفة يجب أن يمتلكها الضابط؟ ولماذا؟",
+    "إذا أخطأ أحد أفرادك، كيف ستتعامل معه؟",
+    "إذا خالف صديقك النظام، هل ستعاقبه؟ ولماذا؟",
+    "إذا أصدر قائد أعلى منك أمرًا خاطئًا، ماذا تفعل؟",
+    "كيف تتصرف إذا فقدت السيطرة على موقف أثناء قيادتك؟",
+    "إذا تعارضت مصلحة القطاع مع مصلحة شخص قريب منك، ماذا تختار؟",
+    "ما الفرق بين الحزم والتسلط؟",
+    "كيف تكسب احترام أفرادك دون إساءة استخدام صلاحياتك؟",
+    "إذا اختلف ضابطان تحت قيادتك، كيف تحل الخلاف؟",
+    "ما أول شيء تفعله عند استلامك قيادة قطاع؟",
+    "إذا فشل قرار اتخذته، هل تعترف بالخطأ؟ ولماذا؟",
+    "ماذا تفعل إذا رفض أحد الأفراد تنفيذ أمر نظامي؟",
+    "كيف تتصرف تحت الضغط عندما لا تملك جميع المعلومات؟",
+    "هل الرتبة تعطيك الحق في تجاوز الأنظمة؟ وضّح.",
+    "إذا اكتشفت تقصيرًا من قائد أعلى منك، كيف تتصرف؟",
+    "ما الذي يجعلك تستحق رتبة ضابط أكثر من غيرك؟",
+    "اذكر موقفًا اضطررت فيه لاتخاذ قرار صعب، وكيف اتخذته.",
+    "إذا أصبحت ضابطًا غدًا، ما أول شيء ستغيره أو تطوره؟",
+];
+const OFFICER_RANKS = CONFIG.MILITARY_RANKS.slice(CONFIG.MILITARY_RANKS.indexOf("ملازم"));
+const OFFICER_ROOM_MODES = ["private", "listen", "open", "mute"];
+const OFFICER_OPEN_BEFORE_MS = 5 * 60 * 1000;
+
+const OfficerAppSchema = new mongoose.Schema({
+    uid: { type: String, required: true, unique: true },
+    name: String,
+    prevExperience: String,
+    discordUser: String,
+    answers: [String],
+    stage: { type: String, enum: ["pending", "interview", "training", "officer", "rejected"], default: "pending" },
+    rejectedAt: { type: String, default: null },
+    interview: {
+        room: { type: Number, default: null },
+        at: { type: Date, default: null },
+        enteredAt: { type: Date, default: null },
+        scheduledBy: { type: String, default: null },
+        decidedAt: { type: Date, default: null },
+    },
+    training: {
+        registered: { type: Boolean, default: false },
+        registeredAt: { type: Date, default: null },
+        attendedAt: { type: Date, default: null },
+        decidedAt: { type: Date, default: null },
+    },
+    officerRank: { type: String, default: null },
+    decidedBy: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now },
+}, { minimize: false });
+const OfficerApp = mongoose.model("OfficerApp", OfficerAppSchema);
+
+const OfficerRoom = mongoose.model("OfficerRoom", new mongoose.Schema({ n: { type: Number, unique: true } }));
+const OfficerRoomLogSchema = new mongoose.Schema({
+    n: Number, uid: String, name: String, isSenior: Boolean,
+    action: String, at: { type: Date, default: Date.now },
+});
+OfficerRoomLogSchema.index({ n: 1, at: -1 });
+const OfficerRoomLog = mongoose.model("OfficerRoomLog", OfficerRoomLogSchema);
+
+// ---------- حالة الرومات الصوتية (بالذاكرة) ----------
+const offLive = new Map();   // n -> Map(uid -> { uid, name, isSenior, joinedAt })
+const offCfg = new Map();    // n -> { mode, speakerUid }
+function offGetCfg(n) {
+    let c = offCfg.get(n);
+    if (!c) { c = { mode: "private", speakerUid: null }; offCfg.set(n, c); }
+    return c;
+}
+function offState(n) {
+    const cfg = offGetCfg(n);
+    const m = offLive.get(n) || new Map();
+    return {
+        n, mode: cfg.mode, speakerUid: cfg.speakerUid,
+        participants: Array.from(m.values()).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
+    };
+}
+function offPushState(n) {
+    const st = offState(n);
+    const uids = new Set(st.participants.map(p => p.uid));
+    sseBroadcast("vsig", { t: "state", state: st }, c => c.uid && uids.has(c.uid));
+}
+function offSendTo(uid, payload) {
+    sseBroadcast("vsig", payload, c => c.uid === uid);
+}
+function offIce() {
+    const arr = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }];
+    if (process.env.TURN_URL) {
+        arr.push({
+            urls: String(process.env.TURN_URL).split(",").map(x => x.trim()).filter(Boolean),
+            username: process.env.TURN_USER || "",
+            credential: process.env.TURN_PASS || "",
+        });
+    }
+    return arr;
+}
+function offRemove(uid, n) {
+    const m = offLive.get(n);
+    if (!m || !m.has(uid)) return;
+    const p = m.get(uid);
+    m.delete(uid);
+    const cfg = offGetCfg(n);
+    if (cfg.speakerUid === uid) cfg.speakerUid = null;
+    OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, action: "leave" }).catch(() => {});
+    offPushState(n);
+}
+function offRemoveEverywhere(uid) {
+    for (const n of Array.from(offLive.keys())) offRemove(uid, n);
+}
+function offOnSseClose(uid) {
+    if (!uid) return;
+    setTimeout(() => {
+        let still = false;
+        for (const c of sseClients) { if (c.uid === uid) { still = true; break; } }
+        if (!still) offRemoveEverywhere(uid);
+    }, 12000);
+}
+
+function offParseN(v) {
+    const n = parseInt(v, 10);
+    return Number.isInteger(n) && n >= 1 && n <= 999 ? n : null;
+}
+function offBuildDate(dateStr, hour, minute) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || ""))) return null;
+    const h = parseInt(hour, 10), m = parseInt(minute, 10);
+    if (!Number.isInteger(h) || h < 0 || h > 23 || !Number.isInteger(m) || m < 0 || m > 59) return null;
+    const pad = x => String(x).padStart(2, "0");
+    const d = new Date(dateStr + "T" + pad(h) + ":" + pad(m) + ":00+03:00");
+    return isNaN(d.getTime()) ? null : d;
+}
+function offPublicApp(a) {
+    if (!a) return null;
+    return {
+        id: String(a._id), name: a.name, stage: a.stage, rejectedAt: a.rejectedAt,
+        interview: { room: a.interview ? a.interview.room : null, at: a.interview ? a.interview.at : null, entered: !!(a.interview && a.interview.enteredAt) },
+        training: { registered: !!(a.training && a.training.registered), attended: !!(a.training && a.training.attendedAt) },
+        officerRank: a.officerRank, createdAt: a.createdAt,
+    };
+}
+
+async function offDiscordLookup(raw) {
+    const q = String(raw || "").trim().replace(/^@/, "");
+    if (!q) return { error: "ما فيه يوزر مكتوب" };
+    if (!botReady) return { error: "البوت غير متصل حالياً، حاول بعد شوي" };
+    const guild = client.guilds.cache.get(CONFIG.GUILD_ID) || await client.guilds.fetch(CONFIG.GUILD_ID).catch(() => null);
+    if (!guild) return { error: "تعذر الوصول لسيرفر الديسكورد" };
+    let member = null, user = null;
+    if (/^\d{15,22}$/.test(q)) {
+        member = await guild.members.fetch(q).catch(() => null);
+        if (!member) user = await client.users.fetch(q).catch(() => null);
+    } else {
+        const lower = q.toLowerCase();
+        const base = lower.split("#")[0];
+        const found = await guild.members.search({ query: base, limit: 10 }).catch(() => null);
+        if (found) {
+            const list = Array.from(found.values());
+            member = list.find(m => m.user.username.toLowerCase() === base)
+                || list.find(m => (m.user.tag || "").toLowerCase() === lower)
+                || list.find(m => (m.user.globalName || "").toLowerCase() === base)
+                || list.find(m => (m.nickname || "").toLowerCase() === base)
+                || null;
+        }
+    }
+    if (member) {
+        return {
+            ok: true, inServer: true,
+            discordName: member.displayName || member.user.globalName || member.user.username,
+            username: member.user.username, id: member.id,
+        };
+    }
+    if (user) {
+        return { ok: true, inServer: false, discordName: user.globalName || user.username, username: user.username, id: user.id };
+    }
+    return { ok: true, inServer: false, discordName: null, username: q, id: null };
+}
+
+// ---------- التقديم (للجميع) ----------
+app.get("/api/officers/me", ensureAuth, async (req, res) => {
+    const a = await OfficerApp.findOne({ uid: req.user.id }).lean();
+    res.json({ app: offPublicApp(a), questions: OFFICER_QUESTIONS, serverNow: Date.now() });
+});
+
+app.post("/api/officers/apply", ensureAuth, async (req, res) => {
+    const b = req.body || {};
+    const clean = (v, max) => String(v || "").trim().slice(0, max);
+    const name = clean(b.name, 60);
+    const prev = clean(b.prevExperience, 400);
+    const discordUser = clean(b.discordUser, 60);
+    if (name.length < 2) return res.status(400).json({ error: "اكتب اسمك" });
+    if (!prev) return res.status(400).json({ error: "اكتب خبراتك السابقة (وإذا ما عندك اكتب: لا يوجد)" });
+    if (discordUser.length < 2) return res.status(400).json({ error: "اكتب يوزرك في الديسكورد" });
+    const answers = Array.isArray(b.answers) ? b.answers.map(x => clean(x, 1500)) : [];
+    if (answers.length !== OFFICER_QUESTIONS.length) return res.status(400).json({ error: "الاستبيان ناقص، أعد تحميل الصفحة" });
+    const miss = answers.findIndex(x => !x);
+    if (miss >= 0) return res.status(400).json({ error: "جاوب على السؤال رقم " + (miss + 1) });
+    const exists = await OfficerApp.findOne({ uid: req.user.id }).lean();
+    if (exists) return res.status(409).json({ error: "عندك تقديم سابق في سلك الضباط" });
+    try {
+        await OfficerApp.create({ uid: req.user.id, name, prevExperience: prev, discordUser, answers });
+    } catch (e) {
+        if (e && e.code === 11000) return res.status(409).json({ error: "عندك تقديم سابق في سلك الضباط" });
+        throw e;
+    }
+    await logEvent({ action: "تقديم سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: name });
+    res.json({ ok: true });
+});
+
+// ---------- الكبار: التقديمات ----------
+app.get("/api/officers/admin/applications", ensureSeniorAdmin, async (req, res) => {
+    const all = await OfficerApp.find({}).sort({ createdAt: 1 }).lean();
+    const pending = all.filter(a => a.stage === "pending").map(a => ({
+        id: String(a._id), name: a.name, prevExperience: a.prevExperience, discordUser: a.discordUser,
+        answers: a.answers, createdAt: a.createdAt,
+    }));
+    const history = all.filter(a => a.stage !== "pending").reverse().map(a => ({
+        id: String(a._id), name: a.name, stage: a.stage, rejectedAt: a.rejectedAt, officerRank: a.officerRank,
+    }));
+    res.json({ pending, history, questions: OFFICER_QUESTIONS });
+});
+
+app.post("/api/officers/admin/applications/:id/check-user", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findById(req.params.id).lean();
+    if (!a) return res.status(404).json({ error: "الطلب غير موجود" });
+    const r = await offDiscordLookup(a.discordUser);
+    if (r.error) return res.status(503).json({ error: r.error });
+    res.json(r);
+});
+
+app.post("/api/officers/admin/applications/:id/approve", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findById(req.params.id);
+    if (!a || a.stage !== "pending") return res.status(404).json({ error: "الطلب غير موجود أو تم البت فيه" });
+    const b = req.body || {};
+    const at = offBuildDate(b.date, b.hour, b.minute);
+    if (!at) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
+    const room = offParseN(b.room);
+    if (!room) return res.status(400).json({ error: "حدد روم المقابلة" });
+    await OfficerRoom.updateOne({ n: room }, { $setOnInsert: { n: room } }, { upsert: true });
+    a.stage = "interview";
+    a.interview.room = room;
+    a.interview.at = at;
+    a.interview.scheduledBy = req.user.id;
+    a.decidedBy = req.user.id;
+    await a.save();
+    await logEvent({ action: "قبول تقديم سلك الضباط + موعد مقابلة", actorId: req.user.id, actorTag: req.user.username, details: a.name + " — روم " + room });
+    res.json({ ok: true });
+});
+
+app.post("/api/officers/admin/applications/:id/reject", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findById(req.params.id);
+    if (!a || a.stage !== "pending") return res.status(404).json({ error: "الطلب غير موجود أو تم البت فيه" });
+    a.stage = "rejected"; a.rejectedAt = "application"; a.decidedBy = req.user.id;
+    await a.save();
+    await logEvent({ action: "رفض تقديم سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: a.name });
+    res.json({ ok: true });
+});
+
+app.delete("/api/officers/admin/applications/:id", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findByIdAndDelete(req.params.id);
+    if (!a) return res.status(404).json({ error: "الطلب غير موجود" });
+    offRemoveEverywhere(a.uid);
+    await logEvent({ action: "حذف تقديم سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: a.name });
+    res.json({ ok: true });
+});
+
+// ---------- الكبار: المقابلة ----------
+app.get("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
+    await OfficerRoom.updateOne({ n: 1 }, { $setOnInsert: { n: 1 } }, { upsert: true });
+    const rooms = await OfficerRoom.find({}).sort({ n: 1 }).lean();
+    const apps = await OfficerApp.find({ stage: "interview" }).lean();
+    const out = [];
+    for (const r of rooms) {
+        const st = offState(r.n);
+        const logs = await OfficerRoomLog.find({ n: r.n }).sort({ at: -1 }).limit(40).lean();
+        const live = offLive.get(r.n) || new Map();
+        out.push({
+            n: r.n, mode: st.mode, speakerUid: st.speakerUid, participants: st.participants,
+            log: logs.map(l => ({ name: l.name, isSenior: l.isSenior, action: l.action, at: l.at })),
+            interviewees: apps.filter(a => a.interview && a.interview.room === r.n)
+                .sort((x, y) => new Date(x.interview.at) - new Date(y.interview.at))
+                .map(a => ({ id: String(a._id), name: a.name, at: a.interview.at, entered: !!a.interview.enteredAt, inRoom: live.has(a.uid) })),
+        });
+    }
+    res.json({ rooms: out });
+});
+
+app.post("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
+    const last = await OfficerRoom.findOne({}).sort({ n: -1 }).lean();
+    const n = (last ? last.n : 0) + 1;
+    if (n > 999) return res.status(400).json({ error: "وصلت الحد الأعلى للرومات" });
+    await OfficerRoom.create({ n });
+    res.json({ ok: true, n });
+});
+
+app.post("/api/officers/admin/applications/:id/interview-result", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findById(req.params.id);
+    if (!a || a.stage !== "interview") return res.status(404).json({ error: "الطلب غير موجود أو تم البت فيه" });
+    if (!a.interview.enteredAt) return res.status(400).json({ error: "هذا الشخص ما دخل المقابلة بعد" });
+    const result = String((req.body || {}).result || "");
+    if (result !== "accepted" && result !== "rejected") return res.status(400).json({ error: "نتيجة غير صحيحة" });
+    a.interview.decidedAt = new Date();
+    a.decidedBy = req.user.id;
+    if (result === "accepted") { a.stage = "training"; }
+    else { a.stage = "rejected"; a.rejectedAt = "interview"; }
+    await a.save();
+    await logEvent({ action: result === "accepted" ? "قبول مقابلة سلك الضباط" : "رفض مقابلة سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: a.name });
+    res.json({ ok: true });
+});
+
+// ---------- الكبار: التدريب ----------
+app.get("/api/officers/admin/training", ensureSeniorAdmin, async (req, res) => {
+    const list = await OfficerApp.find({ stage: "training" }).sort({ createdAt: 1 }).lean();
+    res.json({
+        ranks: OFFICER_RANKS,
+        eligible: list.filter(a => !(a.training && a.training.registered)).map(a => ({ id: String(a._id), name: a.name })),
+        trainees: list.filter(a => a.training && a.training.registered).map(a => ({
+            id: String(a._id), name: a.name, registeredAt: a.training.registeredAt, attendedAt: a.training.attendedAt,
+        })),
+    });
+});
+
+app.post("/api/officers/admin/applications/:id/register-trainee", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findById(req.params.id);
+    if (!a || a.stage !== "training") return res.status(404).json({ error: "هذا الشخص غير موجود بمرحلة التدريب" });
+    if (a.training.registered) return res.status(400).json({ error: "مسجّل متدرب من قبل" });
+    a.training.registered = true; a.training.registeredAt = new Date();
+    await a.save();
+    await logEvent({ action: "تسجيل متدرب سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: a.name });
+    res.json({ ok: true });
+});
+
+app.post("/api/officers/admin/applications/:id/attended", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findById(req.params.id);
+    if (!a || a.stage !== "training" || !a.training.registered) return res.status(404).json({ error: "هذا الشخص غير مسجّل متدرب" });
+    if (a.training.attendedAt) return res.status(400).json({ error: "تم تسجيل حضوره من قبل" });
+    a.training.attendedAt = new Date();
+    await a.save();
+    await logEvent({ action: "حضور تدريب سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: a.name });
+    res.json({ ok: true });
+});
+
+app.post("/api/officers/admin/applications/:id/training-result", ensureSeniorAdmin, async (req, res) => {
+    const a = await OfficerApp.findById(req.params.id);
+    if (!a || a.stage !== "training" || !a.training.registered) return res.status(404).json({ error: "هذا الشخص غير موجود بالتدريب" });
+    if (!a.training.attendedAt) return res.status(400).json({ error: "سجّل حضوره للتدريب أول" });
+    const b = req.body || {};
+    const result = String(b.result || "");
+    if (result !== "accepted" && result !== "rejected") return res.status(400).json({ error: "نتيجة غير صحيحة" });
+    a.training.decidedAt = new Date();
+    a.decidedBy = req.user.id;
+    if (result === "accepted") {
+        const rank = String(b.rank || "");
+        if (!OFFICER_RANKS.includes(rank)) return res.status(400).json({ error: "حدد رتبة الضابط" });
+        a.stage = "officer"; a.officerRank = rank;
+        await a.save();
+        await Account.updateOne({ uid: a.uid }, { $set: { isOfficer: true, officerRank: rank } });
+        await Personnel.updateOne({ discord: a.uid }, { $set: { rank }, $setOnInsert: { discordTag: a.name } }, { upsert: true });
+        await logEvent({ action: "قبول ضابط جديد", discordId: a.uid, discordTag: a.name, actorId: req.user.id, actorTag: req.user.username, details: a.name + " — الرتبة: " + rank });
+    } else {
+        a.stage = "rejected"; a.rejectedAt = "training";
+        await a.save();
+        await logEvent({ action: "رفض بعد التدريب (سلك الضباط)", actorId: req.user.id, actorTag: req.user.username, details: a.name });
+    }
+    res.json({ ok: true });
+});
+
+// ---------- الروم الصوتي ----------
+app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
+    const n = offParseN(req.params.n);
+    if (!n) return res.status(400).json({ error: "روم غير صحيح" });
+    const uid = req.user.id;
+    const senior = isSeniorAdmin(uid);
+    let name = req.user.username;
+    let appDoc = null;
+    if (senior) {
+        await OfficerRoom.updateOne({ n }, { $setOnInsert: { n } }, { upsert: true });
+    } else {
+        appDoc = await OfficerApp.findOne({ uid, stage: "interview", "interview.room": n });
+        if (!appDoc || !appDoc.interview || !appDoc.interview.at) return res.status(403).json({ error: "ما عندك مقابلة بهذا الروم" });
+        if (Date.now() < new Date(appDoc.interview.at).getTime() - OFFICER_OPEN_BEFORE_MS) {
+            return res.status(403).json({ error: "الروم ينفتح قبل موعد مقابلتك بخمس دقايق" });
+        }
+        name = appDoc.name || name;
+    }
+    for (const otherN of Array.from(offLive.keys())) { if (otherN !== n) offRemove(uid, otherN); }
+    let m = offLive.get(n);
+    if (!m) { m = new Map(); offLive.set(n, m); }
+    const existing = Array.from(m.keys()).filter(u => u !== uid);
+    const wasIn = m.has(uid);
+    m.set(uid, { uid, name, isSenior: senior, joinedAt: Date.now() });
+    offPushState(n);
+    if (!wasIn) OfficerRoomLog.create({ n, uid, name, isSenior: senior, action: "join" }).catch(() => {});
+    if (appDoc && !appDoc.interview.enteredAt) {
+        await OfficerApp.updateOne({ _id: appDoc._id }, { $set: { "interview.enteredAt": new Date() } });
+    }
+    res.json({ ok: true, state: offState(n), existing, iceServers: offIce() });
+});
+
+app.post("/api/officers/rooms/:n/leave", ensureAuth, async (req, res) => {
+    const n = offParseN(req.params.n);
+    if (n) offRemove(req.user.id, n);
+    res.json({ ok: true });
+});
+
+app.get("/api/officers/rooms/:n/state", ensureAuth, async (req, res) => {
+    const n = offParseN(req.params.n);
+    const m = n ? offLive.get(n) : null;
+    if (!m || !m.has(req.user.id)) return res.status(404).json({ error: "أنت لست داخل الروم" });
+    res.json({ state: offState(n) });
+});
+
+app.post("/api/officers/rooms/:n/signal", ensureAuth, async (req, res) => {
+    const n = offParseN(req.params.n);
+    const m = n ? offLive.get(n) : null;
+    const to = String((req.body || {}).to || "");
+    if (!m || !m.has(req.user.id) || !m.has(to) || to === req.user.id) return res.status(404).json({ error: "غير موجود بالروم" });
+    const data = (req.body || {}).data;
+    if (!data || typeof data !== "object" || JSON.stringify(data).length > 60000) return res.status(400).json({ error: "بيانات غير صحيحة" });
+    offSendTo(to, { t: "signal", n, from: req.user.id, data });
+    res.json({ ok: true });
+});
+
+app.post("/api/officers/rooms/:n/mode", ensureSeniorAdmin, async (req, res) => {
+    const n = offParseN(req.params.n);
+    const mode = String((req.body || {}).mode || "");
+    if (!n || !OFFICER_ROOM_MODES.includes(mode)) return res.status(400).json({ error: "وضع غير صحيح" });
+    offGetCfg(n).mode = mode;
+    offPushState(n);
+    res.json({ ok: true });
+});
+
+app.post("/api/officers/rooms/:n/speaker", ensureSeniorAdmin, async (req, res) => {
+    const n = offParseN(req.params.n);
+    if (!n) return res.status(400).json({ error: "روم غير صحيح" });
+    const uid = (req.body || {}).uid ? String(req.body.uid) : null;
+    const cfg = offGetCfg(n);
+    if (uid) {
+        const m = offLive.get(n);
+        const p = m ? m.get(uid) : null;
+        if (!p) return res.status(404).json({ error: "هذا الشخص مو داخل الروم" });
+        if (p.isSenior) return res.status(400).json({ error: "هذا من الكبار" });
+        cfg.speakerUid = uid;
+    } else {
+        cfg.speakerUid = null;
+    }
+    offPushState(n);
+    res.json({ ok: true });
+});
+
+
 app.get("/", (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -4536,6 +4990,48 @@ app.get("/", (req, res) => {
     .sp-prev img { height: 46px; border-radius: 6px; }
     #sp-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 6000; display: none; align-items: center; justify-content: center; padding: 14px; }
     #sp-lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+    .off-steps { display: flex; gap: 8px; margin-bottom: 16px; }
+    .off-step { flex: 1; text-align: center; padding: 10px 6px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: var(--muted); font-size: 13px; font-weight: 700; }
+    .off-step.cur { background: var(--green2); color: #fff; border-color: var(--green2); }
+    .off-step.done { color: #4ade80; border-color: #22c55e; }
+    .off-step.bad { color: #fca5a5; border-color: #ef4444; }
+    .off-rules { margin: 10px 0 14px; padding: 0; list-style: none; }
+    .off-rules li { background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; margin-bottom: 7px; font-size: 14px; line-height: 1.8; }
+    .off-rules.strict li { border-color: rgba(239,68,68,0.45); background: rgba(239,68,68,0.07); }
+    .off-ov { position: fixed; inset: 0; z-index: 6000; background: rgba(5,10,20,0.78); display: flex; align-items: center; justify-content: center; padding: 14px; }
+    .off-box { background: linear-gradient(160deg, #0d1f3c, #0a1628); border: 1px solid var(--border); border-radius: 14px; width: 100%; max-width: 420px; max-height: 90vh; overflow-y: auto; padding: 20px; }
+    .off-qa { border-top: 1px dashed rgba(255,255,255,0.1); padding: 8px 0; font-size: 13px; }
+    .off-qa b { color: var(--gold-soft); display: block; margin-bottom: 3px; }
+    .off-qa div { white-space: pre-wrap; word-break: break-word; }
+    .off-chip { display: inline-block; background: rgba(59,130,246,0.18); border: 1px solid var(--border); border-radius: 20px; padding: 3px 12px; font-size: 12px; margin: 0 0 6px 6px; }
+    .off-chip.sen { border-color: #eab308; color: #fbbf24; }
+    .off-logrow { font-size: 12px; color: var(--muted); padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); }
+    .off-res { font-size: 13px; margin-top: 8px; padding: 8px 12px; border-radius: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); }
+    #off-voice { position: fixed; inset: 0; z-index: 4000; background: linear-gradient(160deg, #060e1c, #0a1628); overflow-y: auto; padding: 14px 14px 110px; }
+    .ov-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .ov-head b { color: var(--gold-soft); font-size: 17px; }
+    .ov-modes { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .ov-mode { flex: 1 1 150px; padding: 10px 8px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.05); color: #94a3b8; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+    .ov-mode.on { background: var(--green2); color: #fff; border-color: var(--green2); }
+    .ov-note { text-align: center; font-size: 13px; color: var(--muted); margin: 8px 0 12px; }
+    .ov-stage { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+    .ov-vwrap { background: #000; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
+    .ov-vwrap video { width: 100%; max-height: 62vh; display: block; background: #000; }
+    .ov-vcap { background: rgba(255,255,255,0.06); padding: 5px 10px; font-size: 12px; color: var(--gold-soft); }
+    .ov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+    .ov-tile { background: rgba(255,255,255,0.05); border: 2px solid transparent; border-radius: 14px; padding: 14px 8px 10px; text-align: center; transition: border-color 0.15s, box-shadow 0.15s; }
+    .ov-tile.sel { border-color: #eab308; }
+    .ov-tile.speaking { border-color: #22c55e; box-shadow: 0 0 0 3px rgba(34,197,94,0.25); }
+    .ov-av { width: 56px; height: 56px; border-radius: 50%; margin: 0 auto 8px; background: linear-gradient(135deg, #1d4ed8, #60a5fa); display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 800; color: #fff; }
+    .ov-name { font-size: 13px; font-weight: 700; word-break: break-word; }
+    .ov-role { font-size: 11px; color: var(--muted); margin: 3px 0; }
+    .ov-ic { font-size: 16px; min-height: 22px; }
+    .ov-tile .btn { margin-top: 6px; width: 100%; padding: 0.35rem 0.4rem; font-size: 12px; }
+    .ov-bar { position: fixed; bottom: 0; left: 0; right: 0; z-index: 4100; display: flex; justify-content: center; gap: 12px; padding: 14px; background: rgba(5,15,30,0.95); border-top: 1px solid rgba(59,130,246,0.3); }
+    .ov-btn { min-width: 108px; padding: 12px 16px; border-radius: 30px; border: 1px solid var(--border); background: rgba(255,255,255,0.08); color: #fff; font-family: inherit; font-size: 14px; font-weight: 700; cursor: pointer; }
+    .ov-btn.off { background: #7f1d1d; border-color: #ef4444; }
+    .ov-btn.dis { opacity: 0.45; }
+    .ov-btn.leave { background: #ef4444; border-color: #ef4444; }
 </style>
 <div id="wf-overlay">
     <div class="wf-box" id="wf-box"></div>
@@ -5205,6 +5701,7 @@ function spConnect() {
             try { var d = JSON.parse(e.data); if (SP.cur && SP.cur.id === d.id) { SP.cur.typing = !!d.on; spShowTyping(); } } catch (x) {}
         });
         es.addEventListener('changed', function () { spLiveRefresh(); });
+        es.addEventListener('vsig', function (e) { try { offOnVsig(JSON.parse(e.data)); } catch (x) {} });
     } catch (e) {}
 }
 function spReconnect() { if (SP.es) { try { SP.es.close(); } catch (e) {} SP.es = null; SP.esOk = false; } spConnect(); }
@@ -5684,6 +6181,8 @@ function buildNav() {
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
+    items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
+    if (ME.isSeniorAdmin) items.push({ label: '🎖️ إدارة سلك الضباط', fn: 'renderOfficerAdmin()' });
     items.push({ label: '🎧 الدعم', fn: 'spOpen()', cls: 'sp-nav-user' });
     if (ME.isAdmin) items.push({ label: '🎧 تذاكر الدعم', fn: 'renderSupportAdmin()', cls: 'sp-nav-admin' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
@@ -5797,6 +6296,7 @@ async function pollTick() {
         if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending();
         checkPendingWarning();
         checkPromotionAlert();
+        offOnPoll();
     } catch (e) {}
 }
 function startBlockedRecheck() {
@@ -8868,6 +9368,843 @@ async function saveSettings() {
     try { await api('/api/senior/settings', { method: 'POST', body: JSON.stringify(body) }); toast('تم الحفظ'); }
     catch (e) { toast(e.message); }
 }
+/* ============================ 🎖️ سلك الضباط ============================ */
+var OFF = { my: null, questions: [], offset: 0, sig: '', tick: null };
+var OFFA = { tab: 'apps', sig: '', timer: null, data: null, checks: {} };
+var VC = null;
+var OFF_MODES = [
+    { k: 'private', t: '🔒 خاص (الكبار والمتحدث فقط)' },
+    { k: 'listen', t: '👂 الكل يسمع المتحدث' },
+    { k: 'open', t: '🗣️ الكل يتكلم ويسمع' },
+    { k: 'mute', t: '🔇 ما أحد يتكلم' }
+];
+
+function offNow() { return Date.now() + OFF.offset; }
+async function offFetch(url, opts) {
+    var o = Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {});
+    var r = await fetch(url, o);
+    var d = await r.json().catch(function () { return {}; });
+    if (!r.ok) { var er = new Error(d.error || 'خطأ'); er.status = r.status; throw er; }
+    return d;
+}
+function offPost(url, body) { return offFetch(url, { method: 'POST', body: JSON.stringify(body || {}) }); }
+function offFmt(d) {
+    try { return new Date(d).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh', weekday: 'long', day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit', hour12: true }); }
+    catch (e) { return String(d); }
+}
+function offFmtTime(d) {
+    try { return new Date(d).toLocaleTimeString('ar-SA', { timeZone: 'Asia/Riyadh', hour: 'numeric', minute: '2-digit', hour12: true }); }
+    catch (e) { return String(d); }
+}
+function offCountdown(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    var d = Math.floor(s / 86400); s -= d * 86400;
+    var h = Math.floor(s / 3600); s -= h * 3600;
+    var m = Math.floor(s / 60); s -= m * 60;
+    var p = function (x) { return (x < 10 ? '0' : '') + x; };
+    if (d > 0) return d + ' يوم و ' + h + ' ساعة';
+    if (h > 0) return h + ':' + p(m) + ':' + p(s);
+    return p(m) + ':' + p(s);
+}
+function offStopTimers() {
+    if (OFF.tick) { clearInterval(OFF.tick); OFF.tick = null; }
+    if (OFFA.timer) { clearInterval(OFFA.timer); OFFA.timer = null; }
+}
+function offModalOpen(html) {
+    offModalClose();
+    var ov = document.createElement('div');
+    ov.className = 'off-ov'; ov.id = 'off-modal';
+    ov.innerHTML = '<div class="off-box">' + html + '</div>';
+    document.body.appendChild(ov);
+}
+function offModalClose() {
+    var m = document.getElementById('off-modal');
+    if (m) m.remove();
+}
+
+/* ---------------------------- صفحة المتقدم ---------------------------- */
+function renderOfficerPage() {
+    offStopTimers();
+    OFF.sig = '';
+    document.getElementById('app').innerHTML = '<div id="off-root"><div class="card">جارِ التحميل...</div></div>';
+    offLoadMe(false);
+}
+async function offLoadMe(silent) {
+    try {
+        var d = await offFetch('/api/officers/me');
+        OFF.offset = d.serverNow - Date.now();
+        OFF.questions = d.questions;
+        var sig = JSON.stringify(d.app || null);
+        if (silent && sig === OFF.sig) return;
+        OFF.sig = sig; OFF.my = d.app;
+        if (document.getElementById('off-root')) offPaintApplicant();
+    } catch (e) { if (!silent) toast(e.message); }
+}
+function offStepIndex(a) {
+    if (!a) return 0;
+    if (a.stage === 'pending') return 0;
+    if (a.stage === 'interview') return 1;
+    if (a.stage === 'training' || a.stage === 'officer') return 2;
+    if (a.stage === 'rejected') return a.rejectedAt === 'application' ? 0 : (a.rejectedAt === 'interview' ? 1 : 2);
+    return 0;
+}
+function offStepsHtml(a) {
+    var names = ['1- التقديم', '2- المقابلة', '3- التدريب'];
+    var cur = offStepIndex(a);
+    var bad = !!(a && a.stage === 'rejected');
+    var fin = !!(a && a.stage === 'officer');
+    return '<div class="off-steps">' + names.map(function (n, i) {
+        var c = 'off-step';
+        if (i < cur || (fin && i === cur)) c += ' done';
+        else if (i === cur) c += bad ? ' bad' : ' cur';
+        return '<div class="' + c + '">' + n + '</div>';
+    }).join('') + '</div>';
+}
+function offPaintApplicant() {
+    var root = document.getElementById('off-root');
+    if (!root) return;
+    var a = OFF.my;
+    var h = '<div class="card row"><h2>🎖️ سلك الضباط</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>';
+    h += offStepsHtml(a);
+    if (!a) h += offFormHtml();
+    else if (a.stage === 'pending') h += offPendingHtml();
+    else if (a.stage === 'interview') h += offInterviewHtml(a);
+    else if (a.stage === 'training') h += offTrainingHtml(a);
+    else if (a.stage === 'officer') h += offOfficerHtml(a);
+    else h += offRejectedHtml(a);
+    root.innerHTML = h;
+    if (OFF.tick) { clearInterval(OFF.tick); OFF.tick = null; }
+    if (a && a.stage === 'interview') { OFF.tick = setInterval(offTick, 1000); offTick(); }
+}
+function offFormHtml() {
+    var h = '<div class="card"><h2>🎖️ سلك الضباط | استبيان التقديم</h2>';
+    h += '<label>الاسم:</label><input id="off-f-name" maxlength="60" value="' + spEsc((ME && ME.registeredName) || '') + '">';
+    h += '<label>خبراتك السابقة في سلك الضباط:</label><textarea id="off-f-exp" rows="2" maxlength="400" placeholder="اكتب خبراتك، وإذا ما عندك اكتب: لا يوجد"></textarea>';
+    h += '<label>يوزرك في الديسكورد:</label><input id="off-f-ds" maxlength="60" dir="ltr" placeholder="username">';
+    h += '<div style="text-align:center;color:var(--muted);margin:14px 0;">━━━━━━━━━━━━━━━━━━</div>';
+    OFF.questions.forEach(function (q, i) {
+        h += '<label>' + (i + 1) + '- ' + spEsc(q) + '</label><textarea class="off-f-q" rows="3" maxlength="1500"></textarea>';
+    });
+    h += '<button class="btn" onclick="offSubmitApply()">📨 إرسال التقديم</button></div>';
+    return h;
+}
+async function offSubmitApply() {
+    var name = document.getElementById('off-f-name').value.trim();
+    var exp = document.getElementById('off-f-exp').value.trim();
+    var ds = document.getElementById('off-f-ds').value.trim();
+    var answers = Array.prototype.map.call(document.querySelectorAll('.off-f-q'), function (t) { return t.value.trim(); });
+    if (name.length < 2) return toast('اكتب اسمك');
+    if (!exp) return toast('اكتب خبراتك السابقة (أو اكتب: لا يوجد)');
+    if (ds.length < 2) return toast('اكتب يوزرك في الديسكورد');
+    var miss = answers.findIndex(function (x) { return !x; });
+    if (miss >= 0) return toast('جاوب على السؤال رقم ' + (miss + 1));
+    try {
+        await api('/api/officers/apply', { method: 'POST', body: JSON.stringify({ name: name, prevExperience: exp, discordUser: ds, answers: answers }) });
+        toast('✅ تم إرسال تقديمك');
+        offLoadMe(false);
+    } catch (e) { toast(e.message); }
+}
+function offPendingHtml() {
+    return '<div class="card center"><div style="font-size:54px;">⏳</div><h3>انتظر قبولك</h3>' +
+        '<p style="color:var(--muted);line-height:1.9;">وصل تقديمك للكبار، وبانتظار قرارهم. إذا انقبل تقديمك يظهر لك هنا موعد المقابلة.</p></div>';
+}
+function offInterviewHtml(a) {
+    var iv = a.interview || {};
+    var h = '<div class="card"><h2>🎙️ المقابلة</h2>';
+    h += '<p>تم قبول تقديمك ✅ وهذا موعد مقابلتك:</p>';
+    h += '<div class="stat" style="margin:10px 0;"><div class="num" style="font-size:18px;">' + spEsc(offFmt(iv.at)) + '</div><div class="lbl">روم المقابلة رقم ' + iv.room + ' (بتوقيت السعودية)</div></div>';
+    h += '<h3>📋 تعليمات المقابلة</h3><ul class="off-rules">';
+    h += '<li>تأكد إن المايك شغال وسماعتك تمام قبل لا تدخل.</li>';
+    h += '<li>الزر ينفتح قبل الموعد بخمس دقايق، ادخل بدري وخلك جاهز.</li>';
+    h += '<li>لا تتكلم إلا إذا الكبير فتح لك المايك، وانتظر دورك.</li>';
+    h += '<li>خلك جاد ومحترم وجاوب بوضوح وبدون استهبال.</li>';
+    h += '<li>ممنوع تسجل المقابلة أو تصورها أو تنشرها.</li>';
+    h += '<li>لا تطلع من الروم إلا إذا قالوا لك.</li>';
+    h += '<li>بعد ما تخلص انتظر النتيجة هنا في الموقع.</li>';
+    h += '</ul>';
+    h += '<button class="btn gold" id="off-enter-btn" onclick="offEnterClick()">🔒 دخول الروم الصوتي</button>';
+    if (iv.entered) h += '<div class="off-res">✅ سبق ودخلت المقابلة، انتظر قرار الكبار.</div>';
+    h += '</div>';
+    return h;
+}
+function offTick() {
+    var b = document.getElementById('off-enter-btn');
+    if (!b || !OFF.my || OFF.my.stage !== 'interview') { if (OFF.tick) { clearInterval(OFF.tick); OFF.tick = null; } return; }
+    var at = new Date(OFF.my.interview.at).getTime();
+    var left = at - 5 * 60 * 1000 - offNow();
+    if (left > 0) {
+        b.disabled = true; b.style.opacity = '0.5';
+        b.textContent = '🔒 دخول الروم الصوتي — ينفتح بعد ' + offCountdown(left);
+    } else {
+        b.disabled = false; b.style.opacity = '';
+        b.textContent = '🎙️ دخول الروم الصوتي';
+    }
+}
+function offEnterClick() {
+    if (!OFF.my || !OFF.my.interview) return;
+    var at = new Date(OFF.my.interview.at).getTime();
+    if (offNow() < at - 5 * 60 * 1000) return toast('الروم لسا مقفل');
+    offJoinVoice(OFF.my.interview.room);
+}
+function offTrainingHtml(a) {
+    var t = a.training || {};
+    var h = '<div class="card"><h2>🏋️ التدريب</h2>';
+    h += '<p>تم قبولك من المقابلة ✅</p>';
+    if (!t.registered) h += '<div class="off-res">⏳ بانتظار الكبار يسجلونك متدرب.</div>';
+    else if (!t.attended) h += '<div class="off-res">📝 تم تسجيلك متدرب، انتظر موعد التدريب من الكبار.</div>';
+    else h += '<div class="off-res">✅ تم تسجيل حضورك للتدريب، بانتظار قرار الكبار النهائي.</div>';
+    h += '<h3 style="margin-top:16px;">⚠️ تعليمات التدريب (صارمة)</h3><ul class="off-rules strict">';
+    h += '<li>لازم تدخل بدري قبل موعد التدريب، والتأخير يعرضك للرفض.</li>';
+    h += '<li>لازم تكون حاضر وموجود طول التدريب، ممنوع الغياب أو الانسحاب.</li>';
+    h += '<li>التزم بكل أوامر وتعليمات الكبار بدون نقاش.</li>';
+    h += '<li>ممنوع الاستهتار أو المزح أو الإزعاج أثناء التدريب.</li>';
+    h += '<li>جهّز مايكك وحسابك قبل التدريب ولا تضيع وقت الباقين.</li>';
+    h += '<li>قرار القبول أو الرفض بعد التدريب من الكبار ونهائي.</li>';
+    h += '</ul></div>';
+    return h;
+}
+function offOfficerHtml(a) {
+    return '<div class="card center"><div style="font-size:60px;">🎖️</div><h2>مبروك! صرت ضابط</h2>' +
+        '<p style="color:var(--gold-soft);font-size:18px;font-weight:800;">رتبتك: ' + spEsc(a.officerRank || '') + '</p></div>';
+}
+function offRejectedHtml(a) {
+    var msg = a.rejectedAt === 'application' ? 'للأسف تم رفض تقديمك.' : (a.rejectedAt === 'interview' ? 'للأسف تم رفضك بعد المقابلة.' : 'للأسف تم رفضك بعد التدريب.');
+    return '<div class="card center"><div style="font-size:54px;">❌</div><h3>' + msg + '</h3>' +
+        '<p style="color:var(--muted);line-height:1.9;">لو عندك استفسار تواصل مع الكبار.</p></div>';
+}
+
+/* ---------------------------- الروم الصوتي (WebRTC) ---------------------------- */
+function offFindP(st, uid) {
+    for (var i = 0; i < st.participants.length; i++) if (st.participants[i].uid === uid) return st.participants[i];
+    return null;
+}
+/* هل from يقدر يسمعه to ؟ */
+function offAllowed(st, from, to) {
+    if (from === to) return false;
+    var f = offFindP(st, from), t = offFindP(st, to);
+    if (!f || !t) return false;
+    if (f.isSenior && t.isSenior) return true;
+    var sp = st.speakerUid, mode = st.mode;
+    if (f.isSenior) {
+        if (mode === 'private') return to === sp;
+        return true;
+    }
+    if (mode === 'open') return true;
+    if (mode === 'mute') return false;
+    if (from !== sp) return false;
+    if (t.isSenior) return true;
+    return mode === 'listen';
+}
+function offCanSpeak() {
+    if (!VC) return false;
+    return VC.state.participants.some(function (p) { return p.uid !== VC.me && offAllowed(VC.state, VC.me, p.uid); });
+}
+function offCanShare() {
+    if (!VC) return false;
+    return VC.isSenior || offCanSpeak();
+}
+function offModeDesc(m) {
+    if (m === 'private') return 'المتحدث يسمعه الكبار فقط، وما يسمع إلا الكبار.';
+    if (m === 'listen') return 'الكل يسمع المتحدث والكبار، والمتقدمين الباقين ما يتكلمون.';
+    if (m === 'open') return 'الكل يتكلم ويسمع.';
+    return 'المتقدمين ما يتكلمون ولا أحد يسمعهم، والكبار يسمعون بس.';
+}
+function offSignal(uid, data) {
+    if (!VC) return;
+    offPost('/api/officers/rooms/' + VC.n + '/signal', { to: uid, data: data }).catch(function () {});
+}
+function offSignalAll(data) {
+    if (!VC) return;
+    Object.keys(VC.peers).forEach(function (uid) { offSignal(uid, data); });
+}
+function offQueue(uid, fn) {
+    if (!VC) return;
+    VC.q[uid] = (VC.q[uid] || Promise.resolve()).then(fn).catch(function () {});
+}
+
+async function offJoinVoice(n) {
+    if (VC) { toast('أنت داخل روم حالياً'); return; }
+    if (!window.RTCPeerConnection || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        toast('متصفحك لا يدعم الصوت، استخدم Chrome أو Safari حديث');
+        return;
+    }
+    var stream;
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+    } catch (e) { toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
+    var j;
+    try { j = await offPost('/api/officers/rooms/' + n + '/join', {}); }
+    catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); toast(e.message); return; }
+    VC = {
+        n: n, me: ME.discordId, isSenior: !!ME.isSeniorAdmin, stream: stream, mic: stream.getAudioTracks()[0], micOn: true,
+        state: j.state, ice: j.iceServers, peers: {}, q: {}, earlyIce: {}, shareFlags: {}, speaking: {},
+        sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0
+    };
+    var ov = document.createElement('div');
+    ov.id = 'off-voice';
+    ov.innerHTML = '<div class="ov-head"><b>🎙️ مقابلة رقم ' + n + '</b><span style="font-size:12px;color:var(--muted);">' + (VC.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</span></div>' +
+        '<div id="ov-modes" class="ov-modes"></div><div id="ov-note" class="ov-note"></div>' +
+        '<div id="ov-stage" class="ov-stage"></div><div id="ov-grid" class="ov-grid"></div>' +
+        '<div id="ov-bar" class="ov-bar"></div><div id="ov-audio" style="display:none"></div>';
+    document.body.appendChild(ov);
+    document.body.style.overflow = 'hidden';
+    offWatch(VC.me, stream, null);
+    (j.existing || []).forEach(function (uid) { var P = offMakePeer(uid, true); offStartOffer(P, false); });
+    offApplyPerms();
+    offPaintAll();
+    VC.poll = setInterval(offVoicePoll, 5000);
+}
+
+function offMakePeer(uid, initiator) {
+    var v = VC;
+    var pc = new RTCPeerConnection({ iceServers: v.ice });
+    var pj = offFindP(v.state, uid);
+    var P = {
+        uid: uid, pc: pc, initiator: initiator, aSender: null, vSender: null, aCur: undefined, vCur: undefined,
+        pendingIce: v.earlyIce[uid] || [], audioEl: document.createElement('audio'), videoEl: null, videoTrack: null,
+        joinedAt: pj ? pj.joinedAt : null, watchT: null, stream: null
+    };
+    delete v.earlyIce[uid];
+    P.audioEl.autoplay = true;
+    P.audioEl.setAttribute('playsinline', '');
+    document.getElementById('ov-audio').appendChild(P.audioEl);
+    v.peers[uid] = P;
+    if (initiator) {
+        var ta = pc.addTransceiver('audio', { direction: 'sendrecv' });
+        var tv = pc.addTransceiver('video', { direction: 'sendrecv' });
+        P.aSender = ta.sender; P.vSender = tv.sender;
+    }
+    pc.onicecandidate = function (e) { if (e.candidate && VC === v) offSignal(uid, { ice: e.candidate }); };
+    pc.ontrack = function (e) {
+        if (VC !== v) return;
+        if (e.track.kind === 'audio') {
+            P.stream = new MediaStream([e.track]);
+            P.audioEl.srcObject = P.stream;
+            var pp = P.audioEl.play(); if (pp && pp.catch) pp.catch(function () {});
+            offWatch(uid, P.stream, P);
+        } else {
+            P.videoTrack = e.track;
+            P.videoEl = document.createElement('video');
+            P.videoEl.autoplay = true; P.videoEl.muted = true;
+            P.videoEl.setAttribute('playsinline', '');
+            P.videoEl.srcObject = new MediaStream([e.track]);
+            P.videoEl.ondblclick = function () { if (this.requestFullscreen) this.requestFullscreen(); };
+            offPaintStage();
+        }
+        offApplyPerms();
+    };
+    pc.onconnectionstatechange = function () {
+        if (pc.connectionState === 'failed' && P.initiator && VC === v && Date.now() - v.lastRestart > 8000) {
+            v.lastRestart = Date.now();
+            offStartOffer(P, true);
+        }
+    };
+    return P;
+}
+function offBindSenders(P) {
+    P.pc.getTransceivers().forEach(function (t) {
+        var kind = t.receiver && t.receiver.track ? t.receiver.track.kind : null;
+        if (!kind) return;
+        try { t.direction = 'sendrecv'; } catch (e) {}
+        if (kind === 'audio') P.aSender = t.sender; else P.vSender = t.sender;
+    });
+}
+async function offStartOffer(P, restart) {
+    try {
+        var o = await P.pc.createOffer(restart ? { iceRestart: true } : undefined);
+        await P.pc.setLocalDescription(o);
+        offSignal(P.uid, { sdp: P.pc.localDescription });
+    } catch (e) {}
+}
+async function offFlushIce(P) {
+    var list = P.pendingIce; P.pendingIce = [];
+    for (var i = 0; i < list.length; i++) { try { await P.pc.addIceCandidate(list[i]); } catch (e) {} }
+}
+async function offOnSignal(from, data) {
+    var v = VC;
+    if (!v || !data) return;
+    if (typeof data.share !== 'undefined') { v.shareFlags[from] = !!data.share; offPaintStage(); offPaintGrid(); return; }
+    var P = v.peers[from];
+    if (data.sdp) {
+        if (data.sdp.type === 'offer') {
+            var pj = offFindP(v.state, from);
+            if (P && pj && P.joinedAt && P.joinedAt !== pj.joinedAt) { offClosePeer(from); P = null; }
+            if (!P) P = offMakePeer(from, false);
+            await P.pc.setRemoteDescription(data.sdp);
+            if (VC !== v) return;
+            offBindSenders(P);
+            await offFlushIce(P);
+            var ans = await P.pc.createAnswer();
+            await P.pc.setLocalDescription(ans);
+            offSignal(from, { sdp: P.pc.localDescription });
+            if (v.sharing) offSignal(from, { share: true });
+            offApplyPerms();
+        } else if (data.sdp.type === 'answer' && P) {
+            await P.pc.setRemoteDescription(data.sdp);
+            await offFlushIce(P);
+            if (v.sharing) offSignal(from, { share: true });
+        }
+    } else if (data.ice) {
+        if (!P) { (v.earlyIce[from] = v.earlyIce[from] || []).push(data.ice); return; }
+        if (P.pc.remoteDescription) { try { await P.pc.addIceCandidate(data.ice); } catch (e) {} }
+        else P.pendingIce.push(data.ice);
+    }
+}
+function offClosePeer(uid) {
+    if (!VC) return;
+    var P = VC.peers[uid];
+    if (!P) return;
+    if (P.watchT) clearInterval(P.watchT);
+    try { P.pc.close(); } catch (e) {}
+    if (P.audioEl && P.audioEl.parentNode) P.audioEl.parentNode.removeChild(P.audioEl);
+    if (P.videoEl && P.videoEl.parentNode) P.videoEl.parentNode.removeChild(P.videoEl);
+    delete VC.peers[uid];
+    delete VC.shareFlags[uid];
+    delete VC.speaking[uid];
+}
+function offOnVsig(d) {
+    if (!VC || !d) return;
+    if (d.t === 'state') offApplyState(d.state);
+    else if (d.t === 'signal' && d.n === VC.n) offQueue(d.from, function () { return offOnSignal(d.from, d.data); });
+}
+function offApplyState(st) {
+    if (!VC || !st || st.n !== VC.n) return;
+    var meIn = st.participants.some(function (p) { return p.uid === VC.me; });
+    if (!meIn) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); return; }
+    VC.state = st;
+    Object.keys(VC.peers).forEach(function (uid) {
+        var p = offFindP(st, uid);
+        if (!p || (VC.peers[uid].joinedAt && p.joinedAt !== VC.peers[uid].joinedAt)) offClosePeer(uid);
+    });
+    offApplyPerms();
+    offPaintAll();
+}
+async function offVoicePoll() {
+    if (!VC) return;
+    var n = VC.n;
+    try {
+        var d = await offFetch('/api/officers/rooms/' + n + '/state');
+        if (VC && VC.n === n) offApplyState(d.state);
+    } catch (e) {
+        if (e.status === 404 || e.status === 403 || e.status === 401) { if (VC && VC.n === n) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); } }
+    }
+}
+/* تطبيق صلاحيات الصوت والشاشة لكل شخص */
+function offApplyPerms() {
+    if (!VC) return;
+    var st = VC.state, me = VC.me;
+    if (VC.screenTrack && !offCanShare()) offStopShare();
+    Object.keys(VC.peers).forEach(function (uid) {
+        var P = VC.peers[uid];
+        var okSend = offAllowed(st, me, uid);
+        var audio = (okSend && VC.micOn) ? VC.mic : null;
+        var video = (okSend && VC.screenTrack) ? VC.screenTrack : null;
+        if (P.aSender && P.aCur !== audio) { P.aCur = audio; P.aSender.replaceTrack(audio).catch(function () {}); }
+        if (P.vSender && P.vCur !== video) { P.vCur = video; P.vSender.replaceTrack(video).catch(function () {}); }
+        P.audioEl.muted = !offAllowed(st, uid, me);
+    });
+}
+function offWatch(uid, stream, P) {
+    try {
+        if (!VC) return;
+        if (!VC.ac) VC.ac = new (window.AudioContext || window.webkitAudioContext)();
+        var src = VC.ac.createMediaStreamSource(stream);
+        var an = VC.ac.createAnalyser(); an.fftSize = 512;
+        src.connect(an);
+        var buf = new Uint8Array(an.fftSize);
+        var v = VC;
+        var t = setInterval(function () {
+            if (VC !== v) { clearInterval(t); return; }
+            an.getByteTimeDomainData(buf);
+            var s = 0;
+            for (var i = 0; i < buf.length; i++) { var x = (buf[i] - 128) / 128; s += x * x; }
+            var on = Math.sqrt(s / buf.length) > 0.04;
+            if (uid === v.me) on = on && v.micOn && offCanSpeak();
+            else on = on && offAllowed(v.state, uid, v.me);
+            if (v.speaking[uid] !== on) {
+                v.speaking[uid] = on;
+                var el = document.getElementById('vt-' + uid);
+                if (el) el.classList.toggle('speaking', on);
+            }
+        }, 200);
+        if (P) P.watchT = t; else v.timers.push(t);
+    } catch (e) {}
+}
+
+/* رسم واجهة الروم */
+function offPaintAll() { offPaintModes(); offPaintNote(); offPaintStage(); offPaintGrid(); offPaintBar(); }
+function offPaintModes() {
+    var box = document.getElementById('ov-modes');
+    if (!box || !VC) return;
+    if (!VC.isSenior) { box.innerHTML = ''; return; }
+    box.innerHTML = OFF_MODES.map(function (m) {
+        return '<button class="ov-mode' + (VC.state.mode === m.k ? ' on' : '') + '" data-m="' + m.k + '" onclick="offSetMode(this.dataset.m)">' + m.t + '</button>';
+    }).join('');
+}
+function offPaintNote() {
+    var box = document.getElementById('ov-note');
+    if (!box || !VC) return;
+    if (VC.isSenior) box.textContent = offModeDesc(VC.state.mode) + ' — اضغط زر فتح المايك تحت اسم المتقدم.';
+    else box.textContent = offCanSpeak() ? '🎙️ المايك مفتوح لك، تكلم.' : '🔇 مايكك مقفل — انتظر الكبير يفتحه لك.';
+}
+function offPaintGrid() {
+    var box = document.getElementById('ov-grid');
+    if (!box || !VC) return;
+    var st = VC.state;
+    box.innerHTML = st.participants.map(function (p) {
+        var isMe = p.uid === VC.me;
+        var sel = st.speakerUid === p.uid;
+        var cls = 'ov-tile' + (VC.speaking[p.uid] ? ' speaking' : '') + (sel ? ' sel' : '');
+        var canTalk = st.participants.some(function (q) { return q.uid !== p.uid && offAllowed(st, p.uid, q.uid); });
+        var sharing = isMe ? VC.sharing : !!VC.shareFlags[p.uid];
+        var h = '<div class="' + cls + '" id="vt-' + p.uid + '">';
+        h += '<div class="ov-av">' + spEsc((p.name || '?').trim().charAt(0)) + '</div>';
+        h += '<div class="ov-name">' + spEsc(p.name) + (isMe ? ' (أنت)' : '') + '</div>';
+        h += '<div class="ov-role">' + (p.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</div>';
+        h += '<div class="ov-ic">' + (canTalk ? '🎙️' : '🔇') + (sharing ? ' 🖥️' : '') + '</div>';
+        if (VC.isSenior && !p.isSenior) {
+            h += '<button class="btn sm' + (sel ? ' danger' : '') + '" data-u="' + p.uid + '" onclick="offSetSpeaker(this.dataset.u)">' + (sel ? '🔇 إسكات' : '🎙️ فتح المايك') + '</button>';
+        }
+        return h + '</div>';
+    }).join('');
+}
+function offPaintStage() {
+    var box = document.getElementById('ov-stage');
+    if (!box || !VC) return;
+    var want = [];
+    Object.keys(VC.peers).forEach(function (uid) {
+        var P = VC.peers[uid];
+        if (P.videoEl && VC.shareFlags[uid] && offAllowed(VC.state, uid, VC.me)) want.push(P);
+    });
+    Array.prototype.slice.call(box.children).forEach(function (el) {
+        var keep = want.some(function (P) { return P.wrap === el; });
+        if (!keep) box.removeChild(el);
+    });
+    want.forEach(function (P) {
+        if (!P.wrap) {
+            var p = offFindP(VC.state, P.uid);
+            var w = document.createElement('div');
+            w.className = 'ov-vwrap';
+            var cap = document.createElement('div');
+            cap.className = 'ov-vcap';
+            cap.textContent = '🖥️ شاشة ' + (p ? p.name : '');
+            w.appendChild(P.videoEl); w.appendChild(cap);
+            P.wrap = w;
+        }
+        if (!P.wrap.parentNode) box.appendChild(P.wrap);
+        var pp = P.videoEl.play(); if (pp && pp.catch) pp.catch(function () {});
+    });
+    if (VC.sharing && !document.getElementById('ov-self-share')) {
+        var s = document.createElement('div');
+        s.id = 'ov-self-share'; s.className = 'ov-note'; s.textContent = '🖥️ أنت تشارك شاشتك الحين';
+        box.appendChild(s);
+    } else if (!VC.sharing) {
+        var old = document.getElementById('ov-self-share');
+        if (old) old.remove();
+    }
+}
+function offPaintBar() {
+    var box = document.getElementById('ov-bar');
+    if (!box || !VC) return;
+    var canSpeak = offCanSpeak();
+    var micCls = 'ov-btn' + (!canSpeak ? ' dis' : (VC.micOn ? '' : ' off'));
+    var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
+    var shCls = 'ov-btn' + ((!offCanShare() && !VC.sharing) ? ' dis' : (VC.sharing ? ' off' : ''));
+    var shTxt = VC.sharing ? '⏹️ إيقاف المشاركة' : '🖥️ مشاركة الشاشة';
+    box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' +
+        '<button class="' + shCls + '" onclick="offToggleShare()">' + shTxt + '</button>' +
+        '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
+}
+function offToggleMic() {
+    if (!VC) return;
+    if (!offCanSpeak()) { toast('المايك مقفل، انتظر الكبير يفتحه لك'); return; }
+    VC.micOn = !VC.micOn;
+    offApplyPerms(); offPaintBar();
+}
+async function offToggleShare() {
+    if (!VC) return;
+    if (VC.sharing) { offStopShare(); return; }
+    if (!offCanShare()) { toast('ما يمديك تشارك الشاشة الحين'); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) { toast('جهازك لا يدعم مشاركة الشاشة'); return; }
+    try {
+        var ds = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        if (!VC) { ds.getTracks().forEach(function (t) { t.stop(); }); return; }
+        VC.screenStream = ds;
+        VC.screenTrack = ds.getVideoTracks()[0];
+        VC.screenTrack.onended = function () { offStopShare(); };
+        VC.sharing = true;
+        offSignalAll({ share: true });
+        offApplyPerms(); offPaintStage(); offPaintGrid(); offPaintBar();
+    } catch (e) {}
+}
+function offStopShare() {
+    if (!VC || !VC.sharing) return;
+    try { if (VC.screenStream) VC.screenStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    VC.screenStream = null; VC.screenTrack = null; VC.sharing = false;
+    offSignalAll({ share: false });
+    offApplyPerms(); offPaintStage(); offPaintGrid(); offPaintBar();
+}
+function offSetMode(mode) {
+    if (!VC) return;
+    offPost('/api/officers/rooms/' + VC.n + '/mode', { mode: mode }).catch(function (e) { toast(e.message); });
+}
+function offSetSpeaker(uid) {
+    if (!VC) return;
+    var next = VC.state.speakerUid === uid ? null : uid;
+    offPost('/api/officers/rooms/' + VC.n + '/speaker', { uid: next }).catch(function (e) { toast(e.message); });
+}
+function offLeaveVoice(silent) {
+    var v = VC;
+    if (!v) return;
+    VC = null;
+    if (v.poll) clearInterval(v.poll);
+    v.timers.forEach(function (t) { clearInterval(t); });
+    Object.keys(v.peers).forEach(function (uid) {
+        var P = v.peers[uid];
+        if (P.watchT) clearInterval(P.watchT);
+        try { P.pc.close(); } catch (e) {}
+    });
+    try { v.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { if (v.screenStream) v.screenStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { if (v.ac) v.ac.close(); } catch (e) {}
+    var el = document.getElementById('off-voice');
+    if (el) el.remove();
+    document.body.style.overflow = '';
+    if (!silent) offPost('/api/officers/rooms/' + v.n + '/leave', {}).catch(function () {});
+    if (document.getElementById('off-root')) offLoadMe(false);
+    if (document.getElementById('offa-content')) offaReload(false);
+}
+window.addEventListener('pagehide', function () {
+    if (VC) { try { navigator.sendBeacon('/api/officers/rooms/' + VC.n + '/leave'); } catch (e) {} }
+});
+
+/* ---------------------------- صفحة الكبار ---------------------------- */
+function renderOfficerAdmin(tab) {
+    offStopTimers();
+    OFFA.tab = (typeof tab === 'string') ? tab : 'apps';
+    OFFA.sig = '';
+    var tabs = [['apps', '📥 التقديمات'], ['rooms', '🎙️ المقابلة'], ['train', '🏋️ التدريب']];
+    document.getElementById('app').innerHTML =
+        '<div class="card row"><h2>🎖️ إدارة سلك الضباط</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>' +
+        '<div class="tabs" id="offa-tabs">' + tabs.map(function (t) {
+            return '<div class="tab' + (t[0] === OFFA.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="offaTab(this.dataset.t)">' + t[1] + '</div>';
+        }).join('') + '</div><div id="offa-content"><div class="card">جارِ التحميل...</div></div>';
+    offaReload(false);
+    OFFA.timer = setInterval(function () {
+        if (!document.getElementById('offa-content')) { clearInterval(OFFA.timer); OFFA.timer = null; return; }
+        offaReload(true);
+    }, 4000);
+}
+function offaTab(name) {
+    OFFA.tab = name; OFFA.sig = '';
+    Array.prototype.forEach.call(document.querySelectorAll('#offa-tabs .tab'), function (t) { t.classList.toggle('active', t.dataset.t === name); });
+    document.getElementById('offa-content').innerHTML = '<div class="card">جارِ التحميل...</div>';
+    offaReload(false);
+}
+async function offaReload(silent) {
+    if (silent && VC) return;
+    var tab = OFFA.tab;
+    var url = tab === 'apps' ? '/api/officers/admin/applications' : (tab === 'rooms' ? '/api/officers/admin/rooms' : '/api/officers/admin/training');
+    try {
+        var d = await offFetch(url);
+        if (tab !== OFFA.tab) return;
+        var sig = tab + JSON.stringify(d);
+        if (silent && sig === OFFA.sig) return;
+        OFFA.sig = sig; OFFA.data = d;
+        offaPaint();
+    } catch (e) { if (!silent) toast(e.message); }
+}
+function offaPaint() {
+    var box = document.getElementById('offa-content');
+    if (!box || !OFFA.data) return;
+    if (OFFA.tab === 'apps') box.innerHTML = offaAppsHtml(OFFA.data);
+    else if (OFFA.tab === 'rooms') box.innerHTML = offaRoomsHtml(OFFA.data);
+    else box.innerHTML = offaTrainHtml(OFFA.data);
+}
+function offaStageText(a) {
+    if (a.stage === 'interview') return 'في المقابلة';
+    if (a.stage === 'training') return 'في التدريب';
+    if (a.stage === 'officer') return 'ضابط — ' + (a.officerRank || '');
+    if (a.stage === 'rejected') return 'مرفوض (' + (a.rejectedAt === 'application' ? 'التقديم' : (a.rejectedAt === 'interview' ? 'المقابلة' : 'التدريب')) + ')';
+    return a.stage;
+}
+function offaAppsHtml(d) {
+    var h = '';
+    if (!d.pending.length) h += '<div class="card" style="color:var(--muted);">لا توجد تقديمات جديدة حالياً</div>';
+    d.pending.forEach(function (a) {
+        var chk = OFFA.checks[a.id];
+        h += '<div class="card"><div class="row"><h3>' + spEsc(a.name) + '</h3><span class="badge pending">بانتظار القرار</span></div>';
+        h += '<div class="acc-row"><span>الخبرات السابقة</span><b>' + spEsc(a.prevExperience) + '</b></div>';
+        h += '<div class="acc-row"><span>يوزر الديسكورد</span><b dir="ltr">' + spEsc(a.discordUser) + '</b></div>';
+        h += '<div style="margin:8px 0;"><button class="btn sm gold" data-id="' + a.id + '" onclick="offaCheck(this.dataset.id)">🔍 فحص اليوزر</button></div>';
+        if (chk) {
+            if (chk.error) h += '<div class="off-res">⚠️ ' + spEsc(chk.error) + '</div>';
+            else h += '<div class="off-res">' + (chk.inServer ? '✅ داخل السيرفر' : '❌ غير موجود داخل السيرفر') +
+                '<br>الاسم في الديسكورد: <b>' + spEsc(chk.discordName || 'غير معروف') + '</b></div>';
+        }
+        h += '<details style="margin:10px 0;"><summary style="cursor:pointer;color:var(--gold-soft);">📄 عرض إجابات الاستبيان</summary>';
+        a.answers.forEach(function (ans, i) {
+            h += '<div class="off-qa"><b>' + (i + 1) + '- ' + spEsc(d.questions[i] || '') + '</b><div>' + spEsc(ans) + '</div></div>';
+        });
+        h += '</details>';
+        h += '<div class="row" style="justify-content:flex-start;"><button class="btn" data-id="' + a.id + '" onclick="offaApprove(this.dataset.id)">✅ قبول</button>' +
+            '<button class="btn danger" data-id="' + a.id + '" onclick="offaReject(this.dataset.id)">❌ رفض</button></div></div>';
+    });
+    if (d.history.length) {
+        h += '<div class="card"><h3>📚 السجل</h3>';
+        d.history.forEach(function (a) {
+            h += '<div class="log-item"><span>' + spEsc(a.name) + ' — ' + spEsc(offaStageText(a)) + '</span>' +
+                '<button class="btn danger sm" data-id="' + a.id + '" onclick="offaDelete(this.dataset.id)">🗑️</button></div>';
+        });
+        h += '</div>';
+    }
+    return h;
+}
+async function offaCheck(id) {
+    OFFA.checks[id] = { error: 'جارِ الفحص...' };
+    offaPaint();
+    try { OFFA.checks[id] = await api('/api/officers/admin/applications/' + id + '/check-user', { method: 'POST', body: '{}' }); }
+    catch (e) { OFFA.checks[id] = { error: e.message }; }
+    offaPaint();
+}
+async function offaApprove(id) {
+    var rooms = [1];
+    try { var r = await offFetch('/api/officers/admin/rooms'); rooms = r.rooms.map(function (x) { return x.n; }); } catch (e) {}
+    var today = '';
+    try { today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Riyadh' }); } catch (e) {}
+    var hours = '';
+    for (var i = 0; i < 24; i++) {
+        var lbl = (i % 12 === 0 ? 12 : i % 12) + ' ' + (i < 12 ? 'صباحاً' : 'مساءً');
+        hours += '<option value="' + i + '">' + lbl + '</option>';
+    }
+    var roomOpts = rooms.map(function (n) { return '<option value="' + n + '">مقابلة ' + n + '</option>'; }).join('');
+    offModalOpen('<h3>📅 موعد المقابلة</h3>' +
+        '<label>اليوم</label><input type="date" id="offm-date" value="' + today + '">' +
+        '<label>الساعة</label><select id="offm-hour">' + hours + '</select>' +
+        '<label>الدقيقة (اكتبها أنت)</label><input type="number" id="offm-min" min="0" max="59" value="0">' +
+        '<label>الروم</label><select id="offm-room">' + roomOpts + '</select>' +
+        '<div class="row" style="justify-content:flex-start;"><button class="btn" data-id="' + id + '" onclick="offaSubmitApprove(this.dataset.id)">✅ قبول وتحديد الموعد</button>' +
+        '<button class="btn gray" onclick="offModalClose()">إلغاء</button></div>');
+}
+async function offaSubmitApprove(id) {
+    var body = {
+        date: document.getElementById('offm-date').value,
+        hour: document.getElementById('offm-hour').value,
+        minute: document.getElementById('offm-min').value,
+        room: document.getElementById('offm-room').value
+    };
+    if (!body.date) return toast('حدد اليوم');
+    if (body.minute === '') return toast('اكتب الدقيقة');
+    try {
+        await api('/api/officers/admin/applications/' + id + '/approve', { method: 'POST', body: JSON.stringify(body) });
+        offModalClose(); toast('✅ تم القبول وتحديد الموعد');
+        offaReload(false);
+    } catch (e) { toast(e.message); }
+}
+async function offaReject(id) {
+    if (!(await confirmModal('متأكد تبي ترفض هذا التقديم؟'))) return;
+    try { await api('/api/officers/admin/applications/' + id + '/reject', { method: 'POST', body: '{}' }); toast('تم الرفض'); offaReload(false); }
+    catch (e) { toast(e.message); }
+}
+async function offaDelete(id) {
+    if (!(await confirmModal('متأكد تبي تحذف هذا الطلب نهائياً؟ (يقدر يقدم من جديد)'))) return;
+    try { await api('/api/officers/admin/applications/' + id, { method: 'DELETE' }); toast('تم الحذف'); offaReload(false); }
+    catch (e) { toast(e.message); }
+}
+function offaRoomsHtml(d) {
+    var h = '<div class="card row"><span style="color:var(--muted);">رومات المقابلات</span><button class="btn gold sm" onclick="offaNewRoom()">➕ روم جديد</button></div>';
+    d.rooms.forEach(function (r) {
+        h += '<div class="card"><div class="row"><h3>🎙️ مقابلة ' + r.n + '</h3><button class="btn sm" data-n="' + r.n + '" onclick="offaEnterRoom(this.dataset.n)">دخول الروم الصوتي</button></div>';
+        h += '<div style="margin:8px 0;"><b style="color:var(--gold-soft);font-size:13px;">الداخلين الحين (' + r.participants.length + ')</b><div style="margin-top:6px;">';
+        if (!r.participants.length) h += '<span style="color:var(--muted);font-size:13px;">ما أحد داخل</span>';
+        r.participants.forEach(function (p) { h += '<span class="off-chip' + (p.isSenior ? ' sen' : '') + '">' + (p.isSenior ? '🎖️ ' : '') + spEsc(p.name) + '</span>'; });
+        h += '</div></div>';
+        h += '<div style="margin:8px 0;"><b style="color:var(--gold-soft);font-size:13px;">سجل الدخول والخروج</b><div style="max-height:150px;overflow-y:auto;margin-top:4px;">';
+        if (!r.log.length) h += '<span style="color:var(--muted);font-size:13px;">لا يوجد سجل</span>';
+        r.log.forEach(function (l) {
+            h += '<div class="off-logrow">' + (l.action === 'join' ? '➡️ دخل' : '⬅️ طلع') + ' — ' + spEsc(l.name) + ' — ' + spEsc(offFmtTime(l.at)) + '</div>';
+        });
+        h += '</div></div>';
+        h += '<div style="margin:8px 0;"><b style="color:var(--gold-soft);font-size:13px;">لوحة المقابلة (النتيجة)</b>';
+        if (!r.interviewees.length) h += '<div style="color:var(--muted);font-size:13px;margin-top:4px;">لا يوجد متقدمين مجدولين بهذا الروم</div>';
+        r.interviewees.forEach(function (a) {
+            h += '<div class="log-item"><span>' + spEsc(a.name) + ' <small style="color:var(--muted);">— ' + spEsc(offFmt(a.at)) + (a.inRoom ? ' — 🟢 داخل الروم' : '') + '</small></span>';
+            if (a.entered) {
+                h += '<span><button class="btn sm" data-id="' + a.id + '" onclick="offaInterviewResult(this.dataset.id, 1)">✅ مقبول</button> ' +
+                    '<button class="btn danger sm" data-id="' + a.id + '" onclick="offaInterviewResult(this.dataset.id, 0)">❌ مرفوض</button></span>';
+            } else h += '<span class="badge pending">ما دخل بعد</span>';
+            h += '</div>';
+        });
+        h += '</div></div>';
+    });
+    return h;
+}
+function offaEnterRoom(n) { offJoinVoice(parseInt(n, 10)); }
+async function offaNewRoom() {
+    try { await api('/api/officers/admin/rooms', { method: 'POST', body: '{}' }); offaReload(false); }
+    catch (e) { toast(e.message); }
+}
+async function offaInterviewResult(id, ok) {
+    if (!(await confirmModal(ok ? 'تأكيد قبول هذا المتقدم من المقابلة؟' : 'تأكيد رفض هذا المتقدم؟'))) return;
+    try {
+        await api('/api/officers/admin/applications/' + id + '/interview-result', { method: 'POST', body: JSON.stringify({ result: ok ? 'accepted' : 'rejected' }) });
+        toast(ok ? '✅ تم القبول' : 'تم الرفض');
+        offaReload(false);
+    } catch (e) { toast(e.message); }
+}
+function offaTrainHtml(d) {
+    var h = '<div class="card"><h3>➕ تسجيل متدرب</h3><p style="color:var(--muted);font-size:13px;">المقبولين من المقابلة فقط</p>';
+    if (!d.eligible.length) h += '<div style="color:var(--muted);font-size:13px;">لا يوجد مقبولين بانتظار التسجيل</div>';
+    d.eligible.forEach(function (a) {
+        h += '<div class="log-item"><span>' + spEsc(a.name) + '</span><button class="btn sm" data-id="' + a.id + '" onclick="offaRegTrainee(this.dataset.id)">تسجيل متدرب</button></div>';
+    });
+    h += '</div><div class="card"><h3>👥 المتدربين المسجلين</h3>';
+    if (!d.trainees.length) h += '<div style="color:var(--muted);font-size:13px;">ما أحد مسجل بالتدريب</div>';
+    d.trainees.forEach(function (a) {
+        h += '<div class="log-item"><span>' + spEsc(a.name) + (a.attendedAt ? ' <small style="color:#4ade80;">— حضر ' + spEsc(offFmtTime(a.attendedAt)) + '</small>' : '') + '</span>';
+        if (!a.attendedAt) h += '<button class="btn gold sm" data-id="' + a.id + '" onclick="offaAttended(this.dataset.id)">✅ حضر التدريب</button>';
+        else h += '<span><button class="btn sm" data-id="' + a.id + '" onclick="offaTrainAccept(this.dataset.id)">✅ قبول</button> ' +
+            '<button class="btn danger sm" data-id="' + a.id + '" onclick="offaTrainReject(this.dataset.id)">❌ رفض</button></span>';
+        h += '</div>';
+    });
+    return h + '</div>';
+}
+async function offaRegTrainee(id) {
+    try { await api('/api/officers/admin/applications/' + id + '/register-trainee', { method: 'POST', body: '{}' }); toast('تم التسجيل'); offaReload(false); }
+    catch (e) { toast(e.message); }
+}
+async function offaAttended(id) {
+    try { await api('/api/officers/admin/applications/' + id + '/attended', { method: 'POST', body: '{}' }); toast('تم تسجيل الحضور'); offaReload(false); }
+    catch (e) { toast(e.message); }
+}
+function offaTrainAccept(id) {
+    var ranks = (OFFA.data && OFFA.data.ranks) || [];
+    offModalOpen('<h3>🎖️ قبول وتحديد الرتبة</h3><label>الرتبة</label><select id="offm-rank">' +
+        ranks.map(function (r) { return '<option value="' + spEsc(r) + '">' + spEsc(r) + '</option>'; }).join('') + '</select>' +
+        '<div class="row" style="justify-content:flex-start;"><button class="btn" data-id="' + id + '" onclick="offaSubmitAccept(this.dataset.id)">✅ تأكيد القبول</button>' +
+        '<button class="btn gray" onclick="offModalClose()">إلغاء</button></div>');
+}
+async function offaSubmitAccept(id) {
+    var rank = document.getElementById('offm-rank').value;
+    try {
+        await api('/api/officers/admin/applications/' + id + '/training-result', { method: 'POST', body: JSON.stringify({ result: 'accepted', rank: rank }) });
+        offModalClose(); toast('🎖️ صار ضابط');
+        offaReload(false);
+    } catch (e) { toast(e.message); }
+}
+async function offaTrainReject(id) {
+    if (!(await confirmModal('تأكيد رفض هذا المتدرب نهائياً؟'))) return;
+    try { await api('/api/officers/admin/applications/' + id + '/training-result', { method: 'POST', body: JSON.stringify({ result: 'rejected' }) }); toast('تم الرفض'); offaReload(false); }
+    catch (e) { toast(e.message); }
+}
+/* تحديث تلقائي من الـ polling العام */
+function offOnPoll() {
+    try {
+        if (document.getElementById('off-root') && !VC) offLoadMe(true);
+        if (document.getElementById('offa-content') && !VC) offaReload(true);
+    } catch (e) {}
+}
+
 init();
 </script>
 </body>
