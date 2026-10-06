@@ -4202,8 +4202,8 @@ app.post("/api/support/admin/tickets/:id/join", async (req, res) => {
 
 app.post("/api/support/tickets/:id/close", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
-    const { t, role } = x;
-    if (role !== "admin") return res.status(403).json({ error: "إغلاق التكت من الإدارة فقط" });
+    const { t, role, uid } = x;
+    if (role !== "admin" && !(uid && isSeniorAdmin(uid))) return res.status(403).json({ error: "إغلاق التكت من الإدارة فقط" });
     if (t.status === "closed") return res.json({ ok: true });
     t.status = "closed";
     supportAddMsg(t, { sender: "system", name: "النظام", text: "🔒 تم إغلاق التكت بواسطة " + req.user.username });
@@ -5484,7 +5484,9 @@ document.addEventListener('click', function (e) {
 }, true);
 
 async function api(url, opts) {
-    const btn = __lastClickedBtn;
+    const noLock = !!(opts && opts.noLock);
+    if (noLock) { opts = Object.assign({}, opts); delete opts.noLock; }
+    const btn = noLock ? null : __lastClickedBtn;
     if (btn) {
         if (btn.dataset.busy === '1') throw new Error('لحظة، طلبك السابق لسا قيد التنفيذ');
         btn.dataset.busy = '1';
@@ -6325,7 +6327,7 @@ function spPaintState() {
     var isSen = !!(ME && ME.isSeniorAdmin);
     var canWrite = !closed && (!adm || t.status === 'active' || isSen);
     document.getElementById('sp-compose').style.display = canWrite ? 'flex' : 'none';
-    document.getElementById('sp-close').style.display = (closed || !adm) ? 'none' : 'inline';
+    document.getElementById('sp-close').style.display = (closed || !(adm || isSen)) ? 'none' : 'inline';
     var banBtn = document.getElementById('sp-ban');
     if (banBtn) banBtn.style.display = (adm && isSen) ? 'inline' : 'none';
     var delBtn = document.getElementById('sp-del');
@@ -7523,7 +7525,7 @@ function searchHCCandidate(q) {
         if (!q || !q.trim()) { box.innerHTML = ''; return; }
         box.innerHTML = 'جارِ البحث...';
         try {
-            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
             if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
             box.innerHTML = list.filter(p => p.registeredName).map(p => \`
                 <div class="card" style="padding:8px 12px;margin-top:6px;">
@@ -7567,7 +7569,7 @@ function searchMPCandidate(role, q) {
         if (!q || !q.trim()) { box.innerHTML = ''; return; }
         box.innerHTML = 'جارِ البحث...';
         try {
-            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
             if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
             box.innerHTML = list.filter(p => p.registeredName).map(p => \`
                 <div class="card" style="padding:8px 12px;margin-top:6px;">
@@ -7613,7 +7615,7 @@ function searchSectorCandidate(sectorKey, role, q) {
         if (!q || !q.trim()) { box.innerHTML = ''; return; }
         box.innerHTML = 'جارِ البحث...';
         try {
-            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
             if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
             box.innerHTML = list.filter(p => p.registeredName).map(p => \`
                 <div class="card" style="padding:8px 12px;margin-top:6px;">
@@ -8449,7 +8451,7 @@ function searchMPPOCandidate(q) {
         if (!q || !q.trim()) { box.innerHTML = ''; return; }
         box.innerHTML = 'جارِ البحث...';
         try {
-            const { list } = await api('/api/mp/members');
+            const { list } = await api('/api/mp/members', { noLock: true });
             const filtered = list.filter(p => p.registeredName && p.registeredName.includes(q));
             if (filtered.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
             box.innerHTML = filtered.slice(0, 15).map(p => \`
@@ -8711,7 +8713,7 @@ async function loadPersonnel() {
 let personnelCache = [];
 async function searchPersonnel() {
     const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
-    const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+    const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
     if (currentAdminTab !== 'personnel') return;
     personnelCache = list;
     cardRemember(list);
@@ -9306,7 +9308,7 @@ function searchVOCandidate(q) {
         if (!q || !q.trim()) { box.innerHTML = ''; return; }
         box.innerHTML = 'جارِ البحث...';
         try {
-            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
             const ok = list.filter(function (p) { return p.registeredName; });
             if (!ok.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
             box.innerHTML = ok.map(function (p) {
@@ -10765,15 +10767,8 @@ function offaLogHtml(d) {
                 '<div class="off-stayt">➡️ دخل: ' + spEsc(offFmtTimeS(st.start)) + ' — ' + spEsc(tail) + '</div></div>';
         });
         h += '</div>';
-        h += '<div style="margin:10px 0;"><b style="color:var(--gold-soft);font-size:13px;">🎧 التسجيل الصوتي</b>';
-        if (s.recs && s.recs.length) {
-            s.recs.forEach(function (r, k) {
-                h += '<div class="off-stay"><div style="font-size:12px;color:var(--muted);">جزء ' + (k + 1) + ' — سجّله ' + spEsc(r.name || '') + ' — ' + spEsc(offFmtTimeS(r.start)) + (r.end ? ' إلى ' + spEsc(offFmtTimeS(r.end)) : '') + '</div>' +
-                    '<audio controls preload="none" style="width:100%;margin-top:4px;" src="/api/officers/admin/rec/' + encodeURIComponent(r.sid) + '"></audio></div>';
-            });
-        } else h += '<div style="color:var(--muted);font-size:12px;margin-top:4px;">ما فيه تسجيل صوتي لهذي الجلسة.</div>';
-        h += '</div>';
-        h += '<button class="btn gold sm" data-i="' + i + '" onclick="offaReplay(this.dataset.i)">▶️ فيديو توضيحي للجلسة</button></div>';
+        if (s.recs && s.recs.length) h += '<div style="color:var(--muted);font-size:12px;margin:8px 0;">🎧 هذي الجلسة فيها تسجيل صوتي، يشتغل من زر الفيديو التوضيحي.</div>';
+        h += '<button class="btn gold sm" data-i="' + i + '" onclick="offaReplay(this.dataset.i)">' + (s.recs && s.recs.length ? '▶️ فيديو توضيحي + التسجيل' : '▶️ فيديو توضيحي للجلسة') + '</button></div>';
     });
     return h;
 }
@@ -10811,8 +10806,20 @@ function offaReplay(i) {
     });
     Object.keys(sp).forEach(function (u) { sp[u].sort(function (a, b) { return a[0] - b[0]; }); });
     REP = { s: s, E: E, span: span, evs: evs, T: 0, mult: 1, playing: true, timer: null, base: Math.max(1, span / 30000), states: {}, passed: -1, segs: segs, si: 0, audio: null, rate: 1, sp: sp };
-    offModalOpen(offaReplayShell(s));
-    if (segs.length) offaReplayAudioStart();
+    offModalOpen(offaReplayGate(s, segs.length > 0));
+}
+function offaReplayGate(s, hasAudio) {
+    return '<h3>🎬 فيديو توضيحي — مقابلة ' + s.room + '</h3>' +
+        '<div style="text-align:center;margin:14px 0;"><div style="font-size:46px;">' + (hasAudio ? '🎧' : '🎬') + '</div>' +
+        '<p style="color:var(--muted);font-size:13px;line-height:1.9;margin:8px 0 0;">' +
+        (hasAudio ? 'هذي المقابلة فيها تسجيل صوتي. اضغط تشغيل ويشتغل الصوت مع الخط الزمني، وجنب اسم اللي يتكلم يطلع المايك.' : 'هذي الجلسة بدون تسجيل صوتي. اضغط تشغيل لإعادة الدخول والخروج.') + '</p></div>' +
+        '<div style="display:flex;gap:8px;justify-content:center;"><button class="btn" onclick="offaReplayStart()">▶️ تشغيل ' + (hasAudio ? 'التسجيل' : 'الفيديو') + '</button>' +
+        '<button class="btn danger sm" onclick="offaReplayClose()">✖ إغلاق</button></div>';
+}
+function offaReplayStart() {
+    if (!REP || REP.timer) return;
+    offModalOpen(offaReplayShell(REP.s));
+    if (REP.segs.length) offaReplayAudioStart();
     REP.timer = setInterval(offaReplayTick, 100);
     offaReplayTick(true);
 }
