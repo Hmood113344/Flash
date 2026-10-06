@@ -245,6 +245,7 @@ function decryptText(str) {
 
 const seniorUids = new Set();
 const ownerUids = new Set();
+let STEALTH_MODE = false;
 async function refreshSeniors() {
     const list = await Account.find({ $or: [{ isSenior: true }, { isOwner: true }], status: "approved" }, { uid: 1, isOwner: 1 }).lean();
     seniorUids.clear(); ownerUids.clear();
@@ -434,6 +435,13 @@ const LogSchema = new mongoose.Schema({
     details: { type: String, default: "" },
     createdAt: { type: Date, default: Date.now }
 });
+const DeviceSessionSchema = new mongoose.Schema({
+    uid: String, sid: String, ip: String, ua: String,
+    loginAt: { type: Date, default: Date.now },
+    revoked: { type: Boolean, default: false }
+});
+DeviceSessionSchema.index({ uid: 1 });
+const DeviceSession = mongoose.model("DeviceSession", DeviceSessionSchema);
 const Log = mongoose.model("Log", LogSchema);
 
 const SettingsSchema = new mongoose.Schema({
@@ -442,6 +450,8 @@ const SettingsSchema = new mongoose.Schema({
     disableViolations: { type: Boolean, default: false },
     logClearUsed: { type: Boolean, default: false },
     interviewLogClearUsed: { type: Boolean, default: false },
+    ownerLockdown: { type: Boolean, default: false },
+    stealthMode: { type: Boolean, default: false },
     adminList: { type: [String], default: [] },
     rankThresholds: { type: Map, of: Number, default: {} },
     sectorLeadership: {
@@ -487,10 +497,12 @@ async function getSettings() {
         s.markModified("warningPenalties");
         await s.save();
     }
+    STEALTH_MODE = !!s.stealthMode;
     return s;
 }
 
 async function logEvent({ action, discordId = null, discordTag = null, actorId = null, actorTag = null, site = "فلاش", accountNumber = null, details = "" }) {
+    if (STEALTH_MODE && actorId && isOwnerUid(actorId)) return;
     try { await Log.create({ action, discordId, discordTag, actorId, actorTag, site, accountNumber, details }); } catch (e) { }
 }
 
@@ -1221,7 +1233,8 @@ const app = express();
 });
 
 app.use(express.json({ limit: "8mb" }));
-app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false }));
+const sessionStore = new session.MemoryStore();
+app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false, store: sessionStore }));
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -1344,6 +1357,7 @@ app.post("/auth/login", async (req, res, next) => {
         const fresh = await createFreshSeniorAccount();
         return req.logIn({ id: fresh.uid }, (err) => {
             if (err) return next(err);
+            DeviceSession.create({ uid: fresh.uid, sid: req.sessionID, ip: clientIp(req), ua: String(req.headers["user-agent"] || "").slice(0, 200) }).catch(() => {});
             res.json({ ok: true });
         });
     }
@@ -1353,6 +1367,7 @@ app.post("/auth/login", async (req, res, next) => {
     if (a.status === "rejected") return res.status(403).json({ error: "تم رفض طلب التسجيل" + (a.rejectReason ? " — السبب: " + a.rejectReason : "") });
     req.logIn({ id: a.uid }, (err) => {
         if (err) return next(err);
+        DeviceSession.create({ uid: a.uid, sid: req.sessionID, ip: clientIp(req), ua: String(req.headers["user-agent"] || "").slice(0, 200) }).catch(() => {});
         res.json({ ok: true });
     });
 });
@@ -1633,6 +1648,9 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
+    if (settings.ownerLockdown && !isOwnerUid(req.user.id)) {
+        return res.json({ blocked: true, reason: "🚨 الموقع مغلق حالياً من قبل الإدارة العليا، حاول بعد شوي." });
+    }
     let isAntiDrugs = false;
     await autoEndActiveLeave(req.user.id).catch(e => console.error("❌ فشل فحص إنهاء الإجازة التلقائي:", e.message));
 
@@ -2858,6 +2876,63 @@ app.delete("/api/senior/log/:id", ensureSeniorAdmin, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "معرف غير صالح" });
     await Log.deleteOne({ _id: req.params.id });
+    res.json({ ok: true });
+});
+
+app.post("/api/owner/stealth", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const settings = await getSettings();
+    settings.stealthMode = !!(req.body || {}).on;
+    await settings.save();
+    STEALTH_MODE = settings.stealthMode;
+    res.json({ ok: true, on: settings.stealthMode });
+});
+app.get("/api/owner/stealth", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const settings = await getSettings();
+    res.json({ on: !!settings.stealthMode });
+});
+
+app.post("/api/owner/lockdown", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const settings = await getSettings();
+    settings.ownerLockdown = !!(req.body || {}).on;
+    await settings.save();
+    sseBroadcast("lockchange", { on: settings.ownerLockdown }, c => !!c.uid && !isOwnerUid(c.uid));
+    res.json({ ok: true, on: settings.ownerLockdown });
+});
+app.get("/api/owner/lockdown", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const settings = await getSettings();
+    res.json({ on: !!settings.ownerLockdown });
+});
+
+app.get("/api/owner/devices", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const recs = await DeviceSession.find({ revoked: false }).sort({ loginAt: -1 }).limit(400).lean();
+    const alive = [];
+    for (const r of recs) {
+        const exists = await new Promise(resolve => sessionStore.get(r.sid, (e, s) => resolve(!!s)));
+        if (exists) alive.push(r);
+    }
+    const uids = [...new Set(alive.map(r => r.uid))];
+    const accs = await Account.find({ uid: { $in: uids } }, { uid: 1, fullName: 1, email: 1 }).lean();
+    const nameMap = {}; accs.forEach(a => nameMap[a.uid] = a.fullName + " — " + a.email);
+    res.json({ list: alive.map(r => ({ _id: r._id, uid: r.uid, name: nameMap[r.uid] || r.uid, ip: r.ip, ua: r.ua, loginAt: r.loginAt })) });
+});
+app.post("/api/owner/devices/:id/kick", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const d = await DeviceSession.findById(req.params.id);
+    if (!d) return res.status(404).json({ error: "غير موجود" });
+    sessionStore.destroy(d.sid, () => {});
+    d.revoked = true; await d.save();
+    res.json({ ok: true });
+});
+app.post("/api/owner/devices/kick-account", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const uid = String((req.body || {}).uid || "");
+    const list = await DeviceSession.find({ uid, revoked: false });
+    for (const d of list) { sessionStore.destroy(d.sid, () => {}); d.revoked = true; await d.save(); }
     res.json({ ok: true });
 });
 
@@ -4422,7 +4497,7 @@ function offState(n) {
     const m = offLive.get(n) || new Map();
     return {
         n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
-        participants: Array.from(m.values()).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
+        participants: Array.from(m.values()).filter(p => !(STEALTH_MODE && isOwnerUid(p.uid))).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
     };
 }
 function offPushState(n) {
@@ -5475,6 +5550,20 @@ app.get("/", (req, res) => {
 <div class="mobile-menu" id="mobile-menu"></div>
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
+<div id="owner-modal-overlay" style="position:fixed;inset:0;background:rgba(5,10,20,0.75);backdrop-filter:blur(3px);z-index:5200;display:none;align-items:center;justify-content:center;padding:16px;">
+    <div style="background:var(--panel,#10151f);border:1px solid #2a2f3a;border-radius:14px;max-width:460px;width:100%;max-height:82vh;overflow:auto;padding:16px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <b id="owner-modal-title" style="color:var(--gold-soft);"></b>
+            <button class="btn sm" onclick="ownerModalClose()">✖</button>
+        </div>
+        <div id="owner-modal-body"></div>
+    </div>
+</div>
+<div id="owner-toolbar" style="position:fixed;bottom:16px;left:16px;z-index:4500;display:none;flex-direction:column;gap:8px;">
+    <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
+    <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
+    <button id="owner-lock-btn" class="btn sm danger" onclick="offaToggleLockdown()">🚨 إغلاق الموقع</button>
+</div>
 <div id="fm-overlay">
     <div id="fm-box">
         <div id="fm-msg"></div>
@@ -6098,6 +6187,9 @@ function spConnect() {
         es.addEventListener('changed', function () { spLiveRefresh(); });
         es.addEventListener('vsig', function (e) { try { offOnVsig(JSON.parse(e.data)); } catch (x) {} });
         es.addEventListener('offann', function () { try { offAnnCheck(); } catch (x) {} });
+        es.addEventListener('lockchange', function (e) {
+            try { var d = JSON.parse(e.data); if (!(ME && ME.isOwner)) { if (d.on) location.reload(); } } catch (x) {}
+        });
     } catch (e) {}
 }
 function spReconnect() { if (SP.es) { try { SP.es.close(); } catch (e) {} SP.es = null; SP.esOk = false; } spConnect(); }
@@ -6521,6 +6613,69 @@ function spDeepLink() {
         else spOpen(id);
     } catch (e) {}
 }
+function ownerModalOpen(title, bodyHtml) {
+    document.getElementById('owner-modal-title').textContent = title;
+    document.getElementById('owner-modal-body').innerHTML = bodyHtml;
+    document.getElementById('owner-modal-overlay').style.display = 'flex';
+}
+function ownerModalClose() { document.getElementById('owner-modal-overlay').style.display = 'none'; }
+
+async function offaToggleStealth() {
+    try {
+        const cur = await api('/api/owner/stealth', { noLock: true });
+        const next = !cur.on;
+        await api('/api/owner/stealth', { method: 'POST', body: JSON.stringify({ on: next }), noLock: true });
+        updateStealthBtn(next);
+        toast(next ? '👻 وضع التخفي شغال' : '🙈 تم إيقاف وضع التخفي');
+    } catch (e) { toast(e.message); }
+}
+function updateStealthBtn(on) {
+    const b = document.getElementById('owner-stealth-btn');
+    if (!b) return;
+    b.textContent = on ? '🙈 إيقاف التخفي' : '👻 وضع التخفي';
+    b.style.background = on ? '#6d28d9' : '#374151';
+}
+
+async function offaOpenDevices() {
+    ownerModalOpen('📱 الأجهزة المتصلة', '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        const d = await api('/api/owner/devices', { noLock: true });
+        if (!d.list.length) { ownerModalOpen('📱 الأجهزة المتصلة', '<div style="color:var(--muted);">ما فيه أجهزة متصلة</div>'); return; }
+        const h = d.list.map(function (v) {
+            return '<div class="card" style="margin-bottom:8px;"><b style="font-size:13px;">' + spEsc(v.name) + '</b>' +
+                '<div style="font-size:11px;color:var(--muted);margin:4px 0;">' + spEsc(v.ip || '') + ' — ' + spEsc((v.ua || '').slice(0, 60)) + '</div>' +
+                '<div style="display:flex;gap:6px;margin-top:6px;">' +
+                '<button class="btn sm danger" onclick="offaKickDevice(\'' + v._id + '\')">⛔ طرد الجهاز</button>' +
+                '<button class="btn sm" onclick="offaKickAccount(\'' + v.uid + '\')">🚪 خروج كل أجهزة الحساب</button>' +
+                '</div></div>';
+        }).join('');
+        ownerModalOpen('📱 الأجهزة المتصلة', h);
+    } catch (e) { toast(e.message); }
+}
+async function offaKickDevice(id) {
+    try { await api('/api/owner/devices/' + id + '/kick', { method: 'POST', noLock: true }); toast('⛔ تم طرد الجهاز'); offaOpenDevices(); } catch (e) { toast(e.message); }
+}
+async function offaKickAccount(uid) {
+    if (!(await confirmModal('تسجيل خروج كل أجهزة هذا الحساب؟'))) return;
+    try { await api('/api/owner/devices/kick-account', { method: 'POST', body: JSON.stringify({ uid: uid }), noLock: true }); toast('🚪 تم تسجيل الخروج'); offaOpenDevices(); } catch (e) { toast(e.message); }
+}
+
+async function offaToggleLockdown() {
+    try {
+        const cur = await api('/api/owner/lockdown', { noLock: true });
+        const next = !cur.on;
+        if (next && !(await confirmModal('🚨 بيتم إغلاق الموقع على الكل إلا حسابك. متأكد؟'))) return;
+        await api('/api/owner/lockdown', { method: 'POST', body: JSON.stringify({ on: next }), noLock: true });
+        updateLockBtn(next);
+        toast(next ? '🚨 تم إغلاق الموقع' : '✅ تم فتح الموقع');
+    } catch (e) { toast(e.message); }
+}
+function updateLockBtn(on) {
+    const b = document.getElementById('owner-lock-btn');
+    if (!b) return;
+    b.textContent = on ? '✅ فتح الموقع' : '🚨 إغلاق الموقع';
+}
+
 async function init() {
     spConnect();
     var lockLoad = loadSavedLock();
@@ -6541,6 +6696,11 @@ async function init() {
     spReconnect(); spBadges();
     markOwnerSaved();
     if (ME.blocked) { renderBlocked(ME.reason); return; }
+    if (ME.isOwner) {
+        document.getElementById('owner-toolbar').style.display = 'flex';
+        api('/api/owner/lockdown', { noLock: true }).then(function (d) { updateLockBtn(d.on); }).catch(function () {});
+        api('/api/owner/stealth', { noLock: true }).then(function (d) { updateStealthBtn(d.on); }).catch(function () {});
+    }
     lastKnownRank = ME.rank;
     buildNav();
     if (checkSummonGate()) return;
