@@ -441,6 +441,7 @@ const SettingsSchema = new mongoose.Schema({
     disableLogin: { type: Boolean, default: false },
     disableViolations: { type: Boolean, default: false },
     logClearUsed: { type: Boolean, default: false },
+    interviewLogClearUsed: { type: Boolean, default: false },
     adminList: { type: [String], default: [] },
     rankThresholds: { type: Map, of: Number, default: {} },
     sectorLeadership: {
@@ -4852,7 +4853,21 @@ app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res)
         else if (a.stage === "training" || a.stage === "officer" || (a.stage === "rejected" && a.rejectedAt === "training")) st.result = "pass";
         else if (a.stage === "rejected" && a.rejectedAt === "interview") st.result = "fail";
     }));
-    res.json({ sessions: top });
+    const stg = await getSettings();
+    res.json({ sessions: top, canClear: isOwnerUid(req.user.id) && !stg.interviewLogClearUsed });
+});
+
+app.post("/api/officers/admin/interview-log/clear", ensureSeniorAdmin, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "هذا الزر لصاحب المالك فقط" });
+    const settings = await getSettings();
+    if (settings.interviewLogClearUsed) return res.status(403).json({ error: "تم استخدام زر حذف سجلات المقابلة من قبل" });
+    settings.interviewLogClearUsed = true;
+    await settings.save();
+    await OfficerRoomLog.deleteMany({});
+    await OfficerRecChunk.deleteMany({});
+    await OfficerRec.deleteMany({});
+    await logEvent({ action: "حذف سجلات تسجيل المقابلة", actorId: req.user.id, actorTag: req.user.username, details: "تم حذف كل سجلات المقابلات والتسجيلات الصوتية" });
+    res.json({ ok: true });
 });
 
 app.post("/api/officers/admin/applications/:id/interview-result", ensureSeniorAdmin, async (req, res) => {
@@ -10752,6 +10767,7 @@ function offResultChip(r) {
 function offaLogHtml(d) {
     var list = d.sessions || [];
     var h = '<div class="card"><h3>📼 تسجيل المقابلة</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">سجل كل جلسة مقابلة صارت بالرومات: من أول واحد دخل الروم إلى آخر واحد طلع، مع وقت دخول وخروج كل شخص، وتسجيل صوتي للمقابلة (يُحفظ ١٤ يوم)، وفيديو توضيحي يعيد لك الجلسة خطوة بخطوة.</p></div>';
+    if (d.canClear) h += '<div class="card row" style="border-color:#7f1d1d;"><div><b style="color:#f87171;">🗑️ حذف سجلات المقابلة كلها</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">يحذف كل الجلسات والتسجيلات الصوتية. يشتغل مرة وحدة بس، وبعدها الزر يختفي.</div></div><button class="btn danger sm" onclick="offaClearInterviewLog()">حذف السجلات</button></div>';
     if (!list.length) return h + '<div class="card center" style="color:var(--muted);">ما فيه جلسات مسجلة</div>';
     list.forEach(function (s, i) {
         var E = s.end || Date.now();
@@ -11006,6 +11022,15 @@ async function offaNewRoom() {
     try { await api('/api/officers/admin/rooms', { method: 'POST', body: '{}' }); offaReload(false); }
     catch (e) { toast(e.message); }
 }
+async function offaClearInterviewLog() {
+    if (!(await confirmModal('⚠️ بتنحذف كل سجلات تسجيل المقابلة والتسجيلات الصوتية نهائياً، والزر ما يرجع بعدها. متأكد؟'))) return;
+    try {
+        await offPost('/api/officers/admin/interview-log/clear', {});
+        toast('🗑️ تم حذف سجلات المقابلة');
+        offaReload(false);
+    } catch (e) { toast(e.message); }
+}
+
 async function offaInterviewResult(id, ok) {
     if (!(await confirmModal(ok ? 'تأكيد قبول هذا المتقدم من المقابلة؟' : 'تأكيد رفض هذا المتقدم؟'))) return;
     try {
