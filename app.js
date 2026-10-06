@@ -2695,6 +2695,49 @@ app.post("/api/owner/saved-login-lock", ensureAuth, async (req, res) => {
     res.json({ ok: true, locked });
 });
 
+app.post("/api/senior/officers-announce", ensureSeniorAdmin, async (req, res) => {
+    const test = !!(req.body && req.body.test);
+    const st = await getSettings();
+    if (!test && st.officersLocked) return res.status(400).json({ error: "سلك الضباط مقفول، افتحه أول" });
+    await OfficerAnn.create({ test, createdBy: req.user.id, createdByName: req.user.username });
+    await logEvent({ action: test ? "إعلان سلك الضباط (تجربة للمالك)" : "إعلان سلك الضباط للأفراد", actorId: req.user.id, actorTag: req.user.username, details: "" });
+    sseBroadcast("offann", { t: Date.now() }, c => c.uid && (!test || isOwnerUid(c.uid)));
+    res.json({ ok: true, test });
+});
+
+app.get("/api/officers/announcement", ensureAuth, async (req, res) => {
+    const uid = req.user.id;
+    let ann = null;
+    if (isOwnerUid(uid)) {
+        const t = await OfficerAnn.findOne({ test: true, createdAt: { $gte: new Date(Date.now() - 24 * 3600 * 1000) } }).sort({ createdAt: -1 }).lean();
+        if (t && !(await OfficerAnnAck.findOne({ aid: String(t._id), uid }).lean())) ann = t;
+    }
+    if (!ann) {
+        const st = await getSettings();
+        if (!st.officersLocked) {
+            const r = await OfficerAnn.findOne({ test: false, createdAt: { $gte: new Date(Date.now() - 7 * 24 * 3600 * 1000) } }).sort({ createdAt: -1 }).lean();
+            if (r && !(await OfficerAnnAck.findOne({ aid: String(r._id), uid }).lean())) {
+                const [p, a] = await Promise.all([
+                    Personnel.findOne({ discord: uid }).select("rank").lean(),
+                    OfficerApp.findOne({ uid }).select("_id").lean(),
+                ]);
+                const ri = p ? CONFIG.MILITARY_RANKS.indexOf(p.rank) : -1;
+                if (!a && ri >= 0 && ri <= CONFIG.MILITARY_RANKS.indexOf("رئيس رقباء")) ann = r;
+            }
+        }
+    }
+    res.set("Cache-Control", "no-store");
+    res.json({ ann: ann ? { id: String(ann._id), test: !!ann.test } : null });
+});
+
+app.post("/api/officers/announcement/ack", ensureAuth, async (req, res) => {
+    const id = String((req.body && req.body.id) || "");
+    const status = (req.body && req.body.status) === "applied" ? "applied" : "dismissed";
+    if (!id) return res.status(400).json({ error: "طلب غير صحيح" });
+    await OfficerAnnAck.updateOne({ aid: id, uid: req.user.id }, { $set: { status, at: new Date() } }, { upsert: true });
+    res.json({ ok: true });
+});
+
 app.post("/api/senior/officers-lock", ensureSeniorAdmin, async (req, res) => {
     const locked = !!(req.body && req.body.locked);
     await getSettings();
@@ -4315,6 +4358,48 @@ OfficerRoomLogSchema.index({ n: 1, at: -1 });
 const OfficerRoomLog = mongoose.model("OfficerRoomLog", OfficerRoomLogSchema);
 
 // ---------- حالة الرومات الصوتية (بالذاكرة) ----------
+const OfficerRecSchema = new mongoose.Schema({
+    sid: { type: String, unique: true }, n: Number, uid: String, name: String, mime: String,
+    startedAt: { type: Date, default: Date.now }, endedAt: { type: Date, default: null }, lastAt: Date,
+    chunks: { type: Number, default: 0 },
+});
+const OfficerRec = mongoose.model("OfficerRec", OfficerRecSchema);
+const OfficerRecChunkSchema = new mongoose.Schema({ sid: String, seq: Number, data: Buffer });
+OfficerRecChunkSchema.index({ sid: 1, seq: 1 });
+const OfficerRecChunk = mongoose.model("OfficerRecChunk", OfficerRecChunkSchema);
+const OfficerAnnSchema = new mongoose.Schema({
+    test: { type: Boolean, default: false }, createdBy: String, createdByName: String,
+    createdAt: { type: Date, default: Date.now },
+});
+const OfficerAnn = mongoose.model("OfficerAnn", OfficerAnnSchema);
+const OfficerAnnAckSchema = new mongoose.Schema({ aid: String, uid: String, status: String, at: { type: Date, default: Date.now } });
+OfficerAnnAckSchema.index({ aid: 1, uid: 1 }, { unique: true });
+const OfficerAnnAck = mongoose.model("OfficerAnnAck", OfficerAnnAckSchema);
+const offRecActive = new Map();
+function offRecEnd(n, graceful) {
+    const r = offRecActive.get(n);
+    if (!r) return;
+    offRecActive.delete(n);
+    OfficerRec.updateOne({ sid: r.sid, endedAt: null }, { $set: { endedAt: graceful ? new Date() : new Date(r.lastAt) } }).catch(() => {});
+}
+function offRecIsActive(n) {
+    const r = offRecActive.get(n);
+    if (!r) return false;
+    const m = offLive.get(n);
+    if (!m || !m.has(r.uid) || Date.now() - r.lastAt > 45000) { offRecEnd(n, false); return false; }
+    return true;
+}
+async function offRecCleanup() {
+    try {
+        const old = await OfficerRec.find({ startedAt: { $lt: new Date(Date.now() - 14 * 24 * 3600 * 1000) } }).select("sid").lean();
+        if (!old.length) return;
+        const sids = old.map(r => r.sid);
+        await OfficerRecChunk.deleteMany({ sid: { $in: sids } });
+        await OfficerRec.deleteMany({ sid: { $in: sids } });
+    } catch (e) {}
+}
+setTimeout(offRecCleanup, 60000);
+setInterval(offRecCleanup, 6 * 3600 * 1000);
 const offLive = new Map();   // n -> Map(uid -> { uid, name, isSenior, joinedAt })
 const offCfg = new Map();    // n -> { mode, speakerUid }
 function offGetCfg(n) {
@@ -4326,7 +4411,7 @@ function offState(n) {
     const cfg = offGetCfg(n);
     const m = offLive.get(n) || new Map();
     return {
-        n, mode: cfg.mode, speakerUid: cfg.speakerUid,
+        n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
         participants: Array.from(m.values()).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
     };
 }
@@ -4356,6 +4441,8 @@ function offRemove(uid, n) {
     m.delete(uid);
     const cfg = offGetCfg(n);
     if (cfg.speakerUid === uid) cfg.speakerUid = null;
+    const rr = offRecActive.get(n);
+    if (rr && rr.uid === uid) offRecEnd(n, true);
     OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, action: "leave" }).catch(() => {});
     offPushState(n);
 }
@@ -4591,6 +4678,68 @@ app.post("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true, n });
 });
 
+app.post("/api/officers/rec/start", ensureSeniorAdmin, async (req, res) => {
+    const n = offParseN(req.body && req.body.n);
+    const m = n ? offLive.get(n) : null;
+    const me = m ? m.get(req.user.id) : null;
+    if (!me || !me.isSenior) return res.status(403).json({ error: "لازم تكون داخل الروم" });
+    if (!Array.from(m.values()).some(x => !x.isSenior)) return res.json({ ok: false });
+    if (offRecIsActive(n)) return res.json({ ok: false, busy: true });
+    const mime = String((req.body && req.body.mime) || "audio/webm").slice(0, 60);
+    const sid = n + "-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex");
+    await OfficerRec.create({ sid, n, uid: req.user.id, name: me.name, mime, lastAt: new Date() });
+    offRecActive.set(n, { sid, uid: req.user.id, lastAt: Date.now() });
+    offPushState(n);
+    res.json({ ok: true, sid });
+});
+
+app.post("/api/officers/rec/chunk", ensureSeniorAdmin, express.raw({ type: "*/*", limit: "3mb" }), async (req, res) => {
+    const sid = String(req.query.sid || "");
+    const seq = parseInt(req.query.seq, 10);
+    const meta = await OfficerRec.findOne({ sid }).select("uid n").lean();
+    if (!meta || meta.uid !== req.user.id || !(seq >= 0)) return res.status(404).json({ error: "تسجيل غير موجود" });
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ error: "بيانات فارغة" });
+    await OfficerRecChunk.updateOne({ sid, seq }, { $set: { data: buf } }, { upsert: true });
+    await OfficerRec.updateOne({ sid }, { $max: { chunks: seq + 1 }, $set: { lastAt: new Date() } });
+    const r = offRecActive.get(meta.n);
+    if (r && r.sid === sid) r.lastAt = Date.now();
+    res.json({ ok: true });
+});
+
+app.post("/api/officers/rec/stop", ensureSeniorAdmin, async (req, res) => {
+    const sid = String((req.body && req.body.sid) || "");
+    const meta = await OfficerRec.findOne({ sid }).select("uid n endedAt").lean();
+    if (!meta || meta.uid !== req.user.id) return res.status(404).json({ error: "تسجيل غير موجود" });
+    if (!meta.endedAt) await OfficerRec.updateOne({ sid }, { $set: { endedAt: new Date() } });
+    const r = offRecActive.get(meta.n);
+    if (r && r.sid === sid) { offRecActive.delete(meta.n); offPushState(meta.n); }
+    res.json({ ok: true });
+});
+
+app.get("/api/officers/admin/rec/:sid", ensureSeniorAdmin, async (req, res) => {
+    const sid = String(req.params.sid || "");
+    const meta = await OfficerRec.findOne({ sid }).select("mime").lean();
+    if (!meta) return res.status(404).end();
+    const parts = await OfficerRecChunk.find({ sid }).sort({ seq: 1 }).select("data").lean();
+    const buf = Buffer.concat(parts.map(x => Buffer.isBuffer(x.data) ? x.data : Buffer.from(x.data.buffer || x.data)));
+    if (!buf.length) return res.status(404).end();
+    const total = buf.length;
+    res.set("Content-Type", meta.mime || "audio/webm");
+    res.set("Accept-Ranges", "bytes");
+    res.set("Cache-Control", "private, max-age=300");
+    const rg = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
+    if (rg && (rg[1] !== "" || rg[2] !== "")) {
+        let start = rg[1] === "" ? Math.max(0, total - parseInt(rg[2], 10)) : parseInt(rg[1], 10);
+        let end = rg[1] === "" || rg[2] === "" ? total - 1 : Math.min(parseInt(rg[2], 10), total - 1);
+        if (start > end || start >= total) { res.status(416).set("Content-Range", "bytes */" + total).end(); return; }
+        res.status(206).set("Content-Range", "bytes " + start + "-" + end + "/" + total).set("Content-Length", String(end - start + 1));
+        return res.end(buf.subarray(start, end + 1));
+    }
+    res.set("Content-Length", String(total));
+    res.end(buf);
+});
+
 app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res) => {
     const since = new Date(Date.now() - 60 * 24 * 3600 * 1000);
     const logs = await OfficerRoomLog.find({ at: { $gte: since } }).sort({ at: 1 }).limit(8000).maxTimeMS(10000).lean();
@@ -4643,6 +4792,12 @@ app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res)
     const uids = new Set();
     top.forEach(s => s.stays.forEach(st => { if (!st.isSenior) uids.add(st.uid); }));
     const apps = uids.size ? await OfficerApp.find({ uid: { $in: Array.from(uids) } }).select("uid stage rejectedAt age").lean() : [];
+    const recs = await OfficerRec.find({ startedAt: { $gte: since }, chunks: { $gt: 0 } }).sort({ startedAt: 1 }).select("sid n name mime startedAt endedAt lastAt").lean();
+    top.forEach(s => {
+        const lim = (s.end || Date.now()) + 120000;
+        s.recs = recs.filter(r => r.n === s.room && new Date(r.startedAt).getTime() >= s.start - 120000 && new Date(r.startedAt).getTime() <= lim)
+            .map(r => ({ sid: r.sid, name: r.name, mime: r.mime, start: new Date(r.startedAt).getTime(), end: r.endedAt ? new Date(r.endedAt).getTime() : (r.lastAt ? new Date(r.lastAt).getTime() : null) }));
+    });
     const byUid = new Map(apps.map(a => [a.uid, a]));
     top.forEach(s => s.stays.forEach(st => {
         if (st.isSenior) return;
@@ -5143,6 +5298,17 @@ app.get("/", (req, res) => {
     .off-chip.sen { border-color: #eab308; color: #fbbf24; }
     .off-logrow { font-size: 12px; color: var(--muted); padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); }
     .off-res { font-size: 13px; margin-top: 8px; padding: 8px 12px; border-radius: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); }
+    .ann-ov { position: fixed; inset: 0; z-index: 6500; display: flex; align-items: center; justify-content: center; background: rgba(2,6,15,0.42); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); padding: 16px; touch-action: none; }
+    .ann-card { position: relative; width: 100%; max-width: 380px; max-height: 50vh; max-height: 50dvh; overflow-y: auto; background: linear-gradient(160deg, #101c36, #0a1226); border: 1px solid rgba(234,179,8,0.55); border-radius: 20px; padding: 24px 18px 18px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.7); animation: annIn 0.28s ease; touch-action: pan-y; }
+    @keyframes annIn { from { transform: translateY(18px) scale(0.96); opacity: 0; } to { transform: none; opacity: 1; } }
+    .ann-x { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; border-radius: 50%; border: none; background: rgba(255,255,255,0.1); color: #e2e8f0; font-size: 16px; cursor: pointer; line-height: 32px; padding: 0; }
+    .ann-badge { display: inline-block; background: rgba(234,179,8,0.15); color: #fde047; border: 1px solid rgba(234,179,8,0.4); border-radius: 20px; padding: 3px 12px; font-size: 12px; font-weight: 700; margin-bottom: 8px; }
+    .ann-card h3 { margin: 6px 0; font-size: 18px; color: #f8fafc; }
+    .ann-card p { color: #cbd5e1; font-size: 13px; line-height: 1.9; margin: 6px 0 12px; }
+    .ann-test { font-size: 11px; color: #fbbf24; margin-bottom: 8px; }
+    .ann-btns { display: flex; gap: 8px; }
+    .ann-btns .btn { flex: 1; margin: 0; }
+    html.ann-open, html.ann-open body { overflow: hidden; }
     .off-gantt { margin: 10px 0; }
     .off-grow { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
     .off-gname { width: 92px; flex-shrink: 0; font-size: 11px; color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -5858,6 +6024,7 @@ function spConnect() {
         });
         es.addEventListener('changed', function () { spLiveRefresh(); });
         es.addEventListener('vsig', function (e) { try { offOnVsig(JSON.parse(e.data)); } catch (x) {} });
+        es.addEventListener('offann', function () { try { offAnnCheck(); } catch (x) {} });
     } catch (e) {}
 }
 function spReconnect() { if (SP.es) { try { SP.es.close(); } catch (e) {} SP.es = null; SP.esOk = false; } spConnect(); }
@@ -9517,7 +9684,22 @@ function officersLockCardHtml(locked) {
     return '<div class="card" id="officers-lock-card" style="margin-top:12px;">' +
         '<div class="row"><span>🎖️ قفل سلك الضباط</span><span style="color:' + (locked ? '#fca5a5' : '#86efac') + ';font-weight:700;">' + (locked ? 'مقفول' : 'مفتوح') + '</span></div>' +
         '<p style="color:var(--muted);font-size:12px;line-height:1.8;margin-top:6px;">إذا انقفل، اللي قدموا قبل (بالتقديم أو المقابلة أو التدريب) يكملون عادي، واللي ما قدموا يطلع لهم أن سلك الضباط مقفول.</p>' +
-        '<button class="btn' + (locked ? '' : ' danger') + '" style="margin-top:10px;" onclick="toggleOfficersLock(' + (locked ? 'false' : 'true') + ')">' + (locked ? '🔓 فتح سلك الضباط' : '🔒 قفل سلك الضباط') + '</button></div>';
+        '<button class="btn' + (locked ? '' : ' danger') + '" style="margin-top:10px;" onclick="toggleOfficersLock(' + (locked ? 'false' : 'true') + ')">' + (locked ? '🔓 فتح سلك الضباط' : '🔒 قفل سلك الضباط') + '</button>' +
+        (locked ? '' : '<button class="btn gold" style="margin-top:8px;" onclick="offAnnAsk()">📢 إرسال إعلان للأفراد</button>') + '</div>';
+}
+function offAnnAsk() {
+    offModalOpen('<h3>📢 إعلان سلك الضباط</h3><p style="line-height:1.9;margin:10px 0 16px;">تبي يجي إعلان للأفراد من رتبة <b>جندي</b> إلى <b>رئيس رقباء</b> على سلك الضباط؟</p>' +
+        '<div style="display:flex;flex-direction:column;gap:8px;"><button class="btn" onclick="offAnnSend(false)">✅ نعم، أرسل للأفراد</button>' +
+        '<button class="btn gray" onclick="offModalClose()">❌ لا</button>' +
+        '<button class="btn gold" onclick="offAnnSend(true)">🧪 تجربة على حساب المالك فقط</button></div>');
+}
+async function offAnnSend(test) {
+    try {
+        await api('/api/senior/officers-announce', { method: 'POST', body: JSON.stringify({ test: !!test }) });
+        offModalClose();
+        toast(test ? '🧪 تم إرسال التجربة لحساب المالك' : '📢 تم إرسال الإعلان للأفراد');
+        setTimeout(offAnnCheck, 700);
+    } catch (e) { toast(e.message); }
 }
 async function toggleOfficersLock(lock) {
     var ok = await confirmModal(lock ? 'تبي تقفل سلك الضباط؟ اللي ما قدموا ما يقدرون يقدمون.' : 'تبي تفتح سلك الضباط للتقديم؟');
@@ -9527,6 +9709,7 @@ async function toggleOfficersLock(lock) {
         var c = document.getElementById('officers-lock-card');
         if (c) c.outerHTML = officersLockCardHtml(lock);
         toast(lock ? '🔒 تم قفل سلك الضباط' : '🔓 تم فتح سلك الضباط');
+        if (!lock) offAnnAsk();
     } catch (e) { toast(e.message); }
 }
 function ownerLockCardHtml(locked) {
@@ -9849,6 +10032,7 @@ async function offJoinVoice(n) {
     (j.existing || []).forEach(function (uid) { var P = offMakePeer(uid, true); offStartOffer(P, false); });
     offApplyPerms();
     offPaintAll();
+    offRecCheck();
     VC.poll = setInterval(offVoicePoll, 5000);
 }
 
@@ -9876,6 +10060,7 @@ function offMakePeer(uid, initiator) {
         if (VC !== v) return;
         if (e.track.kind === 'audio') {
             P.stream = new MediaStream([e.track]);
+            offRecAddPeer(uid);
             P.audioEl.srcObject = P.stream;
             var pp = P.audioEl.play(); if (pp && pp.catch) pp.catch(function () {});
             offWatch(uid, P.stream, P);
@@ -9898,6 +10083,90 @@ function offMakePeer(uid, initiator) {
         }
     };
     return P;
+}
+function offRecSupported() { return !!(window.MediaRecorder && (window.AudioContext || window.webkitAudioContext)); }
+function offRecMime() {
+    var c = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+    for (var i = 0; i < c.length; i++) { try { if (MediaRecorder.isTypeSupported(c[i])) return c[i]; } catch (e) {} }
+    return '';
+}
+function offRecCheck() {
+    var v = VC;
+    if (!v || !v.isSenior || !offRecSupported()) return;
+    var hasApplicant = v.state.participants.some(function (p) { return !p.isSenior; });
+    if (v.rec) { if (!hasApplicant) offRecStopFor(v); return; }
+    if (!hasApplicant || v.state.rec || v.recBusy || Date.now() < (v.recRetry || 0)) return;
+    v.recBusy = true;
+    offPost('/api/officers/rec/start', { n: v.n, mime: offRecMime() }).then(function (r) {
+        v.recBusy = false;
+        if (VC !== v || !r.ok) return;
+        offRecBegin(v, r.sid);
+    }).catch(function () { v.recBusy = false; v.recRetry = Date.now() + 15000; });
+}
+function offRecBegin(v, sid) {
+    try {
+        if (!v.ac) v.ac = new (window.AudioContext || window.webkitAudioContext)();
+        try { if (v.ac.state === 'suspended') v.ac.resume(); } catch (e) {}
+        var dest = v.ac.createMediaStreamDestination();
+        var micSrc = v.ac.createMediaStreamSource(v.stream);
+        var gain = v.ac.createGain();
+        gain.gain.value = (v.micOn && offCanSpeak()) ? 1 : 0;
+        micSrc.connect(gain); gain.connect(dest);
+        var mime = offRecMime();
+        var rec = { sid: sid, dest: dest, gain: gain, micSrc: micSrc, nodes: {}, seq: 0, q: Promise.resolve(), mr: null };
+        v.rec = rec;
+        Object.keys(v.peers).forEach(function (uid) { offRecAddPeer(uid); });
+        var mr = new MediaRecorder(dest.stream, mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : { audioBitsPerSecond: 32000 });
+        mr.ondataavailable = function (e) { if (e.data && e.data.size) offRecUpload(rec, e.data); };
+        mr.onstop = function () { rec.q = rec.q.then(function () { return offPost('/api/officers/rec/stop', { sid: sid }); }).catch(function () {}); };
+        rec.mr = mr;
+        mr.start(10000);
+    } catch (e) {
+        v.rec = null;
+        v.recRetry = Date.now() + 30000;
+        offPost('/api/officers/rec/stop', { sid: sid }).catch(function () {});
+    }
+}
+function offRecUpload(rec, blob) {
+    var seq = rec.seq++;
+    rec.q = rec.q.then(async function () {
+        for (var i = 0; i < 3; i++) {
+            try {
+                var r = await fetch('/api/officers/rec/chunk?sid=' + encodeURIComponent(rec.sid) + '&seq=' + seq, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: blob });
+                if (r.ok) return;
+            } catch (e) {}
+            await new Promise(function (ok) { setTimeout(ok, 1500); });
+        }
+    });
+}
+function offRecAddPeer(uid) {
+    var v = VC;
+    if (!v || !v.rec) return;
+    var P = v.peers[uid];
+    if (!P || !P.stream) return;
+    var cur = v.rec.nodes[uid];
+    if (cur && cur.stream === P.stream) return;
+    if (cur) { try { cur.src.disconnect(); } catch (e) {} }
+    try {
+        var src = v.ac.createMediaStreamSource(P.stream);
+        src.connect(v.rec.dest);
+        v.rec.nodes[uid] = { src: src, stream: P.stream };
+    } catch (e) {}
+}
+function offRecDropPeer(uid) {
+    if (!VC || !VC.rec) return;
+    var cur = VC.rec.nodes[uid];
+    if (cur) { try { cur.src.disconnect(); } catch (e) {} delete VC.rec.nodes[uid]; }
+}
+function offRecStopFor(v) {
+    var rec = v.rec;
+    if (!rec) return;
+    v.rec = null;
+    try { if (rec.mr && rec.mr.state !== 'inactive') rec.mr.stop(); } catch (e) {}
+    setTimeout(function () {
+        Object.keys(rec.nodes).forEach(function (u) { try { rec.nodes[u].src.disconnect(); } catch (e) {} });
+        try { rec.micSrc.disconnect(); } catch (e) {}
+    }, 1500);
 }
 function offBindSenders(P) {
     P.pc.getTransceivers().forEach(function (t) {
@@ -9953,6 +10222,7 @@ function offClosePeer(uid) {
     var P = VC.peers[uid];
     if (!P) return;
     if (P.watchT) clearInterval(P.watchT);
+    offRecDropPeer(uid);
     try { P.pc.close(); } catch (e) {}
     if (P.audioEl && P.audioEl.parentNode) P.audioEl.parentNode.removeChild(P.audioEl);
     if (P.videoEl && P.videoEl.parentNode) P.videoEl.parentNode.removeChild(P.videoEl);
@@ -9971,6 +10241,7 @@ function offApplyState(st) {
     var meIn = st.participants.some(function (p) { return p.uid === VC.me; });
     if (!meIn) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); return; }
     VC.state = st;
+    offRecCheck();
     Object.keys(VC.peers).forEach(function (uid) {
         var p = offFindP(st, uid);
         if (!p || (VC.peers[uid].joinedAt && p.joinedAt !== VC.peers[uid].joinedAt)) offClosePeer(uid);
@@ -9992,6 +10263,7 @@ async function offVoicePoll() {
 function offApplyPerms() {
     if (!VC) return;
     var st = VC.state, me = VC.me;
+    if (VC.rec) VC.rec.gain.gain.value = (VC.micOn && offCanSpeak()) ? 1 : 0;
     if (VC.screenTrack && !offCanShare()) offStopShare();
     Object.keys(VC.peers).forEach(function (uid) {
         var P = VC.peers[uid];
@@ -10046,6 +10318,7 @@ function offPaintNote() {
     if (!box || !VC) return;
     if (VC.isSenior) box.textContent = offModeDesc(VC.state.mode) + ' — اضغط زر فتح المايك تحت اسم المتقدم.';
     else box.textContent = offCanSpeak() ? '🎙️ المايك مفتوح لك، تكلم.' : '🔇 أنت مستمع فقط — انتظر الكبير يفتح لك المايك.';
+    if (VC.state.rec) box.textContent += ' 🔴 المقابلة مسجّلة صوتياً.';
 }
 function offPaintGrid() {
     var box = document.getElementById('ov-grid');
@@ -10191,7 +10464,13 @@ function offLeaveVoice(silent) {
     });
     try { v.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
     try { if (v.screenStream) v.screenStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-    try { if (v.ac) v.ac.close(); } catch (e) {}
+    if (v.rec) {
+        offRecStopFor(v);
+        var acRef = v.ac;
+        setTimeout(function () { try { if (acRef) acRef.close(); } catch (e) {} }, 2500);
+    } else {
+        try { if (v.ac) v.ac.close(); } catch (e) {}
+    }
     var el = document.getElementById('off-voice');
     if (el) el.remove();
     document.body.style.overflow = '';
@@ -10392,7 +10671,7 @@ function offResultChip(r) {
 }
 function offaLogHtml(d) {
     var list = d.sessions || [];
-    var h = '<div class="card"><h3>📼 تسجيل المقابلة</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">سجل كل جلسة مقابلة صارت بالرومات: من أول واحد دخل الروم إلى آخر واحد طلع، مع وقت دخول وخروج كل شخص، وفيديو توضيحي يعيد لك الجلسة خطوة بخطوة.</p></div>';
+    var h = '<div class="card"><h3>📼 تسجيل المقابلة</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">سجل كل جلسة مقابلة صارت بالرومات: من أول واحد دخل الروم إلى آخر واحد طلع، مع وقت دخول وخروج كل شخص، وتسجيل صوتي للمقابلة (يُحفظ ١٤ يوم)، وفيديو توضيحي يعيد لك الجلسة خطوة بخطوة.</p></div>';
     if (!list.length) return h + '<div class="card center" style="color:var(--muted);">ما فيه جلسات مسجلة</div>';
     list.forEach(function (s, i) {
         var E = s.end || Date.now();
@@ -10429,6 +10708,14 @@ function offaLogHtml(d) {
                 (st.age ? ' <span style="color:var(--muted);font-size:12px;">عمره ' + spEsc(String(st.age)) + '</span>' : '') + offResultChip(st.result) + '</div>' +
                 '<div class="off-stayt">➡️ دخل: ' + spEsc(offFmtTimeS(st.start)) + ' — ' + spEsc(tail) + '</div></div>';
         });
+        h += '</div>';
+        h += '<div style="margin:10px 0;"><b style="color:var(--gold-soft);font-size:13px;">🎧 التسجيل الصوتي</b>';
+        if (s.recs && s.recs.length) {
+            s.recs.forEach(function (r, k) {
+                h += '<div class="off-stay"><div style="font-size:12px;color:var(--muted);">جزء ' + (k + 1) + ' — سجّله ' + spEsc(r.name || '') + ' — ' + spEsc(offFmtTimeS(r.start)) + (r.end ? ' إلى ' + spEsc(offFmtTimeS(r.end)) : '') + '</div>' +
+                    '<audio controls preload="none" style="width:100%;margin-top:4px;" src="/api/officers/admin/rec/' + encodeURIComponent(r.sid) + '"></audio></div>';
+            });
+        } else h += '<div style="color:var(--muted);font-size:12px;margin-top:4px;">ما فيه تسجيل صوتي لهذي الجلسة.</div>';
         h += '</div>';
         h += '<button class="btn gold sm" data-i="' + i + '" onclick="offaReplay(this.dataset.i)">▶️ فيديو توضيحي للجلسة</button></div>';
     });
@@ -10591,8 +10878,63 @@ async function offaTrainReject(id) {
     catch (e) { toast(e.message); }
 }
 /* تحديث تلقائي من الـ polling العام */
+var OFFANN = { shown: false, id: null, tick: 0, busy: false };
+async function offAnnCheck() {
+    if (!ME || ME.blocked || OFFANN.shown || OFFANN.busy || VC) return;
+    OFFANN.busy = true;
+    try {
+        var d = await offFetch('/api/officers/announcement');
+        if (d.ann) {
+            var later = null;
+            try { later = sessionStorage.getItem('offAnnLater'); } catch (e) {}
+            if (later !== d.ann.id) offAnnShow(d.ann);
+        }
+    } catch (e) {}
+    OFFANN.busy = false;
+}
+function offAnnShow(a) {
+    if (OFFANN.shown || document.getElementById('off-ann')) return;
+    OFFANN.shown = true; OFFANN.id = a.id;
+    var ov = document.createElement('div');
+    ov.className = 'ann-ov'; ov.id = 'off-ann';
+    ov.innerHTML = '<div class="ann-card"><button class="ann-x" data-s="dismissed" onclick="offAnnClose(this.dataset.s)" aria-label="إغلاق">✕</button>' +
+        '<div class="ann-badge">📢 إعلان</div><div style="font-size:42px;line-height:1.2;">🎖️</div>' +
+        '<h3>فتح باب التقديم على سلك الضباط</h3>' +
+        '<p>تم فتح باب التقديم على سلك الضباط للأفراد من رتبة جندي إلى رئيس رقباء. تبي تقدّم؟</p>' +
+        (a.test ? '<div class="ann-test">🧪 نسخة تجريبية — تظهر لحساب المالك فقط</div>' : '') +
+        '<div class="ann-btns"><button class="btn" onclick="offAnnApply()">✅ تقديم</button><button class="btn gray" onclick="offAnnLater()">⏳ بقدم لاحقاً</button></div></div>';
+    document.body.appendChild(ov);
+    document.documentElement.classList.add('ann-open');
+}
+function offAnnRemove() {
+    var el = document.getElementById('off-ann');
+    if (el) el.remove();
+    document.documentElement.classList.remove('ann-open');
+    OFFANN.shown = false;
+}
+function offAnnClose(status) {
+    var id = OFFANN.id;
+    offAnnRemove();
+    if (id) offPost('/api/officers/announcement/ack', { id: id, status: status }).catch(function () {});
+}
+function offAnnApply() {
+    offAnnClose('applied');
+    if (typeof renderOfficerPage === 'function') renderOfficerPage();
+}
+function offAnnLater() {
+    try { sessionStorage.setItem('offAnnLater', OFFANN.id || ''); } catch (e) {}
+    offAnnRemove();
+}
+document.addEventListener('touchmove', function (e) {
+    if (!OFFANN.shown) return;
+    var c = document.querySelector('#off-ann .ann-card');
+    if (c && c.contains(e.target) && c.scrollHeight > c.clientHeight + 1) return;
+    e.preventDefault();
+}, { passive: false });
 function offOnPoll() {
     try {
+        OFFANN.tick++;
+        if (OFFANN.tick % 6 === 1) offAnnCheck();
         if (document.getElementById('off-root') && !VC) offLoadMe(true);
         if (document.getElementById('offa-content') && !VC) offaReload(true);
     } catch (e) {}
