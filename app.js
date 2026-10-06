@@ -2854,6 +2854,13 @@ app.post("/api/senior/log/clear", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true });
 });
 
+app.delete("/api/senior/log/:id", ensureSeniorAdmin, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "معرف غير صالح" });
+    await Log.deleteOne({ _id: req.params.id });
+    res.json({ ok: true });
+});
+
 app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null } });
@@ -6532,6 +6539,7 @@ async function init() {
         renderLogin(); return;
     }
     spReconnect(); spBadges();
+    markOwnerSaved();
     if (ME.blocked) { renderBlocked(ME.reason); return; }
     lastKnownRank = ME.rank;
     buildNav();
@@ -6729,8 +6737,24 @@ function authField(label, id, type, ph, dir) {
 }
 var SAVED_LOGIN_KEY = 'moi_saved_login';
 var SAVED_LOCK = null;
-function wipeSavedLogin() {
-    try { localStorage.removeItem(SAVED_LOGIN_KEY); } catch (e) {}
+function wipeSavedLogin(keepOwner) {
+    try {
+        if (keepOwner) {
+            var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
+            if (v && v.owner === true) return;
+        }
+        localStorage.removeItem(SAVED_LOGIN_KEY);
+    } catch (e) {}
+}
+function markOwnerSaved() {
+    try {
+        if (!ME || !ME.isOwner || !ME.accountEmail) return;
+        var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
+        if (v && v.email && String(v.email).toLowerCase() === String(ME.accountEmail).toLowerCase() && v.owner !== true) {
+            v.owner = true;
+            localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify(v));
+        }
+    } catch (e) {}
 }
 async function loadSavedLock() {
     var d = null;
@@ -6740,18 +6764,21 @@ async function loadSavedLock() {
         d = await r.json();
     } catch (e) { SAVED_LOCK = true; return; }
     SAVED_LOCK = !!(d && d.locked);
-    if (SAVED_LOCK) wipeSavedLogin();
+    if (SAVED_LOCK) wipeSavedLogin(true);
 }
 function getSavedLogin() {
-    if (SAVED_LOCK !== false) return null;
+    if (SAVED_LOCK === null) return null;
     try {
         var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
-        if (v && v.email && v.password) return v;
+        if (v && v.email && v.password) {
+            if (SAVED_LOCK === true && v.owner !== true) return null;
+            return v;
+        }
     } catch (e) { }
     return null;
 }
 function setSavedLogin(email, password) {
-    try { localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify({ email: email, password: password })); } catch (e) { }
+    try { localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify({ email: email, password: password, owner: !!(ME && ME.isOwner) })); } catch (e) { }
 }
 function renderSavedLogin(saved) {
     authShell(
@@ -6787,12 +6814,14 @@ async function doSavedLogin() {
     authErr('');
     try {
         await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: saved.email, password: saved.password }) });
-        init();
+        await init();
+        if (SAVED_LOCK === true && !(ME && ME.isOwner)) wipeSavedLogin();
     } catch (e) { authErr(e.message + ' — لو غيّرت كلمة المرور اضغط "الدخول بحساب ثاني" وسجّل من جديد'); }
 }
 async function offerSaveLogin(email, pw) {
     try {
-        if (SAVED_LOCK !== false) return;
+        if (SAVED_LOCK === null) return;
+        if (SAVED_LOCK === true && !(ME && ME.isOwner)) return;
         if (ME && ME.seniorTemp) return;
         var cur = getSavedLogin();
         if (cur && cur.email.toLowerCase() === email.toLowerCase() && cur.password === pw) return;
@@ -9496,7 +9525,7 @@ function renderLog(list) {
     container.innerHTML = list.map(log => {
         const meta = LOG_META[log.action] || { icon: 'ℹ️', label: log.action, color: '#94a3b8', border: '#64748b' };
         return \`
-        <div class="log-item" style="border-color:\${meta.border};flex-wrap:wrap;">
+        <div class="log-item" data-lid="\${log._id}" style="border-color:\${meta.border};flex-wrap:wrap;">
             <div><span style="color:\${meta.color};font-weight:bold;">\${meta.icon} \${meta.label}</span></div>
             <div style="text-align:left;color:#94a3b8;font-size:0.85rem;">
                 \${log.discordTag || log.discordId ? \`<div>الشخص: <b style="color:#60a5fa;">\${log.discordTag || ''}</b> \${log.discordId ? '(' + log.discordId + ')' : ''}</div>\` : ''}
@@ -9506,6 +9535,43 @@ function renderLog(list) {
             </div>
         </div>\`;
     }).join('');
+    if (ME && ME.isOwner) bindLogSwipe(container);
+}
+function bindLogSwipe(container) {
+    Array.prototype.forEach.call(container.querySelectorAll('.log-item[data-lid]'), function (el) {
+        var sx = 0, sy = 0, dx = 0, on = false;
+        el.style.touchAction = 'pan-y';
+        el.addEventListener('pointerdown', function (e) {
+            on = true; sx = e.clientX; sy = e.clientY; dx = 0;
+            el.style.transition = 'none';
+            try { el.setPointerCapture(e.pointerId); } catch (x) {}
+        });
+        el.addEventListener('pointermove', function (e) {
+            if (!on) return;
+            dx = e.clientX - sx;
+            if (Math.abs(e.clientY - sy) > Math.abs(dx) + 12) { on = false; el.style.transform = ''; el.style.opacity = ''; return; }
+            if (dx > 0) { el.style.transform = 'translateX(' + dx + 'px)'; el.style.opacity = String(Math.max(0.25, 1 - dx / 300)); }
+        });
+        var end = async function () {
+            if (!on) return;
+            on = false;
+            el.style.transition = 'transform .2s, opacity .2s';
+            if (dx < 120) { el.style.transform = ''; el.style.opacity = ''; return; }
+            el.style.transform = 'translateX(110%)'; el.style.opacity = '0';
+            var id = el.dataset.lid;
+            try {
+                await api('/api/senior/log/' + id, { method: 'DELETE', noLock: true });
+                allLogsData = allLogsData.filter(function (l) { return String(l._id) !== id; });
+                lastLogId = allLogsData[0] ? allLogsData[0]._id : null;
+                setTimeout(function () { el.remove(); }, 200);
+            } catch (e) {
+                el.style.transform = ''; el.style.opacity = '';
+                toast(e.message);
+            }
+        };
+        el.addEventListener('pointerup', end);
+        el.addEventListener('pointercancel', end);
+    });
 }
 async function loadNotesPage() {
     const box = document.getElementById('admin-content');
@@ -9792,12 +9858,12 @@ function ownerLockCardHtml(locked) {
         '<button class="btn" style="margin-top:10px;" onclick="toggleSavedLock(' + (locked ? 'false' : 'true') + ')">' + (locked ? '🔓 فتح حفظ الحساب' : '🔒 قفل حفظ الحساب') + '</button></div>';
 }
 async function toggleSavedLock(lock) {
-    const ok = await confirmModal(lock ? 'تبي تقفل حفظ الحساب بالجهاز؟ ما بيطلع لأحد "تبي تدخل هذا الحساب" وكل واحد يسجل يدوي، وتنمسح الحسابات المحفوظة بالأجهزة.' : 'تبي تفتح حفظ الحساب بالجهاز؟');
+    const ok = await confirmModal(lock ? 'تبي تقفل حفظ الحساب بالجهاز؟ ما بيطلع لأحد غير المالك "تبي تدخل هذا الحساب" وكل واحد يسجل يدوي، وتنمسح الحسابات المحفوظة بالأجهزة، إلا حساب المالك يبقى محفوظ ويطلع له تبي تدخل حسابك هذا.' : 'تبي تفتح حفظ الحساب بالجهاز؟');
     if (!ok) return;
     try {
         await api('/api/owner/saved-login-lock', { method: 'POST', body: JSON.stringify({ locked: lock }) });
         SAVED_LOCK = lock;
-        if (lock) wipeSavedLogin();
+        if (lock) { markOwnerSaved(); wipeSavedLogin(true); }
         const c = document.getElementById('owner-lock-card');
         if (c) c.outerHTML = ownerLockCardHtml(lock);
         toast(lock ? '🔒 تم القفل' : '🔓 تم الفتح');
