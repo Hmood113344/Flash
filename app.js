@@ -5551,7 +5551,7 @@ app.get("/", (req, res) => {
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
 <div id="owner-modal-overlay" style="position:fixed;inset:0;background:rgba(5,10,20,0.75);backdrop-filter:blur(3px);z-index:5200;display:none;align-items:center;justify-content:center;padding:16px;">
-    <div style="background:var(--panel,#10151f);border:1px solid #2a2f3a;border-radius:14px;max-width:460px;width:100%;max-height:82vh;overflow:auto;padding:16px;">
+    <div id="owner-modal-box" style="background:var(--panel,#10151f);border:1px solid #2a2f3a;border-radius:14px;max-width:460px;width:100%;max-height:82vh;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:16px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
             <b id="owner-modal-title" style="color:var(--gold-soft);"></b>
             <button class="btn sm" onclick="ownerModalClose()">✖</button>
@@ -6613,12 +6613,27 @@ function spDeepLink() {
         else spOpen(id);
     } catch (e) {}
 }
+var OWNER_MODAL_OPEN = false;
 function ownerModalOpen(title, bodyHtml) {
     document.getElementById('owner-modal-title').textContent = title;
     document.getElementById('owner-modal-body').innerHTML = bodyHtml;
     document.getElementById('owner-modal-overlay').style.display = 'flex';
+    if (!OWNER_MODAL_OPEN) {
+        OWNER_MODAL_OPEN = true;
+        document.body.style.overflow = 'hidden';
+    }
 }
-function ownerModalClose() { document.getElementById('owner-modal-overlay').style.display = 'none'; }
+function ownerModalClose() {
+    document.getElementById('owner-modal-overlay').style.display = 'none';
+    OWNER_MODAL_OPEN = false;
+    document.body.style.overflow = '';
+}
+document.addEventListener('touchmove', function (e) {
+    if (!OWNER_MODAL_OPEN) return;
+    var box = document.getElementById('owner-modal-box');
+    if (box && box.contains(e.target) && box.scrollHeight > box.clientHeight + 1) return;
+    e.preventDefault();
+}, { passive: false });
 
 async function offaToggleStealth() {
     try {
