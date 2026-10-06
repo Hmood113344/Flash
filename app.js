@@ -4362,6 +4362,7 @@ const OfficerRecSchema = new mongoose.Schema({
     sid: { type: String, unique: true }, n: Number, uid: String, name: String, mime: String,
     startedAt: { type: Date, default: Date.now }, endedAt: { type: Date, default: null }, lastAt: Date,
     chunks: { type: Number, default: 0 },
+    speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
 });
 const OfficerRec = mongoose.model("OfficerRec", OfficerRecSchema);
 const OfficerRecChunkSchema = new mongoose.Schema({ sid: String, seq: Number, data: Buffer });
@@ -4707,6 +4708,23 @@ app.post("/api/officers/rec/chunk", ensureSeniorAdmin, express.raw({ type: "*/*"
     res.json({ ok: true });
 });
 
+app.post("/api/officers/rec/events", ensureSeniorAdmin, async (req, res) => {
+    const sid = String((req.body && req.body.sid) || "");
+    const meta = await OfficerRec.findOne({ sid }).select("uid speechN").lean();
+    if (!meta || meta.uid !== req.user.id) return res.status(404).json({ error: "تسجيل غير موجود" });
+    const raw = Array.isArray(req.body.ev) ? req.body.ev.slice(0, 300) : [];
+    const ev = [];
+    for (const e of raw) {
+        if (!Array.isArray(e) || e.length < 3) continue;
+        const o = Number(e[2]);
+        if (!(o >= 0) || o > 12 * 3600 * 1000) continue;
+        ev.push([String(e[0]).slice(0, 32), e[1] ? 1 : 0, Math.round(o)]);
+    }
+    if (!ev.length || (meta.speechN || 0) > 20000) return res.json({ ok: true });
+    await OfficerRec.updateOne({ sid }, { $push: { speech: { $each: ev } }, $inc: { speechN: ev.length } });
+    res.json({ ok: true });
+});
+
 app.post("/api/officers/rec/stop", ensureSeniorAdmin, async (req, res) => {
     const sid = String((req.body && req.body.sid) || "");
     const meta = await OfficerRec.findOne({ sid }).select("uid n endedAt").lean();
@@ -4792,11 +4810,11 @@ app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res)
     const uids = new Set();
     top.forEach(s => s.stays.forEach(st => { if (!st.isSenior) uids.add(st.uid); }));
     const apps = uids.size ? await OfficerApp.find({ uid: { $in: Array.from(uids) } }).select("uid stage rejectedAt age").lean() : [];
-    const recs = await OfficerRec.find({ startedAt: { $gte: since }, chunks: { $gt: 0 } }).sort({ startedAt: 1 }).select("sid n name mime startedAt endedAt lastAt").lean();
+    const recs = await OfficerRec.find({ startedAt: { $gte: since }, chunks: { $gt: 0 } }).sort({ startedAt: 1 }).select("sid n name mime startedAt endedAt lastAt speech").lean();
     top.forEach(s => {
         const lim = (s.end || Date.now()) + 120000;
         s.recs = recs.filter(r => r.n === s.room && new Date(r.startedAt).getTime() >= s.start - 120000 && new Date(r.startedAt).getTime() <= lim)
-            .map(r => ({ sid: r.sid, name: r.name, mime: r.mime, start: new Date(r.startedAt).getTime(), end: r.endedAt ? new Date(r.endedAt).getTime() : (r.lastAt ? new Date(r.lastAt).getTime() : null) }));
+            .map(r => ({ sid: r.sid, name: r.name, mime: r.mime, start: new Date(r.startedAt).getTime(), end: r.endedAt ? new Date(r.endedAt).getTime() : (r.lastAt ? new Date(r.lastAt).getTime() : null), speech: r.speech || [] }));
     });
     const byUid = new Map(apps.map(a => [a.uid, a]));
     top.forEach(s => s.stays.forEach(st => {
@@ -5327,6 +5345,11 @@ app.get("/", (req, res) => {
     .rp-row.wait { opacity: 0.4; }
     .rp-row.in { background: rgba(34,197,94,0.16); border-color: #22c55e; }
     .rp-row.out { background: rgba(100,116,139,0.18); opacity: 0.75; }
+    .off-talk { color: #86efac; font-size: 12px; font-weight: 700; }
+    .rp-mic { font-size: 11px; font-weight: 700; color: #94a3b8; margin-right: 4px; }
+    .rp-mic.live { color: #4ade80; animation: rpPulse 0.9s ease-in-out infinite; }
+    @keyframes rpPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+    .rp-row.talk { box-shadow: 0 0 0 2px #22c55e; }
     .rp-feed { max-height: 120px; overflow-y: auto; font-size: 12px; color: #cbd5e1; margin-top: 8px; line-height: 1.9; }
     #off-voice { position: fixed; inset: 0; z-index: 4000; background: linear-gradient(160deg, #060e1c, #0a1628); overflow-y: auto; padding: 14px 14px 110px; }
     .ov-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -5938,7 +5961,7 @@ function showPromotionAlert(a) {
 function closePromotionAlert() {
     document.getElementById('promo-alert-overlay').classList.remove('open');
     currentPromoAlertId = null;
-    if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending();
+    if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
     checkPromotionAlert();
 }
 async function promoAlertApprove() {
@@ -6628,9 +6651,9 @@ async function pollTick() {
         if (document.getElementById('mine-list')) loadMine(true);
         if (document.getElementById('pending-box')) loadPending();
         if (currentAdminTab === 'log') loadLog(true);
-        if (typeof sectorPanelTab !== 'undefined' && sectorPanelTab === 'members' && document.getElementById('sector-content')) loadSectorMembers();
-        if (typeof poTab !== 'undefined' && poTab === 'members' && document.getElementById('po-content')) loadPoMembers();
-        if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending();
+        if (typeof sectorPanelTab !== 'undefined' && sectorPanelTab === 'members' && document.getElementById('sector-content')) loadSectorMembers(true);
+        if (typeof poTab !== 'undefined' && poTab === 'members' && document.getElementById('po-content')) loadPoMembers(true);
+        if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
         checkPendingWarning();
         checkPromotionAlert();
         offOnPoll();
@@ -7654,16 +7677,16 @@ function hcCard(r, withActions) {
             </div>\` : ''}
         </div>\`;
 }
-async function loadHCPending() {
+async function loadHCPending(silent) {
     const box = document.getElementById('hc-content');
     if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     let data;
     try { data = await api('/api/high-command/promotion-requests'); }
-    catch (e) { if (hcTab !== 'pending') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    catch (e) { if (hcTab !== 'pending' || silent) return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
     if (hcTab !== 'pending') return;
-    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات معلّقة</div>'; return; }
-    box.innerHTML = data.list.map(r => hcCard(r, true)).join('');
+    if (data.list.length === 0) { paintSilent(box, 'hp', '<div class="card center" style="color:var(--muted);">لا توجد طلبات معلّقة</div>', silent); return; }
+    paintSilent(box, 'hp', data.list.map(r => hcCard(r, true)).join(''), silent);
 }
 async function hcDecide(id, action) {
     if (action === 'reject') {
@@ -7823,22 +7846,30 @@ async function loadPromotionRequests() {
             <div style="margin-top:4px;"><span class="badge \${r.status}">\${r.status === 'pending' ? 'قيد المراجعة (القيادة العليا)' : r.status === 'approved' ? 'تمت الموافقة' : 'مرفوض'}</span>\${r.status === 'rejected' && r.rejectReason ? \` — \${r.rejectReason}\` : ''}</div>
         </div>\`).join('');
 }
-async function loadSectorMembers() {
+var SILENT_SIG = {};
+function paintSilent(box, key, html, silent) {
+    if (silent && SILENT_SIG[key] === html && box.innerHTML) return;
+    var y = window.scrollY;
+    box.innerHTML = html;
+    SILENT_SIG[key] = html;
+    if (silent) window.scrollTo(0, y);
+}
+async function loadSectorMembers(silent) {
     const box = document.getElementById('sector-content');
     if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     let data;
     try { data = await api('/api/sector/members'); }
     catch (e) {
-        if (sectorPanelTab !== 'members') return;
+        if (sectorPanelTab !== 'members' || silent) return;
         box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
         return;
     }
     if (sectorPanelTab !== 'members') return;
     sectorMembersCache = data.list;
     cardRemember(data.list);
-    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء مسجّلين بهذا القطاع حالياً</div>'; return; }
-    box.innerHTML = data.list.map(p => \`
+    if (data.list.length === 0) { paintSilent(box, 'sm', '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء مسجّلين بهذا القطاع حالياً</div>', silent); return; }
+    paintSilent(box, 'sm', data.list.map(p => \`
         <div class="card">
             <div class="row">
                 <div>
@@ -7855,7 +7886,7 @@ async function loadSectorMembers() {
                     <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/sector/personnel/')">⚠️ تحذير</button>
                 </div>
             </div>
-        </div>\`).join('');
+        </div>\`).join(''), silent);
 }
 async function sectorPromote(discord, direction) {
     const reason = await promptModal(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
@@ -7988,21 +8019,21 @@ function poTabSwitch(name, el) {
     if (name === 'violations') loadPoViolations();
     if (name === 'leave') loadSectorLeavePending();
 }
-async function loadPoMembers() {
+async function loadPoMembers(silent) {
     const box = document.getElementById('po-content');
     if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     let data;
     try { data = await api('/api/personnel-officer/members'); }
     catch (e) {
-        if (poTab !== 'members') return;
+        if (poTab !== 'members' || silent) return;
         box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
         return;
     }
     if (poTab !== 'members') return;
     cardRemember(data.list);
-    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أفراد برتبة رئيس رقباء وتحت بقطاعك حالياً</div>'; return; }
-    box.innerHTML = data.list.map(p => \`
+    if (data.list.length === 0) { paintSilent(box, 'pm', '<div class="card center" style="color:var(--muted);">لا يوجد أفراد برتبة رئيس رقباء وتحت بقطاعك حالياً</div>', silent); return; }
+    paintSilent(box, 'pm', data.list.map(p => \`
         <div class="card">
             <div class="row">
                 <div>
@@ -8018,7 +8049,7 @@ async function loadPoMembers() {
                     <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/personnel-officer/personnel/')">⚠️ تحذير</button>
                 </div>
             </div>
-        </div>\`).join('');
+        </div>\`).join(''), silent);
 }
 async function editMemberPoints(discord, currentPoints) {
     const val = await promptModal('عدد النقاط الجديد:', currentPoints);
@@ -10113,14 +10144,19 @@ function offRecBegin(v, sid) {
         gain.gain.value = (v.micOn && offCanSpeak()) ? 1 : 0;
         micSrc.connect(gain); gain.connect(dest);
         var mime = offRecMime();
-        var rec = { sid: sid, dest: dest, gain: gain, micSrc: micSrc, nodes: {}, seq: 0, q: Promise.resolve(), mr: null };
+        var rec = { sid: sid, dest: dest, gain: gain, micSrc: micSrc, nodes: {}, seq: 0, q: Promise.resolve(), mr: null, ev: [], t0: performance.now() };
         v.rec = rec;
         Object.keys(v.peers).forEach(function (uid) { offRecAddPeer(uid); });
         var mr = new MediaRecorder(dest.stream, mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : { audioBitsPerSecond: 32000 });
-        mr.ondataavailable = function (e) { if (e.data && e.data.size) offRecUpload(rec, e.data); };
-        mr.onstop = function () { rec.q = rec.q.then(function () { return offPost('/api/officers/rec/stop', { sid: sid }); }).catch(function () {}); };
+        mr.ondataavailable = function (e) {
+            if (e.data && e.data.size) offRecUpload(rec, e.data);
+            rec.q = rec.q.then(function () { return offRecFlushEv(rec); });
+        };
+        mr.onstop = function () { rec.q = rec.q.then(function () { return offRecFlushEv(rec); }).then(function () { return offPost('/api/officers/rec/stop', { sid: sid }); }).catch(function () {}); };
         rec.mr = mr;
         mr.start(10000);
+        rec.t0 = performance.now();
+        Object.keys(v.speaking).forEach(function (u) { if (v.speaking[u]) rec.ev.push([u, 1, 0]); });
     } catch (e) {
         v.rec = null;
         v.recRetry = Date.now() + 30000;
@@ -10138,6 +10174,14 @@ function offRecUpload(rec, blob) {
             await new Promise(function (ok) { setTimeout(ok, 1500); });
         }
     });
+}
+function offRecFlushEv(rec) {
+    if (!rec.ev.length) return Promise.resolve();
+    var batch = rec.ev;
+    rec.ev = [];
+    return fetch('/api/officers/rec/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid: rec.sid, ev: batch }) })
+        .then(function (r) { if (!r.ok) throw new Error('x'); })
+        .catch(function () { rec.ev = batch.concat(rec.ev); });
 }
 function offRecAddPeer(uid) {
     var v = VC;
@@ -10162,6 +10206,8 @@ function offRecStopFor(v) {
     var rec = v.rec;
     if (!rec) return;
     v.rec = null;
+    var o = Math.round(performance.now() - rec.t0);
+    Object.keys(v.speaking).forEach(function (u) { if (v.speaking[u]) rec.ev.push([u, 0, o]); });
     try { if (rec.mr && rec.mr.state !== 'inactive') rec.mr.stop(); } catch (e) {}
     setTimeout(function () {
         Object.keys(rec.nodes).forEach(function (u) { try { rec.nodes[u].src.disconnect(); } catch (e) {} });
@@ -10295,6 +10341,7 @@ function offWatch(uid, stream, P) {
             else on = on && offAllowed(v.state, uid, v.me);
             if (v.speaking[uid] !== on) {
                 v.speaking[uid] = on;
+                if (v.rec) v.rec.ev.push([uid, on ? 1 : 0, Math.round(performance.now() - v.rec.t0)]);
                 var el = document.getElementById('vt-' + uid);
                 if (el) el.classList.toggle('speaking', on);
             }
@@ -10699,13 +10746,22 @@ function offaLogHtml(d) {
         });
         h += '<div class="off-gaxis"><span>' + spEsc(offFmtTimeS(s.start)) + '</span><span>' + (s.live ? 'الحين' : spEsc(offFmtTimeS(E))) + '</span></div></div>';
         h += '<div style="margin:8px 0;"><b style="color:var(--gold-soft);font-size:13px;">الدخول والخروج بالترتيب</b>';
+        var talk = {};
+        (s.recs || []).forEach(function (r) {
+            var open = {};
+            (r.speech || []).forEach(function (e) {
+                if (e[1] === 1) { if (open[e[0]] === undefined) open[e[0]] = e[2]; }
+                else if (open[e[0]] !== undefined) { talk[e[0]] = (talk[e[0]] || 0) + Math.max(0, e[2] - open[e[0]]); delete open[e[0]]; }
+            });
+        });
         s.stays.forEach(function (st, k) {
             var tail;
             if (st.end) tail = '⬅️ طلع: ' + offFmtTimeS(st.end) + ' — مدة البقاء: ' + offDur(st.end - st.start);
             else if (st.ongoing) tail = '🟢 داخل الروم الحين';
             else tail = '⚠️ انقطع اتصاله (وقت الخروج غير مسجل)';
             h += '<div class="off-stay"><div><b>' + (k + 1) + '- ' + spEsc(st.name) + '</b> <span class="off-chip' + (st.isSenior ? ' sen' : '') + '">' + (st.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</span>' +
-                (st.age ? ' <span style="color:var(--muted);font-size:12px;">عمره ' + spEsc(String(st.age)) + '</span>' : '') + offResultChip(st.result) + '</div>' +
+                (st.age ? ' <span style="color:var(--muted);font-size:12px;">عمره ' + spEsc(String(st.age)) + '</span>' : '') + offResultChip(st.result) +
+                (talk[st.uid] ? ' <span class="off-talk">🎤 تحدث ' + spEsc(offDur(talk[st.uid])) + '</span>' : '') + '</div>' +
                 '<div class="off-stayt">➡️ دخل: ' + spEsc(offFmtTimeS(st.start)) + ' — ' + spEsc(tail) + '</div></div>';
         });
         h += '</div>';
@@ -10726,15 +10782,16 @@ var REP = null;
 function offaReplayShell(s) {
     var h = '<h3>🎬 فيديو توضيحي — مقابلة ' + s.room + '</h3>';
     h += '<div class="rp-clock" id="rp-clock">--</div>';
-    h += '<div style="text-align:center;font-size:12px;color:var(--muted);">مضى: <span id="rp-elapsed">0 ث</span> — داخل الروم: <b id="rp-count">0</b></div>';
+    h += '<div style="text-align:center;font-size:12px;color:var(--muted);">مضى: <span id="rp-elapsed">0 ث</span> — داخل الروم: <b id="rp-count">0</b><span id="rp-aud"></span></div>';
     h += '<div class="rp-prog"><div id="rp-bar"></div></div>';
     s.stays.forEach(function (st, k) {
-        h += '<div class="rp-row wait" id="rp-r' + k + '"><span>' + (st.isSenior ? '🎖️ ' : '') + spEsc(st.name) + '</span><span id="rp-s' + k + '">لم يدخل</span></div>';
+        h += '<div class="rp-row wait" id="rp-r' + k + '"><span>' + (st.isSenior ? '🎖️ ' : '') + spEsc(st.name) + ' <span class="rp-mic" id="rp-m' + k + '"></span></span><span id="rp-s' + k + '">لم يدخل</span></div>';
     });
     h += '<div class="rp-feed" id="rp-feed"></div>';
     h += '<div style="display:flex;gap:8px;justify-content:center;margin-top:12px;"><button class="btn sm" id="rp-pp" onclick="offaReplayToggle()">⏸️ إيقاف</button><button class="btn gray sm" id="rp-sp" onclick="offaReplaySpeed()">×1</button><button class="btn danger sm" onclick="offaReplayClose()">✖ إغلاق</button></div>';
     return h;
 }
+function offaRecUrl(i) { return '/api/officers/admin/rec/' + encodeURIComponent(REP.segs[i].sid); }
 function offaReplay(i) {
     var s = OFFA.data && OFFA.data.sessions ? OFFA.data.sessions[parseInt(i, 10)] : null;
     if (!s) return;
@@ -10747,15 +10804,68 @@ function offaReplay(i) {
         if (st.end) evs.push({ t: st.end, k: k, a: 'leave' });
     });
     evs.sort(function (x, y) { return x.t - y.t; });
-    REP = { s: s, E: E, span: span, evs: evs, T: 0, mult: 1, playing: true, timer: null, base: Math.max(1, span / 30000), states: {}, passed: -1 };
+    var segs = (s.recs || []).filter(function (r) { return r.sid; }).sort(function (a, b) { return a.start - b.start; });
+    var sp = {};
+    segs.forEach(function (r) {
+        (r.speech || []).forEach(function (e) { (sp[e[0]] = sp[e[0]] || []).push([r.start + e[2], e[1]]); });
+    });
+    Object.keys(sp).forEach(function (u) { sp[u].sort(function (a, b) { return a[0] - b[0]; }); });
+    REP = { s: s, E: E, span: span, evs: evs, T: 0, mult: 1, playing: true, timer: null, base: Math.max(1, span / 30000), states: {}, passed: -1, segs: segs, si: 0, audio: null, rate: 1, sp: sp };
     offModalOpen(offaReplayShell(s));
+    if (segs.length) offaReplayAudioStart();
     REP.timer = setInterval(offaReplayTick, 100);
     offaReplayTick(true);
+}
+function offaReplayAudioStart() {
+    var a = new Audio();
+    a.preload = 'auto';
+    REP.audio = a;
+    REP.si = 0;
+    REP.T = Math.max(0, REP.segs[0].start - REP.s.start);
+    a.onended = function () { offaReplayNextSeg(); };
+    a.onerror = function () { if (!REP) return; toast('تعذر تشغيل الصوت، يتم العرض بدون صوت'); offaReplayAudioOff(); };
+    a.src = offaRecUrl(0);
+    a.playbackRate = REP.rate;
+    var pr = a.play(); if (pr && pr.catch) pr.catch(function () {});
+    var el = document.getElementById('rp-aud');
+    if (el) el.textContent = ' — 🔊 الصوت شغال';
+}
+function offaReplayNextSeg() {
+    if (!REP || !REP.audio) return;
+    REP.si++;
+    if (REP.si >= REP.segs.length) { REP.T = REP.span; REP.playing = false; offaReplayPaintBtn(); return; }
+    var a = REP.audio;
+    REP.T = Math.max(0, REP.segs[REP.si].start - REP.s.start);
+    a.src = offaRecUrl(REP.si);
+    a.playbackRate = REP.rate;
+    var pr = a.play(); if (pr && pr.catch) pr.catch(function () {});
+}
+function offaReplayAudioOff() {
+    if (!REP || !REP.audio) return;
+    try { REP.audio.pause(); REP.audio.removeAttribute('src'); } catch (e) {}
+    REP.audio = null;
+    REP.sp = {};
+    REP.states = {};
+    var el = document.getElementById('rp-aud');
+    if (el) el.textContent = '';
+}
+function offaReplaySpeak(uid, now) {
+    var arr = REP.sp[uid];
+    if (!arr) return 0;
+    var spoke = false, on = false;
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i][0] > now) break;
+        if (arr[i][1] === 1) { spoke = true; on = true; } else on = false;
+    }
+    return on ? 2 : (spoke ? 1 : 0);
 }
 function offaReplayTick(first) {
     if (!REP) return;
     if (!document.getElementById('rp-clock')) { offaReplayStop(); return; }
-    if (REP.playing && first !== true) {
+    if (REP.audio) {
+        var seg = REP.segs[REP.si];
+        if (REP.playing && seg) REP.T = Math.min(REP.span, Math.max(0, seg.start + REP.audio.currentTime * 1000 - REP.s.start));
+    } else if (REP.playing && first !== true) {
         REP.T += 100 * REP.base * REP.mult;
         if (REP.T >= REP.span) { REP.T = REP.span; REP.playing = false; offaReplayPaintBtn(); }
     }
@@ -10772,12 +10882,16 @@ function offaReplayTick(first) {
             else state = 'in';
         }
         if (state === 'in') inCount++;
-        if (REP.states[k] !== state) {
-            REP.states[k] = state;
+        var m = state === 'wait' ? 0 : offaReplaySpeak(st.uid, now);
+        var key = state + '|' + m;
+        if (REP.states[k] !== key) {
+            REP.states[k] = key;
             var row = document.getElementById('rp-r' + k);
             var lab = document.getElementById('rp-s' + k);
-            if (row) row.className = 'rp-row ' + state;
+            var mic = document.getElementById('rp-m' + k);
+            if (row) row.className = 'rp-row ' + state + (m === 2 ? ' talk' : '');
             if (lab) lab.textContent = state === 'in' ? '🟢 داخل الروم' : (state === 'out' ? (st.end ? '⚫ طلع ' + offFmtTimeS(st.end) : '⚠️ انقطع') : 'لم يدخل');
+            if (mic) { mic.className = 'rp-mic' + (m === 2 ? ' live' : ''); mic.textContent = m === 2 ? '🎤 يتحدث الحين' : (m === 1 ? '🎤 تحدث' : ''); }
         }
     });
     document.getElementById('rp-count').textContent = inCount;
@@ -10801,18 +10915,40 @@ function offaReplayPaintBtn() {
 }
 function offaReplayToggle() {
     if (!REP) return;
-    if (!REP.playing && REP.T >= REP.span) { REP.T = 0; REP.passed = -1; REP.states = {}; REP.playing = true; }
-    else REP.playing = !REP.playing;
+    var a = REP.audio;
+    if (!REP.playing && REP.T >= REP.span) {
+        REP.passed = -1; REP.states = {}; REP.playing = true;
+        if (a) {
+            REP.si = 0;
+            REP.T = Math.max(0, REP.segs[0].start - REP.s.start);
+            a.src = offaRecUrl(0);
+            a.playbackRate = REP.rate;
+            var pr = a.play(); if (pr && pr.catch) pr.catch(function () {});
+        } else REP.T = 0;
+    } else {
+        REP.playing = !REP.playing;
+        if (a) {
+            if (REP.playing) { var p2 = a.play(); if (p2 && p2.catch) p2.catch(function () {}); }
+            else a.pause();
+        }
+    }
     offaReplayPaintBtn();
 }
 function offaReplaySpeed() {
     if (!REP) return;
-    REP.mult = REP.mult === 1 ? 2 : (REP.mult === 2 ? 4 : 1);
     var b = document.getElementById('rp-sp');
+    if (REP.audio) {
+        REP.rate = REP.rate === 1 ? 1.5 : (REP.rate === 1.5 ? 2 : 1);
+        REP.audio.playbackRate = REP.rate;
+        if (b) b.textContent = '×' + REP.rate;
+        return;
+    }
+    REP.mult = REP.mult === 1 ? 2 : (REP.mult === 2 ? 4 : 1);
     if (b) b.textContent = '×' + REP.mult;
 }
 function offaReplayStop() {
     if (REP && REP.timer) clearInterval(REP.timer);
+    if (REP && REP.audio) { try { REP.audio.pause(); REP.audio.removeAttribute('src'); } catch (e) {} }
     REP = null;
 }
 function offaReplayClose() {
