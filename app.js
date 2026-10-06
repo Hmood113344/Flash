@@ -6645,8 +6645,8 @@ async function offaOpenDevices() {
             return '<div class="card" style="margin-bottom:8px;"><b style="font-size:13px;">' + spEsc(v.name) + '</b>' +
                 '<div style="font-size:11px;color:var(--muted);margin:4px 0;">' + spEsc(v.ip || '') + ' — ' + spEsc((v.ua || '').slice(0, 60)) + '</div>' +
                 '<div style="display:flex;gap:6px;margin-top:6px;">' +
-                '<button class="btn sm danger" onclick="offaKickDevice(\'' + v._id + '\')">⛔ طرد الجهاز</button>' +
-                '<button class="btn sm" onclick="offaKickAccount(\'' + v.uid + '\')">🚪 خروج كل أجهزة الحساب</button>' +
+                '<button class="btn sm danger" onclick="offaKickDevice(\\'' + v._id + '\\')">⛔ طرد الجهاز</button>' +
+                '<button class="btn sm" onclick="offaKickAccount(\\'' + v.uid + '\\')">🚪 خروج كل أجهزة الحساب</button>' +
                 '</div></div>';
         }).join('');
         ownerModalOpen('📱 الأجهزة المتصلة', h);
