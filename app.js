@@ -4376,6 +4376,7 @@ const OfficerAnn = mongoose.model("OfficerAnn", OfficerAnnSchema);
 const OfficerAnnAckSchema = new mongoose.Schema({ aid: String, uid: String, status: String, at: { type: Date, default: Date.now } });
 OfficerAnnAckSchema.index({ aid: 1, uid: 1 }, { unique: true });
 const OfficerAnnAck = mongoose.model("OfficerAnnAck", OfficerAnnAckSchema);
+const OFF_ROOMS_MAX = 5;
 const offRecActive = new Map();
 function offRecEnd(n, graceful) {
     const r = offRecActive.get(n);
@@ -4622,7 +4623,7 @@ app.post("/api/officers/admin/applications/:id/approve", ensureSeniorAdmin, asyn
     if (!at) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
     const room = offParseN(b.room);
     if (!room) return res.status(400).json({ error: "حدد روم المقابلة" });
-    await OfficerRoom.updateOne({ n: room }, { $setOnInsert: { n: room } }, { upsert: true });
+    if (!(await OfficerRoom.exists({ n: room }))) return res.status(400).json({ error: "هذا الروم غير موجود" });
     a.stage = "interview";
     a.interview.room = room;
     a.interview.at = at;
@@ -4652,7 +4653,7 @@ app.delete("/api/officers/admin/applications/:id", ensureSeniorAdmin, async (req
 
 // ---------- الكبار: المقابلة ----------
 app.get("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
-    await OfficerRoom.updateOne({ n: 1 }, { $setOnInsert: { n: 1 } }, { upsert: true });
+    if (!(await OfficerRoom.countDocuments({}))) await OfficerRoom.create({ n: 1 }).catch(() => {});
     const rooms = await OfficerRoom.find({}).sort({ n: 1 }).lean();
     const apps = await OfficerApp.find({ stage: "interview" }).lean();
     const out = [];
@@ -4668,15 +4669,40 @@ app.get("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
                 .map(a => ({ id: String(a._id), name: a.name, at: a.interview.at, entered: !!a.interview.enteredAt, inRoom: live.has(a.uid) })),
         });
     }
-    res.json({ rooms: out });
+    res.json({ rooms: out, max: OFF_ROOMS_MAX });
 });
 
 app.post("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
-    const last = await OfficerRoom.findOne({}).sort({ n: -1 }).lean();
-    const n = (last ? last.n : 0) + 1;
-    if (n > 999) return res.status(400).json({ error: "وصلت الحد الأعلى للرومات" });
-    await OfficerRoom.create({ n });
+    const existing = await OfficerRoom.find({}).select("n").lean();
+    if (existing.length >= OFF_ROOMS_MAX) return res.status(400).json({ error: "وصلت الحد الأقصى (" + OFF_ROOMS_MAX + " رومات)" });
+    const used = new Set(existing.map(r => r.n));
+    let n = 1;
+    while (used.has(n)) n++;
+    try { await OfficerRoom.create({ n }); }
+    catch (e) { return res.status(409).json({ error: "صار تعارض، جرب مرة ثانية" }); }
     res.json({ ok: true, n });
+});
+
+app.delete("/api/officers/admin/rooms/:n", ensureSeniorAdmin, async (req, res) => {
+    const n = offParseN(req.params.n);
+    const rooms = await OfficerRoom.find({}).sort({ n: 1 }).lean();
+    if (!n || !rooms.some(r => r.n === n)) return res.status(404).json({ error: "الروم غير موجود" });
+    if (rooms.length <= 1) return res.status(400).json({ error: "لازم يبقى روم واحد على الأقل" });
+    const target = rooms.find(r => r.n !== n).n;
+    const m = offLive.get(n);
+    if (m) {
+        for (const uid of Array.from(m.keys())) {
+            offSendTo(uid, { t: "roomdeleted", n });
+            offRemove(uid, n);
+        }
+    }
+    offRecEnd(n, true);
+    offCfg.delete(n);
+    offLive.delete(n);
+    const mv = await OfficerApp.updateMany({ stage: "interview", "interview.room": n }, { $set: { "interview.room": target } });
+    await OfficerRoom.deleteOne({ n });
+    await logEvent({ action: "حذف روم مقابلة", actorId: req.user.id, actorTag: req.user.username, details: "روم " + n });
+    res.json({ ok: true, movedTo: target, moved: mv.modifiedCount || 0 });
 });
 
 app.post("/api/officers/rec/start", ensureSeniorAdmin, async (req, res) => {
@@ -4910,7 +4936,7 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
     let name = req.user.username;
     let appDoc = null;
     if (senior) {
-        await OfficerRoom.updateOne({ n }, { $setOnInsert: { n } }, { upsert: true });
+        if (!(await OfficerRoom.exists({ n }))) return res.status(404).json({ error: "هذا الروم غير موجود" });
     } else {
         appDoc = await OfficerApp.findOne({ uid, stage: "interview", "interview.room": n });
         if (!appDoc || !appDoc.interview || !appDoc.interview.at) return res.status(403).json({ error: "ما عندك مقابلة بهذا الروم" });
@@ -9781,7 +9807,7 @@ var OFF_MODES = [
     { k: 'private', t: '🔒 خاص (الكبار والمتحدث فقط)' },
     { k: 'listen', t: '👂 الكبار يتكلمون والباقي يسمعون' },
     { k: 'open', t: '🗣️ الكل يتكلم ويسمع' },
-    { k: 'mute', t: '🔇 ما أحد يتكلم' }
+    { k: 'mute', t: '🔇 محد يتكلم ولا أحد يسمع (الكبار فقط يسمعون)' }
 ];
 function offNow() { return Date.now() + OFF.offset; }
 async function offFetch(url, opts) {
@@ -9999,6 +10025,7 @@ function offAllowed(st, from, to) {
     if (!f || !t) return false;
     if (f.isSenior && t.isSenior) return true;
     var sp = st.speakerUid, mode = st.mode;
+    if (mode === 'mute') return false;
     if (f.isSenior) {
         if (mode === 'private') return to === sp;
         return true;
@@ -10020,7 +10047,7 @@ function offModeDesc(m) {
     if (m === 'private') return 'الكبار والمتحدث بس يسمعون بعض، وباقي المتقدمين ما يسمعون شي.';
     if (m === 'listen') return 'الكبار فقط الي يتكلمون، والمتقدمين يسمعونهم بس. والمتقدم الي تفتح له المايك يسمعه الكبار فقط.';
     if (m === 'open') return 'الكل يتكلم ويسمع.';
-    return 'المتقدمين ما يتكلمون، والكبار يتكلمون ويسمعهم الكل.';
+    return 'محد يتكلم ولا أحد يسمع من المتقدمين، والكبار فقط هم اللي يسمعون بعض.';
 }
 function offSignal(uid, data) {
     if (!VC) return;
@@ -10282,6 +10309,7 @@ function offOnVsig(d) {
     if (!VC || !d) return;
     if (d.t === 'state') offApplyState(d.state);
     else if (d.t === 'kicked' && d.n === VC.n) { toast('🚫 تم طردك من الروم'); offLeaveVoice(true); }
+    else if (d.t === 'roomdeleted' && d.n === VC.n) { toast('🗑️ تم حذف هذا الروم'); offLeaveVoice(true); }
     else if (d.t === 'signal' && d.n === VC.n) offQueue(d.from, function () { return offOnSignal(d.from, d.data); });
 }
 function offApplyState(st) {
@@ -10366,7 +10394,7 @@ function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
     if (VC.isSenior) box.textContent = offModeDesc(VC.state.mode) + ' — اضغط زر فتح المايك تحت اسم المتقدم.';
-    else box.textContent = offCanSpeak() ? '🎙️ المايك مفتوح لك، تكلم.' : '🔇 أنت مستمع فقط — انتظر الكبير يفتح لك المايك.';
+    else box.textContent = VC.state.mode === 'mute' ? '🔇 الروم صامت حالياً — ما أحد يتكلم ولا تسمع شي، الكبار فقط يسمعون بعض.' : (offCanSpeak() ? '🎙️ المايك مفتوح لك، تكلم.' : '🔇 أنت مستمع فقط — انتظر الكبير يفتح لك المايك.');
     if (VC.state.rec) box.textContent += ' 🔴 المقابلة مسجّلة صوتياً.';
 }
 function offPaintGrid() {
@@ -10669,9 +10697,12 @@ async function offaDelete(id) {
     catch (e) { toast(e.message); }
 }
 function offaRoomsHtml(d) {
-    var h = '<div class="card row"><span style="color:var(--muted);">رومات المقابلات</span><button class="btn gold sm" onclick="offaNewRoom()">➕ روم جديد</button></div>';
+    var max = d.max || 5;
+    var h = '<div class="card row"><span style="color:var(--muted);">رومات المقابلات (' + d.rooms.length + '/' + max + ')</span>' +
+        (d.rooms.length >= max ? '<span style="color:var(--muted);font-size:12px;">وصلت الحد الأقصى</span>' : '<button class="btn gold sm" onclick="offaNewRoom()">➕ روم جديد</button>') + '</div>';
     d.rooms.forEach(function (r) {
-        h += '<div class="card"><div class="row"><h3>🎙️ مقابلة ' + r.n + '</h3><button class="btn sm" data-n="' + r.n + '" onclick="offaEnterRoom(this.dataset.n)">دخول الروم الصوتي</button></div>';
+        h += '<div class="card"><div class="row"><h3>🎙️ مقابلة ' + r.n + '</h3><span style="display:flex;gap:6px;"><button class="btn sm" data-n="' + r.n + '" onclick="offaEnterRoom(this.dataset.n)">دخول الروم الصوتي</button>' +
+            (d.rooms.length > 1 ? '<button class="btn danger sm" data-n="' + r.n + '" onclick="offaDeleteRoom(this.dataset.n)">🗑️ حذف</button>' : '') + '</span></div>';
         h += '<div style="margin:8px 0;"><b style="color:var(--gold-soft);font-size:13px;">الداخلين الحين (' + r.participants.length + ')</b><div style="margin-top:6px;">';
         if (!r.participants.length) h += '<span style="color:var(--muted);font-size:13px;">ما أحد داخل</span>';
         r.participants.forEach(function (p) { h += '<span class="off-chip' + (p.isSenior ? ' sen' : '') + '">' + (p.isSenior ? '🎖️ ' : '') + spEsc(p.name) + '</span>'; });
@@ -10963,6 +10994,14 @@ function offaReplayClose() {
     offModalClose();
 }
 function offaEnterRoom(n) { offJoinVoice(parseInt(n, 10)); }
+async function offaDeleteRoom(n) {
+    if (!(await confirmModal('تحذف مقابلة ' + n + '؟ اللي داخلها ينطردون، والمتقدمين المجدولين فيها ينتقلون لأول روم متبقي، وما يرجع بعد الحذف.'))) return;
+    try {
+        var r = await api('/api/officers/admin/rooms/' + n, { method: 'DELETE' });
+        toast('🗑️ تم حذف الروم' + (r.moved ? ' ونقل ' + r.moved + ' متقدم لمقابلة ' + r.movedTo : ''));
+        offaReload(false);
+    } catch (e) { toast(e.message); }
+}
 async function offaNewRoom() {
     try { await api('/api/officers/admin/rooms', { method: 'POST', body: '{}' }); offaReload(false); }
     catch (e) { toast(e.message); }
