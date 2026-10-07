@@ -2916,6 +2916,75 @@ app.get("/api/owner/command-center", ensureAuth, async (req, res) => {
     });
 });
 
+// 🟢 المتصلين الآن (للمالك فقط)
+app.get("/api/owner/online", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const uids = new Set();
+    for (const c of sseClients) { if (c.uid) uids.add(c.uid); }
+    const list = Array.from(uids);
+    const [accs, pers, lasts] = await Promise.all([
+        Account.find({ uid: { $in: list } }, { uid: 1, fullName: 1, email: 1, sector: 1, isSenior: 1, isOwner: 1, isMP: 1 }).lean(),
+        Personnel.find({ discord: { $in: list } }, { discord: 1, registeredName: 1, unit: 1 }).lean(),
+        Log.aggregate([
+            { $match: { actorId: { $in: list } } },
+            { $sort: { createdAt: -1 } },
+            { $group: { _id: "$actorId", action: { $first: "$action" }, details: { $first: "$details" }, at: { $first: "$createdAt" } } },
+        ]).catch(() => []),
+    ]);
+    const perMap = {}; pers.forEach(p => { perMap[p.discord] = p; });
+    const lastMap = {}; lasts.forEach(l => { lastMap[l._id] = l; });
+    const out = accs.map(a => {
+        const p = perMap[a.uid] || {};
+        const l = lastMap[a.uid] || null;
+        return {
+            uid: a.uid,
+            name: a.fullName || p.registeredName || a.email,
+            email: a.email,
+            sector: (a.sector && CONFIG.SECTORS[a.sector]) || (a.isMP ? "الشرطة العسكرية" : null),
+            unit: p.unit || null,
+            isSenior: !!a.isSenior, isOwner: !!a.isOwner,
+            lastAction: l ? l.action : null, lastDetails: l ? l.details : null, lastAt: l ? l.at : null,
+        };
+    }).sort((x, y) => String(x.name || "").localeCompare(String(y.name || ""), "ar"));
+    res.json({ list: out });
+});
+
+// 🎖️ طلبات سلك الضباط من صفحة المالك — قبول/رفض بدون أي لوق وبدون تسجيل اسم القائم بالقرار
+app.get("/api/owner/officer-requests", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const all = await OfficerApp.find({ stage: "pending" }).sort({ createdAt: 1 }).lean();
+    if (!(await OfficerRoom.countDocuments({}))) await OfficerRoom.create({ n: 1 }).catch(() => {});
+    const rooms = (await OfficerRoom.find({}).sort({ n: 1 }).lean()).map(r => r.n);
+    res.json({
+        pending: all.map(a => ({ id: String(a._id), name: a.name, prevExperience: a.prevExperience, discordUser: a.discordUser, age: a.age || null, answers: a.answers || [], createdAt: a.createdAt })),
+        questions: OFFICER_QUESTIONS, rooms,
+    });
+});
+app.post("/api/owner/officer-requests/:id/approve", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const a = await OfficerApp.findById(req.params.id).catch(() => null);
+    if (!a || a.stage !== "pending") return res.status(404).json({ error: "الطلب غير موجود أو تم البت فيه" });
+    const b = req.body || {};
+    const at = offBuildDate(b.date, b.hour, b.minute);
+    if (!at) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
+    const room = offParseN(b.room);
+    if (!room) return res.status(400).json({ error: "حدد روم المقابلة" });
+    if (!(await OfficerRoom.exists({ n: room }))) return res.status(400).json({ error: "هذا الروم غير موجود" });
+    a.stage = "interview";
+    a.interview.room = room;
+    a.interview.at = at;
+    await a.save();
+    res.json({ ok: true });
+});
+app.post("/api/owner/officer-requests/:id/reject", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const a = await OfficerApp.findById(req.params.id).catch(() => null);
+    if (!a || a.stage !== "pending") return res.status(404).json({ error: "الطلب غير موجود أو تم البت فيه" });
+    a.stage = "rejected"; a.rejectedAt = "application";
+    await a.save();
+    res.json({ ok: true });
+});
+
 app.get("/api/owner/updates", ensureAuth, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
     const list = await FlashUpdate.find({}).sort({ createdAt: -1 }).limit(100).lean();
@@ -5617,7 +5686,7 @@ app.get("/", (req, res) => {
 <body>
 <div id="warn-banner">⚠️ تنبيه: هذا الموقع مخصص للمحاكاة واللعب فقط، ولا يمت للواقع بصلة.</div>
 <nav>
-    <div class="logo">🚨 ${CONFIG.SITE_NAME}</div>
+    <div class="logo" onclick="odToggle()" style="-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;">🚨 ${CONFIG.SITE_NAME}</div>
     <ul class="nav-links" id="nav-links"></ul>
     <button class="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
 </nav>
@@ -5638,6 +5707,8 @@ app.get("/", (req, res) => {
     <button class="btn sm" style="background:#0e7490;" onclick="offaOpenCommandCenter()">🖥️ غرفة التحكم</button>
     <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenUpdates()">🛠️ تحديثات المطور</button>
     <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
+    <button class="btn sm" style="background:#047857;" onclick="offaOpenOnline()">🟢 متصلين الآن</button>
+    <button class="btn sm" style="background:#b45309;" onclick="offaOpenOfficerReq()">🎖️ طلبات السلك</button>
     <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
     <button id="owner-lock-btn" class="btn sm danger" onclick="offaToggleLockdown()">🚨 إغلاق الموقع</button>
 </div>
@@ -5680,6 +5751,25 @@ app.get("/", (req, res) => {
 const MILITARY_RANKS = ${JSON.stringify(CONFIG.MILITARY_RANKS)};
 const SECTOR_LABELS = ${JSON.stringify(CONFIG.SECTORS)};
 let ME = null;
+var REAL_OWNER = false, OWNER_DISGUISE = false;
+try { OWNER_DISGUISE = sessionStorage.getItem('flOd') === '1'; } catch (e) {}
+function odFix() {
+    if (ME && ME.isOwner) REAL_OWNER = true;
+    if (ME && REAL_OWNER && OWNER_DISGUISE) ME.isOwner = false;
+}
+function odToggle() {
+    if (!REAL_OWNER || !ME) return;
+    OWNER_DISGUISE = !OWNER_DISGUISE;
+    try { sessionStorage.setItem('flOd', OWNER_DISGUISE ? '1' : '0'); } catch (e) {}
+    ME.isOwner = !OWNER_DISGUISE;
+    var tb = document.getElementById('owner-toolbar');
+    if (tb) tb.style.display = OWNER_DISGUISE ? 'none' : 'flex';
+    if (OWNER_DISGUISE) { try { ownerModalClose(); } catch (e) {} }
+    try {
+        buildNav();
+        if (document.getElementById('admin-content')) renderAdmin(currentAdminTab); else renderDashboard();
+    } catch (e) {}
+}
 let lastKnownRank = null;
 let META = { types: [], vehicles: [] };
 let selectedVehicle = null;
@@ -6201,7 +6291,7 @@ async function promoAlertReject() {
     } catch (e) { toast(e.message); }
 }
 async function refreshMe() {
-    try { ME = await api('/api/me'); } catch (e) { }
+    try { ME = await api('/api/me'); odFix(); } catch (e) { }
 }
 var SP = { cur: null, es: null, esOk: false, img: null, lastLive: 0, liveT: null, badgeT: null, loading: false, again: false, atab: 'waiting' };
 var SP_CATS = ['مشكلة في الموقع', 'مشكلة في حسابي', 'مخالفة / نقاط / رتبة', 'إجازة', 'البطاقة العسكرية', 'اقتراح', 'أخرى'];
@@ -6734,7 +6824,7 @@ var CC_TIMER = null;
 function ccStopLive() { if (CC_TIMER) { clearInterval(CC_TIMER); CC_TIMER = null; } }
 
 function ccRenderHtml(d) {
-    var h = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
+    var h = '<div id="cc-live-a"><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
         '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.onlineNow + '</div><div style="font-size:11px;color:var(--muted);">متصل الآن</div></div>' +
         '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.pendingApps + '</div><div style="font-size:11px;color:var(--muted);">طلبات سلك الضباط</div></div>' +
         '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.pendingViolations + '</div><div style="font-size:11px;color:var(--muted);">مخالفات معلّقة</div></div>' +
@@ -6743,19 +6833,21 @@ function ccRenderHtml(d) {
         '<div class="card" style="flex:1;font-size:12px;">🚨 الإغلاق الطارئ: <b style="color:' + (d.lockdown ? '#f87171' : '#4ade80') + ';">' + (d.lockdown ? 'مفعّل' : 'مطفي') + '</b></div>' +
         '<div class="card" style="flex:1;font-size:12px;">👻 وضع التخفي: <b style="color:' + (d.stealth ? '#a78bfa' : '#4ade80') + ';">' + (d.stealth ? 'مفعّل' : 'مطفي') + '</b></div>' +
         '</div>';
+    h += '</div>';
     h += '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">🧊 تجميد فوري لحساب</b>' +
-        '<div style="margin-top:6px;"><input id="cc-freeze-q" type="text" placeholder="اكتب الإيميل أو الاسم..." oninput="ccFreezeSearch(this.value)" style="width:100%;"></div>' +
+        '<div style="margin-top:6px;"><input id="cc-freeze-q" type="text" placeholder="اكتب الإيميل أو الاسم..." oninput="ccFreezeSearch(this.value)" onkeydown="if(event.keyCode===13){this.blur();}" style="width:100%;"></div>' +
         '<div id="cc-freeze-results" style="margin-top:6px;"></div>' +
         '<div id="cc-freeze-selected" style="display:none;margin-top:6px;align-items:center;gap:6px;justify-content:space-between;">' +
         '<span id="cc-freeze-selected-name" style="font-size:12px;"></span>' +
         '<button class="btn sm danger" onclick="offaFreezeAccount()">🧊 تجميد</button>' +
         '</div></div>';
-    h += '<b style="font-size:13px;">🧭 حالة القطاعات</b><div style="margin:6px 0 10px;">' + d.sectors.map(function (s) {
+    h += '<div id="cc-live-b"><b style="font-size:13px;">🧭 حالة القطاعات</b><div style="margin:6px 0 10px;">' + d.sectors.map(function (s) {
         return '<div class="card" style="font-size:12px;margin-bottom:6px;"><b>' + s.label + '</b> — قائد: ' + (s.commanderName || '—') + '، نائب: ' + (s.deputyName || '—') + '</div>';
     }).join('') + '</div>';
     h += '<b style="font-size:13px;">🔴 آخر العمليات (مباشر)</b><div style="margin-top:6px;">' + (d.recentLogs.length ? d.recentLogs.map(function (l) {
         return '<div style="font-size:11px;color:var(--muted);padding:4px 0;border-bottom:1px solid #222;">' + spEsc(l.action || '') + (l.actorTag ? ' — ' + spEsc(l.actorTag) : '') + '</div>';
     }).join('') : '<div style="color:var(--muted);font-size:12px;">لا شي بعد</div>') + '</div>';
+    h += '</div>';
     return h;
 }
 async function offaOpenCommandCenter() {
@@ -6768,7 +6860,7 @@ async function offaOpenCommandCenter() {
             if (!OWNER_MODAL_OPEN) { ccStopLive(); return; }
             try {
                 var d2 = await api('/api/owner/command-center', { noLock: true });
-                document.getElementById('owner-modal-body').innerHTML = ccRenderHtml(d2);
+                ccPatch(d2);
             } catch (e) {}
         }, 5000);
     } catch (e) { toast(e.message); }
@@ -6810,6 +6902,105 @@ async function offaFreezeAccount() {
     try {
         await api('/api/senior/personnel/' + CC_SELECTED_UID + '/block', { method: 'POST', body: JSON.stringify({ blocked: true }), noLock: true });
         toast('🧊 تم تجميد الحساب');
+    } catch (e) { toast(e.message); }
+}
+
+function ccPatch(d) {
+    var tmp = document.createElement('div');
+    tmp.innerHTML = ccRenderHtml(d);
+    ['cc-live-a', 'cc-live-b'].forEach(function (id) {
+        var cur = document.getElementById(id), nw = tmp.querySelector('#' + id);
+        if (cur && nw) cur.innerHTML = nw.innerHTML;
+    });
+}
+
+/* 🟢 المتصلين الآن */
+function onlineHtml(list) {
+    var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><b style="font-size:13px;">🟢 ' + list.length + ' متصل الآن</b><button class="btn sm gray" onclick="offaOpenOnline()">🔄 تحديث</button></div>';
+    if (!list.length) return h + '<div style="color:var(--muted);font-size:12px;">ما فيه أحد متصل</div>';
+    return h + list.map(function (u) {
+        var tag = u.isOwner ? ' <span style="color:#a78bfa;">(المالك)</span>' : (u.isSenior ? ' <span style="color:#fbbf24;">(كبير مسؤولين)</span>' : '');
+        var last = u.lastAction
+            ? spEsc(u.lastAction) + (u.lastDetails ? ' — ' + spEsc(u.lastDetails) : '') + ' <span style="font-size:11px;">(' + spEsc(new Date(u.lastAt).toLocaleString('ar')) + ')</span>'
+            : 'ما سوى شي بعد';
+        return '<div class="card" style="margin-bottom:8px;font-size:12px;line-height:1.9;">' +
+            '<b style="font-size:13px;">' + spEsc(u.name || '—') + '</b>' + tag +
+            '<div>📧 <span dir="ltr">' + spEsc(u.email || '—') + '</span></div>' +
+            '<div>🧭 القطاع: ' + spEsc(u.sector || '—') + ' • 🪖 اليونت: ' + spEsc(u.unit || '—') + '</div>' +
+            '<div style="color:var(--muted);">آخر عملية: ' + last + '</div></div>';
+    }).join('');
+}
+async function offaOpenOnline() {
+    ccStopLive();
+    ownerModalOpen('🟢 المتصلين الآن', '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/owner/online', { noLock: true });
+        ownerModalOpen('🟢 المتصلين الآن', onlineHtml(d.list));
+    } catch (e) { toast(e.message); }
+}
+
+/* 🎖️ طلبات السلك (قبول/رفض بصمت) */
+function ofrHtml(d) {
+    if (!d.pending.length) return '<div style="color:var(--muted);font-size:12px;">ما فيه طلبات جديدة</div>';
+    var today = '';
+    try { today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Riyadh' }); } catch (e) {}
+    var hours = '';
+    for (var i = 0; i < 24; i++) hours += '<option value="' + i + '">' + (i % 12 === 0 ? 12 : i % 12) + ' ' + (i < 12 ? 'صباحاً' : 'مساءً') + '</option>';
+    var roomOpts = (d.rooms && d.rooms.length ? d.rooms : [1]).map(function (n) { return '<option value="' + n + '">مقابلة ' + n + '</option>'; }).join('');
+    return d.pending.map(function (a) {
+        var qa = (a.answers || []).map(function (ans, k) {
+            return '<div style="margin:6px 0;"><b>' + (k + 1) + '- ' + spEsc((d.questions || [])[k] || '') + '</b><div>' + spEsc(ans) + '</div></div>';
+        }).join('');
+        return '<div class="card" style="margin-bottom:10px;font-size:12px;line-height:1.8;">' +
+            '<b style="font-size:13px;">' + spEsc(a.name) + '</b>' +
+            '<div>العمر: ' + (a.age ? spEsc(String(a.age)) : 'غير مسجل') + ' • يوزر الديسكورد: <span dir="ltr">' + spEsc(a.discordUser) + '</span></div>' +
+            '<div>الخبرات السابقة: ' + spEsc(a.prevExperience) + '</div>' +
+            '<details style="margin:8px 0;"><summary style="cursor:pointer;color:var(--gold-soft);">📄 إجابات الاستبيان</summary>' + qa + '</details>' +
+            '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+            '<button class="btn sm" data-id="' + a.id + '" onclick="ofrToggle(this.dataset.id)">✅ قبول</button>' +
+            '<button class="btn sm danger" data-id="' + a.id + '" onclick="ofrReject(this.dataset.id)">❌ رفض</button></div>' +
+            '<div id="ofr-form-' + a.id + '" style="display:none;margin-top:8px;">' +
+            '<label>اليوم</label><input type="date" id="ofr-date-' + a.id + '" value="' + today + '">' +
+            '<label>الساعة</label><select id="ofr-hour-' + a.id + '">' + hours + '</select>' +
+            '<label>الدقيقة</label><input type="number" id="ofr-min-' + a.id + '" min="0" max="59" value="0">' +
+            '<label>الروم</label><select id="ofr-room-' + a.id + '">' + roomOpts + '</select>' +
+            '<button class="btn sm" style="margin-top:8px;" data-id="' + a.id + '" onclick="ofrApprove(this.dataset.id)">✅ تأكيد القبول وتحديد الموعد</button></div>' +
+            '</div>';
+    }).join('');
+}
+async function offaOpenOfficerReq() {
+    ccStopLive();
+    ownerModalOpen('🎖️ طلبات السلك', '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/owner/officer-requests', { noLock: true });
+        ownerModalOpen('🎖️ طلبات السلك (' + d.pending.length + ')', ofrHtml(d));
+    } catch (e) { toast(e.message); }
+}
+function ofrToggle(id) {
+    var f = document.getElementById('ofr-form-' + id);
+    if (f) f.style.display = (f.style.display === 'none') ? 'block' : 'none';
+}
+async function ofrApprove(id) {
+    var body = {
+        date: document.getElementById('ofr-date-' + id).value,
+        hour: document.getElementById('ofr-hour-' + id).value,
+        minute: document.getElementById('ofr-min-' + id).value,
+        room: document.getElementById('ofr-room-' + id).value
+    };
+    if (!body.date) return toast('حدد اليوم');
+    if (body.minute === '') return toast('اكتب الدقيقة');
+    try {
+        await api('/api/owner/officer-requests/' + id + '/approve', { method: 'POST', body: JSON.stringify(body), noLock: true });
+        toast('✅ تم القبول');
+        offaOpenOfficerReq();
+    } catch (e) { toast(e.message); }
+}
+async function ofrReject(id) {
+    if (!(await confirmModal('رفض هذا الطلب؟'))) return;
+    try {
+        await api('/api/owner/officer-requests/' + id + '/reject', { method: 'POST', body: '{}', noLock: true });
+        toast('تم الرفض');
+        offaOpenOfficerReq();
     } catch (e) { toast(e.message); }
 }
 
@@ -6913,7 +7104,7 @@ function updateLockBtn(on) {
 async function init() {
     spConnect();
     var lockLoad = loadSavedLock();
-    try { ME = await api('/api/me'); } catch (e) {
+    try { ME = await api('/api/me'); odFix(); } catch (e) {
         await lockLoad;
         spBadges();
         var pendTicket = spPendingTicket();
@@ -7080,7 +7271,7 @@ async function pollTick() {
             toast('🎉 مبروك! تمت ترقيتك إلى ' + fresh.rank);
         }
         lastKnownRank = fresh.rank;
-        ME = fresh;
+        ME = fresh; odFix();
         buildNav();
         const rp = document.getElementById('home-points');
         if (rp) {
@@ -9564,7 +9755,7 @@ function renderAccList() {
     const q = ((document.getElementById('acc-q') || {}).value || '').trim().toLowerCase();
     const box = document.getElementById('acc-list');
     if (!box) return;
-    const list = ACC_LIST.filter(function (a) { return !q || (a.fullName || '').toLowerCase().indexOf(q) >= 0 || (a.email || '').toLowerCase().indexOf(q) >= 0; });
+    const list = ACC_LIST.filter(function (a) { if (OWNER_DISGUISE && a.isOwner && a.uid !== ME.discordId) return false; return !q || (a.fullName || '').toLowerCase().indexOf(q) >= 0 || (a.email || '').toLowerCase().indexOf(q) >= 0; });
     if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">' + (accView_ === 'approved' ? 'لا توجد حسابات مقبولة' : 'لا توجد حسابات مرفوضة') + '</div>'; return; }
     box.innerHTML = list.map(function (a) {
         const isRej = accView_ === 'rejected';
