@@ -6744,7 +6744,12 @@ function ccRenderHtml(d) {
         '<div class="card" style="flex:1;font-size:12px;">👻 وضع التخفي: <b style="color:' + (d.stealth ? '#a78bfa' : '#4ade80') + ';">' + (d.stealth ? 'مفعّل' : 'مطفي') + '</b></div>' +
         '</div>';
     h += '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">🧊 تجميد فوري لحساب</b>' +
-        '<div style="display:flex;gap:6px;margin-top:6px;"><input id="cc-freeze-id" type="text" placeholder="آيدي الديسكورد" style="flex:1;"><button class="btn sm danger" onclick="offaFreezeAccount()">تجميد</button></div></div>';
+        '<div style="margin-top:6px;"><input id="cc-freeze-q" type="text" placeholder="اكتب الإيميل أو الاسم..." oninput="ccFreezeSearch(this.value)" style="width:100%;"></div>' +
+        '<div id="cc-freeze-results" style="margin-top:6px;"></div>' +
+        '<div id="cc-freeze-selected" style="display:none;margin-top:6px;align-items:center;gap:6px;justify-content:space-between;">' +
+        '<span id="cc-freeze-selected-name" style="font-size:12px;"></span>' +
+        '<button class="btn sm danger" onclick="offaFreezeAccount()">🧊 تجميد</button>' +
+        '</div></div>';
     h += '<b style="font-size:13px;">🧭 حالة القطاعات</b><div style="margin:6px 0 10px;">' + d.sectors.map(function (s) {
         return '<div class="card" style="font-size:12px;margin-bottom:6px;"><b>' + s.label + '</b> — قائد: ' + (s.commanderName || '—') + '، نائب: ' + (s.deputyName || '—') + '</div>';
     }).join('') + '</div>';
@@ -6768,13 +6773,42 @@ async function offaOpenCommandCenter() {
         }, 5000);
     } catch (e) { toast(e.message); }
 }
+var CC_ACCOUNTS = null, CC_SELECTED_UID = null;
+async function ccFreezeSearch(q) {
+    q = (q || '').trim();
+    CC_SELECTED_UID = null;
+    var sel = document.getElementById('cc-freeze-selected');
+    if (sel) sel.style.display = 'none';
+    var box = document.getElementById('cc-freeze-results');
+    if (!box) return;
+    if (!q) { box.innerHTML = ''; return; }
+    if (!CC_ACCOUNTS) {
+        box.innerHTML = '<div style="color:var(--muted);font-size:12px;">جارِ التحميل...</div>';
+        try { CC_ACCOUNTS = (await api('/api/senior/accounts', { noLock: true })).list; } catch (e) { CC_ACCOUNTS = []; }
+    }
+    var qn = q.toLowerCase();
+    var matches = CC_ACCOUNTS.filter(function (a) {
+        return (a.email && a.email.toLowerCase().indexOf(qn) !== -1) || (a.fullName && a.fullName.toLowerCase().indexOf(qn) !== -1);
+    }).slice(0, 8);
+    if (!matches.length) { box.innerHTML = '<div style="color:var(--muted);font-size:12px;">ما فيه نتائج</div>'; return; }
+    box.innerHTML = matches.map(function (a) {
+        return '<div class="card" style="padding:8px;margin-bottom:4px;cursor:pointer;" onclick="ccFreezePick(\\'' + a.uid + '\\')"><b style="font-size:12px;">' + spEsc(a.fullName || '') + '</b><div style="font-size:11px;color:var(--muted);">' + spEsc(a.email || '') + '</div></div>';
+    }).join('');
+}
+function ccFreezePick(uid) {
+    var acc = (CC_ACCOUNTS || []).find(function (a) { return a.uid === uid; });
+    if (!acc) return;
+    CC_SELECTED_UID = uid;
+    document.getElementById('cc-freeze-results').innerHTML = '';
+    document.getElementById('cc-freeze-q').value = acc.fullName || acc.email;
+    document.getElementById('cc-freeze-selected-name').textContent = '✅ محدد: ' + (acc.fullName || acc.email);
+    document.getElementById('cc-freeze-selected').style.display = 'flex';
+}
 async function offaFreezeAccount() {
-    var id = (document.getElementById('cc-freeze-id') || {}).value;
-    id = id ? id.trim() : '';
-    if (!id) { toast('حط آيدي الديسكورد'); return; }
+    if (!CC_SELECTED_UID) { toast('اختر حساب من نتائج البحث أول'); return; }
     if (!(await confirmModal('تجميد هذا الحساب فوراً؟'))) return;
     try {
-        await api('/api/senior/personnel/' + id + '/block', { method: 'POST', body: JSON.stringify({ blocked: true }), noLock: true });
+        await api('/api/senior/personnel/' + CC_SELECTED_UID + '/block', { method: 'POST', body: JSON.stringify({ blocked: true }), noLock: true });
         toast('🧊 تم تجميد الحساب');
     } catch (e) { toast(e.message); }
 }
