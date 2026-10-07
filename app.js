@@ -2893,6 +2893,54 @@ app.get("/api/owner/stealth", ensureAuth, async (req, res) => {
     res.json({ on: !!settings.stealthMode });
 });
 
+app.get("/api/owner/command-center", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const onlineUids = new Set();
+    for (const c of sseClients) { if (c.uid) onlineUids.add(c.uid); }
+    const recentLogs = await Log.find({}).sort({ createdAt: -1 }).limit(10).lean();
+    const settings = await getSettings();
+    const [pendingApps, pendingViolations] = await Promise.all([
+        OfficerApp.countDocuments({ stage: "pending" }).catch(() => 0),
+        Violation.countDocuments({ status: "pending" }).catch(() => 0),
+    ]);
+    const sectors = Object.keys(CONFIG.SECTORS).map(k => {
+        const lead = (settings.sectorLeadership || {})[k] || {};
+        return { key: k, label: CONFIG.SECTORS[k], commanderName: lead.commanderName || null, deputyName: lead.deputyName || null };
+    });
+    res.json({
+        onlineNow: onlineUids.size,
+        recentLogs,
+        sectors,
+        pendingApps, pendingViolations,
+        lockdown: !!settings.ownerLockdown, stealth: !!settings.stealthMode,
+    });
+});
+
+app.post("/api/owner/ask", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    if (!CONFIG.ANTHROPIC_API_KEY || typeof fetch !== "function") return res.status(400).json({ error: "ميزة الذكاء الاصطناعي غير مفعّلة بهذا السيرفر (ما فيه مفتاح API)" });
+    const question = String((req.body || {}).question || "").trim().slice(0, 500);
+    if (!question) return res.status(400).json({ error: "اكتب سؤال" });
+    const logs = await Log.find({}).sort({ createdAt: -1 }).limit(150).lean();
+    const logsText = logs.map(l => "- [" + new Date(l.createdAt).toISOString() + "] " + l.action + " | الفاعل: " + (l.actorTag || "-") + " | " + (l.details || "")).join("\n");
+    const sys = "أنت مساعد تحليل بيانات لموقع إداري (لعب أدوار داخل Discord، مو واقعي). عندك سجل آخر 150 عملية بالموقع. جاوب سؤال المالك بالعربي، بشكل مختصر ومباشر، بالاعتماد فقط على البيانات المعطاة تحت. لو البيانات ما تكفي للإجابة على السؤال، قول ذلك صراحة بدل ما تخمن أو تختلق معلومة.\n\nسجل آخر العمليات:\n" + logsText;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000);
+    try {
+        const r = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST", signal: ctrl.signal,
+            headers: { "content-type": "application/json", "x-api-key": CONFIG.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+            body: JSON.stringify({ model: CONFIG.SUPPORT_AI_MODEL, max_tokens: 700, system: sys, messages: [{ role: "user", content: question }] }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error((d && d.error && d.error.message) || ("HTTP " + r.status));
+        const answer = (d.content || []).filter(x => x.type === "text").map(x => x.text).join("\n").trim();
+        res.json({ answer: answer || "ما قدرت أطلّع جواب واضح من البيانات المتوفرة." });
+    } catch (e) {
+        res.status(500).json({ error: "تعذر الاتصال بالمساعد: " + e.message });
+    } finally { clearTimeout(timer); }
+});
+
 app.post("/api/owner/lockdown", ensureAuth, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
     const settings = await getSettings();
@@ -5351,7 +5399,7 @@ app.get("/", (req, res) => {
     .wf-box textarea { width: 100%; min-height: 90px; margin-top: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 8px; color: #fff; padding: 10px; font-family: inherit; font-size: 14px; resize: vertical; }
     .wf-actions { display: flex; gap: 8px; margin-top: 14px; }
     .wf-actions button { flex: 1; }
-    #sp-fab { position: fixed; bottom: 22px; left: 22px; z-index: 997; width: 54px; height: 54px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.2); background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; font-size: 24px; cursor: pointer; box-shadow: 0 6px 22px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; }
+    #sp-fab { position: fixed; bottom: 22px; left: 22px; z-index: 5300; width: 54px; height: 54px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.2); background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; font-size: 24px; cursor: pointer; box-shadow: 0 6px 22px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; }
     #sp-fab:active { transform: scale(0.94); }
     .sp-badge { background: #ef4444; color: #fff; border-radius: 10px; min-width: 18px; height: 18px; padding: 0 5px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; justify-content: center; margin-inline-start: 6px; }
     #sp-fab .sp-badge { position: absolute; top: -4px; right: -4px; margin: 0; }
@@ -5559,7 +5607,9 @@ app.get("/", (req, res) => {
         <div id="owner-modal-body"></div>
     </div>
 </div>
-<div id="owner-toolbar" style="position:fixed;bottom:16px;left:16px;z-index:4500;display:none;flex-direction:column;gap:8px;">
+<div id="owner-toolbar" style="position:fixed;bottom:92px;left:16px;z-index:4500;display:none;flex-direction:column;gap:8px;">
+    <button class="btn sm" style="background:#0e7490;" onclick="offaOpenCommandCenter()">🖥️ غرفة التحكم</button>
+    <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenAsk()">🧠 اسأل بياناتك</button>
     <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
     <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
     <button id="owner-lock-btn" class="btn sm danger" onclick="offaToggleLockdown()">🚨 إغلاق الموقع</button>
@@ -6627,6 +6677,7 @@ function ownerModalClose() {
     document.getElementById('owner-modal-overlay').style.display = 'none';
     OWNER_MODAL_OPEN = false;
     document.body.style.overflow = '';
+    ccStopLive();
 }
 document.addEventListener('touchmove', function (e) {
     if (!OWNER_MODAL_OPEN) return;
@@ -6651,7 +6702,75 @@ function updateStealthBtn(on) {
     b.style.background = on ? '#6d28d9' : '#374151';
 }
 
+var CC_TIMER = null;
+function ccStopLive() { if (CC_TIMER) { clearInterval(CC_TIMER); CC_TIMER = null; } }
+
+function ccRenderHtml(d) {
+    var h = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
+        '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.onlineNow + '</div><div style="font-size:11px;color:var(--muted);">متصل الآن</div></div>' +
+        '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.pendingApps + '</div><div style="font-size:11px;color:var(--muted);">طلبات سلك الضباط</div></div>' +
+        '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.pendingViolations + '</div><div style="font-size:11px;color:var(--muted);">مخالفات معلّقة</div></div>' +
+        '</div>';
+    h += '<div style="display:flex;gap:8px;margin-bottom:10px;">' +
+        '<div class="card" style="flex:1;font-size:12px;">🚨 الإغلاق الطارئ: <b style="color:' + (d.lockdown ? '#f87171' : '#4ade80') + ';">' + (d.lockdown ? 'مفعّل' : 'مطفي') + '</b></div>' +
+        '<div class="card" style="flex:1;font-size:12px;">👻 وضع التخفي: <b style="color:' + (d.stealth ? '#a78bfa' : '#4ade80') + ';">' + (d.stealth ? 'مفعّل' : 'مطفي') + '</b></div>' +
+        '</div>';
+    h += '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">🧊 تجميد فوري لحساب</b>' +
+        '<div style="display:flex;gap:6px;margin-top:6px;"><input id="cc-freeze-id" type="text" placeholder="آيدي الديسكورد" style="flex:1;"><button class="btn sm danger" onclick="offaFreezeAccount()">تجميد</button></div></div>';
+    h += '<b style="font-size:13px;">🧭 حالة القطاعات</b><div style="margin:6px 0 10px;">' + d.sectors.map(function (s) {
+        return '<div class="card" style="font-size:12px;margin-bottom:6px;"><b>' + s.label + '</b> — قائد: ' + (s.commanderName || '—') + '، نائب: ' + (s.deputyName || '—') + '</div>';
+    }).join('') + '</div>';
+    h += '<b style="font-size:13px;">🔴 آخر العمليات (مباشر)</b><div style="margin-top:6px;">' + (d.recentLogs.length ? d.recentLogs.map(function (l) {
+        return '<div style="font-size:11px;color:var(--muted);padding:4px 0;border-bottom:1px solid #222;">' + spEsc(l.action || '') + (l.actorTag ? ' — ' + spEsc(l.actorTag) : '') + '</div>';
+    }).join('') : '<div style="color:var(--muted);font-size:12px;">لا شي بعد</div>') + '</div>';
+    return h;
+}
+async function offaOpenCommandCenter() {
+    ccStopLive();
+    ownerModalOpen('🖥️ غرفة التحكم', '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/owner/command-center', { noLock: true });
+        ownerModalOpen('🖥️ غرفة التحكم', ccRenderHtml(d));
+        CC_TIMER = setInterval(async function () {
+            if (!OWNER_MODAL_OPEN) { ccStopLive(); return; }
+            try {
+                var d2 = await api('/api/owner/command-center', { noLock: true });
+                document.getElementById('owner-modal-body').innerHTML = ccRenderHtml(d2);
+            } catch (e) {}
+        }, 5000);
+    } catch (e) { toast(e.message); }
+}
+async function offaFreezeAccount() {
+    var id = (document.getElementById('cc-freeze-id') || {}).value;
+    id = id ? id.trim() : '';
+    if (!id) { toast('حط آيدي الديسكورد'); return; }
+    if (!(await confirmModal('تجميد هذا الحساب فوراً؟'))) return;
+    try {
+        await api('/api/senior/personnel/' + id + '/block', { method: 'POST', body: JSON.stringify({ blocked: true }), noLock: true });
+        toast('🧊 تم تجميد الحساب');
+    } catch (e) { toast(e.message); }
+}
+
+async function offaOpenAsk() {
+    ccStopLive();
+    ownerModalOpen('🧠 اسأل بياناتك', '<div style="display:flex;gap:6px;margin-bottom:10px;"><input id="ask-q" type="text" placeholder="مثال: كم حساب انطرد هالاسبوع؟" style="flex:1;"><button class="btn sm" onclick="offaAskSubmit()">اسأل</button></div><div id="ask-answer" style="font-size:13px;white-space:pre-wrap;"></div>');
+    var inp = document.getElementById('ask-q');
+    if (inp) inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') offaAskSubmit(); });
+}
+async function offaAskSubmit() {
+    var q = (document.getElementById('ask-q') || {}).value;
+    q = q ? q.trim() : '';
+    if (!q) return;
+    var ansBox = document.getElementById('ask-answer');
+    if (ansBox) ansBox.textContent = 'جارِ التفكير...';
+    try {
+        var d = await api('/api/owner/ask', { method: 'POST', body: JSON.stringify({ question: q }), noLock: true });
+        if (ansBox) ansBox.textContent = d.answer;
+    } catch (e) { if (ansBox) ansBox.textContent = ''; toast(e.message); }
+}
+
 async function offaOpenDevices() {
+    ccStopLive();
     ownerModalOpen('📱 الأجهزة المتصلة', '<div style="color:var(--muted);">جارِ التحميل...</div>');
     try {
         const d = await api('/api/owner/devices', { noLock: true });
