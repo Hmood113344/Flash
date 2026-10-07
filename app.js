@@ -1710,7 +1710,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
 
     const mpRole = getMPRole(req.user.id, settings);
     const mpPersonnelOfficer = isMPPersonnelOfficer(req.user.id, settings);
-    let isMilitaryPolice = !!(mpRole || mpPersonnelOfficer || senior);
+    let isMilitaryPolice = !!(mpRole || mpPersonnelOfficer);
     if (!isMilitaryPolice) isMilitaryPolice = await isMilitaryPoliceMember(req.user.id);
     const mpInfo = mpRole ? {
         role: mpRole,
