@@ -2916,29 +2916,44 @@ app.get("/api/owner/command-center", ensureAuth, async (req, res) => {
     });
 });
 
-app.post("/api/owner/ask", ensureAuth, async (req, res) => {
+app.get("/api/owner/updates", ensureAuth, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
-    if (!CONFIG.ANTHROPIC_API_KEY || typeof fetch !== "function") return res.status(400).json({ error: "ميزة الذكاء الاصطناعي غير مفعّلة بهذا السيرفر (ما فيه مفتاح API)" });
-    const question = String((req.body || {}).question || "").trim().slice(0, 500);
-    if (!question) return res.status(400).json({ error: "اكتب سؤال" });
-    const logs = await Log.find({}).sort({ createdAt: -1 }).limit(150).lean();
-    const logsText = logs.map(l => "- [" + new Date(l.createdAt).toISOString() + "] " + l.action + " | الفاعل: " + (l.actorTag || "-") + " | " + (l.details || "")).join("\n");
-    const sys = "أنت مساعد تحليل بيانات لموقع إداري (لعب أدوار داخل Discord، مو واقعي). عندك سجل آخر 150 عملية بالموقع. جاوب سؤال المالك بالعربي، بشكل مختصر ومباشر، بالاعتماد فقط على البيانات المعطاة تحت. لو البيانات ما تكفي للإجابة على السؤال، قول ذلك صراحة بدل ما تخمن أو تختلق معلومة.\n\nسجل آخر العمليات:\n" + logsText;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30000);
-    try {
-        const r = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST", signal: ctrl.signal,
-            headers: { "content-type": "application/json", "x-api-key": CONFIG.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-            body: JSON.stringify({ model: CONFIG.SUPPORT_AI_MODEL, max_tokens: 700, system: sys, messages: [{ role: "user", content: question }] }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error((d && d.error && d.error.message) || ("HTTP " + r.status));
-        const answer = (d.content || []).filter(x => x.type === "text").map(x => x.text).join("\n").trim();
-        res.json({ answer: answer || "ما قدرت أطلّع جواب واضح من البيانات المتوفرة." });
-    } catch (e) {
-        res.status(500).json({ error: "تعذر الاتصال بالمساعد: " + e.message });
-    } finally { clearTimeout(timer); }
+    const list = await FlashUpdate.find({}).sort({ createdAt: -1 }).limit(100).lean();
+    res.json({ list });
+});
+app.post("/api/owner/updates", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const title = String((req.body || {}).title || "").trim().slice(0, 150);
+    const body = String((req.body || {}).body || "").trim().slice(0, 2000);
+    if (!title || !body) return res.status(400).json({ error: "لازم عنوان ووصف" });
+    const u = await FlashUpdate.create({ title, body, createdBy: req.user.id, createdByName: req.user.username });
+    res.json({ ok: true, update: u });
+});
+app.post("/api/owner/updates/:id/publish", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const u = await FlashUpdate.findByIdAndUpdate(req.params.id, { $set: { published: true, publishedAt: new Date() } }, { new: true });
+    if (!u) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "نشر تحديث جديد بفلاش", actorId: req.user.id, actorTag: req.user.username, details: u.title });
+    sseBroadcast("flashupdate", { t: Date.now() }, c => !!c.uid);
+    res.json({ ok: true });
+});
+app.delete("/api/owner/updates/:id", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    await FlashUpdate.deleteOne({ _id: req.params.id });
+    res.json({ ok: true });
+});
+
+app.get("/api/updates/latest", ensureAuth, async (req, res) => {
+    const uid = req.user.id;
+    const u = await FlashUpdate.findOne({ published: true, publishedAt: { $gte: new Date(Date.now() - 14 * 24 * 3600 * 1000) } }).sort({ publishedAt: -1 }).lean();
+    if (!u) return res.json({ update: null });
+    const acked = await FlashUpdateAck.findOne({ uid, uaId: String(u._id) }).lean();
+    if (acked) return res.json({ update: null });
+    res.json({ update: { id: String(u._id) } });
+});
+app.post("/api/updates/:id/ack", ensureAuth, async (req, res) => {
+    await FlashUpdateAck.updateOne({ uid: req.user.id, uaId: req.params.id }, { $set: { at: new Date() } }, { upsert: true });
+    res.json({ ok: true });
 });
 
 app.post("/api/owner/lockdown", ensureAuth, async (req, res) => {
@@ -4507,6 +4522,18 @@ const OfficerAnn = mongoose.model("OfficerAnn", OfficerAnnSchema);
 const OfficerAnnAckSchema = new mongoose.Schema({ aid: String, uid: String, status: String, at: { type: Date, default: Date.now } });
 OfficerAnnAckSchema.index({ aid: 1, uid: 1 }, { unique: true });
 const OfficerAnnAck = mongoose.model("OfficerAnnAck", OfficerAnnAckSchema);
+
+const FlashUpdateSchema = new mongoose.Schema({
+    title: String, body: String,
+    createdBy: String, createdByName: String,
+    createdAt: { type: Date, default: Date.now },
+    published: { type: Boolean, default: false },
+    publishedAt: { type: Date, default: null },
+});
+const FlashUpdate = mongoose.model("FlashUpdate", FlashUpdateSchema);
+const FlashUpdateAckSchema = new mongoose.Schema({ uid: String, uaId: String, at: { type: Date, default: Date.now } });
+FlashUpdateAckSchema.index({ uid: 1, uaId: 1 }, { unique: true });
+const FlashUpdateAck = mongoose.model("FlashUpdateAck", FlashUpdateAckSchema);
 const OFF_ROOMS_MAX = 5;
 const offRecActive = new Map();
 function offRecEnd(n, graceful) {
@@ -5609,7 +5636,7 @@ app.get("/", (req, res) => {
 </div>
 <div id="owner-toolbar" style="position:fixed;bottom:92px;left:16px;z-index:4500;display:none;flex-direction:column;gap:8px;">
     <button class="btn sm" style="background:#0e7490;" onclick="offaOpenCommandCenter()">🖥️ غرفة التحكم</button>
-    <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenAsk()">🧠 اسأل بياناتك</button>
+    <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenUpdates()">🛠️ تحديثات المطور</button>
     <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
     <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
     <button id="owner-lock-btn" class="btn sm danger" onclick="offaToggleLockdown()">🚨 إغلاق الموقع</button>
@@ -6237,6 +6264,7 @@ function spConnect() {
         es.addEventListener('changed', function () { spLiveRefresh(); });
         es.addEventListener('vsig', function (e) { try { offOnVsig(JSON.parse(e.data)); } catch (x) {} });
         es.addEventListener('offann', function () { try { offAnnCheck(); } catch (x) {} });
+        es.addEventListener('flashupdate', function () { try { flashUpdCheck(); } catch (x) {} });
         es.addEventListener('lockchange', function (e) {
             try { var d = JSON.parse(e.data); if (!(ME && ME.isOwner)) { if (d.on) location.reload(); } } catch (x) {}
         });
@@ -6751,22 +6779,60 @@ async function offaFreezeAccount() {
     } catch (e) { toast(e.message); }
 }
 
-async function offaOpenAsk() {
-    ccStopLive();
-    ownerModalOpen('🧠 اسأل بياناتك', '<div style="display:flex;gap:6px;margin-bottom:10px;"><input id="ask-q" type="text" placeholder="مثال: كم حساب انطرد هالاسبوع؟" style="flex:1;"><button class="btn sm" onclick="offaAskSubmit()">اسأل</button></div><div id="ask-answer" style="font-size:13px;white-space:pre-wrap;"></div>');
-    var inp = document.getElementById('ask-q');
-    if (inp) inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') offaAskSubmit(); });
+function udStatusBadge(u) {
+    return u.published ? '<span style="color:#4ade80;">🟢 منشور</span>' : '<span style="color:#fbbf24;">🟡 مسودة</span>';
 }
-async function offaAskSubmit() {
-    var q = (document.getElementById('ask-q') || {}).value;
-    q = q ? q.trim() : '';
-    if (!q) return;
-    var ansBox = document.getElementById('ask-answer');
-    if (ansBox) ansBox.textContent = 'جارِ التفكير...';
+function udRenderList(list) {
+    if (!list.length) return '<div style="color:var(--muted);font-size:12px;">ما فيه تحديثات بعد</div>';
+    return list.map(function (u) {
+        return '<div class="card" style="margin-bottom:8px;"><div style="display:flex;justify-content:space-between;gap:8px;"><b style="font-size:13px;">' + spEsc(u.title) + '</b>' + udStatusBadge(u) + '</div>' +
+            '<div style="font-size:12px;color:var(--muted);margin:4px 0;white-space:pre-wrap;">' + spEsc(u.body) + '</div>' +
+            '<div style="display:flex;gap:6px;margin-top:6px;">' +
+            (u.published ? '' : '<button class="btn sm" onclick="offaPublishUpdate(\\'' + u._id + '\\')">🚀 نشر الآن</button>') +
+            '<button class="btn sm danger" onclick="offaDeleteUpdate(\\'' + u._id + '\\')">🗑️ حذف</button>' +
+            '</div></div>';
+    }).join('');
+}
+async function offaOpenUpdates() {
+    ccStopLive();
+    ownerModalOpen('🛠️ تحديثات المطور', '<div style="color:var(--muted);">جارِ التحميل...</div>');
     try {
-        var d = await api('/api/owner/ask', { method: 'POST', body: JSON.stringify({ question: q }), noLock: true });
-        if (ansBox) ansBox.textContent = d.answer;
-    } catch (e) { if (ansBox) ansBox.textContent = ''; toast(e.message); }
+        var d = await api('/api/owner/updates', { noLock: true });
+        var h = '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">✍️ اكتب تحديث جديد</b>' +
+            '<input id="ud-title" type="text" placeholder="عنوان التحديث" style="margin-top:8px;">' +
+            '<textarea id="ud-body" placeholder="وش الجديد بالضبط؟ (يطلع للأعضاء بنفس الكتابة)" style="margin-top:6px;min-height:80px;"></textarea>' +
+            '<button class="btn sm" style="margin-top:6px;" onclick="offaSaveUpdate()">💾 حفظ كمسودة</button>' +
+            '<div style="font-size:11px;color:var(--muted);margin-top:4px;">يتحفظ هنا بس، محد يشوفه إلا لما تضغط «🚀 نشر الآن» من تحت.</div></div>' +
+            '<b style="font-size:13px;">📜 التحديثات المحفوظة</b><div style="margin-top:6px;">' + udRenderList(d.list) + '</div>';
+        ownerModalOpen('🛠️ تحديثات المطور', h);
+    } catch (e) { toast(e.message); }
+}
+async function offaSaveUpdate() {
+    var title = (document.getElementById('ud-title') || {}).value || '';
+    var body = (document.getElementById('ud-body') || {}).value || '';
+    title = title.trim(); body = body.trim();
+    if (!title || !body) { toast('لازم تكتب عنوان ووصف'); return; }
+    try {
+        await api('/api/owner/updates', { method: 'POST', body: JSON.stringify({ title: title, body: body }), noLock: true });
+        toast('💾 تم حفظ المسودة');
+        offaOpenUpdates();
+    } catch (e) { toast(e.message); }
+}
+async function offaPublishUpdate(id) {
+    if (!(await confirmModal('🚀 بينزل هذا التحديث للكل الآن وتطلع له نافذة إعلان. متأكد؟'))) return;
+    try {
+        await api('/api/owner/updates/' + id + '/publish', { method: 'POST', noLock: true });
+        toast('🚀 تم النشر');
+        offaOpenUpdates();
+    } catch (e) { toast(e.message); }
+}
+async function offaDeleteUpdate(id) {
+    if (!(await confirmModal('حذف هذا التحديث نهائياً؟'))) return;
+    try {
+        await api('/api/owner/updates/' + id, { method: 'DELETE', noLock: true });
+        toast('🗑️ تم الحذف');
+        offaOpenUpdates();
+    } catch (e) { toast(e.message); }
 }
 
 async function offaOpenDevices() {
@@ -10133,6 +10199,7 @@ async function offAnnSend(test) {
         offModalClose();
         toast(test ? '🧪 تم إرسال التجربة لحساب المالك' : '📢 تم إرسال الإعلان للأفراد');
         setTimeout(offAnnCheck, 700);
+        setTimeout(flashUpdCheck, 1000);
     } catch (e) { toast(e.message); }
 }
 async function toggleOfficersLock(lock) {
@@ -11498,10 +11565,50 @@ document.addEventListener('touchmove', function (e) {
     if (c && c.contains(e.target) && c.scrollHeight > c.clientHeight + 1) return;
     e.preventDefault();
 }, { passive: false });
+
+var FLASHUPD = { shown: false, id: null, busy: false };
+async function flashUpdCheck() {
+    if (!ME || ME.blocked || FLASHUPD.shown || FLASHUPD.busy || VC || OFFANN.shown) return;
+    FLASHUPD.busy = true;
+    try {
+        var d = await offFetch('/api/updates/latest');
+        if (d.update) flashUpdShow(d.update);
+    } catch (e) {}
+    FLASHUPD.busy = false;
+}
+function flashUpdShow(u) {
+    if (FLASHUPD.shown || document.getElementById('flash-upd')) return;
+    FLASHUPD.shown = true; FLASHUPD.id = u.id;
+    var ov = document.createElement('div');
+    ov.className = 'ann-ov'; ov.id = 'flash-upd';
+    ov.innerHTML = '<div class="ann-card"><button class="ann-x" onclick="flashUpdClose()" aria-label="إغلاق">✕</button>' +
+        '<div class="ann-badge">🆕 تحديث جديد</div><div style="font-size:42px;line-height:1.2;">🚀</div>' +
+        '<h3>تم إصدار تحديث جديد على فلاش!</h3>' +
+        '<p>سوّينا شغل وراكم هالفترة 👀 جرّبوا الموقع الحين وشوفوا الجديد بنفسكم.</p>' +
+        '<div class="ann-btns"><button class="btn" onclick="flashUpdClose()">✅ يلا بشوف</button></div></div>';
+    document.body.appendChild(ov);
+    document.documentElement.classList.add('ann-open');
+}
+function flashUpdClose() {
+    var id = FLASHUPD.id;
+    var el = document.getElementById('flash-upd');
+    if (el) el.remove();
+    document.documentElement.classList.remove('ann-open');
+    FLASHUPD.shown = false;
+    if (id) offPost('/api/updates/' + id + '/ack', {}).catch(function () {});
+}
+document.addEventListener('touchmove', function (e) {
+    if (!FLASHUPD.shown) return;
+    var c = document.querySelector('#flash-upd .ann-card');
+    if (c && c.contains(e.target) && c.scrollHeight > c.clientHeight + 1) return;
+    e.preventDefault();
+}, { passive: false });
+
 function offOnPoll() {
     try {
         OFFANN.tick++;
         if (OFFANN.tick % 6 === 1) offAnnCheck();
+        if (OFFANN.tick % 6 === 3) flashUpdCheck();
         if (document.getElementById('off-root') && !VC) offLoadMe(true);
         if (document.getElementById('offa-content') && !VC) offaReload(true);
     } catch (e) {}
