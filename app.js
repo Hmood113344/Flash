@@ -5707,8 +5707,6 @@ app.get("/", (req, res) => {
     <button class="btn sm" style="background:#0e7490;" onclick="offaOpenCommandCenter()">🖥️ غرفة التحكم</button>
     <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenUpdates()">🛠️ تحديثات المطور</button>
     <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
-    <button class="btn sm" style="background:#047857;" onclick="offaOpenOnline()">🟢 متصلين الآن</button>
-    <button class="btn sm" style="background:#b45309;" onclick="offaOpenOfficerReq()">🎖️ طلبات السلك</button>
     <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
     <button id="owner-lock-btn" class="btn sm danger" onclick="offaToggleLockdown()">🚨 إغلاق الموقع</button>
 </div>
@@ -6825,8 +6823,8 @@ function ccStopLive() { if (CC_TIMER) { clearInterval(CC_TIMER); CC_TIMER = null
 
 function ccRenderHtml(d) {
     var h = '<div id="cc-live-a"><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
-        '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.onlineNow + '</div><div style="font-size:11px;color:var(--muted);">متصل الآن</div></div>' +
-        '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.pendingApps + '</div><div style="font-size:11px;color:var(--muted);">طلبات سلك الضباط</div></div>' +
+        '<div class="card" onclick="offaOpenOnline()" style="flex:1;min-width:110px;text-align:center;cursor:pointer;"><div style="font-size:22px;">' + d.onlineNow + '</div><div style="font-size:11px;color:var(--muted);">متصل الآن</div></div>' +
+        '<div class="card" onclick="offaOpenOfficerReq()" style="flex:1;min-width:110px;text-align:center;cursor:pointer;"><div style="font-size:22px;">' + d.pendingApps + '</div><div style="font-size:11px;color:var(--muted);">طلبات سلك الضباط</div></div>' +
         '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.pendingViolations + '</div><div style="font-size:11px;color:var(--muted);">مخالفات معلّقة</div></div>' +
         '</div>';
     h += '<div style="display:flex;gap:8px;margin-bottom:10px;">' +
@@ -6916,7 +6914,7 @@ function ccPatch(d) {
 
 /* 🟢 المتصلين الآن */
 function onlineHtml(list) {
-    var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><b style="font-size:13px;">🟢 ' + list.length + ' متصل الآن</b><button class="btn sm gray" onclick="offaOpenOnline()">🔄 تحديث</button></div>';
+    var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><b style="font-size:13px;">🟢 ' + list.length + ' متصل الآن</b><span><button class="btn sm gray" onclick="offaOpenOnline()">🔄 تحديث</button> <button class="btn sm gray" onclick="offaOpenCommandCenter()">↩ رجوع</button></span></div>';
     if (!list.length) return h + '<div style="color:var(--muted);font-size:12px;">ما فيه أحد متصل</div>';
     return h + list.map(function (u) {
         var tag = u.isOwner ? ' <span style="color:#a78bfa;">(المالك)</span>' : (u.isSenior ? ' <span style="color:#fbbf24;">(كبير مسؤولين)</span>' : '');
@@ -6941,13 +6939,14 @@ async function offaOpenOnline() {
 
 /* 🎖️ طلبات السلك (قبول/رفض بصمت) */
 function ofrHtml(d) {
-    if (!d.pending.length) return '<div style="color:var(--muted);font-size:12px;">ما فيه طلبات جديدة</div>';
+    var back = '<div style="margin-bottom:8px;"><button class="btn sm gray" onclick="offaOpenCommandCenter()">↩ رجوع لغرفة التحكم</button></div>';
+    if (!d.pending.length) return back + '<div style="color:var(--muted);font-size:12px;">ما فيه طلبات جديدة</div>';
     var today = '';
     try { today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Riyadh' }); } catch (e) {}
     var hours = '';
     for (var i = 0; i < 24; i++) hours += '<option value="' + i + '">' + (i % 12 === 0 ? 12 : i % 12) + ' ' + (i < 12 ? 'صباحاً' : 'مساءً') + '</option>';
     var roomOpts = (d.rooms && d.rooms.length ? d.rooms : [1]).map(function (n) { return '<option value="' + n + '">مقابلة ' + n + '</option>'; }).join('');
-    return d.pending.map(function (a) {
+    return back + d.pending.map(function (a) {
         var qa = (a.answers || []).map(function (ans, k) {
             return '<div style="margin:6px 0;"><b>' + (k + 1) + '- ' + spEsc((d.questions || [])[k] || '') + '</b><div>' + spEsc(ans) + '</div></div>';
         }).join('');
