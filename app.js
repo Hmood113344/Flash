@@ -5755,6 +5755,15 @@ function odFix() {
     if (ME && ME.isOwner) REAL_OWNER = true;
     if (ME && REAL_OWNER && OWNER_DISGUISE) ME.isOwner = false;
 }
+var HOME_ST_I = 0;
+function homeStatusTick(keep) {
+    var el = document.getElementById('home-rank');
+    if (!el || !ME) return;
+    if (ME.isBlocked || ME.blocked) { el.textContent = '🚫 موقوف'; return; }
+    if (!keep) HOME_ST_I = 1 - HOME_ST_I;
+    el.textContent = HOME_ST_I === 0 ? '✅ فعّال' : (ME.rank || '✅ فعّال');
+}
+setInterval(function () { homeStatusTick(false); }, 3000);
 function odToggle() {
     if (!REAL_OWNER || !ME) return;
     OWNER_DISGUISE = !OWNER_DISGUISE;
@@ -7275,7 +7284,7 @@ async function pollTick() {
         const rp = document.getElementById('home-points');
         if (rp) {
             document.getElementById('home-points').textContent = ME.points;
-            document.getElementById('home-rank').textContent = ME.rank;
+            homeStatusTick(true);
             const nx = document.getElementById('home-next');
             if (nx) nx.textContent = ME.nextRank ? (ME.rank + ' ——> ' + ME.nextRank) : 'أعلى رتبة';
             const rem = document.getElementById('home-remaining');
