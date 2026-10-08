@@ -485,6 +485,7 @@ const SettingsSchema = new mongoose.Schema({
     leaveBalanceDefault: { type: Number, default: 10 },
     lockSavedLogin: { type: Boolean, default: false },
     officersLocked: { type: Boolean, default: false },
+    officerTrainers: { type: [String], default: [] },
 }, { minimize: false });
 const Settings = mongoose.model("Settings", SettingsSchema);
 
@@ -1255,7 +1256,7 @@ function scheduleChanged() {
     }, 250);
 }
 app.use("/api", (req, res, next) => {
-    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0 && !/^\/officers\/rooms\/\d+\/(signal|mode|speaker|chat|iv)/.test(req.path)) {
+    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0 && !/^\/officers\/rooms\/\d+\/(signal|mode|speaker|chat|iv|mute)/.test(req.path)) {
         res.on("finish", () => { if (res.statusCode < 400) scheduleChanged(); });
     }
     next();
@@ -1737,6 +1738,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isBlocked: p.isBlocked,
         isAdmin,
         isSeniorAdmin: senior,
+        isTrainer: Array.isArray(settings.officerTrainers) && settings.officerTrainers.includes(req.user.id),
         isAntiDrugs,
         sectorInfo,
         personnelOfficerInfo,
@@ -4605,6 +4607,19 @@ const FlashUpdateAckSchema = new mongoose.Schema({ uid: String, uaId: String, at
 FlashUpdateAckSchema.index({ uid: 1, uaId: 1 }, { unique: true });
 const FlashUpdateAck = mongoose.model("FlashUpdateAck", FlashUpdateAckSchema);
 const OFF_ROOMS_MAX = 5;
+// ---------- المدربين + رومات التدريب (901-903) ----------
+const OFF_TRAIN_ROOMS = [901, 902, 903];
+function offIsTrain(n) { return OFF_TRAIN_ROOMS.includes(n); }
+async function offIsTrainer(uid) {
+    const st = await getSettings();
+    return Array.isArray(st.officerTrainers) && st.officerTrainers.includes(String(uid));
+}
+async function ensureTrainerOrSenior(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (isSeniorAdmin(req.user.id)) return next();
+    if (await offIsTrainer(req.user.id)) return next();
+    return res.status(403).json({ error: "هذا القسم للمدربين وكبار المسؤولين فقط" });
+}
 const offRecActive = new Map();
 function offRecEnd(n, graceful) {
     const r = offRecActive.get(n);
@@ -4651,7 +4666,7 @@ function offIvGet(n, uid) {
     let m = offIv.get(n);
     if (!m) { m = new Map(); offIv.set(n, m); }
     let e = m.get(uid);
-    if (!e) { e = { cur: null, marks: offIvClean(null) }; m.set(uid, e); }
+    if (!e) { e = { cur: null, marks: offIvClean(null), report: null }; m.set(uid, e); }
     return e;
 }
 function offIvDrop(n, uid) {
@@ -4675,20 +4690,21 @@ function offState(n, viewerUid) {
     const isGhost = p => STEALTH_MODE && isOwnerUid(p.uid) && !viewerIsOwner;
     const meP = viewerUid ? m.get(viewerUid) : null;
     const ivm = offIv.get(n);
-    let iv = null, myQ = null;
+    let iv = null, myQ = null, myReport = null;
     if (meP && meP.isSenior) {
         iv = {};
-        if (ivm) for (const [u, e] of ivm) iv[u] = { cur: e.cur, marks: e.marks };
+        if (ivm) for (const [u, e] of ivm) iv[u] = { cur: e.cur, marks: e.marks, sent: !!e.report };
     } else if (meP && ivm && ivm.has(viewerUid)) {
         const e = ivm.get(viewerUid);
         if (e.cur !== null && e.cur !== undefined) myQ = OFFICER_INTERVIEW_QUESTIONS[e.cur] || null;
+        if (e.report) myReport = { at: e.report.at, items: e.report.marks.map((mk, i) => ({ q: OFFICER_INTERVIEW_QUESTIONS[i], mark: mk })) };
     }
     const ch = offChat.get(n);
     return {
         n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
-        chatSeq: ch ? ch.seq : 0, iv, myQ,
-        participants: all.filter(p => !isGhost(p)).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
-        ghosts: all.filter(isGhost).map(p => ({ uid: p.uid, isSenior: p.isSenior, joinedAt: p.joinedAt })),
+        chatSeq: ch ? ch.seq : 0, iv, myQ, myReport, training: offIsTrain(n),
+        participants: all.filter(p => !isGhost(p)).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
+        ghosts: all.filter(isGhost).map(p => ({ uid: p.uid, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
     };
 }
 function offPushState(n) {
@@ -4724,7 +4740,7 @@ function offRemove(uid, n) {
     if (cfg.speakerUid === uid) cfg.speakerUid = null;
     const rr = offRecActive.get(n);
     if (rr && rr.uid === uid) offRecEnd(n, true);
-    OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, action: "leave" }).catch(() => {});
+    if (!offIsTrain(n)) OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, action: "leave" }).catch(() => {});
     offPushState(n);
 }
 function offRemoveEverywhere(uid) {
@@ -5000,6 +5016,7 @@ app.post("/api/officers/rec/start", ensureSeniorAdmin, async (req, res) => {
     const m = n ? offLive.get(n) : null;
     const me = m ? m.get(req.user.id) : null;
     if (!me || !me.isSenior) return res.status(403).json({ error: "لازم تكون داخل الروم" });
+    if (offIsTrain(n)) return res.json({ ok: false });
     if (!Array.from(m.values()).some(x => !x.isSenior)) return res.json({ ok: false });
     if (offRecIsActive(n)) return res.json({ ok: false, busy: true });
     const mime = String((req.body && req.body.mime) || "audio/webm").slice(0, 60);
@@ -5198,7 +5215,7 @@ app.post("/api/officers/admin/applications/:id/interview-result", ensureSeniorAd
 });
 
 // ---------- الكبار: التدريب ----------
-app.get("/api/officers/admin/training", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/officers/admin/training", ensureTrainerOrSenior, async (req, res) => {
     const list = await OfficerApp.find({ stage: "training" }).sort({ createdAt: 1 }).lean();
     res.json({
         ranks: OFFICER_RANKS,
@@ -5209,7 +5226,7 @@ app.get("/api/officers/admin/training", ensureSeniorAdmin, async (req, res) => {
     });
 });
 
-app.post("/api/officers/admin/applications/:id/register-trainee", ensureSeniorAdmin, async (req, res) => {
+app.post("/api/officers/admin/applications/:id/register-trainee", ensureTrainerOrSenior, async (req, res) => {
     const a = await OfficerApp.findById(req.params.id);
     if (!a || a.stage !== "training") return res.status(404).json({ error: "هذا الشخص غير موجود بمرحلة التدريب" });
     if (a.training.registered) return res.status(400).json({ error: "مسجّل متدرب من قبل" });
@@ -5219,7 +5236,7 @@ app.post("/api/officers/admin/applications/:id/register-trainee", ensureSeniorAd
     res.json({ ok: true });
 });
 
-app.post("/api/officers/admin/applications/:id/attended", ensureSeniorAdmin, async (req, res) => {
+app.post("/api/officers/admin/applications/:id/attended", ensureTrainerOrSenior, async (req, res) => {
     const a = await OfficerApp.findById(req.params.id);
     if (!a || a.stage !== "training" || !a.training.registered) return res.status(404).json({ error: "هذا الشخص غير مسجّل متدرب" });
     if (a.training.attendedAt) return res.status(400).json({ error: "تم تسجيل حضوره من قبل" });
@@ -5254,6 +5271,40 @@ app.post("/api/officers/admin/applications/:id/training-result", ensureSeniorAdm
     res.json({ ok: true });
 });
 
+// ---------- الكبار: إدارة المدربين ----------
+app.get("/api/officers/admin/trainers", ensureSeniorAdmin, async (req, res) => {
+    const st = await getSettings();
+    const ids = Array.isArray(st.officerTrainers) ? st.officerTrainers : [];
+    const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, registeredName: 1, discordTag: 1, rank: 1 }).lean() : [];
+    const by = new Map(ps.map(x => [x.discord, x]));
+    res.json({ trainers: ids.map(id => { const x = by.get(id); return { uid: id, name: (x && (x.registeredName || x.discordTag)) || id, rank: x ? x.rank : null }; }) });
+});
+app.get("/api/officers/admin/trainers/search", ensureSeniorAdmin, async (req, res) => {
+    const q = String(req.query.q || "").trim().slice(0, 40);
+    if (!q) return res.json({ results: [] });
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const list = await Personnel.find({ registeredName: { $ne: null }, $or: [{ registeredName: rx }, { discordTag: rx }, { discord: q }] },
+        { discord: 1, registeredName: 1, discordTag: 1, rank: 1 }).limit(15).lean();
+    const st = await getSettings();
+    const cur = new Set(Array.isArray(st.officerTrainers) ? st.officerTrainers : []);
+    res.json({ results: list.map(x => ({ uid: x.discord, name: x.registeredName || x.discordTag || x.discord, tag: x.discordTag || "", rank: x.rank, isTrainer: cur.has(x.discord) })) });
+});
+app.post("/api/officers/admin/trainers", ensureSeniorAdmin, async (req, res) => {
+    const uid = String((req.body || {}).uid || "");
+    const p = uid ? await Personnel.findOne({ discord: uid, registeredName: { $ne: null } }, { registeredName: 1 }).lean() : null;
+    if (!p) return res.status(404).json({ error: "هذا العضو غير مسجل بفلاش" });
+    await Settings.updateOne({}, { $addToSet: { officerTrainers: uid } });
+    await logEvent({ action: "تعيين مدرب سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: p.registeredName });
+    res.json({ ok: true });
+});
+app.delete("/api/officers/admin/trainers/:uid", ensureSeniorAdmin, async (req, res) => {
+    const uid = String(req.params.uid || "");
+    await Settings.updateOne({}, { $pull: { officerTrainers: uid } });
+    for (const n of OFF_TRAIN_ROOMS) { const m = offLive.get(n); const q = m ? m.get(uid) : null; if (q && q.role === "trainer") { offSendTo(uid, { t: "kicked", n }); offRemove(uid, n); } }
+    await logEvent({ action: "إزالة مدرب سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: uid });
+    res.json({ ok: true });
+});
+
 // ---------- الروم الصوتي ----------
 app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
     const n = offParseN(req.params.n);
@@ -5262,7 +5313,22 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
     const senior = isSeniorAdmin(uid);
     let name = req.user.username;
     let appDoc = null;
-    if (senior) {
+    const isTrain = offIsTrain(n);
+    let role = senior ? "senior" : "applicant";
+    if (isTrain) {
+        if (!senior) {
+            if (await offIsTrainer(uid)) {
+                role = "trainer";
+                const pr = await Personnel.findOne({ discord: uid }, { registeredName: 1 }).lean();
+                name = (pr && pr.registeredName) || name;
+            } else {
+                const tr = await OfficerApp.findOne({ uid, stage: "training", "training.registered": true }).lean();
+                if (!tr) return res.status(403).json({ error: "ما أنت مسجل متدرب بالتدريب" });
+                role = "trainee";
+                name = tr.name || name;
+            }
+        }
+    } else if (senior) {
         if (!(await OfficerRoom.exists({ n }))) return res.status(404).json({ error: "هذا الروم غير موجود" });
     } else {
         appDoc = await OfficerApp.findOne({ uid, stage: "interview", "interview.room": n });
@@ -5277,10 +5343,10 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
     if (!m) { m = new Map(); offLive.set(n, m); }
     const existing = Array.from(m.keys()).filter(u => u !== uid);
     const wasIn = m.has(uid);
-    m.set(uid, { uid, name, isSenior: senior, joinedAt: Date.now() });
-    if (appDoc) { const ive = offIvGet(n, uid); ive.cur = null; ive.marks = offIvClean(appDoc.interview && appDoc.interview.marks); }
+    m.set(uid, { uid, name, isSenior: senior, role, muted: role === "trainee", joinedAt: Date.now() });
+    if (appDoc) { const ive = offIvGet(n, uid); ive.cur = null; ive.report = null; ive.marks = offIvClean(appDoc.interview && appDoc.interview.marks); }
     offPushState(n);
-    if (!wasIn) OfficerRoomLog.create({ n, uid, name, isSenior: senior, action: "join" }).catch(() => {});
+    if (!wasIn && !isTrain) OfficerRoomLog.create({ n, uid, name, isSenior: senior, action: "join" }).catch(() => {});
     if (appDoc && !appDoc.interview.enteredAt) {
         await OfficerApp.updateOne({ _id: appDoc._id }, { $set: { "interview.enteredAt": new Date() } });
     }
@@ -5334,6 +5400,26 @@ app.post("/api/officers/rooms/:n/kick", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true });
 });
 
+// ---------- إسكات (رومات التدريب) ----------
+// الكبار: يسكتون/يفتحون مايك أي واحد (حتى المدرب). المدرب: يسكت المتدربين فقط.
+app.post("/api/officers/rooms/:n/mute", ensureAuth, (req, res) => {
+    const n = offParseN(req.params.n);
+    if (!n || !offIsTrain(n)) return res.status(400).json({ error: "هذا مو روم تدريب" });
+    const m = offLive.get(n);
+    const me = m ? m.get(req.user.id) : null;
+    if (!me) return res.status(403).json({ error: "لازم تكون داخل الروم" });
+    const target = m.get(String((req.body || {}).uid || ""));
+    if (!target) return res.status(404).json({ error: "هذا الشخص مو داخل الروم" });
+    const want = !!(req.body || {}).muted;
+    if (!me.isSenior) {
+        if (me.role !== "trainer") return res.status(403).json({ error: "ما عندك صلاحية" });
+        if (target.role !== "trainee" || !want) return res.status(403).json({ error: "المدرب يقدر يسكت المتدربين فقط" });
+    }
+    target.muted = want;
+    offPushState(n);
+    res.json({ ok: true });
+});
+
 // ---------- أسئلة المقابلة (الكبار) ----------
 function offIvCtx(req, res) {
     const n = offParseN(req.params.n);
@@ -5371,6 +5457,16 @@ app.post("/api/officers/rooms/:n/iv/mark", ensureSeniorAdmin, async (req, res) =
     const e = offIvGet(c.n, c.uid);
     e.marks[i] = mark;
     await OfficerApp.updateOne({ uid: c.uid, stage: "interview" }, { $set: { "interview.marks": e.marks.slice() } }).catch(() => {});
+    offPushState(c.n);
+    res.json({ ok: true });
+});
+// إرسال تقرير المقابلة للمتقدم (بعد تقييم الأسئلة الخمسة)
+app.post("/api/officers/rooms/:n/iv/report", ensureSeniorAdmin, (req, res) => {
+    const c = offIvCtx(req, res);
+    if (!c) return;
+    const e = offIvGet(c.n, c.uid);
+    if (e.marks.some(x => !x)) return res.status(400).json({ error: "كمّل تقييم الأسئلة الخمسة أول" });
+    e.report = { at: Date.now(), marks: e.marks.slice() };
     offPushState(c.n);
     res.json({ ok: true });
 });
@@ -5814,6 +5910,28 @@ app.get("/", (req, res) => {
     .ov-btn.off { background: #7f1d1d; border-color: #ef4444; }
     .ov-btn.dis { opacity: 0.45; }
     .ov-btn.leave { background: #ef4444; border-color: #ef4444; }
+    #off-voice { padding-top: 66px; }
+    #off-voice.frozen { overflow: hidden; }
+    .ov-bar { flex-wrap: wrap; }
+    .ov-btn.alert { border-color: #eab308; background: rgba(234,179,8,0.2); }
+    .ov-chat-btn { position: fixed; top: 10px; right: 10px; z-index: 4150; padding: 11px 20px; border-radius: 30px; border: 1px solid #60a5fa; background: #1d4ed8; color: #fff; font-family: inherit; font-size: 15px; font-weight: 800; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,0.45); }
+    .ov-chat-dot { display: inline-block; min-width: 18px; height: 18px; line-height: 18px; border-radius: 9px; background: #ef4444; color: #fff; font-size: 11px; margin-right: 6px; padding: 0 5px; text-align: center; }
+    .ov-sheet { position: fixed; inset: 0; z-index: 4400; display: none; }
+    .ov-sheet.open { display: block; }
+    .ov-sheet-bg { position: absolute; inset: 0; background: rgba(0,0,0,0.6); touch-action: none; }
+    .ov-sheet-pn { position: absolute; left: 0; right: 0; bottom: 0; height: 50vh; background: #0b1730; border-top: 2px solid #3b82f6; border-radius: 18px 18px 0 0; display: flex; flex-direction: column; padding: 0 12px 12px; }
+    .ov-sheet-hd { touch-action: none; cursor: ns-resize; padding: 8px 0 6px; user-select: none; }
+    .ov-grab { width: 48px; height: 5px; border-radius: 3px; background: rgba(255,255,255,0.35); margin: 0 auto 8px; }
+    .ov-sheet-row { display: flex; justify-content: space-between; align-items: center; }
+    .ov-sheet-pn .ov-chat-list { flex: 1; max-height: none; overflow-y: auto; overscroll-behavior: contain; }
+    .ov-pop { position: fixed; inset: 0; z-index: 4300; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; padding: 16px; }
+    .ov-pop-box { background: #0b1730; border: 1px solid var(--border); border-radius: 16px; padding: 16px; width: 100%; max-width: 460px; max-height: 85vh; overflow-y: auto; }
+    .ov-hrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .ov-hrow b { color: var(--gold-soft); font-size: 15px; }
+    .ov-rep { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border-radius: 10px; margin-bottom: 6px; font-size: 13px; line-height: 1.7; border: 1px solid var(--border); background: rgba(255,255,255,0.04); }
+    .ov-rep.r { border-color: rgba(34,197,94,0.6); }
+    .ov-rep.w { border-color: rgba(239,68,68,0.6); }
+    .ov-rep span:first-child { flex: 0 0 auto; min-width: 40px; font-weight: 800; }
     .ov-card { background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 14px; padding: 12px; margin: 12px 0; }
     .ov-card > b { color: var(--gold-soft); font-size: 15px; display: block; margin-bottom: 8px; }
     .ov-q { display: flex; gap: 8px; align-items: flex-start; width: 100%; text-align: right; margin-bottom: 7px; padding: 9px 10px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: #e2e8f0; font-family: inherit; font-size: 13px; line-height: 1.7; cursor: pointer; }
@@ -7369,6 +7487,7 @@ function buildNav() {
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
+    if (ME.isTrainer && !ME.isSeniorAdmin) items.push({ label: '🏋️ صفحة المدرب', fn: 'renderTrainerPage()' });
     items.push({ label: '🎧 الدعم', fn: 'spOpen()', cls: 'sp-nav-user' });
     if (ME.isAdmin) items.push({ label: '🎧 تذاكر الدعم', fn: 'renderSupportAdmin()', cls: 'sp-nav-admin' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
@@ -10902,6 +11021,7 @@ function offAllowed(st, from, to) {
     if (from === to) return false;
     var f = offFindP(st, from), t = offFindP(st, to);
     if (!f || !t) return false;
+    if (st.training) return !f.muted;
     if (f.isSenior && t.isSenior) return true;
     var sp = st.speakerUid, mode = st.mode;
     if (mode === 'mute') return false;
@@ -10953,24 +11073,32 @@ async function offJoinVoice(n) {
     var j;
     try { j = await offPost('/api/officers/rooms/' + n + '/join', {}); }
     catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); toast(e.message); return; }
+    var myP = offFindP(j.state, ME.discordId);
+    var myRole = myP ? myP.role : (ME.isSeniorAdmin ? 'senior' : 'applicant');
     VC = {
         n: n, me: ME.discordId, isSenior: !!ME.isSeniorAdmin, stream: stream, mic: stream.getAudioTracks()[0], micOn: true,
         state: j.state, ice: j.iceServers, peers: {}, q: {}, earlyIce: {}, shareFlags: {}, speaking: {},
         sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0,
-        ivQ: j.ivQuestions || [], chat: [], chatSeq: 0, chatBusy: false, ivTarget: null, profiles: {}, profBusy: {}, profOpen: false, ansOpen: false, ivHtml: ''
+        ivQ: j.ivQuestions || [], chat: [], chatSeq: 0, chatBusy: false, ivTarget: null, profiles: {}, profBusy: {}, profOpen: false, ansOpen: false, ivHtml: '',
+        training: !!(j.state && j.state.training), seenP: {}, qSeen: '', repSeen: 0, repShown: {}, ivHidden: false, chatUnread: 0, popup: null
     };
     var ov = document.createElement('div');
     ov.id = 'off-voice';
-    ov.innerHTML = '<div class="ov-head"><b>🎙️ مقابلة رقم ' + n + '</b><span style="font-size:12px;color:var(--muted);">' + (VC.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</span></div>' +
+    ov.innerHTML = '<div class="ov-head"><b>' + (VC.training ? '🏋️ تدريب رقم ' + (n - 900) : '🎙️ مقابلة رقم ' + n) + '</b><span style="font-size:12px;color:var(--muted);">' + offRoleLabel(myRole) + '</span></div>' +
         '<div id="ov-modes" class="ov-modes"></div><div id="ov-note" class="ov-note"></div>' +
         '<div id="ov-iv"></div>' +
         '<div id="ov-stage" class="ov-stage"></div><div id="ov-grid" class="ov-grid"></div>' +
-        '<div class="ov-card"><b>💬 الشات</b><div id="ov-chat-list" class="ov-chat-list"></div>' +
-        '<div class="ov-chat-in"><input id="ov-chat-inp" maxlength="500" placeholder="اكتب رابط أو تعليمات أو سؤال..." onkeydown="offChatKey(event)"><button class="btn sm" onclick="offChatSend()">إرسال</button></div></div>' +
-        '<div id="ov-bar" class="ov-bar"></div><div id="ov-audio" style="display:none"></div>';
+        '<div id="ov-bar" class="ov-bar"></div><div id="ov-audio" style="display:none"></div>' +
+        '<button class="ov-chat-btn" onclick="offChatOpen()">💬 شات<span id="ov-chat-dot"></span></button>' +
+        '<div id="ov-sheet" class="ov-sheet"><div class="ov-sheet-bg"></div><div class="ov-sheet-pn" id="ov-sheet-pn">' +
+        '<div class="ov-sheet-hd" id="ov-sheet-hd"><div class="ov-grab"></div><div class="ov-sheet-row"><b style="color:var(--gold-soft);">💬 الشات</b><button class="btn gray sm" onclick="offChatClose()">↩️ رجوع للروم</button></div></div>' +
+        '<div id="ov-chat-list" class="ov-chat-list"></div>' +
+        '<div class="ov-chat-in"><input id="ov-chat-inp" maxlength="500" placeholder="اكتب رابط أو تعليمات أو سؤال..." onkeydown="offChatKey(event)"><button class="btn sm" onclick="offChatSend()">إرسال</button></div></div></div>';
     document.body.appendChild(ov);
     document.body.style.overflow = 'hidden';
     offWatch(VC.me, stream, null);
+    offSheetInit();
+    offSalatCheck(j.state);
     (j.existing || []).forEach(function (uid) { var P = offMakePeer(uid, true); offStartOffer(P, false); });
     (j.chat || []).forEach(function (m) { offChatAdd(m, true); });
     offApplyPerms();
@@ -11036,7 +11164,7 @@ function offRecMime() {
 }
 function offRecCheck() {
     var v = VC;
-    if (!v || !v.isSenior || !offRecSupported()) return;
+    if (!v || !v.isSenior || v.training || !offRecSupported()) return;
     var hasApplicant = v.state.participants.some(function (p) { return !p.isSenior; });
     if (v.rec) { if (!hasApplicant) offRecStopFor(v); return; }
     if (!hasApplicant || v.state.rec || v.recBusy || Date.now() < (v.recRetry || 0)) return;
@@ -11203,6 +11331,7 @@ function offApplyState(st) {
     if (!meIn) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); return; }
     VC.state = st;
     if ((st.chatSeq || 0) > VC.chatSeq) offChatSync();
+    offSalatCheck(st);
     offRecCheck();
     Object.keys(VC.peers).forEach(function (uid) {
         var p = offFindP(st, uid);
@@ -11271,7 +11400,7 @@ function offPaintAll() { offPaintModes(); offPaintNote(); offPaintIv(); offPaint
 function offPaintModes() {
     var box = document.getElementById('ov-modes');
     if (!box || !VC) return;
-    if (!VC.isSenior) { box.innerHTML = ''; return; }
+    if (!VC.isSenior || VC.state.training) { box.innerHTML = ''; return; }
     box.innerHTML = OFF_MODES.map(function (m) {
         return '<button class="ov-mode' + (VC.state.mode === m.k ? ' on' : '') + '" data-m="' + m.k + '" onclick="offSetMode(this.dataset.m)">' + m.t + '</button>';
     }).join('');
@@ -11279,6 +11408,13 @@ function offPaintModes() {
 function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
+    if (VC.state.training) {
+        var tme = offFindP(VC.state, VC.me), trole = tme ? tme.role : '';
+        if (trole === 'senior') box.textContent = 'روم تدريب — الكل مكتوم إلا المدرب. تقدر تسكت أو تفتح مايك أي أحد (حتى المدرب).';
+        else if (trole === 'trainer') box.textContent = '🏋️ أنت المدرب — المتدربين يسمعونك فقط، وتقدر تسكت أي متدرب.';
+        else box.textContent = (tme && tme.muted) ? '🔇 أنت مكتوم — تسمع المدرب فقط.' : '🎙️ المايك مفتوح لك.';
+        return;
+    }
     if (VC.isSenior) box.textContent = offModeDesc(VC.state.mode) + ' — اضغط زر فتح المايك تحت اسم المتقدم.';
     else box.textContent = VC.state.mode === 'mute' ? '🔇 الروم صامت حالياً — ما أحد يتكلم ولا تسمع شي، الكبار فقط يسمعون بعض.' : (offCanSpeak() ? '🎙️ المايك مفتوح لك، تكلم.' : '🔇 أنت مستمع فقط — انتظر الكبير يفتح لك المايك.');
     if (VC.state.rec) box.textContent += ' 🔴 المقابلة مسجّلة صوتياً.';
@@ -11296,9 +11432,19 @@ function offPaintGrid() {
         var h = '<div class="' + cls + '" id="vt-' + p.uid + '">';
         h += '<div class="ov-av">' + spEsc((p.name || '?').trim().charAt(0)) + '</div>';
         h += '<div class="ov-name">' + spEsc(p.name) + (isMe ? ' (أنت)' : '') + '</div>';
-        h += '<div class="ov-role">' + (p.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</div>';
+        h += '<div class="ov-role">' + offRoleLabel(p.role || (p.isSenior ? 'senior' : 'applicant')) + '</div>';
         h += '<div class="ov-ic">' + (canTalk ? '🎙️' : '🔇') + (sharing ? ' 🖥️' : '') + '</div>';
-        if (VC.isSenior && !p.isSenior) {
+        if (st.training) {
+            var myPp = offFindP(st, VC.me), myR = myPp ? myPp.role : '';
+            if (!isMe) {
+                if (VC.isSenior) {
+                    h += '<button class="btn sm' + (p.muted ? '' : ' danger') + '" data-u="' + p.uid + '" data-m="' + (p.muted ? '0' : '1') + '" onclick="offTrainMute(this.dataset.u, this.dataset.m)">' + (p.muted ? '🎙️ فتح المايك' : '🔇 إسكات') + '</button>';
+                    if (!p.isSenior) h += '<button class="btn sm danger" data-u="' + p.uid + '" onclick="offKick(this.dataset.u)">🚫 طرد</button>';
+                } else if (myR === 'trainer' && p.role === 'trainee' && !p.muted) {
+                    h += '<button class="btn sm danger" data-u="' + p.uid + '" data-m="1" onclick="offTrainMute(this.dataset.u, this.dataset.m)">🔇 إسكات</button>';
+                }
+            }
+        } else if (VC.isSenior && !p.isSenior) {
             h += '<button class="btn sm' + (sel ? ' danger' : '') + '" data-u="' + p.uid + '" onclick="offSetSpeaker(this.dataset.u)">' + (sel ? '🔇 إسكات' : '🎙️ فتح المايك') + '</button>';
             h += '<button class="btn sm danger" data-u="' + p.uid + '" onclick="offKick(this.dataset.u)">🚫 طرد</button>';
         }
@@ -11346,7 +11492,9 @@ function offPaintBar() {
     var canSpeak = offCanSpeak();
     var micCls = 'ov-btn' + (!canSpeak ? ' dis' : (VC.micOn ? '' : ' off'));
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
-    box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' +
+    var qb = '';
+    if (!VC.isSenior && !VC.state.training) qb = '<button class="ov-btn' + (offQNew() ? ' alert' : '') + '" onclick="offQOpen()">❓ أسئلة المقابلة' + (offQNew() ? ' 🔴' : '') + '</button>';
+    box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
 }
 /* ---------------------------- أسئلة المقابلة + الشات + ملف المتقدم ---------------------------- */
@@ -11401,11 +11549,14 @@ function offPaintIv() {
     var box = document.getElementById('ov-iv');
     if (!box || !VC) return;
     var st = VC.state, h = '';
-    if (!VC.isSenior) {
-        if (st.myQ) h = '<div class="ov-myq"><div class="ov-myq-h">❓ سؤال المقابلة</div><div class="ov-myq-t">' + spEsc(st.myQ) + '</div></div>';
+    if (st.training) { box.innerHTML = ''; return; }
+    if (!VC.isSenior) { box.innerHTML = ''; offQRefresh(); offReportCheck(); return; }
+    var t = offIvTarget();
+    var autoRep = false;
+    if (VC.ivHidden) {
+        h = '<div class="ov-card"><div class="ov-hrow"><b>🎯 لوحة المقابلة (مخفية)</b><button class="btn gold sm" onclick="offIvToggle()">👁️ إظهار الأسئلة</button></div></div>';
     } else {
-        var t = offIvTarget();
-        h = '<div class="ov-card"><b>🎯 لوحة المقابلة</b>';
+        h = '<div class="ov-card"><div class="ov-hrow"><b>🎯 لوحة المقابلة</b><button class="btn gray sm" onclick="offIvToggle()">🙈 إخفاء الأسئلة</button></div>';
         if (!t) h += '<div class="ov-note">ما فيه متقدم داخل الروم حالياً.</div>';
         else {
             var aps = st.participants.filter(function (p) { return !p.isSenior; });
@@ -11414,7 +11565,7 @@ function offPaintIv() {
                     return '<button class="ov-mode' + (p.uid === t.uid ? ' on' : '') + '" style="flex:none;margin:0 0 4px 4px;" data-u="' + p.uid + '" onclick="offIvPick(this.dataset.u)">' + spEsc(p.name) + '</button>';
                 }).join('') + '</div>';
             } else h += '<div class="ov-role" style="margin-bottom:8px;">المتقدم: <b>' + spEsc(t.name) + '</b></div>';
-            var e = (st.iv && st.iv[t.uid]) || { cur: null, marks: ['', '', '', '', ''] };
+            var e = (st.iv && st.iv[t.uid]) || { cur: null, marks: ['', '', '', '', ''], sent: false };
             (VC.ivQ || []).forEach(function (q, i) {
                 var mk = e.marks[i];
                 h += '<button class="ov-q' + (e.cur === i ? ' cur' : '') + (mk === 'r' ? ' r' : (mk === 'w' ? ' w' : '')) + '" data-i="' + i + '" onclick="offIvAsk(this.dataset.i)">' +
@@ -11424,12 +11575,15 @@ function offPaintIv() {
                 h += '<div class="ov-cur">📢 السؤال المعروض للمتقدم الحين: <b>' + (e.cur + 1) + '</b> — قيّم إجابته:</div>' +
                     '<div class="ov-jb"><button class="btn sm" data-m="r" onclick="offIvMark(this.dataset.m)">✔ صح</button>' +
                     '<button class="btn danger sm" data-m="w" onclick="offIvMark(this.dataset.m)">✘ غلط</button>' +
-                    '<button class="btn gray sm" onclick="offIvHide()">إخفاء السؤال</button></div>';
+                    '<button class="btn gray sm" onclick="offIvHide()">إخفاء السؤال عن المتقدم</button></div>';
             }
             var ev = offIvEval(e.marks);
             if (ev.done) {
                 h += '<div class="ov-eval ' + (ev.right >= 4 ? 'good' : (ev.right === 3 ? 'mid' : 'bad')) + '"><b>📊 التقييم النهائي: ' + ev.right + ' / 5 — ' + ev.label + '</b>' +
-                    '<div class="ov-role">صح: ' + ev.right + ' • غلط: ' + ev.wrong + ' — وبعدها تقدر تسأله أسئلتك الخاصة.</div></div>';
+                    '<div class="ov-role">صح: ' + ev.right + ' • غلط: ' + ev.wrong + ' — وبعدها تقدر تسأله أسئلتك الخاصة.</div>' +
+                    '<div class="ov-jb" style="margin-top:8px;"><button class="btn sm" onclick="offIvReportShow()">📄 عرض التقرير</button>' +
+                    '<button class="btn gold sm" onclick="offIvReportSend()">' + (e.sent ? '✅ أُرسل — إعادة الإرسال' : '📤 إرسال التقرير للعضو') + '</button></div></div>';
+                if (!VC.repShown[t.uid]) { VC.repShown[t.uid] = true; autoRep = true; }
             } else if (ev.right || ev.wrong) {
                 h += '<div class="ov-eval">📊 التقييم الحالي: ' + ev.right + ' صح • ' + ev.wrong + ' غلط (باقي ' + (5 - ev.right - ev.wrong) + ')</div>';
             }
@@ -11438,9 +11592,155 @@ function offPaintIv() {
         }
         h += '</div>';
     }
-    if (VC.ivHtml === h) return;
-    VC.ivHtml = h;
-    box.innerHTML = h;
+    if (VC.ivHtml !== h) { VC.ivHtml = h; box.innerHTML = h; }
+    if (autoRep) setTimeout(function () { if (VC) offIvReportShow(); }, 60);
+}
+function offIvToggle() { if (!VC) return; VC.ivHidden = !VC.ivHidden; VC.ivHtml = ''; offPaintIv(); }
+/* ---- النوافذ المنبثقة داخل الروم + التقرير + أسئلة المتقدم ---- */
+function offPopOpen(html, kind) {
+    if (!VC) return;
+    offPopClose();
+    var d = document.createElement('div');
+    d.className = 'ov-pop'; d.id = 'ov-pop';
+    d.innerHTML = '<div class="ov-pop-box" id="ov-pop-box">' + html + '</div>';
+    (document.getElementById('off-voice') || document.body).appendChild(d);
+    VC.popup = kind || 'x';
+}
+function offPopClose() {
+    var d = document.getElementById('ov-pop');
+    if (d) d.remove();
+    if (VC) VC.popup = null;
+}
+function offReportHtml(items, name) {
+    var ev = offIvEval(items.map(function (x) { return x.mark; }));
+    var h = '<h3 style="color:var(--gold-soft);margin-bottom:10px;">📄 تقرير المقابلة' + (name ? ' — ' + spEsc(name) : '') + '</h3>';
+    items.forEach(function (x, i) {
+        h += '<div class="ov-rep ' + (x.mark === 'r' ? 'r' : 'w') + '"><span>' + (x.mark === 'r' ? '✅' : '❌') + ' ' + (i + 1) + '</span><span>' + spEsc(x.q) + '</span></div>';
+    });
+    h += '<div class="ov-eval ' + (ev.right >= 4 ? 'good' : (ev.right === 3 ? 'mid' : 'bad')) + '"><b>📊 صح: ' + ev.right + ' • غلط: ' + ev.wrong + '</b>' +
+        '<div style="margin-top:4px;">التقييم: <b>' + ev.right + ' / 5 — ' + ev.label + '</b></div></div>';
+    return h;
+}
+function offIvReportShow() {
+    if (!VC) return;
+    var t = offIvTarget();
+    var e = t && VC.state.iv ? VC.state.iv[t.uid] : null;
+    if (!t || !e) return;
+    var items = (VC.ivQ || []).map(function (q, i) { return { q: q, mark: e.marks[i] }; });
+    offPopOpen(offReportHtml(items, t.name) +
+        '<div class="ov-jb" style="margin-top:10px;"><button class="btn gold sm" onclick="offIvReportSend()">📤 إرسال التقرير للعضو</button>' +
+        '<button class="btn gray sm" onclick="offPopClose()">إغلاق</button></div>', 'rep');
+}
+function offIvReportSend() {
+    if (!VC) return;
+    var t = offIvTarget();
+    if (!t) return;
+    offPost('/api/officers/rooms/' + VC.n + '/iv/report', { uid: t.uid }).then(function () {
+        toast('📤 تم إرسال التقرير للعضو');
+        offPopClose();
+    }).catch(function (e) { toast(e.message); });
+}
+function offReportCheck() {
+    var r = VC && VC.state ? VC.state.myReport : null;
+    if (!r || r.at === VC.repSeen) return;
+    VC.repSeen = r.at;
+    offPopOpen(offReportHtml(r.items, '') + '<button class="btn" style="margin-top:10px;width:100%;" onclick="offPopClose()">إغلاق</button>', 'myrep');
+}
+function offReportReopen() {
+    var r = VC && VC.state ? VC.state.myReport : null;
+    if (!r) return;
+    offPopOpen(offReportHtml(r.items, '') + '<button class="btn" style="margin-top:10px;width:100%;" onclick="offPopClose()">إغلاق</button>', 'myrep');
+}
+function offQNew() { return !!(VC && VC.state && VC.state.myQ && VC.state.myQ !== VC.qSeen); }
+function offQHtml() {
+    var h = '<h3 style="color:var(--gold-soft);margin-bottom:10px;">❓ أسئلة المقابلة</h3>';
+    if (VC.state.myQ) h += '<div class="ov-myq"><div class="ov-myq-t">' + spEsc(VC.state.myQ) + '</div></div>';
+    else h += '<div class="ov-note">ما فيه سؤال معروض الحين، انتظر الكبير.</div>';
+    if (VC.state.myReport) h += '<button class="btn gold sm" style="margin-top:8px;" onclick="offReportReopen()">📄 عرض تقريري</button>';
+    return h + '<button class="btn gray" style="margin-top:10px;width:100%;" onclick="offPopClose()">إغلاق</button>';
+}
+function offQOpen() {
+    if (!VC) return;
+    VC.qSeen = VC.state.myQ || VC.qSeen;
+    offPopOpen(offQHtml(), 'q');
+    offPaintBar();
+}
+function offQRefresh() {
+    if (!VC) return;
+    if (!VC.state.myQ) VC.qSeen = '';
+    if (VC.popup === 'q') {
+        VC.qSeen = VC.state.myQ || VC.qSeen;
+        var b = document.getElementById('ov-pop-box');
+        if (b) b.innerHTML = offQHtml();
+    }
+    offPaintBar();
+}
+/* ---- روم التدريب ---- */
+function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : 'متقدم')); }
+function offTrainMute(uid, m) {
+    if (!VC) return;
+    offPost('/api/officers/rooms/' + VC.n + '/mute', { uid: uid, muted: String(m) === '1' }).catch(function (e) { toast(e.message); });
+}
+/* ---- صوت الصلاة على النبي (يصير أول ما أحد يدخل المقابلة) ---- */
+var OFF_SALAT_URL = '';
+function offSalat() {
+    try {
+        if (OFF_SALAT_URL) { var au = new Audio(OFF_SALAT_URL); var pr = au.play(); if (pr && pr.catch) pr.catch(function () {}); return; }
+        if (window.speechSynthesis && window.SpeechSynthesisUtterance) {
+            var u = new SpeechSynthesisUtterance('صلِّ على النبي');
+            u.lang = 'ar-SA'; u.rate = 0.9; u.volume = 1;
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(u);
+        }
+    } catch (e) {}
+}
+function offSalatCheck(st) {
+    if (!VC || !st || st.training) return;
+    Object.keys(VC.seenP).forEach(function (u) { if (!offFindP(st, u)) delete VC.seenP[u]; });
+    var fresh = false;
+    st.participants.forEach(function (p) { if (!VC.seenP[p.uid]) { VC.seenP[p.uid] = 1; fresh = true; } });
+    if (fresh) offSalat();
+}
+/* ---- الشات: نافذة تاخذ نص الشاشة وتتحرك فوق وتحت ---- */
+function offSheetInit() {
+    var hd = document.getElementById('ov-sheet-hd'), pn = document.getElementById('ov-sheet-pn');
+    if (!hd || !pn) return;
+    var startY = 0, startH = 0, drag = false;
+    hd.addEventListener('pointerdown', function (e) {
+        if (e.target && e.target.closest && e.target.closest('button')) return;
+        drag = true; startY = e.clientY; startH = pn.offsetHeight;
+        try { hd.setPointerCapture(e.pointerId); } catch (x) {}
+    });
+    hd.addEventListener('pointermove', function (e) {
+        if (!drag) return;
+        var vh = window.innerHeight || 700;
+        var h = startH + (startY - e.clientY);
+        pn.style.height = Math.max(vh * 0.3, Math.min(vh * 0.94, h)) + 'px';
+    });
+    var end = function () { drag = false; };
+    hd.addEventListener('pointerup', end);
+    hd.addEventListener('pointercancel', end);
+}
+function offChatOpen() {
+    var sh = document.getElementById('ov-sheet'), ov = document.getElementById('off-voice');
+    if (!sh || !VC) return;
+    sh.classList.add('open');
+    if (ov) ov.classList.add('frozen');
+    VC.chatUnread = 0;
+    offChatDot();
+    offPaintChat();
+    var l = document.getElementById('ov-chat-list');
+    if (l) l.scrollTop = l.scrollHeight;
+}
+function offChatClose() {
+    var sh = document.getElementById('ov-sheet'), ov = document.getElementById('off-voice');
+    if (sh) sh.classList.remove('open');
+    if (ov) ov.classList.remove('frozen');
+}
+function offChatDot() {
+    var d = document.getElementById('ov-chat-dot');
+    if (!d || !VC) return;
+    d.innerHTML = VC.chatUnread > 0 ? '<span class="ov-chat-dot">' + VC.chatUnread + '</span>' : '';
 }
 function offIvAsk(i) {
     if (!VC) return;
@@ -11470,7 +11770,11 @@ function offChatAdd(msg, quiet) {
     VC.chat.push(msg);
     if (VC.chat.length > 100) VC.chat.shift();
     if (msg.id > VC.chatSeq) VC.chatSeq = msg.id;
-    if (!quiet) offPaintChat();
+    if (!quiet) {
+        var sh = document.getElementById('ov-sheet');
+        if (msg.uid !== VC.me && !(sh && sh.classList.contains('open'))) { VC.chatUnread++; offChatDot(); }
+        offPaintChat();
+    }
 }
 function offPaintChat() {
     var box = document.getElementById('ov-chat-list');
@@ -11579,7 +11883,7 @@ function renderOfficerAdmin(tab) {
     OFFA.tab = (typeof tab === 'string') ? tab : 'apps';
     OFFA.sig = '';
     OFFA.data = null;
-    var tabs = [['apps', '📥 التقديمات'], ['rooms', '🎙️ المقابلة'], ['log', '📼 تسجيل المقابلة'], ['train', '🏋️ التدريب']];
+    var tabs = [['apps', '📥 التقديمات'], ['rooms', '🎙️ المقابلة'], ['log', '📼 تسجيل المقابلة'], ['train', '🏋️ التدريب'], ['trainers', '👨‍🏫 المدربين']];
     document.getElementById('admin-content').innerHTML =
         '<div class="tabs" id="offa-tabs" style="margin-top:4px;">' + tabs.map(function (t) {
             return '<div class="tab' + (t[0] === OFFA.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="offaTab(this.dataset.t)">' + t[1] + '</div>';
@@ -11599,7 +11903,7 @@ function offaTab(name) {
 async function offaReload(silent) {
     if (silent && (VC || OFFA.tab === 'log')) return;
     var tab = OFFA.tab;
-    var urls = { apps: '/api/officers/admin/applications', rooms: '/api/officers/admin/rooms', log: '/api/officers/admin/interview-log', train: '/api/officers/admin/training' };
+    var urls = { apps: '/api/officers/admin/applications', rooms: '/api/officers/admin/rooms', log: '/api/officers/admin/interview-log', train: '/api/officers/admin/training', trainers: '/api/officers/admin/trainers' };
     try {
         var d = await offFetch(urls[tab]);
         if (tab !== OFFA.tab) return;
@@ -11615,6 +11919,7 @@ function offaPaint() {
     if (OFFA.tab === 'apps') box.innerHTML = offaAppsHtml(OFFA.data);
     else if (OFFA.tab === 'rooms') box.innerHTML = offaRoomsHtml(OFFA.data);
     else if (OFFA.tab === 'log') { box.innerHTML = offaLogHtml(OFFA.data); if (ME && ME.isOwner) offaBindSessSwipe(box); }
+    else if (OFFA.tab === 'trainers') box.innerHTML = offaTrainersHtml(OFFA.data);
     else box.innerHTML = offaTrainHtml(OFFA.data);
 }
 function offaStageText(a) {
@@ -12072,8 +12377,14 @@ async function offaInterviewResult(id, ok) {
         offaReload(false);
     } catch (e) { toast(e.message); }
 }
+function offTrainRoomsHtml() {
+    return '<div class="card"><h3>🎙️ روم التدريب الصوتي</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">أول ما يدخلون الكل مكتوم ويسمعون المدرب فقط. المدرب يسكت المتدربين، والكبار يتحكمون بالكل (حتى المدرب).</p>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;">' + [1, 2, 3].map(function (i) {
+            return '<button class="btn sm" data-n="' + (900 + i) + '" onclick="offJoinVoice(parseInt(this.dataset.n, 10))">🏋️ دخول روم تدريب ' + i + '</button>';
+        }).join('') + '</div></div>';
+}
 function offaTrainHtml(d) {
-    var h = '<div class="card"><h3>➕ تسجيل متدرب</h3><p style="color:var(--muted);font-size:13px;">المقبولين من المقابلة فقط</p>';
+    var h = offTrainRoomsHtml() + '<div class="card"><h3>➕ تسجيل متدرب</h3><p style="color:var(--muted);font-size:13px;">المقبولين من المقابلة فقط</p>';
     if (!d.eligible.length) h += '<div style="color:var(--muted);font-size:13px;">لا يوجد مقبولين بانتظار التسجيل</div>';
     d.eligible.forEach(function (a) {
         h += '<div class="log-item"><span>' + spEsc(a.name) + '</span><button class="btn sm" data-id="' + a.id + '" onclick="offaRegTrainee(this.dataset.id)">تسجيل متدرب</button></div>';
@@ -12083,6 +12394,7 @@ function offaTrainHtml(d) {
     d.trainees.forEach(function (a) {
         h += '<div class="log-item"><span>' + spEsc(a.name) + (a.attendedAt ? ' <small style="color:#4ade80;">— حضر ' + spEsc(offFmtTime(a.attendedAt)) + '</small>' : '') + '</span>';
         if (!a.attendedAt) h += '<button class="btn gold sm" data-id="' + a.id + '" onclick="offaAttended(this.dataset.id)">✅ حضر التدريب</button>';
+        else if (!(ME && ME.isSeniorAdmin)) h += '<small style="color:var(--muted);">بانتظار قرار الكبار</small>';
         else h += '<span><button class="btn sm" data-id="' + a.id + '" onclick="offaTrainAccept(this.dataset.id)">✅ قبول</button> ' +
             '<button class="btn danger sm" data-id="' + a.id + '" onclick="offaTrainReject(this.dataset.id)">❌ رفض</button></span>';
         h += '</div>';
@@ -12116,6 +12428,67 @@ async function offaTrainReject(id) {
     if (!(await confirmModal('تأكيد رفض هذا المتدرب نهائياً؟'))) return;
     try { await api('/api/officers/admin/applications/' + id + '/training-result', { method: 'POST', body: JSON.stringify({ result: 'rejected' }) }); toast('تم الرفض'); offaReload(false); }
     catch (e) { toast(e.message); }
+}
+/* ---- صفحة المدرب + إدارة المدربين ---- */
+function renderTrainerPage() {
+    if (!ME || !(ME.isTrainer || ME.isSeniorAdmin)) return;
+    offStopTimers();
+    OFFA.tab = 'train'; OFFA.sig = ''; OFFA.data = null;
+    document.getElementById('app').innerHTML = '<div class="card row"><h2>🏋️ صفحة المدرب</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>' +
+        '<div id="offa-content"><div class="card">جارِ التحميل...</div></div>';
+    offaReload(false);
+    OFFA.timer = setInterval(function () {
+        if (!document.getElementById('offa-content')) { clearInterval(OFFA.timer); OFFA.timer = null; return; }
+        offaReload(true);
+    }, 4000);
+}
+var OFFA_TRT = null;
+function offaTrainersHtml(d) {
+    var h = '<div class="card"><h3>🔎 بحث عن عضو مسجل بفلاش</h3><input id="offa-tr-q" placeholder="اكتب الاسم أو اليوزر..." value="' + spEsc(OFFA.trQ || '') + '" oninput="offaTrSearch(this.value)">' +
+        '<div id="offa-tr-res" style="margin-top:8px;">' + offaTrResHtml() + '</div></div>';
+    h += '<div class="card"><h3>👨‍🏫 المدربين الحاليين</h3>';
+    if (!d.trainers.length) h += '<div style="color:var(--muted);font-size:13px;">ما فيه مدربين</div>';
+    d.trainers.forEach(function (t) {
+        h += '<div class="log-item"><span>' + spEsc(t.name) + (t.rank ? ' <small style="color:var(--muted);">— ' + spEsc(t.rank) + '</small>' : '') + '</span>' +
+            '<button class="btn danger sm" data-u="' + t.uid + '" onclick="offaTrDel(this.dataset.u)">إزالة</button></div>';
+    });
+    return h + '</div>';
+}
+function offaTrResHtml() {
+    var r = OFFA.trRes || [];
+    if (!r.length) return OFFA.trQ ? '<div style="color:var(--muted);font-size:13px;">ما فيه نتائج</div>' : '';
+    return r.map(function (x) {
+        return '<div class="log-item"><span>' + spEsc(x.name) + ' <small style="color:var(--muted);">— ' + spEsc(x.rank || '') + (x.tag ? ' — ' + spEsc(x.tag) : '') + '</small></span>' +
+            (x.isTrainer ? '<span class="off-chip sen">مدرب</span>' : '<button class="btn gold sm" data-u="' + x.uid + '" onclick="offaTrAdd(this.dataset.u)">🏋️ تعيين مدرب</button>') + '</div>';
+    }).join('');
+}
+function offaTrResPaint() { var b = document.getElementById('offa-tr-res'); if (b) b.innerHTML = offaTrResHtml(); }
+function offaTrSearch(v) {
+    OFFA.trQ = v;
+    clearTimeout(OFFA_TRT);
+    OFFA_TRT = setTimeout(async function () {
+        if (!v.trim()) { OFFA.trRes = []; offaTrResPaint(); return; }
+        try { var d = await offFetch('/api/officers/admin/trainers/search?q=' + encodeURIComponent(v.trim())); OFFA.trRes = d.results; }
+        catch (e) { OFFA.trRes = []; toast(e.message); }
+        offaTrResPaint();
+    }, 300);
+}
+async function offaTrAdd(uid) {
+    try {
+        await offPost('/api/officers/admin/trainers', { uid: uid });
+        toast('✅ تم تعيينه مدرب');
+        OFFA.trRes = (OFFA.trRes || []).map(function (x) { if (x.uid === uid) x.isTrainer = true; return x; });
+        offaTrResPaint(); offaReload(false);
+    } catch (e) { toast(e.message); }
+}
+async function offaTrDel(uid) {
+    if (!(await confirmModal('تشيل هذا المدرب؟'))) return;
+    try {
+        await offFetch('/api/officers/admin/trainers/' + encodeURIComponent(uid), { method: 'DELETE' });
+        toast('تم الإزالة');
+        OFFA.trRes = (OFFA.trRes || []).map(function (x) { if (x.uid === uid) x.isTrainer = false; return x; });
+        offaTrResPaint(); offaReload(false);
+    } catch (e) { toast(e.message); }
 }
 /* تحديث تلقائي من الـ polling العام */
 var OFFANN = { shown: false, id: null, tick: 0, busy: false };
