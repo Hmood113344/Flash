@@ -11079,7 +11079,7 @@ async function offJoinVoice(n) {
         state: j.state, ice: j.iceServers, peers: {}, q: {}, earlyIce: {}, shareFlags: {}, speaking: {},
         sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0,
         ivQ: j.ivQuestions || [], chat: [], chatSeq: 0, chatBusy: false, ivTarget: null, profiles: {}, profBusy: {}, profOpen: false, ansOpen: false, ivHtml: '',
-        training: !!(j.state && j.state.training), seenP: {}, qSeen: '', repSeen: 0, repShown: {}, ivHidden: false, chatUnread: 0, popup: null
+        training: !!(j.state && j.state.training), qSeen: '', repSeen: 0, repShown: {}, ivHidden: false, chatUnread: 0, popup: null
     };
     var ov = document.createElement('div');
     ov.id = 'off-voice';
@@ -11097,7 +11097,6 @@ async function offJoinVoice(n) {
     document.body.style.overflow = 'hidden';
     offWatch(VC.me, stream, null);
     offSheetInit();
-    offSalatCheck(j.state);
     (j.existing || []).forEach(function (uid) { var P = offMakePeer(uid, true); offStartOffer(P, false); });
     (j.chat || []).forEach(function (m) { offChatAdd(m, true); });
     offApplyPerms();
@@ -11330,7 +11329,6 @@ function offApplyState(st) {
     if (!meIn) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); return; }
     VC.state = st;
     if ((st.chatSeq || 0) > VC.chatSeq) offChatSync();
-    offSalatCheck(st);
     offRecCheck();
     Object.keys(VC.peers).forEach(function (uid) {
         var p = offFindP(st, uid);
@@ -11681,26 +11679,6 @@ function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' :
 function offTrainMute(uid, m) {
     if (!VC) return;
     offPost('/api/officers/rooms/' + VC.n + '/mute', { uid: uid, muted: String(m) === '1' }).catch(function (e) { toast(e.message); });
-}
-/* ---- صوت الصلاة على النبي (يصير أول ما أحد يدخل المقابلة) ---- */
-var OFF_SALAT_URL = '';
-function offSalat() {
-    try {
-        if (OFF_SALAT_URL) { var au = new Audio(OFF_SALAT_URL); var pr = au.play(); if (pr && pr.catch) pr.catch(function () {}); return; }
-        if (window.speechSynthesis && window.SpeechSynthesisUtterance) {
-            var u = new SpeechSynthesisUtterance('صلِّ على النبي');
-            u.lang = 'ar-SA'; u.rate = 0.9; u.volume = 1;
-            window.speechSynthesis.cancel();
-            window.speechSynthesis.speak(u);
-        }
-    } catch (e) {}
-}
-function offSalatCheck(st) {
-    if (!VC || !st || st.training) return;
-    Object.keys(VC.seenP).forEach(function (u) { if (!offFindP(st, u)) delete VC.seenP[u]; });
-    var fresh = false;
-    st.participants.forEach(function (p) { if (!VC.seenP[p.uid]) { VC.seenP[p.uid] = 1; fresh = true; } });
-    if (fresh) offSalat();
 }
 /* ---- الشات: نافذة تاخذ نص الشاشة وتتحرك فوق وتحت ---- */
 function offSheetInit() {
