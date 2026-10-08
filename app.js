@@ -1255,7 +1255,7 @@ function scheduleChanged() {
     }, 250);
 }
 app.use("/api", (req, res, next) => {
-    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0 && !/^\/officers\/rooms\/\d+\/(signal|mode|speaker)/.test(req.path)) {
+    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0 && !/^\/officers\/rooms\/\d+\/(signal|mode|speaker|chat|iv)/.test(req.path)) {
         res.on("finish", () => { if (res.statusCode < 400) scheduleChanged(); });
     }
     next();
@@ -4551,6 +4551,7 @@ const OfficerAppSchema = new mongoose.Schema({
         enteredAt: { type: Date, default: null },
         scheduledBy: { type: String, default: null },
         decidedAt: { type: Date, default: null },
+        marks: { type: [String], default: [] },
     },
     training: {
         registered: { type: Boolean, default: false },
@@ -4630,6 +4631,35 @@ async function offRecCleanup() {
 setTimeout(offRecCleanup, 60000);
 setInterval(offRecCleanup, 6 * 3600 * 1000);
 const offLive = new Map();   // n -> Map(uid -> { uid, name, isSenior, joinedAt })
+// ---------- أسئلة المقابلة (5 أسئلة تظهر للكبار فقط، والكبير يعرضها للمتقدم ويقيّمها صح/غلط) ----------
+const OFFICER_INTERVIEW_QUESTIONS = [
+    "تم إصدار أمر لك من قائد أعلى رتبة، لكنك ترى أن الأمر سيؤثر سلبًا على القطاع، كيف تتصرف؟",
+    "أثناء قيادتك لمهمة، اكتشفت أن أحد الضباط تحت قيادتك ارتكب مخالفة جسيمة، كيف تتعامل معه دون التأثير على سير المهمة؟",
+    "في حال تعارضت أوامر ضابطين أعلى منك رتبة، وكلٌ منهما يطلب منك تنفيذ أمر مختلف، كيف تحدد الأمر الذي ستنفذه؟",
+    "تم تعيينك مسؤولًا عن قطاع يعاني من الفوضى وضعف الانضباط، ما أول قراراتك؟ وكيف تعيد فرض النظام؟",
+    "إذا اكتشفت أن ضابطًا قريبًا منك يستغل صلاحياته لتحقيق مصلحة شخصية، هل تتخذ إجراءً بحقه رغم علاقتك به؟ وضّح تصرفك",
+];
+const offIv = new Map();     // n -> Map(uid -> { cur: null|0..4, marks: ["","","","",""] })  ("r" صح, "w" غلط)
+const offChat = new Map();   // n -> { seq, msgs: [] }
+const OFF_CHAT_MAX = 100;
+function offIvClean(marks) {
+    const out = ["", "", "", "", ""];
+    if (Array.isArray(marks)) for (let i = 0; i < 5; i++) out[i] = (marks[i] === "r" || marks[i] === "w") ? marks[i] : "";
+    return out;
+}
+function offIvGet(n, uid) {
+    let m = offIv.get(n);
+    if (!m) { m = new Map(); offIv.set(n, m); }
+    let e = m.get(uid);
+    if (!e) { e = { cur: null, marks: offIvClean(null) }; m.set(uid, e); }
+    return e;
+}
+function offIvDrop(n, uid) {
+    const m = offIv.get(n);
+    if (!m) return;
+    m.delete(uid);
+    if (!m.size) offIv.delete(n);
+}
 const offCfg = new Map();    // n -> { mode, speakerUid }
 function offGetCfg(n) {
     let c = offCfg.get(n);
@@ -4643,8 +4673,20 @@ function offState(n, viewerUid) {
     const all = Array.from(m.values());
     // المالك المتخفي: ما يظهر لغيره بالقائمة، لكن يبقى بـ ghosts (بدون اسم) عشان الصوت ما ينقطع
     const isGhost = p => STEALTH_MODE && isOwnerUid(p.uid) && !viewerIsOwner;
+    const meP = viewerUid ? m.get(viewerUid) : null;
+    const ivm = offIv.get(n);
+    let iv = null, myQ = null;
+    if (meP && meP.isSenior) {
+        iv = {};
+        if (ivm) for (const [u, e] of ivm) iv[u] = { cur: e.cur, marks: e.marks };
+    } else if (meP && ivm && ivm.has(viewerUid)) {
+        const e = ivm.get(viewerUid);
+        if (e.cur !== null && e.cur !== undefined) myQ = OFFICER_INTERVIEW_QUESTIONS[e.cur] || null;
+    }
+    const ch = offChat.get(n);
     return {
         n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
+        chatSeq: ch ? ch.seq : 0, iv, myQ,
         participants: all.filter(p => !isGhost(p)).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
         ghosts: all.filter(isGhost).map(p => ({ uid: p.uid, isSenior: p.isSenior, joinedAt: p.joinedAt })),
     };
@@ -4676,6 +4718,8 @@ function offRemove(uid, n) {
     if (!m || !m.has(uid)) return;
     const p = m.get(uid);
     m.delete(uid);
+    offIvDrop(n, uid);
+    if (!m.size) offChat.delete(n);
     const cfg = offGetCfg(n);
     if (cfg.speakerUid === uid) cfg.speakerUid = null;
     const rr = offRecActive.get(n);
@@ -4790,8 +4834,9 @@ function offParseAge(raw) {
 }
 
 // ---------- التقديم (للجميع) ----------
-// الرتب الممنوعة من التقديم: كل الرتب ما عدا فريق وفريق اول، والكبار مستثنين
-const OFFICER_BLOCKED_RANKS = new Set(CONFIG.MILITARY_RANKS.filter(r => r !== "فريق" && r !== "فريق اول"));
+// الرتب الممنوعة من التقديم: رتب الضباط الحالية فقط (ملازم وفوق، ما عدا فريق وفريق اول)، والكبار مستثنين
+// اللي رتبته جندي → رئيس رقباء (حتى لو كان ضابط وانتقل لجندي) يقدر يقدم عادي إذا سلك الضباط مفتوح
+const OFFICER_BLOCKED_RANKS = new Set(OFFICER_RANKS.filter(r => r !== "فريق" && r !== "فريق اول"));
 async function offRankBlocked(userId) {
     if (isSeniorAdmin(userId)) return false;
     const p = await Personnel.findOne({ discord: userId }, { rank: 1 }).lean();
@@ -4911,7 +4956,7 @@ app.get("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
             log: logs.map(l => ({ name: l.name, isSenior: l.isSenior, action: l.action, at: l.at })),
             interviewees: apps.filter(a => a.interview && a.interview.room === r.n)
                 .sort((x, y) => new Date(x.interview.at) - new Date(y.interview.at))
-                .map(a => ({ id: String(a._id), name: a.name, at: a.interview.at, entered: !!a.interview.enteredAt, inRoom: live.has(a.uid) })),
+                .map(a => ({ id: String(a._id), name: a.name, at: a.interview.at, entered: !!a.interview.enteredAt, inRoom: live.has(a.uid), marks: offIvClean(a.interview.marks) })),
         });
     }
     res.json({ rooms: out, max: OFF_ROOMS_MAX });
@@ -5233,12 +5278,14 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
     const existing = Array.from(m.keys()).filter(u => u !== uid);
     const wasIn = m.has(uid);
     m.set(uid, { uid, name, isSenior: senior, joinedAt: Date.now() });
+    if (appDoc) { const ive = offIvGet(n, uid); ive.cur = null; ive.marks = offIvClean(appDoc.interview && appDoc.interview.marks); }
     offPushState(n);
     if (!wasIn) OfficerRoomLog.create({ n, uid, name, isSenior: senior, action: "join" }).catch(() => {});
     if (appDoc && !appDoc.interview.enteredAt) {
         await OfficerApp.updateOne({ _id: appDoc._id }, { $set: { "interview.enteredAt": new Date() } });
     }
-    res.json({ ok: true, state: offState(n, uid), existing, iceServers: offIce() });
+    const chJ = offChat.get(n);
+    res.json({ ok: true, state: offState(n, uid), existing, iceServers: offIce(), ivQuestions: senior ? OFFICER_INTERVIEW_QUESTIONS : null, chat: chJ ? chJ.msgs : [] });
 });
 
 app.post("/api/officers/rooms/:n/leave", ensureAuth, async (req, res) => {
@@ -5285,6 +5332,89 @@ app.post("/api/officers/rooms/:n/kick", ensureSeniorAdmin, async (req, res) => {
     offRemove(uid, n);
     await logEvent({ action: "طرد من روم المقابلة", actorId: req.user.id, actorTag: req.user.username, details: p.name + " — روم " + n });
     res.json({ ok: true });
+});
+
+// ---------- أسئلة المقابلة (الكبار) ----------
+function offIvCtx(req, res) {
+    const n = offParseN(req.params.n);
+    const m = n ? offLive.get(n) : null;
+    const me = m ? m.get(req.user.id) : null;
+    if (!me || !me.isSenior) { res.status(403).json({ error: "لازم تكون داخل الروم" }); return null; }
+    const uid = String((req.body || {}).uid || "");
+    const target = m.get(uid);
+    if (!target || target.isSenior) { res.status(404).json({ error: "هذا المتقدم مو داخل الروم" }); return null; }
+    return { n, m, me, uid, target };
+}
+// الكبير يعرض سؤال للمتقدم (q = 0..4) أو يخفيه (q = null)
+app.post("/api/officers/rooms/:n/iv/ask", ensureSeniorAdmin, (req, res) => {
+    const c = offIvCtx(req, res);
+    if (!c) return;
+    const q = (req.body || {}).q;
+    const e = offIvGet(c.n, c.uid);
+    if (q === null || q === undefined) e.cur = null;
+    else {
+        const i = parseInt(q, 10);
+        if (!(i >= 0 && i < OFFICER_INTERVIEW_QUESTIONS.length)) return res.status(400).json({ error: "سؤال غير صحيح" });
+        e.cur = i;
+    }
+    offPushState(c.n);
+    res.json({ ok: true });
+});
+// تقييم الإجابة: r = صح ، w = غلط
+app.post("/api/officers/rooms/:n/iv/mark", ensureSeniorAdmin, async (req, res) => {
+    const c = offIvCtx(req, res);
+    if (!c) return;
+    const b = req.body || {};
+    const i = parseInt(b.q, 10);
+    const mark = String(b.mark || "");
+    if (!(i >= 0 && i < OFFICER_INTERVIEW_QUESTIONS.length) || (mark !== "r" && mark !== "w")) return res.status(400).json({ error: "بيانات غير صحيحة" });
+    const e = offIvGet(c.n, c.uid);
+    e.marks[i] = mark;
+    await OfficerApp.updateOne({ uid: c.uid, stage: "interview" }, { $set: { "interview.marks": e.marks.slice() } }).catch(() => {});
+    offPushState(c.n);
+    res.json({ ok: true });
+});
+// ملف المتقدم المباشر (للكبار فقط)
+app.get("/api/officers/rooms/:n/profile/:uid", ensureSeniorAdmin, async (req, res) => {
+    const n = offParseN(req.params.n);
+    const m = n ? offLive.get(n) : null;
+    const me = m ? m.get(req.user.id) : null;
+    if (!me || !me.isSenior) return res.status(403).json({ error: "لازم تكون داخل الروم" });
+    const uid = String(req.params.uid || "");
+    const p = m.get(uid);
+    if (!p || p.isSenior) return res.status(404).json({ error: "هذا المتقدم مو داخل الروم" });
+    const a = await OfficerApp.findOne({ uid }).lean();
+    if (!a) return res.status(404).json({ error: "ما لقيت تقديمه" });
+    res.json({ name: a.name, age: a.age || null, prevExperience: a.prevExperience || "", discordUser: a.discordUser || "", answers: a.answers || [], questions: OFFICER_QUESTIONS });
+});
+
+// ---------- شات الروم النصي ----------
+app.post("/api/officers/rooms/:n/chat", ensureAuth, (req, res) => {
+    const n = offParseN(req.params.n);
+    const m = n ? offLive.get(n) : null;
+    const me = m ? m.get(req.user.id) : null;
+    if (!me) return res.status(404).json({ error: "أنت لست داخل الروم" });
+    if (STEALTH_MODE && isOwnerUid(req.user.id)) return res.status(403).json({ error: "الشات معطل أثناء التخفي" });
+    if (!me.isSenior && offGetCfg(n).mode === "mute") return res.status(403).json({ error: "الشات مقفل حالياً" });
+    const text = String((req.body || {}).text || "").trim().slice(0, 500);
+    if (!text) return res.status(400).json({ error: "اكتب رسالة" });
+    if (Date.now() - (me.lastChatAt || 0) < 800) return res.status(429).json({ error: "على رواقك شوي" });
+    me.lastChatAt = Date.now();
+    let c = offChat.get(n);
+    if (!c) { c = { seq: 0, msgs: [] }; offChat.set(n, c); }
+    const msg = { id: ++c.seq, uid: me.uid, name: me.name, isSenior: !!me.isSenior, text, at: Date.now() };
+    c.msgs.push(msg);
+    if (c.msgs.length > OFF_CHAT_MAX) c.msgs.shift();
+    for (const u of Array.from(m.keys())) offSendTo(u, { t: "chat", n, msg });
+    res.json({ ok: true });
+});
+app.get("/api/officers/rooms/:n/chat", ensureAuth, (req, res) => {
+    const n = offParseN(req.params.n);
+    const m = n ? offLive.get(n) : null;
+    if (!m || !m.has(req.user.id)) return res.status(404).json({ error: "أنت لست داخل الروم" });
+    const after = parseInt(req.query.after, 10) || 0;
+    const c = offChat.get(n);
+    res.json({ msgs: c ? c.msgs.filter(x => x.id > after) : [], seq: c ? c.seq : 0 });
 });
 
 app.post("/api/officers/rooms/:n/speaker", ensureSeniorAdmin, async (req, res) => {
@@ -5684,6 +5814,32 @@ app.get("/", (req, res) => {
     .ov-btn.off { background: #7f1d1d; border-color: #ef4444; }
     .ov-btn.dis { opacity: 0.45; }
     .ov-btn.leave { background: #ef4444; border-color: #ef4444; }
+    .ov-card { background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 14px; padding: 12px; margin: 12px 0; }
+    .ov-card > b { color: var(--gold-soft); font-size: 15px; display: block; margin-bottom: 8px; }
+    .ov-q { display: flex; gap: 8px; align-items: flex-start; width: 100%; text-align: right; margin-bottom: 7px; padding: 9px 10px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: #e2e8f0; font-family: inherit; font-size: 13px; line-height: 1.7; cursor: pointer; }
+    .ov-q.cur { border-color: #eab308; background: rgba(234,179,8,0.12); }
+    .ov-q.r { border-color: rgba(34,197,94,0.6); }
+    .ov-q.w { border-color: rgba(239,68,68,0.6); }
+    .ov-qn { flex: 0 0 auto; min-width: 42px; font-weight: 800; color: var(--gold-soft); }
+    .ov-cur { font-size: 13px; color: #fde68a; margin: 8px 0 6px; }
+    .ov-jb { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .ov-jb .btn { flex: 1 1 90px; }
+    .ov-eval { border-radius: 12px; padding: 10px 12px; margin-top: 8px; font-size: 14px; border: 1px solid var(--border); background: rgba(255,255,255,0.05); }
+    .ov-eval.good { border-color: rgba(34,197,94,0.6); background: rgba(34,197,94,0.1); }
+    .ov-eval.mid { border-color: rgba(234,179,8,0.6); background: rgba(234,179,8,0.1); }
+    .ov-eval.bad { border-color: rgba(239,68,68,0.6); background: rgba(239,68,68,0.1); }
+    .ov-prof { margin-top: 10px; }
+    .ov-prof > summary, .ov-ans > summary { cursor: pointer; color: var(--gold-soft); font-weight: 700; padding: 4px 0; }
+    .ov-myq { background: rgba(234,179,8,0.12); border: 2px solid #eab308; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    .ov-myq-h { color: #fde68a; font-weight: 800; margin-bottom: 6px; }
+    .ov-myq-t { font-size: 17px; line-height: 2; font-weight: 700; }
+    .ov-chat-list { max-height: 220px; overflow-y: auto; margin-bottom: 8px; }
+    .ov-msg { background: rgba(255,255,255,0.05); border-radius: 10px; padding: 6px 10px; margin-bottom: 5px; font-size: 13px; line-height: 1.8; word-break: break-word; }
+    .ov-msg.sen { border-right: 3px solid #3b82f6; }
+    .ov-msg b { color: var(--gold-soft); }
+    .ov-msg a { color: #93c5fd; text-decoration: underline; }
+    .ov-chat-in { display: flex; gap: 6px; }
+    .ov-chat-in input { flex: 1; min-width: 0; }
 </style>
 <div id="wf-overlay">
     <div class="wf-box" id="wf-box"></div>
@@ -10800,20 +10956,26 @@ async function offJoinVoice(n) {
     VC = {
         n: n, me: ME.discordId, isSenior: !!ME.isSeniorAdmin, stream: stream, mic: stream.getAudioTracks()[0], micOn: true,
         state: j.state, ice: j.iceServers, peers: {}, q: {}, earlyIce: {}, shareFlags: {}, speaking: {},
-        sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0
+        sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0,
+        ivQ: j.ivQuestions || [], chat: [], chatSeq: 0, chatBusy: false, ivTarget: null, profiles: {}, profBusy: {}, profOpen: false, ansOpen: false, ivHtml: ''
     };
     var ov = document.createElement('div');
     ov.id = 'off-voice';
     ov.innerHTML = '<div class="ov-head"><b>🎙️ مقابلة رقم ' + n + '</b><span style="font-size:12px;color:var(--muted);">' + (VC.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</span></div>' +
         '<div id="ov-modes" class="ov-modes"></div><div id="ov-note" class="ov-note"></div>' +
+        '<div id="ov-iv"></div>' +
         '<div id="ov-stage" class="ov-stage"></div><div id="ov-grid" class="ov-grid"></div>' +
+        '<div class="ov-card"><b>💬 الشات</b><div id="ov-chat-list" class="ov-chat-list"></div>' +
+        '<div class="ov-chat-in"><input id="ov-chat-inp" maxlength="500" placeholder="اكتب رابط أو تعليمات أو سؤال..." onkeydown="offChatKey(event)"><button class="btn sm" onclick="offChatSend()">إرسال</button></div></div>' +
         '<div id="ov-bar" class="ov-bar"></div><div id="ov-audio" style="display:none"></div>';
     document.body.appendChild(ov);
     document.body.style.overflow = 'hidden';
     offWatch(VC.me, stream, null);
     (j.existing || []).forEach(function (uid) { var P = offMakePeer(uid, true); offStartOffer(P, false); });
+    (j.chat || []).forEach(function (m) { offChatAdd(m, true); });
     offApplyPerms();
     offPaintAll();
+    offPaintChat();
     offRecCheck();
     VC.poll = setInterval(offVoicePoll, 5000);
 }
@@ -11032,6 +11194,7 @@ function offOnVsig(d) {
     if (d.t === 'state') offApplyState(d.state);
     else if (d.t === 'kicked' && d.n === VC.n) { toast('🚫 تم طردك من الروم'); offLeaveVoice(true); }
     else if (d.t === 'roomdeleted' && d.n === VC.n) { toast('🗑️ تم حذف هذا الروم'); offLeaveVoice(true); }
+    else if (d.t === 'chat' && d.n === VC.n) offChatAdd(d.msg);
     else if (d.t === 'signal' && d.n === VC.n) offQueue(d.from, function () { return offOnSignal(d.from, d.data); });
 }
 function offApplyState(st) {
@@ -11039,6 +11202,7 @@ function offApplyState(st) {
     var meIn = st.participants.some(function (p) { return p.uid === VC.me; });
     if (!meIn) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); return; }
     VC.state = st;
+    if ((st.chatSeq || 0) > VC.chatSeq) offChatSync();
     offRecCheck();
     Object.keys(VC.peers).forEach(function (uid) {
         var p = offFindP(st, uid);
@@ -11103,7 +11267,7 @@ function offWatch(uid, stream, P) {
 }
 
 /* رسم واجهة الروم */
-function offPaintAll() { offPaintModes(); offPaintNote(); offPaintStage(); offPaintGrid(); offPaintBar(); }
+function offPaintAll() { offPaintModes(); offPaintNote(); offPaintIv(); offPaintStage(); offPaintGrid(); offPaintBar(); }
 function offPaintModes() {
     var box = document.getElementById('ov-modes');
     if (!box || !VC) return;
@@ -11184,6 +11348,158 @@ function offPaintBar() {
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
+}
+/* ---------------------------- أسئلة المقابلة + الشات + ملف المتقدم ---------------------------- */
+function offIvEval(marks) {
+    var r = 0, w = 0;
+    (marks || []).forEach(function (x) { if (x === 'r') r++; else if (x === 'w') w++; });
+    var label = r === 5 ? 'ممتاز' : (r === 4 ? 'جيد جداً' : (r === 3 ? 'جيد' : (r === 2 ? 'ضعيف' : 'ضعيف جداً')));
+    return { right: r, wrong: w, done: (r + w) === 5, label: label };
+}
+function offIvChip(marks) {
+    var e = offIvEval(marks);
+    if (!e.right && !e.wrong) return '';
+    return '<br><span class="off-chip' + (e.done && e.right >= 4 ? ' sen' : '') + '">📊 ' + (e.done ? 'التقييم: ' + e.right + '/5 — ' + e.label : e.right + ' صح • ' + e.wrong + ' غلط (ما اكتمل)') + '</span>';
+}
+function offIvTarget() {
+    var st = VC.state;
+    var ap = st.participants.filter(function (p) { return !p.isSenior; });
+    if (!ap.length) return null;
+    var i;
+    if (VC.ivTarget) for (i = 0; i < ap.length; i++) if (ap[i].uid === VC.ivTarget) return ap[i];
+    if (st.speakerUid) for (i = 0; i < ap.length; i++) if (ap[i].uid === st.speakerUid) return ap[i];
+    return ap[0];
+}
+function offIvPick(uid) { if (!VC) return; VC.ivTarget = uid; VC.ivHtml = ''; offPaintIv(); }
+function offLoadProfile(uid) {
+    var v = VC;
+    if (!v || v.profiles[uid] || v.profBusy[uid]) return;
+    v.profBusy[uid] = true;
+    offFetch('/api/officers/rooms/' + v.n + '/profile/' + encodeURIComponent(uid)).then(function (d) {
+        v.profBusy[uid] = false; v.profiles[uid] = d;
+        if (VC === v) offPaintIv();
+    }).catch(function (e) {
+        v.profBusy[uid] = false; v.profiles[uid] = { error: e.message };
+        if (VC === v) offPaintIv();
+    });
+}
+function offProfHtml(uid) {
+    var d = VC.profiles[uid];
+    if (!d) return '<div class="ov-note">جارِ تحميل الملف...</div>';
+    if (d.error) return '<div class="ov-note">' + spEsc(d.error) + '</div>';
+    var h = '<div class="acc-row"><span>الاسم</span><b>' + spEsc(d.name) + '</b></div>';
+    h += '<div class="acc-row"><span>العمر</span><b>' + (d.age ? spEsc(String(d.age)) : 'غير مسجل') + '</b></div>';
+    h += '<div class="acc-row"><span>الخبرات السابقة</span><b>' + spEsc(d.prevExperience) + '</b></div>';
+    h += '<div class="acc-row"><span>يوزر الديسكورد</span><b dir="ltr">' + spEsc(d.discordUser) + '</b></div>';
+    h += '<details class="ov-ans"' + (VC.ansOpen ? ' open' : '') + ' ontoggle="if(VC){VC.ansOpen=this.open;}"><summary>📄 إجابات الاستبيان</summary>';
+    (d.answers || []).forEach(function (a, i) {
+        h += '<div class="off-qa"><b>' + (i + 1) + '- ' + spEsc((d.questions || [])[i] || '') + '</b><div>' + spEsc(a) + '</div></div>';
+    });
+    return h + '</details>';
+}
+function offPaintIv() {
+    var box = document.getElementById('ov-iv');
+    if (!box || !VC) return;
+    var st = VC.state, h = '';
+    if (!VC.isSenior) {
+        if (st.myQ) h = '<div class="ov-myq"><div class="ov-myq-h">❓ سؤال المقابلة</div><div class="ov-myq-t">' + spEsc(st.myQ) + '</div></div>';
+    } else {
+        var t = offIvTarget();
+        h = '<div class="ov-card"><b>🎯 لوحة المقابلة</b>';
+        if (!t) h += '<div class="ov-note">ما فيه متقدم داخل الروم حالياً.</div>';
+        else {
+            var aps = st.participants.filter(function (p) { return !p.isSenior; });
+            if (aps.length > 1) {
+                h += '<div style="margin-bottom:8px;">' + aps.map(function (p) {
+                    return '<button class="ov-mode' + (p.uid === t.uid ? ' on' : '') + '" style="flex:none;margin:0 0 4px 4px;" data-u="' + p.uid + '" onclick="offIvPick(this.dataset.u)">' + spEsc(p.name) + '</button>';
+                }).join('') + '</div>';
+            } else h += '<div class="ov-role" style="margin-bottom:8px;">المتقدم: <b>' + spEsc(t.name) + '</b></div>';
+            var e = (st.iv && st.iv[t.uid]) || { cur: null, marks: ['', '', '', '', ''] };
+            (VC.ivQ || []).forEach(function (q, i) {
+                var mk = e.marks[i];
+                h += '<button class="ov-q' + (e.cur === i ? ' cur' : '') + (mk === 'r' ? ' r' : (mk === 'w' ? ' w' : '')) + '" data-i="' + i + '" onclick="offIvAsk(this.dataset.i)">' +
+                    '<span class="ov-qn">' + (i + 1) + (mk === 'r' ? ' ✅' : (mk === 'w' ? ' ❌' : '')) + '</span><span>' + spEsc(q) + '</span></button>';
+            });
+            if (e.cur !== null && e.cur !== undefined) {
+                h += '<div class="ov-cur">📢 السؤال المعروض للمتقدم الحين: <b>' + (e.cur + 1) + '</b> — قيّم إجابته:</div>' +
+                    '<div class="ov-jb"><button class="btn sm" data-m="r" onclick="offIvMark(this.dataset.m)">✔ صح</button>' +
+                    '<button class="btn danger sm" data-m="w" onclick="offIvMark(this.dataset.m)">✘ غلط</button>' +
+                    '<button class="btn gray sm" onclick="offIvHide()">إخفاء السؤال</button></div>';
+            }
+            var ev = offIvEval(e.marks);
+            if (ev.done) {
+                h += '<div class="ov-eval ' + (ev.right >= 4 ? 'good' : (ev.right === 3 ? 'mid' : 'bad')) + '"><b>📊 التقييم النهائي: ' + ev.right + ' / 5 — ' + ev.label + '</b>' +
+                    '<div class="ov-role">صح: ' + ev.right + ' • غلط: ' + ev.wrong + ' — وبعدها تقدر تسأله أسئلتك الخاصة.</div></div>';
+            } else if (ev.right || ev.wrong) {
+                h += '<div class="ov-eval">📊 التقييم الحالي: ' + ev.right + ' صح • ' + ev.wrong + ' غلط (باقي ' + (5 - ev.right - ev.wrong) + ')</div>';
+            }
+            h += '<details class="ov-prof"' + (VC.profOpen ? ' open' : '') + ' ontoggle="if(VC){VC.profOpen=this.open;}"><summary>👤 ملف المتقدم</summary>' + offProfHtml(t.uid) + '</details>';
+            offLoadProfile(t.uid);
+        }
+        h += '</div>';
+    }
+    if (VC.ivHtml === h) return;
+    VC.ivHtml = h;
+    box.innerHTML = h;
+}
+function offIvAsk(i) {
+    if (!VC) return;
+    var t = offIvTarget();
+    if (!t) return;
+    offPost('/api/officers/rooms/' + VC.n + '/iv/ask', { uid: t.uid, q: parseInt(i, 10) }).catch(function (e) { toast(e.message); });
+}
+function offIvHide() {
+    if (!VC) return;
+    var t = offIvTarget();
+    if (!t) return;
+    offPost('/api/officers/rooms/' + VC.n + '/iv/ask', { uid: t.uid, q: null }).catch(function (e) { toast(e.message); });
+}
+function offIvMark(mark) {
+    if (!VC) return;
+    var t = offIvTarget();
+    var e = t && VC.state.iv ? VC.state.iv[t.uid] : null;
+    if (!t || !e || e.cur === null || e.cur === undefined) return;
+    offPost('/api/officers/rooms/' + VC.n + '/iv/mark', { uid: t.uid, q: e.cur, mark: mark }).catch(function (er) { toast(er.message); });
+}
+function offLinkify(t) {
+    return spEsc(t).replace(/(https?:[/][/][^ <]+)/g, function (u) { return '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + '</a>'; });
+}
+function offChatAdd(msg, quiet) {
+    if (!VC || !msg) return;
+    if (VC.chat.some(function (x) { return x.id === msg.id; })) return;
+    VC.chat.push(msg);
+    if (VC.chat.length > 100) VC.chat.shift();
+    if (msg.id > VC.chatSeq) VC.chatSeq = msg.id;
+    if (!quiet) offPaintChat();
+}
+function offPaintChat() {
+    var box = document.getElementById('ov-chat-list');
+    if (!box || !VC) return;
+    var near = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+    box.innerHTML = VC.chat.length ? VC.chat.map(function (m) {
+        return '<div class="ov-msg' + (m.isSenior ? ' sen' : '') + '"><b>' + (m.isSenior ? '🎖️ ' : '') + spEsc(m.name) + '</b>: ' + offLinkify(m.text) + '</div>';
+    }).join('') : '<div class="ov-note" style="margin:4px 0;">ما فيه رسائل بعد.</div>';
+    if (near) box.scrollTop = box.scrollHeight;
+}
+function offChatSync() {
+    var v = VC;
+    if (!v || v.chatBusy) return;
+    v.chatBusy = true;
+    offFetch('/api/officers/rooms/' + v.n + '/chat?after=' + v.chatSeq).then(function (d) {
+        v.chatBusy = false;
+        if (VC !== v) return;
+        (d.msgs || []).forEach(function (m) { offChatAdd(m, true); });
+        offPaintChat();
+    }).catch(function () { v.chatBusy = false; });
+}
+function offChatKey(ev) { if (ev && ev.key === 'Enter') { ev.preventDefault(); offChatSend(); } }
+function offChatSend() {
+    if (!VC) return;
+    var inp = document.getElementById('ov-chat-inp');
+    var text = inp ? inp.value.trim() : '';
+    if (!text) return;
+    inp.value = '';
+    offPost('/api/officers/rooms/' + VC.n + '/chat', { text: text }).catch(function (e) { toast(e.message); if (inp && !inp.value) inp.value = text; });
 }
 function offToggleMic() {
     if (!VC) return;
@@ -11412,7 +11728,7 @@ function offaRoomsHtml(d) {
         h += '<div style="margin:8px 0;"><b style="color:var(--gold-soft);font-size:13px;">لوحة المقابلة (النتيجة)</b>';
         if (!r.interviewees.length) h += '<div style="color:var(--muted);font-size:13px;margin-top:4px;">لا يوجد متقدمين مجدولين بهذا الروم</div>';
         r.interviewees.forEach(function (a) {
-            h += '<div class="log-item"><span>' + spEsc(a.name) + ' <small style="color:var(--muted);">— ' + spEsc(offFmt(a.at)) + (a.inRoom ? ' — 🟢 داخل الروم' : '') + '</small></span>';
+            h += '<div class="log-item"><span>' + spEsc(a.name) + ' <small style="color:var(--muted);">— ' + spEsc(offFmt(a.at)) + (a.inRoom ? ' — 🟢 داخل الروم' : '') + '</small>' + offIvChip(a.marks) + '</span>';
             if (a.entered) {
                 h += '<span><button class="btn sm" data-id="' + a.id + '" onclick="offaInterviewResult(this.dataset.id, 1)">✅ مقبول</button> ' +
                     '<button class="btn danger sm" data-id="' + a.id + '" onclick="offaInterviewResult(this.dataset.id, 0)">❌ مرفوض</button></span>';
