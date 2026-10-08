@@ -358,6 +358,13 @@ const PromotionRequestSchema = new mongoose.Schema({
     fromRank: String,
     toRank: String,
     direction: { type: String, enum: ["up", "down"] },
+    kind: { type: String, default: "rank" },
+    oldPoints: { type: Number, default: null },
+    newPoints: { type: Number, default: null },
+    pointsDelta: { type: Number, default: null },
+    noteText: { type: String, default: null },
+    noteImage: { type: String, default: null },
+    hasImage: { type: Boolean, default: false },
     reason: { type: String, default: null },
     requestedBy: String,
     requestedByTag: String,
@@ -830,15 +837,53 @@ function buildViolationButtons(id, disabled = false) {
     );
 }
 
+function requestKind(r) { return r && (r.kind === "points" || r.kind === "note") ? r.kind : "rank"; }
+function needsHighCommandApproval(userId, settings) { return !isSeniorAdmin(userId) && !isHighCommand(userId, settings); }
+function fmtDelta(n) { return (n >= 0 ? "+" : "-") + Math.abs(n); }
+
+async function pushNoticeTo(discord, reason, byId, byTag) {
+    if (!discord) return;
+    await Personnel.findOneAndUpdate({ discord }, { $push: { warnings: { kind: "notice", reason, issuedBy: byId, issuedByTag: byTag } } }).catch(() => {});
+}
+
+function broadcastHighCommandAlert(settings) {
+    const ids = new Set((settings.highCommand || []).map(m => m.id));
+    if (!ids.size) return;
+    sseBroadcast("hcalert", { t: Date.now() }, c => !!c.uid && ids.has(c.uid));
+}
+
+async function announceApprovalRequest(doc) {
+    try { broadcastHighCommandAlert(await getSettings()); } catch (e) {}
+    notifyHighCommandOfPromotion(doc).catch(() => {});
+}
+
 async function notifyHighCommandOfPromotion(doc) {
     if (!botReady) return;
     const settings = await getSettings();
     const members = settings.highCommand || [];
     if (!members.length) return;
-    const embed = new EmbedBuilder()
-        .setTitle("🎖️ يوجد تقرير ترقية عسكرية")
-        .setColor(0xf59e0b)
-        .addFields(
+    const kind = requestKind(doc);
+    const embed = new EmbedBuilder().setColor(0xf59e0b).setFooter({ text: `ID: ${doc._id}` }).setTimestamp(doc.createdAt || new Date());
+    if (kind === "points") {
+        embed.setTitle("⭐ طلب نقاط جديد — بانتظار موافقتك").addFields(
+            { name: "الفرد", value: doc.targetName || doc.targetTag || "-", inline: true },
+            { name: "القطاع", value: doc.sectorLabel || "-", inline: true },
+            { name: "التغيير", value: `${fmtDelta(doc.pointsDelta || 0)} نقطة`, inline: true },
+            { name: "النقاط الحالية", value: String(doc.oldPoints), inline: true },
+            { name: "بعد الموافقة", value: String(doc.newPoints), inline: true },
+            { name: "مقدّم الطلب", value: doc.requestedByTag || "-", inline: false },
+            { name: "السبب", value: doc.reason || "-", inline: false },
+        );
+    } else if (kind === "note") {
+        embed.setTitle("📝 طلب ملاحظة جديد — بانتظار موافقتك").addFields(
+            { name: "الفرد", value: doc.targetName || doc.targetTag || "-", inline: true },
+            { name: "القطاع", value: doc.sectorLabel || "-", inline: true },
+            { name: "الصورة", value: doc.hasImage ? "📎 مرفقة (تظهر في الموقع)" : "بدون صورة", inline: true },
+            { name: "مقدّم الطلب", value: doc.requestedByTag || "-", inline: false },
+            { name: "الملاحظة", value: String(doc.noteText || "-").slice(0, 1000), inline: false },
+        );
+    } else {
+        embed.setTitle("🎖️ يوجد تقرير ترقية عسكرية").addFields(
             { name: "الفرد", value: doc.targetName || doc.targetTag, inline: true },
             { name: "القطاع", value: doc.sectorLabel, inline: true },
             { name: "الاتجاه", value: doc.direction === "up" ? "⬆️ ترقية" : "⬇️ تنزيل", inline: true },
@@ -846,9 +891,8 @@ async function notifyHighCommandOfPromotion(doc) {
             { name: "إلى رتبة", value: doc.toRank, inline: true },
             { name: "مقدّم الطلب", value: doc.requestedByTag || "-", inline: false },
             { name: "السبب", value: doc.reason || "-", inline: false },
-        )
-        .setFooter({ text: `ID: ${doc._id}` })
-        .setTimestamp(doc.createdAt || new Date());
+        );
+    }
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setLabel("🔵 اضغط هنا لدخول فلاش").setStyle(ButtonStyle.Link).setURL(CONFIG.SITE_URL),
     );
@@ -857,7 +901,7 @@ async function notifyHighCommandOfPromotion(doc) {
             const user = await client.users.fetch(m.id);
             await user.send({ embeds: [embed], components: [row] });
         } catch (e) {
-            console.error("❌ فشل إرسال إشعار الترقية لعضو القيادة العليا:", m.id, e.message);
+            console.error("❌ فشل إرسال إشعار الطلب لعضو القيادة العليا:", m.id, e.message);
         }
     }
 }
@@ -2496,10 +2540,29 @@ app.post("/api/points/edit/:discord", ensurePointsEditor, async (req, res) => {
     const { points, reason } = req.body;
     if (points === undefined || points === "" || isNaN(parseInt(points))) return res.status(400).json({ error: "حط عدد نقاط صحيح" });
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب تعديل النقاط" });
-    const before = await Personnel.findOne({ discord: req.params.discord }, { points: 1, registeredName: 1, discordTag: 1 });
+    const before = await Personnel.findOne({ discord: req.params.discord }, { points: 1, registeredName: 1, discordTag: 1, discord: 1 });
     if (!before) return res.status(404).json({ error: "غير موجود" });
     const oldPoints = before.points;
     const newPoints = Math.max(0, parseInt(points));
+    const settingsPE = await getSettings();
+    if (needsHighCommandApproval(req.user.id, settingsPE)) {
+        const delta = newPoints - oldPoints;
+        if (delta === 0) return res.status(400).json({ error: "النقاط نفس النقاط الحالية، ما فيه تغيير" });
+        const leaderInfo = getSectorRole(req.user.id, settingsPE);
+        const info = leaderInfo || getPersonnelOfficerSector(req.user.id, settingsPE);
+        if (!info) return res.status(403).json({ error: "ليست لديك صلاحية تعديل النقاط" });
+        const roleLabel = leaderInfo ? (leaderInfo.role === "commander" ? "قائد" : "نائب") : "مسؤول أفراد";
+        const tagFull = req.user.username + ` (${roleLabel} ${info.sectorLabel})`;
+        const doc = await PromotionRequest.create({
+            kind: "points", sector: info.sector, sectorLabel: info.sectorLabel,
+            targetDiscord: before.discord, targetTag: before.discordTag, targetName: before.registeredName,
+            oldPoints, newPoints, pointsDelta: delta, reason: reason.trim(),
+            requestedBy: req.user.id, requestedByTag: tagFull, status: "pending",
+        });
+        await logEvent({ action: "طلب نقاط", discordId: before.discord, discordTag: before.discordTag, actorId: req.user.id, actorTag: tagFull, details: `${fmtDelta(delta)} نقطة (${oldPoints} ← ${newPoints}) — السبب: ${reason.trim()} — بانتظار القيادة العليا` });
+        announceApprovalRequest(doc);
+        return res.json({ ok: true, pending: true });
+    }
     const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { points: newPoints }, { new: true });
     await logEvent({ action: "تعديل نقاط", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${oldPoints} ← ${p.points} — السبب: ${reason.trim()}` });
     notifyHighCommandOfPoints({
@@ -3199,7 +3262,7 @@ app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, 
     const newIdx = direction === "up" ? idx + 1 : idx - 1;
     if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
     const newRank = CONFIG.MILITARY_RANKS[newIdx];
-    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending" });
+    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending", kind: { $nin: ["points", "note"] } });
     if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة العليا" });
     const roleLabel = req.sectorInfo.role === "commander" ? "قائد" : "نائب";
     const doc = await PromotionRequest.create({
@@ -3214,7 +3277,7 @@ app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, 
         actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`,
         details: `${p.rank} ← ${newRank} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
     });
-    notifyHighCommandOfPromotion(doc).catch(() => {});
+    announceApprovalRequest(doc);
     res.json({ ok: true, request: doc });
 });
 
@@ -3248,11 +3311,33 @@ app.get("/api/sector/personnel/:discord/warning-info", ensureSectorLeader, async
     res.json({ count });
 });
 
+
+async function createNoteRequest({ req, info, roleLabel, discord, text, image }) {
+    const p = await Personnel.findOne({ discord }, { registeredName: 1, discordTag: 1, discord: 1 });
+    if (!p) return null;
+    const tagFull = req.user.username + ` (${roleLabel} ${info.sectorLabel})`;
+    const doc = await PromotionRequest.create({
+        kind: "note", sector: info.sector, sectorLabel: info.sectorLabel,
+        targetDiscord: p.discord, targetTag: p.discordTag, targetName: p.registeredName,
+        noteText: text, noteImage: image || null, hasImage: !!image,
+        requestedBy: req.user.id, requestedByTag: tagFull, status: "pending",
+    });
+    await logEvent({ action: "طلب ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: tagFull, details: `على ${p.registeredName || p.discord}: ${text} — بانتظار القيادة العليا` });
+    announceApprovalRequest(doc);
+    return doc;
+}
+
 app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     const { text, image } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
     if (image && image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+    if (needsHighCommandApproval(req.user.id, req.settings)) {
+        const roleLabel = req.sectorInfo.role === "commander" ? "قائد" : "نائب";
+        const doc = await createNoteRequest({ req, info: req.sectorInfo, roleLabel, discord: req.params.discord, text: text.trim(), image: image || null });
+        if (!doc) return res.status(404).json({ error: "غير موجود" });
+        return res.json({ ok: true, pending: true });
+    }
     const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image: image || null, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})` });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
@@ -3298,12 +3383,12 @@ app.post("/api/sector/personnel-officer/remove", ensureSectorLeader, async (req,
 });
 
 app.get("/api/sector/promotion-requests", ensureSectorLeader, async (req, res) => {
-    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
+    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }, { noteImage: 0 }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
 });
 
 app.get("/api/high-command/promotion-requests", ensureHighCommand, async (req, res) => {
-    const list = await PromotionRequest.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
+    const list = await PromotionRequest.find({ status: "pending" }, { noteImage: 0 }).sort({ createdAt: -1 }).limit(200);
     res.json({ list });
 });
 app.get("/api/high-command/promotion-alert", ensureHighCommand, async (req, res) => {
@@ -3313,16 +3398,81 @@ app.get("/api/high-command/promotion-alert", ensureHighCommand, async (req, res)
         id: r._id, sector: r.sector, sectorLabel: r.sectorLabel,
         targetDiscord: r.targetDiscord, targetName: r.targetName, targetTag: r.targetTag,
         fromRank: r.fromRank, toRank: r.toRank, direction: r.direction,
+        kind: requestKind(r), oldPoints: r.oldPoints, newPoints: r.newPoints, pointsDelta: r.pointsDelta,
+        noteText: r.noteText, hasImage: !!r.hasImage,
         reason: r.reason, requestedByTag: r.requestedByTag, createdAt: r.createdAt,
     } });
 });
+app.get("/api/high-command/promotion-requests/:id/image", ensureHighCommand, async (req, res) => {
+    const r = await PromotionRequest.findById(req.params.id, { noteImage: 1, status: 1 });
+    if (!r || !r.noteImage) return res.status(404).json({ error: "لا توجد صورة" });
+    res.json({ image: r.noteImage });
+});
 app.get("/api/high-command/promotion-requests/history", ensureHighCommand, async (req, res) => {
-    const list = await PromotionRequest.find({ status: { $ne: "pending" } }).sort({ reviewedAt: -1 }).limit(200);
+    const list = await PromotionRequest.find({ status: { $ne: "pending" } }, { noteImage: 0 }).sort({ reviewedAt: -1 }).limit(200);
     res.json({ list });
 });
+async function approveExtraRequest(r0, req, res) {
+    const kind = requestKind(r0);
+    const byTag = req.user.username + " (القيادة العليا)";
+    const r = await PromotionRequest.findOneAndUpdate(
+        { _id: r0._id, status: "pending" },
+        { $set: { status: "approved", reviewedBy: req.user.id, reviewedByTag: byTag, reviewedAt: new Date() } },
+        { new: true }
+    );
+    if (!r) return res.status(404).json({ error: "غير موجود" });
+    const revert = async (msg, code = 404) => { await PromotionRequest.updateOne({ _id: r._id }, { $set: { status: "pending" }, $unset: { reviewedBy: "", reviewedByTag: "", reviewedAt: "" } }); return res.status(code).json({ error: msg }); };
+    const settings = await getSettings();
+    const name = r.targetName || r.targetTag;
+    const sl = (settings.sectorLeadership || {})[r.sector];
+    const commanderId = sl && sl.commanderId && sl.commanderId !== r.requestedBy ? sl.commanderId : null;
+
+    if (kind === "points") {
+        const cur = await Personnel.findOne({ discord: r.targetDiscord }, { points: 1 });
+        if (!cur) return revert("الفرد غير موجود");
+        const oldPoints = cur.points;
+        const newPoints = Math.max(0, oldPoints + (r.pointsDelta || 0));
+        await Personnel.updateOne({ discord: r.targetDiscord }, { $set: { points: newPoints } });
+        const gain = (r.pointsDelta || 0) >= 0;
+        const amt = Math.abs(r.pointsDelta || 0);
+        await pushNoticeTo(r.targetDiscord, `⭐ تم ${gain ? "إضافة" : "خصم"} ${amt} نقطة ${gain ? "لك" : "من نقاطك"} بموافقة القيادة العليا (طلب ${r.requestedByTag}). نقاطك الآن: ${newPoints}.${r.reason ? "\nالسبب: " + r.reason : ""}`, req.user.id, req.user.username);
+        await pushNoticeTo(r.requestedBy, `✅ انقبل طلبك بـ${gain ? "إضافة" : "خصم"} ${amt} نقطة لـ${name} من القيادة العليا.`, req.user.id, req.user.username);
+        if (commanderId) await pushNoticeTo(commanderId, `⭐ تم ${gain ? "إضافة" : "خصم"} ${amt} نقطة لـ${name} بأمر القيادة العليا (طلب ${r.requestedByTag}).`, req.user.id, req.user.username);
+        await logEvent({ action: "تعديل نقاط", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: req.user.id, actorTag: byTag, details: `${oldPoints} ← ${newPoints} (${fmtDelta(r.pointsDelta || 0)}) — طلب ${r.requestedByTag} — السبب: ${r.reason || "-"}` });
+        await checkAutoPromotion(r.targetDiscord);
+        return res.json({ ok: true });
+    }
+
+    const saved = await pushNoteWithImage({ discord: r.targetDiscord, text: r.noteText, image: r.noteImage || null, actorId: r.requestedBy, actorTag: r.requestedByTag });
+    if (!saved) return revert("الفرد غير موجود");
+    await PromotionRequest.updateOne({ _id: r._id }, { $set: { noteImage: null } });
+    await pushNoticeTo(r.targetDiscord, `📝 تمت إضافة ملاحظة على ملفك بموافقة القيادة العليا (من ${r.requestedByTag}).\nالملاحظة: ${r.noteText}`, req.user.id, req.user.username);
+    await pushNoticeTo(r.requestedBy, `✅ انقبل طلبك بإضافة ملاحظة على ${name} من القيادة العليا.`, req.user.id, req.user.username);
+    if (commanderId) await pushNoticeTo(commanderId, `📝 تمت إضافة ملاحظة على ${name} بأمر القيادة العليا (طلب ${r.requestedByTag}).`, req.user.id, req.user.username);
+    await logEvent({ action: "إضافة ملاحظة", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: req.user.id, actorTag: byTag, details: `على ${name}: ${r.noteText} — طلب ${r.requestedByTag}` });
+    return res.json({ ok: true });
+}
+
+async function rejectExtraRequest(r0, reason, req, res) {
+    const kind = requestKind(r0);
+    const byTag = req.user.username + " (القيادة العليا)";
+    const r = await PromotionRequest.findOneAndUpdate(
+        { _id: r0._id, status: "pending" },
+        { $set: { status: "rejected", rejectReason: reason, reviewedBy: req.user.id, reviewedByTag: byTag, reviewedAt: new Date(), noteImage: null } },
+        { new: true }
+    );
+    if (!r) return res.status(404).json({ error: "غير موجود" });
+    const name = r.targetName || r.targetTag;
+    const what = kind === "points" ? `${(r.pointsDelta || 0) >= 0 ? "إضافة" : "خصم"} ${Math.abs(r.pointsDelta || 0)} نقطة لـ${name}` : `إضافة ملاحظة على ${name}`;
+    await pushNoticeTo(r.requestedBy, `❌ انرفض طلبك بـ${what} من القيادة العليا. السبب: ${reason}`, req.user.id, req.user.username);
+    await logEvent({ action: kind === "points" ? "رفض طلب نقاط" : "رفض طلب ملاحظة", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: req.user.id, actorTag: byTag, details: `${what} — السبب: ${reason}` });
+    return res.json({ ok: true });
+}
+
 app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, async (req, res) => {
     const r = await PromotionRequest.findById(req.params.id);
     if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+    if (requestKind(r) !== "rank") return approveExtraRequest(r, req, res);
     const p = await Personnel.findOne({ discord: r.targetDiscord });
     if (!p) return res.status(404).json({ error: "الفرد غير موجود" });
     const settings = await getSettings();
@@ -3363,6 +3513,7 @@ app.post("/api/high-command/promotion-requests/:id/reject", ensureHighCommand, a
     if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الرفض" });
     const r = await PromotionRequest.findById(req.params.id);
     if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+    if (requestKind(r) !== "rank") return rejectExtraRequest(r, reason.trim(), req, res);
     r.status = "rejected"; r.rejectReason = reason.trim(); r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username + " (القيادة العليا)"; r.reviewedAt = new Date();
     await r.save();
     const verb = r.direction === "up" ? "ترقيتك" : "تنزيلك";
@@ -3490,6 +3641,12 @@ app.post("/api/personnel-officer/personnel/:discord/note", ensurePersonnelOffice
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
     if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
     if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+    const settingsPO = await getSettings();
+    if (needsHighCommandApproval(req.user.id, settingsPO)) {
+        const doc = await createNoteRequest({ req, info: req.sectorInfo, roleLabel: "مسؤول أفراد", discord: req.params.discord, text: text.trim(), image });
+        if (!doc) return res.status(404).json({ error: "غير موجود" });
+        return res.json({ ok: true, pending: true });
+    }
     const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})` });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
@@ -3524,7 +3681,7 @@ app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePe
     const idx = rankIndex(p.rank);
     const newIdx = direction === "up" ? idx + 1 : idx - 1;
     if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
-    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending" });
+    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending", kind: { $nin: ["points", "note"] } });
     if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة العليا" });
     const doc = await PromotionRequest.create({
         sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel,
@@ -3537,12 +3694,12 @@ app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePe
         actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
         details: `${p.rank} ← ${CONFIG.MILITARY_RANKS[newIdx]} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
     });
-    notifyHighCommandOfPromotion(doc).catch(() => {});
+    announceApprovalRequest(doc);
     res.json({ ok: true, request: doc });
 });
 
 app.get("/api/personnel-officer/requests", ensurePersonnelOfficer, async (req, res) => {
-    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
+    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }, { noteImage: 0 }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
 });
 
@@ -3858,7 +4015,7 @@ app.get("/api/mp/sector-log", ensureMPLeader, async (req, res) => {
     res.json({ list });
 });
 app.get("/api/mp/promotion-log", ensureMPLeader, async (req, res) => {
-    const list = await PromotionRequest.find({}).sort({ createdAt: -1 }).limit(300);
+    const list = await PromotionRequest.find({ kind: { $nin: ["points", "note"] } }).sort({ createdAt: -1 }).limit(300);
     res.json({ list });
 });
 
@@ -5976,10 +6133,11 @@ app.get("/", (req, res) => {
 </div>
 <div id="promo-alert-overlay">
     <div class="promo-box">
-        <div class="promo-title"><span>🎖️</span><span>ترقية عسكرية</span><span>🎖️</span></div>
+        <div class="promo-title"><span id="promo-alert-ic1">🎖️</span><span id="promo-alert-title">ترقية عسكرية</span><span id="promo-alert-ic2">🎖️</span></div>
         <hr class="warn-line">
         <div class="promo-extra" id="promo-alert-extra"></div>
         <div class="promo-reason" id="promo-alert-reason"></div>
+        <img id="promo-alert-img" style="display:none;max-width:100%;max-height:35vh;border-radius:10px;margin-top:12px;">
     </div>
     <div class="promo-actions">
         <button class="promo-approve-btn" onclick="promoAlertApprove()">✅ قبول</button>
@@ -6378,8 +6536,8 @@ async function submitNoteForm() {
     if (!text || !text.trim()) return toast('اكتب الملاحظة');
     if (!noteImageData) return toast('لازم ترفق صورة مع الملاحظة');
     try {
-        await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: noteImageData }) });
-        toast('✅ تمت إضافة الملاحظة');
+        const rr = await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: noteImageData }) });
+        toast(rr && rr.pending ? '📩 تم إرسال الملاحظة للقيادة العليا — بانتظار الموافقة' : '✅ تمت إضافة الملاحظة');
         closeWarnForm();
         noteImageData = null;
         if (noteFormCtx.reloadCall) { try { Function(noteFormCtx.reloadCall)(); } catch (e) {} }
@@ -6419,8 +6577,8 @@ async function submitSectorNoteForm(hasEvidence) {
     if (!text || !text.trim()) return toast('اكتب الملاحظة');
     if (hasEvidence && !noteImageData) return toast('لازم ترفق صورة مع الملاحظة');
     try {
-        await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: hasEvidence ? noteImageData : null }) });
-        toast('✅ تمت إضافة الملاحظة');
+        const rr = await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: hasEvidence ? noteImageData : null }) });
+        toast(rr && rr.pending ? '📩 تم إرسال الملاحظة للقيادة العليا — بانتظار الموافقة' : '✅ تمت إضافة الملاحظة');
         closeWarnForm();
         noteImageData = null;
         if (noteFormCtx.reloadCall) { try { Function(noteFormCtx.reloadCall)(); } catch (e) {} }
@@ -6578,11 +6736,38 @@ async function checkPromotionAlert() {
 }
 function showPromotionAlert(a) {
     currentPromoAlertId = a.id;
-    const dirLabel = a.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل';
-    document.getElementById('promo-alert-extra').textContent =
-        dirLabel + ': ' + (a.targetName || a.targetTag) + '\\n' + a.fromRank + ' ← ' + a.toRank +
-        '\\nالقطاع: ' + a.sectorLabel + '\\nمقدّم الطلب: ' + (a.requestedByTag || '-');
-    document.getElementById('promo-alert-reason').textContent = 'السبب: ' + (a.reason || '-');
+    const kind = a.kind || 'rank';
+    const icon = kind === 'points' ? '⭐' : kind === 'note' ? '📝' : '🎖️';
+    const title = kind === 'points' ? 'طلب نقاط' : kind === 'note' ? 'طلب ملاحظة' : 'ترقية عسكرية';
+    document.getElementById('promo-alert-ic1').textContent = icon;
+    document.getElementById('promo-alert-ic2').textContent = icon;
+    document.getElementById('promo-alert-title').textContent = title;
+    const who = (a.targetName || a.targetTag);
+    const img = document.getElementById('promo-alert-img');
+    img.style.display = 'none'; img.removeAttribute('src');
+    if (kind === 'points') {
+        const d = a.pointsDelta || 0;
+        document.getElementById('promo-alert-extra').textContent =
+            (a.requestedByTag || '-') + ' يبي ' + (d >= 0 ? 'يعطي' : 'يخصم من') + ' العسكري: ' + who + '\\n' +
+            (d >= 0 ? '+' : '-') + Math.abs(d) + ' نقطة (' + a.oldPoints + ' ← ' + a.newPoints + ')\\nالقطاع: ' + a.sectorLabel;
+        document.getElementById('promo-alert-reason').textContent = 'السبب: ' + (a.reason || '-');
+    } else if (kind === 'note') {
+        document.getElementById('promo-alert-extra').textContent =
+            (a.requestedByTag || '-') + ' يبي يضيف ملاحظة على العسكري: ' + who + '\\nالقطاع: ' + a.sectorLabel;
+        document.getElementById('promo-alert-reason').textContent = 'الملاحظة: ' + (a.noteText || '-');
+        if (a.hasImage) {
+            const rid = a.id;
+            api('/api/high-command/promotion-requests/' + rid + '/image').then(function (d) {
+                if (currentPromoAlertId === rid && d.image) { img.src = d.image; img.style.display = 'block'; }
+            }).catch(function () {});
+        }
+    } else {
+        const dirLabel = a.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل';
+        document.getElementById('promo-alert-extra').textContent =
+            dirLabel + ': ' + who + '\\n' + a.fromRank + ' ← ' + a.toRank +
+            '\\nالقطاع: ' + a.sectorLabel + '\\nمقدّم الطلب: ' + (a.requestedByTag || '-');
+        document.getElementById('promo-alert-reason').textContent = 'السبب: ' + (a.reason || '-');
+    }
     document.getElementById('promo-alert-overlay').classList.add('open');
 }
 function closePromotionAlert() {
@@ -6673,6 +6858,13 @@ function spConnect() {
             try { var d = JSON.parse(e.data); if (SP.cur && SP.cur.id === d.id) { SP.cur.typing = !!d.on; spShowTyping(); } } catch (x) {}
         });
         es.addEventListener('changed', function () { spLiveRefresh(); });
+        es.addEventListener('hcalert', function () {
+            try {
+                if (!ME || !ME.isHighCommand) return;
+                checkPromotionAlert();
+                if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
+            } catch (x) {}
+        });
         es.addEventListener('vsig', function (e) { try { offOnVsig(JSON.parse(e.data)); } catch (x) {} });
         es.addEventListener('offann', function () { try { offAnnCheck(); } catch (x) {} });
         es.addEventListener('flashupdate', function () { try { flashUpdCheck(); } catch (x) {} });
@@ -8643,10 +8835,21 @@ function hcTabSwitch(name, el) {
     if (name === 'history') loadHCHistory();
 }
 function hcCard(r, withActions) {
+    const kind = r.kind || 'rank';
+    let body;
+    if (kind === 'points') {
+        const d = r.pointsDelta || 0;
+        body = \`<div style="color:var(--gold-soft);margin-top:4px;">⭐ \${d >= 0 ? 'إضافة' : 'خصم'} \${Math.abs(d)} نقطة (\${r.oldPoints} ← \${r.newPoints})</div>\`;
+    } else if (kind === 'note') {
+        body = \`<div style="color:var(--gold-soft);margin-top:4px;">📝 طلب ملاحظة</div><div style="font-size:13px;margin-top:6px;">الملاحظة: \${r.noteText || '-'}</div>\`;
+        if (withActions && r.hasImage) body += \`<div style="margin-top:6px;"><button class="btn sm gray" onclick="hcShowImage('\${r._id}', this)">🖼️ عرض الصورة</button></div>\`;
+    } else {
+        body = \`<div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ ترقية' : '⬇️ تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>\`;
+    }
     return \`
         <div class="card">
             <b>\${r.targetName || r.targetTag}</b>
-            <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ ترقية' : '⬇️ تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
+            \${body}
             <div style="font-size:12px;color:var(--muted);margin-top:2px;">القطاع: \${r.sectorLabel} • مقدّم الطلب: \${r.requestedByTag || r.requestedBy}</div>
             \${r.reason ? \`<div style="font-size:13px;margin-top:6px;">السبب: \${r.reason}</div>\` : ''}
             \${!withActions ? \`<div style="margin-top:6px;"><span class="badge \${r.status}">\${r.status === 'approved' ? 'مقبول' : 'مرفوض'}</span>\${r.rejectReason ? ' — ' + r.rejectReason : ''}</div>\` : ''}
@@ -8656,6 +8859,13 @@ function hcCard(r, withActions) {
                 <button class="btn danger sm" onclick="hcDecide('\${r._id}','reject')">رفض</button>
             </div>\` : ''}
         </div>\`;
+}
+function hcShowImage(id, btn) {
+    api('/api/high-command/promotion-requests/' + id + '/image').then(function (d) {
+        var im = document.createElement('img');
+        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
+        btn.parentNode.appendChild(im); btn.remove();
+    }).catch(function (e) { toast(e.message); });
 }
 async function loadHCPending(silent) {
     const box = document.getElementById('hc-content');
@@ -8815,12 +9025,12 @@ async function loadPromotionRequests() {
     }
     if (sectorPanelTab !== 'promotions') return;
     const list = data.list || [];
-    const note = \`<div class="card" style="color:var(--muted);font-size:13px;">📩 طلبات الترقية والتنزيل (منك أو من مسؤول الأفراد) تراجعها القيادة العليا — هذي بس متابعة لحالتها.</div>\`;
+    const note = \`<div class="card" style="color:var(--muted);font-size:13px;">📩 طلبات الترقية والتنزيل والنقاط والملاحظات (منك أو من مسؤول الأفراد) تراجعها القيادة العليا — هذي بس متابعة لحالتها.</div>\`;
     if (list.length === 0) { box.innerHTML = note + '<div class="card center" style="color:var(--muted);">لا توجد طلبات حالياً</div>'; return; }
     box.innerHTML = note + list.map(r => \`
         <div class="card">
             <b>\${r.targetName || r.targetTag}</b>
-            <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
+            <div style="color:var(--gold-soft);margin-top:4px;">\${r.kind === 'points' ? ('⭐ طلب ' + ((r.pointsDelta || 0) >= 0 ? 'إضافة ' : 'خصم ') + Math.abs(r.pointsDelta || 0) + ' نقطة (' + r.oldPoints + ' ← ' + r.newPoints + ')') : r.kind === 'note' ? ('📝 طلب ملاحظة: ' + (r.noteText || '')) : ((r.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل') + ': ' + r.fromRank + ' ← ' + r.toRank)}</div>
             \${r.reason ? \`<div style="color:var(--muted);font-size:12px;margin-top:2px;">السبب: \${r.reason}</div>\` : ''}
             <div style="color:var(--muted);font-size:12px;margin-top:2px;">مقدّم الطلب: \${r.requestedByTag || r.requestedBy}</div>
             <div style="margin-top:4px;"><span class="badge \${r.status}">\${r.status === 'pending' ? 'قيد المراجعة (القيادة العليا)' : r.status === 'approved' ? 'تمت الموافقة' : 'مرفوض'}</span>\${r.status === 'rejected' && r.rejectReason ? \` — \${r.rejectReason}\` : ''}</div>
@@ -9039,8 +9249,8 @@ async function editMemberPoints(discord, currentPoints) {
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب السبب');
     try {
-        await api('/api/points/edit/' + discord, { method: 'POST', body: JSON.stringify({ points: parseInt(val), reason: reason.trim() }) });
-        toast('تم تحديث النقاط وإشعار القيادة العليا');
+        const rr = await api('/api/points/edit/' + discord, { method: 'POST', body: JSON.stringify({ points: parseInt(val), reason: reason.trim() }) });
+        toast(rr && rr.pending ? '📩 تم إرسال طلب النقاط للقيادة العليا — بانتظار الموافقة' : 'تم تحديث النقاط وإشعار القيادة العليا');
         if (sectorPanelTab === 'members') loadSectorMembers();
         if (poTab === 'members') loadPoMembers();
     } catch (e) { toast(e.message); }
