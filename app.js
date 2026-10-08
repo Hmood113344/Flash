@@ -4569,7 +4569,7 @@ const OfficerApp = mongoose.model("OfficerApp", OfficerAppSchema);
 
 const OfficerRoom = mongoose.model("OfficerRoom", new mongoose.Schema({ n: { type: Number, unique: true } }));
 const OfficerRoomLogSchema = new mongoose.Schema({
-    n: Number, uid: String, name: String, isSenior: Boolean,
+    n: Number, uid: String, name: String, isSenior: Boolean, role: String,
     action: String, at: { type: Date, default: Date.now },
 });
 OfficerRoomLogSchema.index({ n: 1, at: -1 });
@@ -4740,7 +4740,7 @@ function offRemove(uid, n) {
     if (cfg.speakerUid === uid) cfg.speakerUid = null;
     const rr = offRecActive.get(n);
     if (rr && rr.uid === uid) offRecEnd(n, true);
-    if (!offIsTrain(n)) OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, action: "leave" }).catch(() => {});
+    OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, role: p.role, action: "leave" }).catch(() => {});
     offPushState(n);
 }
 function offRemoveEverywhere(uid) {
@@ -5011,13 +5011,12 @@ app.delete("/api/officers/admin/rooms/:n", ensureSeniorAdmin, async (req, res) =
     res.json({ ok: true, movedTo: target, moved: mv.modifiedCount || 0 });
 });
 
-app.post("/api/officers/rec/start", ensureSeniorAdmin, async (req, res) => {
+app.post("/api/officers/rec/start", ensureTrainerOrSenior, async (req, res) => {
     const n = offParseN(req.body && req.body.n);
     const m = n ? offLive.get(n) : null;
     const me = m ? m.get(req.user.id) : null;
-    if (!me || !me.isSenior) return res.status(403).json({ error: "لازم تكون داخل الروم" });
-    if (offIsTrain(n)) return res.json({ ok: false });
-    if (!Array.from(m.values()).some(x => !x.isSenior)) return res.json({ ok: false });
+    if (!me || !(me.isSenior || (offIsTrain(n) && me.role === "trainer"))) return res.status(403).json({ error: "لازم تكون داخل الروم" });
+    if (!Array.from(m.values()).some(x => !x.isSenior && x.role !== "trainer")) return res.json({ ok: false });
     if (offRecIsActive(n)) return res.json({ ok: false, busy: true });
     const mime = String((req.body && req.body.mime) || "audio/webm").slice(0, 60);
     const sid = n + "-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex");
@@ -5027,7 +5026,7 @@ app.post("/api/officers/rec/start", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true, sid });
 });
 
-app.post("/api/officers/rec/chunk", ensureSeniorAdmin, express.raw({ type: "*/*", limit: "3mb" }), async (req, res) => {
+app.post("/api/officers/rec/chunk", ensureTrainerOrSenior, express.raw({ type: "*/*", limit: "3mb" }), async (req, res) => {
     const sid = String(req.query.sid || "");
     const seq = parseInt(req.query.seq, 10);
     const meta = await OfficerRec.findOne({ sid }).select("uid n").lean();
@@ -5041,7 +5040,7 @@ app.post("/api/officers/rec/chunk", ensureSeniorAdmin, express.raw({ type: "*/*"
     res.json({ ok: true });
 });
 
-app.post("/api/officers/rec/events", ensureSeniorAdmin, async (req, res) => {
+app.post("/api/officers/rec/events", ensureTrainerOrSenior, async (req, res) => {
     const sid = String((req.body && req.body.sid) || "");
     const meta = await OfficerRec.findOne({ sid }).select("uid speechN").lean();
     if (!meta || meta.uid !== req.user.id) return res.status(404).json({ error: "تسجيل غير موجود" });
@@ -5058,7 +5057,7 @@ app.post("/api/officers/rec/events", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true });
 });
 
-app.post("/api/officers/rec/stop", ensureSeniorAdmin, async (req, res) => {
+app.post("/api/officers/rec/stop", ensureTrainerOrSenior, async (req, res) => {
     const sid = String((req.body && req.body.sid) || "");
     const meta = await OfficerRec.findOne({ sid }).select("uid n endedAt").lean();
     if (!meta || meta.uid !== req.user.id) return res.status(404).json({ error: "تسجيل غير موجود" });
@@ -5116,10 +5115,10 @@ app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res)
                 cur = null;
             }
             if (l.action === "join") {
-                if (!cur) cur = { room: n, start: t, end: null, live: false, stays: [] };
+                if (!cur) cur = { room: n, training: offIsTrain(n), start: t, end: null, live: false, stays: [] };
                 const prev = open.get(l.uid);
                 if (prev) { prev.lost = true; open.delete(l.uid); }
-                const st = { uid: l.uid, name: l.name, isSenior: !!l.isSenior, start: t, end: null, lost: false, ongoing: false };
+                const st = { uid: l.uid, name: l.name, isSenior: !!l.isSenior, role: l.role || (l.isSenior ? "senior" : "applicant"), start: t, end: null, lost: false, ongoing: false };
                 open.set(l.uid, st);
                 cur.stays.push(st);
             } else if (l.action === "leave") {
@@ -5151,7 +5150,7 @@ app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res)
     });
     const byUid = new Map(apps.map(a => [a.uid, a]));
     top.forEach(s => s.stays.forEach(st => {
-        if (st.isSenior) return;
+        if (st.isSenior || s.training) return;
         const a = byUid.get(st.uid);
         if (!a) return;
         st.age = a.age || null;
@@ -5346,7 +5345,7 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
     m.set(uid, { uid, name, isSenior: senior, role, muted: role === "trainee", joinedAt: Date.now() });
     if (appDoc) { const ive = offIvGet(n, uid); ive.cur = null; ive.report = null; ive.marks = offIvClean(appDoc.interview && appDoc.interview.marks); }
     offPushState(n);
-    if (!wasIn && !isTrain) OfficerRoomLog.create({ n, uid, name, isSenior: senior, action: "join" }).catch(() => {});
+    if (!wasIn) OfficerRoomLog.create({ n, uid, name, isSenior: senior, role, action: "join" }).catch(() => {});
     if (appDoc && !appDoc.interview.enteredAt) {
         await OfficerApp.updateOne({ _id: appDoc._id }, { $set: { "interview.enteredAt": new Date() } });
     }
@@ -11164,8 +11163,8 @@ function offRecMime() {
 }
 function offRecCheck() {
     var v = VC;
-    if (!v || !v.isSenior || v.training || !offRecSupported()) return;
-    var hasApplicant = v.state.participants.some(function (p) { return !p.isSenior; });
+    if (!v || !(v.isSenior || offMyRole() === 'trainer') || !offRecSupported()) return;
+    var hasApplicant = v.state.participants.some(function (p) { return !p.isSenior && p.role !== 'trainer'; });
     if (v.rec) { if (!hasApplicant) offRecStopFor(v); return; }
     if (!hasApplicant || v.state.rec || v.recBusy || Date.now() < (v.recRetry || 0)) return;
     v.recBusy = true;
@@ -11413,6 +11412,7 @@ function offPaintNote() {
         if (trole === 'senior') box.textContent = 'روم تدريب — الكل مكتوم إلا المدرب. تقدر تسكت أو تفتح مايك أي أحد (حتى المدرب).';
         else if (trole === 'trainer') box.textContent = '🏋️ أنت المدرب — المتدربين يسمعونك فقط، وتقدر تسكت أي متدرب.';
         else box.textContent = (tme && tme.muted) ? '🔇 أنت مكتوم — تسمع المدرب فقط.' : '🎙️ المايك مفتوح لك.';
+        if (VC.state.rec) box.textContent += ' 🔴 التدريب مسجّل صوتياً.';
         return;
     }
     if (VC.isSenior) box.textContent = offModeDesc(VC.state.mode) + ' — اضغط زر فتح المايك تحت اسم المتقدم.';
@@ -11676,6 +11676,7 @@ function offQRefresh() {
     offPaintBar();
 }
 /* ---- روم التدريب ---- */
+function offMyRole() { var p = VC ? offFindP(VC.state, VC.me) : null; return p ? p.role : ''; }
 function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : 'متقدم')); }
 function offTrainMute(uid, m) {
     if (!VC) return;
@@ -11883,7 +11884,7 @@ function renderOfficerAdmin(tab) {
     OFFA.tab = (typeof tab === 'string') ? tab : 'apps';
     OFFA.sig = '';
     OFFA.data = null;
-    var tabs = [['apps', '📥 التقديمات'], ['rooms', '🎙️ المقابلة'], ['log', '📼 تسجيل المقابلة'], ['train', '🏋️ التدريب'], ['trainers', '👨‍🏫 المدربين']];
+    var tabs = [['apps', '📥 التقديمات'], ['rooms', '🎙️ المقابلة'], ['log', '📼 سجل المقابلة والتدريب'], ['train', '🏋️ التدريب'], ['trainers', '👨‍🏫 المدربين']];
     document.getElementById('admin-content').innerHTML =
         '<div class="tabs" id="offa-tabs" style="margin-top:4px;">' + tabs.map(function (t) {
             return '<div class="tab' + (t[0] === OFFA.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="offaTab(this.dataset.t)">' + t[1] + '</div>';
@@ -12068,7 +12069,7 @@ function offResultChip(r) {
 }
 function offaLogHtml(d) {
     var list = d.sessions || [];
-    var h = '<div class="card"><h3>📼 تسجيل المقابلة</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">سجل كل جلسة مقابلة صارت بالرومات: من أول واحد دخل الروم إلى آخر واحد طلع، مع وقت دخول وخروج كل شخص، وتسجيل صوتي للمقابلة (يُحفظ ١٤ يوم)، وفيديو توضيحي يعيد لك الجلسة خطوة بخطوة.</p></div>';
+    var h = '<div class="card"><h3>📼 سجل المقابلة والتدريب</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">سجل كل جلسة مقابلة صارت بالرومات: من أول واحد دخل الروم إلى آخر واحد طلع، مع وقت دخول وخروج كل شخص، وتسجيل صوتي للمقابلة (يُحفظ ١٤ يوم)، وفيديو توضيحي يعيد لك الجلسة خطوة بخطوة.</p></div>';
     if (d.canClear) h += '<div class="card row" style="border-color:#7f1d1d;"><div><b style="color:#f87171;">🗑️ حذف سجلات المقابلة كلها</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">يحذف كل الجلسات والتسجيلات الصوتية. يشتغل مرة وحدة بس، وبعدها الزر يختفي.</div></div><button class="btn danger sm" onclick="offaClearInterviewLog()">حذف السجلات</button></div>';
     if (!list.length) return h + '<div class="card center" style="color:var(--muted);">ما فيه جلسات مسجلة</div>';
     list.forEach(function (s, i) {
@@ -12079,7 +12080,7 @@ function offaLogHtml(d) {
         var first = s.stays[0];
         var lastOut = null;
         s.stays.forEach(function (st) { if (st.end && (!lastOut || st.end >= lastOut.end)) lastOut = st; });
-        h += '<div class="card"' + ((!s.live && ME && ME.isOwner) ? ' data-sw="' + i + '" style="touch-action:pan-y;"' : '') + '><div class="row"><h3>🎙️ مقابلة ' + s.room + '</h3>' + (s.live ? '<span class="badge approved">🟢 جارية الحين</span>' : '<span class="badge pending">انتهت</span>') + '</div>';
+        h += '<div class="card"' + ((!s.live && ME && ME.isOwner) ? ' data-sw="' + i + '" style="touch-action:pan-y;"' : '') + '><div class="row"><h3>' + (s.training ? '🏋️ تدريب ' + (s.room - 900) : '🎙️ مقابلة ' + s.room) + '</h3>' + (s.live ? '<span class="badge approved">🟢 جارية الحين</span>' : '<span class="badge pending">انتهت</span>') + '</div>';
         h += '<div class="acc-row"><span>اليوم</span><b>' + spEsc(offFmtDay(s.start)) + '</b></div>';
         h += '<div class="acc-row"><span>أول واحد دخل</span><b>' + spEsc(first.name) + ' — ' + spEsc(offFmtTimeS(first.start)) + '</b></div>';
         if (s.live) h += '<div class="acc-row"><span>آخر واحد طلع</span><b>الجلسة جارية</b></div>';
@@ -12110,7 +12111,7 @@ function offaLogHtml(d) {
             if (st.end) tail = '⬅️ طلع: ' + offFmtTimeS(st.end) + ' — مدة البقاء: ' + offDur(st.end - st.start);
             else if (st.ongoing) tail = '🟢 داخل الروم الحين';
             else tail = '⚠️ انقطع اتصاله (وقت الخروج غير مسجل)';
-            h += '<div class="off-stay"><div><b>' + (k + 1) + '- ' + spEsc(st.name) + '</b> <span class="off-chip' + (st.isSenior ? ' sen' : '') + '">' + (st.isSenior ? '🎖️ من الكبار' : 'متقدم') + '</span>' +
+            h += '<div class="off-stay"><div><b>' + (k + 1) + '- ' + spEsc(st.name) + '</b> <span class="off-chip' + (st.isSenior ? ' sen' : '') + '">' + offRoleLabel(st.role || (st.isSenior ? 'senior' : 'applicant')) + '</span>' +
                 (st.age ? ' <span style="color:var(--muted);font-size:12px;">عمره ' + spEsc(String(st.age)) + '</span>' : '') + offResultChip(st.result) +
                 (talk[st.uid] ? ' <span class="off-talk">🎤 تحدث ' + spEsc(offDur(talk[st.uid])) + '</span>' : '') + '</div>' +
                 '<div class="off-stayt">➡️ دخل: ' + spEsc(offFmtTimeS(st.start)) + ' — ' + spEsc(tail) + '</div></div>';
