@@ -85,6 +85,7 @@ const CONFIG = {
         patrol: "الدوريات",
         roadSecurity: "أمن الطرق",
         antiDrugs: "مكافحة المخدرات",
+        cyber: "الأمن السيبراني",
     },
 
     MILITARY_POLICE_ROLE_ID: process.env.MILITARY_POLICE_ROLE_ID || "1545415273438249010",
@@ -108,7 +109,7 @@ const CONFIG = {
 };
 
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); })
+    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 const PersonnelSchema = new mongoose.Schema({
@@ -349,6 +350,41 @@ ViolationSchema.index({ status: 1, reviewedAt: -1 });
 ViolationSchema.index({ reporterDiscord: 1, createdAt: -1 });
 const Violation = mongoose.model("Violation", ViolationSchema);
 
+
+const underInvestigation = new Set();
+
+const DeviceLinkSchema = new mongoose.Schema({
+    deviceId: { type: String, required: true, unique: true },
+    accounts: [{ uid: String, count: { type: Number, default: 1 }, firstSeen: Date, lastSeen: Date }],
+});
+const DeviceLink = mongoose.model("DeviceLink", DeviceLinkSchema);
+
+const CyberCaseSchema = new mongoose.Schema({
+    status: { type: String, default: "alert" }, // alert | sent | dismissed | investigating | decision | escalated | resolved
+    pairKey: { type: String, default: null },
+    targetUid: String, targetName: String,
+    relatedUid: String, relatedName: String,
+    sentBy: String, sentByName: String, sentAt: Date,
+    handledBy: String, handledByName: String, handledAt: Date,
+    startedBy: String, startedByName: String, startedAt: Date,
+    endedBy: String, endedByName: String, endedAt: Date,
+    decisionBy: String, decisionByName: String, decisionAt: Date, decisionAction: String, decisionNote: String,
+    muted: { type: [String], default: [] },
+    chat: [{ uid: String, name: String, role: String, text: String, system: { type: Boolean, default: false }, at: { type: Date, default: Date.now } }],
+    createdAt: { type: Date, default: Date.now },
+});
+CyberCaseSchema.index({ pairKey: 1 }, { unique: true, partialFilterExpression: { pairKey: { $type: "string" } } });
+CyberCaseSchema.index({ status: 1, createdAt: -1 });
+const CyberCase = mongoose.model("CyberCase", CyberCaseSchema);
+
+async function loadInvestigations() {
+    try {
+        underInvestigation.clear();
+        const list = await CyberCase.find({ status: "investigating" }, { targetUid: 1 }).lean();
+        list.forEach(c => underInvestigation.add(c.targetUid));
+    } catch (e) { console.error("❌ فشل تحميل التحقيقات:", e.message); }
+}
+
 const PromotionRequestSchema = new mongoose.Schema({
     sector: String,
     sectorLabel: String,
@@ -473,6 +509,11 @@ const SettingsSchema = new mongoose.Schema({
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
         },
         antiDrugs: {
+            commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
+            deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
+            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
+        },
+        cyber: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
@@ -1062,6 +1103,7 @@ async function syncViolationMessage(v) {
 }
 
 async function approveViolation(v, actorId, actorTag) {
+    if (underInvestigation.has(v.reporterDiscord)) return { blocked: true, investigation: true };
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
     v.status = "approved"; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
@@ -1076,6 +1118,7 @@ async function approveViolation(v, actorId, actorTag) {
 }
 
 async function rejectViolation(v, actorId, actorTag, reason) {
+    if (underInvestigation.has(v.reporterDiscord)) return { blocked: true, investigation: true };
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
     v.status = "rejected"; v.rejectReason = reason; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
@@ -1164,7 +1207,8 @@ client.on("interactionCreate", async interaction => {
                     return interaction.reply({ content: "هذه المخالفة تمت مراجعتها مسبقاً.", ephemeral: true });
                 }
                 if (action === "approve") {
-                    await approveViolation(v, interaction.user.id, interaction.user.username);
+                    const ar = await approveViolation(v, interaction.user.id, interaction.user.username);
+                    if (ar && ar.blocked) return interaction.reply({ content: ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حالياً.", ephemeral: true });
                     return interaction.deferUpdate();
                 }
                 if (action === "reject") {
@@ -1189,7 +1233,8 @@ client.on("interactionCreate", async interaction => {
                 if (!v || v.status !== "pending") {
                     return interaction.reply({ content: "هذه المخالفة تمت مراجعتها مسبقاً.", ephemeral: true });
                 }
-                await rejectViolation(v, interaction.user.id, interaction.user.username, reason);
+                const rr = await rejectViolation(v, interaction.user.id, interaction.user.username, reason);
+                if (rr && rr.blocked) return interaction.reply({ content: rr.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنرفض مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنرفض مخالفاته حالياً.", ephemeral: true });
                 return interaction.reply({ content: "✅ تم رفض المخالفة وحفظ السبب.", ephemeral: true });
             }
         }
@@ -1305,6 +1350,12 @@ app.use("/api", (req, res, next) => {
     }
     next();
 });
+app.use("/api", (req, res, next) => {
+    if (!req.user || !underInvestigation.has(req.user.id)) return next();
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+    if (req.path.indexOf("/cyber/") === 0) return next();
+    return res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً", investigation: true });
+});
 async function isSupportAdmin(uid) {
     if (!uid) return false;
     if (isSeniorAdmin(uid)) return true;
@@ -1413,6 +1464,7 @@ app.post("/auth/login", async (req, res, next) => {
     req.logIn({ id: a.uid }, (err) => {
         if (err) return next(err);
         DeviceSession.create({ uid: a.uid, sid: req.sessionID, ip: clientIp(req), ua: String(req.headers["user-agent"] || "").slice(0, 200) }).catch(() => {});
+        if (!a.isSenior && !a.isOwner) trackDevice(req, a.uid);
         res.json({ ok: true });
     });
 });
@@ -1790,6 +1842,8 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         mpPersonnelOfficer,
         isMilitaryPolice,
         isHighCommand: isHighCommand(req.user.id, settings),
+        cyber: await cyberRoleOf(req.user.id),
+        cyberLocked: underInvestigation.has(req.user.id),
         isViolationsOfficer: isViolationsOfficer(req.user.id, settings),
         isOwner: isOwnerUid(req.user.id),
         seniorTemp,
@@ -2073,7 +2127,7 @@ app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) =
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -2083,7 +2137,7 @@ app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) =>
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await rejectViolation(v, req.user.id, req.user.username, reason.trim());
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن رفض مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3220,7 +3274,7 @@ app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, r
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3231,7 +3285,7 @@ app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, re
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await rejectViolation(v, req.user.id, req.user.username, reason.trim());
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن رفض مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3606,7 +3660,7 @@ app.post("/api/violations-officer/violations/:id/approve", ensureViolationsOffic
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)");
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 app.post("/api/violations-officer/violations/:id/reject", ensureViolationsOfficer, async (req, res) => {
@@ -3615,7 +3669,7 @@ app.post("/api/violations-officer/violations/:id/reject", ensureViolationsOffice
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await rejectViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)", reason.trim());
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن رفض مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3723,7 +3777,7 @@ app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
     const r = await approveViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`);
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3734,7 +3788,7 @@ app.post("/api/personnel-officer/violations/:id/reject", ensurePersonnelOfficer,
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
     const r = await rejectViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, reason.trim());
-    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن رفض مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -5688,6 +5742,261 @@ app.post("/api/officers/rooms/:n/speaker", ensureSeniorAdmin, async (req, res) =
 });
 
 
+
+// ================= الأمن السيبراني: كشف الأجهزة + التحقيق =================
+function cyDeviceId(req) {
+    const m = /(?:^|;\s*)fx_did=([a-f0-9]{32})/.exec(String(req.headers.cookie || ""));
+    return m ? m[1] : null;
+}
+async function cyName(uid) {
+    const p = await Personnel.findOne({ discord: uid }, { registeredName: 1 }).lean();
+    if (p && p.registeredName) return p.registeredName;
+    const a = await Account.findOne({ uid }, { fullName: 1, email: 1 }).lean();
+    return (a && (a.fullName || a.email)) || uid;
+}
+async function trackDevice(req, uid) {
+    try {
+        const deviceId = cyDeviceId(req);
+        if (!deviceId) return;
+        const now = new Date();
+        const link = await DeviceLink.findOne({ deviceId });
+        if (!link) { await DeviceLink.create({ deviceId, accounts: [{ uid, count: 1, firstSeen: now, lastSeen: now }] }).catch(() => {}); return; }
+        const mine = link.accounts.find(x => x.uid === uid);
+        if (mine) { mine.count += 1; mine.lastSeen = now; await link.save(); return; }
+        const primary = link.accounts.slice().sort((x, y) => y.count - x.count)[0];
+        link.accounts.push({ uid, count: 1, firstSeen: now, lastSeen: now });
+        await link.save();
+        // "الحساب المعتاد" = الأكثر دخولاً على الجهاز، ولازم يكون دخل مرتين على الأقل
+        if (!primary || primary.uid === uid || primary.count < 2) return;
+        const pa = await Account.findOne({ uid: primary.uid }, { isSenior: 1, isOwner: 1 }).lean();
+        if (!pa || pa.isSenior || pa.isOwner) return;
+        const doc = await CyberCase.create({
+            status: "alert", pairKey: deviceId + ":" + uid,
+            targetUid: primary.uid, targetName: await cyName(primary.uid),
+            relatedUid: uid, relatedName: await cyName(uid),
+        }).catch(() => null);
+        if (doc) cyberPush(doc);
+    } catch (e) { console.error("❌ trackDevice:", e.message); }
+}
+
+const cyberRoleCache = new Map();
+async function cyberRoleOf(uid) {
+    const hit = cyberRoleCache.get(uid);
+    if (hit && Date.now() - hit.t < 20000) return hit.v;
+    const settings = await getSettings();
+    const lead = getSectorRole(uid, settings);
+    const po = getPersonnelOfficerSector(uid, settings);
+    const acc = await Account.findOne({ uid }, { sector: 1 }).lean();
+    const isLeader = isSeniorAdmin(uid) || !!(lead && lead.sector === "cyber");
+    const isMember = !!(acc && acc.sector === "cyber") || !!(po && po.sector === "cyber");
+    const v = { isLeader, isMember };
+    cyberRoleCache.set(uid, { t: Date.now(), v });
+    return v;
+}
+const cyAudCache = new Map();
+async function cyberAudience(c) {
+    const key = c && c.targetUid ? c.targetUid : "_";
+    const hit = cyAudCache.get(key);
+    if (hit && Date.now() - hit.t < 30000) return hit.set;
+    const settings = await getSettings();
+    const set = new Set();
+    const mem = await Account.find({ status: "approved", sector: "cyber" }, { uid: 1 }).lean();
+    mem.forEach(m => set.add(m.uid));
+    const sl = (settings.sectorLeadership || {}).cyber || {};
+    [sl.commanderId, sl.deputyId, sl.personnelOfficerId].filter(Boolean).forEach(x => set.add(x));
+    if (c && c.targetUid) set.add(c.targetUid);
+    cyAudCache.set(key, { t: Date.now(), set });
+    return set;
+}
+async function cyberPush(c) {
+    try {
+        const set = await cyberAudience(c);
+        sseBroadcast("cyber", { t: Date.now() }, cl => !!cl.uid && (set.has(cl.uid) || isSeniorAdmin(cl.uid)));
+    } catch (e) {}
+}
+function cyPublic(c) {
+    return {
+        id: String(c._id), status: c.status, targetUid: c.targetUid, targetName: c.targetName, relatedName: c.relatedName,
+        sentByName: c.sentByName || null, startedByName: c.startedByName || null, decisionAction: c.decisionAction || null,
+        createdAt: c.createdAt, startedAt: c.startedAt || null, endedAt: c.endedAt || null,
+    };
+}
+async function cyAccess(req, res, needLeader) {
+    if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "رقم غير صحيح" }); return null; }
+    const c = await CyberCase.findById(req.params.id);
+    if (!c) { res.status(404).json({ error: "غير موجود" }); return null; }
+    const role = await cyberRoleOf(req.user.id);
+    const isTarget = c.targetUid === req.user.id;
+    if (underInvestigation.has(req.user.id) && !isTarget) { res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني" }); return null; }
+    if (needLeader && (!role.isLeader || isTarget)) { res.status(403).json({ error: "هذا الإجراء لقائد ونائب الأمن السيبراني فقط" }); return null; }
+    if (!role.isLeader && !role.isMember && !(isTarget && c.status === "investigating")) { res.status(403).json({ error: "ليست لديك صلاحية" }); return null; }
+    return { c, role, isTarget };
+}
+async function cySystemMsg(id, text) {
+    await CyberCase.updateOne({ _id: id }, { $push: { chat: { $each: [{ uid: "system", name: "النظام", role: "system", text, system: true }], $slice: -500 } } });
+}
+const CY_LIST_FIELDS = { chat: 0 };
+
+app.get("/api/cyber/state", ensureAuth, async (req, res) => {
+    const uid = req.user.id;
+    const role = await cyberRoleOf(uid);
+    const out = { lock: null, alerts: [], inbox: [], decisions: [], live: [] };
+    if (underInvestigation.has(uid)) {
+        const lc = await CyberCase.findOne({ targetUid: uid, status: "investigating" }, CY_LIST_FIELDS).lean();
+        if (lc) out.lock = cyPublic(lc); else underInvestigation.delete(uid);
+    }
+    const mine = { targetUid: { $ne: uid }, relatedUid: { $ne: uid } };
+    if (role.isMember && !role.isLeader) out.alerts = (await CyberCase.find({ status: "alert", ...mine }, CY_LIST_FIELDS).sort({ createdAt: 1 }).limit(5).lean()).map(cyPublic);
+    if (role.isLeader) {
+        out.inbox = (await CyberCase.find({ status: "sent", ...mine }, CY_LIST_FIELDS).sort({ sentAt: 1 }).limit(5).lean()).map(cyPublic);
+        out.decisions = (await CyberCase.find({ status: "decision" }, CY_LIST_FIELDS).sort({ endedAt: 1 }).limit(5).lean()).map(cyPublic);
+    }
+    if (role.isMember || role.isLeader) out.live = (await CyberCase.find({ status: "investigating", targetUid: { $ne: uid } }, CY_LIST_FIELDS).sort({ startedAt: 1 }).limit(5).lean()).map(cyPublic);
+    res.json(out);
+});
+
+app.get("/api/cyber/cases", ensureAuth, async (req, res) => {
+    const role = await cyberRoleOf(req.user.id);
+    if (!role.isMember && !role.isLeader) return res.status(403).json({ error: "هذا القسم لقطاع الأمن السيبراني فقط" });
+    const list = await CyberCase.find({}, CY_LIST_FIELDS).sort({ createdAt: -1 }).limit(60).lean();
+    res.json({ list: list.map(cyPublic), role });
+});
+
+app.post("/api/cyber/cases/:id/send", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, false); if (!x) return;
+    if (!x.role.isMember && !x.role.isLeader) return res.status(403).json({ error: "ليست لديك صلاحية" });
+    const name = await cyName(req.user.id);
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: "alert" }, { $set: { status: "sent", sentBy: req.user.id, sentByName: name, sentAt: new Date() } }, { new: true });
+    if (!c) return res.status(409).json({ error: "تم التعامل مع هذا التنبيه مسبقاً" });
+    await logEvent({ action: "رفع تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (الأمن السيبراني)", details: `جهاز ${c.targetName} دخل حساب ${c.relatedName} — مرفوع للقائد` });
+    cyberPush(c);
+    res.json({ ok: true });
+});
+app.post("/api/cyber/cases/:id/dismiss", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, false); if (!x) return;
+    if (!x.role.isMember && !x.role.isLeader) return res.status(403).json({ error: "ليست لديك صلاحية" });
+    const name = await cyName(req.user.id);
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: "alert" }, { $set: { status: "dismissed", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }, { new: true });
+    if (!c) return res.status(409).json({ error: "تم التعامل مع هذا التنبيه مسبقاً" });
+    cyberPush(c);
+    res.json({ ok: true });
+});
+app.post("/api/cyber/cases/:id/resolve", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, true); if (!x) return;
+    const name = await cyName(req.user.id);
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent", "decision"] } }, { $set: { status: "resolved", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }, { new: true });
+    if (!c) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
+    await logEvent({ action: "حل عملية سيبرانية", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `جهاز ${c.targetName} / حساب ${c.relatedName}` });
+    cyberPush(c);
+    res.json({ ok: true });
+});
+app.post("/api/cyber/cases/:id/investigate", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, true); if (!x) return;
+    if (x.c.targetUid === req.user.id) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
+    const name = await cyName(req.user.id);
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent"] } }, { $set: { status: "investigating", startedBy: req.user.id, startedByName: name, startedAt: new Date() } }, { new: true });
+    if (!c) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
+    underInvestigation.add(c.targetUid);
+    await cySystemMsg(c._id, `🔍 فتح ${name} تحقيقاً سيبرانياً بحق ${c.targetName} — السبب: دخل بجهازه حساب ${c.relatedName}`);
+    await logEvent({ action: "بدء تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `جهاز ${c.targetName} دخل حساب ${c.relatedName}` });
+    cyberPush(c);
+    res.json({ ok: true, id: String(c._id) });
+});
+app.post("/api/cyber/cases/:id/end", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, true); if (!x) return;
+    const name = await cyName(req.user.id);
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: "investigating" }, { $set: { status: "decision", endedBy: req.user.id, endedByName: name, endedAt: new Date() } }, { new: true });
+    if (!c) return res.status(409).json({ error: "التحقيق منتهي مسبقاً" });
+    underInvestigation.delete(c.targetUid);
+    await cySystemMsg(c._id, `⏹️ أنهى ${name} التحقيق`);
+    await pushNoticeTo(c.targetUid, "🔓 انتهى التحقيق السيبراني وتم فك التقييد عن حسابك.", req.user.id, name);
+    await logEvent({ action: "إنهاء تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `${c.targetName} — بانتظار قرار القيادة` });
+    cyberPush(c);
+    res.json({ ok: true });
+});
+app.post("/api/cyber/cases/:id/decide", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, true); if (!x) return;
+    const action = req.body && req.body.action;
+    if (!["escalate", "resolve"].includes(action)) return res.status(400).json({ error: "قرار غير معروف" });
+    const note = String((req.body && req.body.note) || "").trim().slice(0, 500);
+    const name = await cyName(req.user.id);
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: "decision" }, { $set: { status: action === "escalate" ? "escalated" : "resolved", decisionAction: action, decisionNote: note || null, decisionBy: req.user.id, decisionByName: name, decisionAt: new Date() } }, { new: true });
+    if (!c) return res.status(409).json({ error: "تم اتخاذ قرار مسبقاً" });
+    if (action === "escalate") {
+        const settings = await getSettings();
+        const full = await CyberCase.findById(c._id, { chat: 1 }).lean();
+        const msgs = ((full && full.chat) || []).filter(m => !m.system).length;
+        const text = `🔍 تقرير تحقيق سيبراني\nالعضو: ${c.targetName}\nالسبب: دخل بجهازه حساب ${c.relatedName}\nرفعه: ${c.sentByName || "-"} • قاد التحقيق: ${c.startedByName || "-"}\nعدد رسائل التحقيق: ${msgs}${note ? "\nملاحظة القيادة: " + note : ""}\nأُبلغتم بقرار من ${name}.`;
+        for (const m of (settings.highCommand || [])) await pushNoticeTo(m.id, text, req.user.id, name);
+        if (botReady) {
+            const embed = new EmbedBuilder().setTitle("🔍 تقرير تحقيق سيبراني").setColor(0xef4444).addFields(
+                { name: "العضو", value: c.targetName || "-", inline: true },
+                { name: "الحساب المدخول", value: c.relatedName || "-", inline: true },
+                { name: "قاد التحقيق", value: c.startedByName || "-", inline: true },
+                { name: "ملاحظة القيادة", value: note || "-", inline: false },
+            ).setTimestamp(new Date());
+            for (const m of (settings.highCommand || [])) { try { const u = await client.users.fetch(m.id); await u.send({ embeds: [embed] }); } catch (e) {} }
+        }
+    }
+    await logEvent({ action: action === "escalate" ? "إبلاغ القيادة العليا (سيبراني)" : "حل عملية سيبرانية", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `${c.targetName}${note ? " — " + note : ""}` });
+    cyberPush(c);
+    res.json({ ok: true });
+});
+
+app.get("/api/cyber/cases/:id/room", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, false); if (!x) return;
+    const c = x.c;
+    const settings = await getSettings();
+    const sl = (settings.sectorLeadership || {}).cyber || {};
+    const leaderIds = [sl.commanderId, sl.deputyId].filter(Boolean);
+    const memberDocs = await Account.find({ status: "approved", sector: "cyber" }, { uid: 1 }).lean();
+    const roleOf = new Map();
+    memberDocs.forEach(m => roleOf.set(m.uid, "member"));
+    leaderIds.forEach(u => roleOf.set(u, "leader"));
+    roleOf.set(c.targetUid, "target");
+    if (x.role.isLeader) roleOf.set(req.user.id, roleOf.get(req.user.id) === "target" ? "target" : "leader");
+    const uids = Array.from(roleOf.keys());
+    const names = new Map();
+    (await Personnel.find({ discord: { $in: uids } }, { discord: 1, registeredName: 1 }).lean()).forEach(p => { if (p.registeredName) names.set(p.discord, p.registeredName); });
+    (await Account.find({ uid: { $in: uids } }, { uid: 1, fullName: 1, email: 1 }).lean()).forEach(a => { if (!names.has(a.uid)) names.set(a.uid, a.fullName || a.email); });
+    const online = new Set();
+    for (const cl of sseClients) if (cl.uid) online.add(cl.uid);
+    const order = { target: 0, leader: 1, member: 2 };
+    const participants = uids.map(u => ({ uid: u, name: names.get(u) || u, role: roleOf.get(u), online: online.has(u) })).sort((a, b) => order[a.role] - order[b.role]);
+    const meRole = x.isTarget ? "target" : (x.role.isLeader ? "leader" : "member");
+    res.json({
+        c: cyPublic(c), me: { uid: req.user.id, role: meRole }, participants, muted: c.muted || [],
+        messages: (c.chat || []).slice(-200).map(m => ({ uid: m.uid, name: m.name, role: m.role, text: m.text, system: !!m.system, at: m.at })),
+    });
+});
+app.post("/api/cyber/cases/:id/chat", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, false); if (!x) return;
+    if (x.c.status !== "investigating") return res.status(400).json({ error: "التحقيق منتهي" });
+    if ((x.c.muted || []).includes(req.user.id)) return res.status(403).json({ error: "🔇 تم إسكاتك في هذا التحقيق" });
+    const text = String((req.body && req.body.text) || "").trim().slice(0, 500);
+    if (!text) return res.status(400).json({ error: "اكتب رسالة" });
+    const role = x.isTarget ? "target" : (x.role.isLeader ? "leader" : "member");
+    const name = await cyName(req.user.id);
+    await CyberCase.updateOne({ _id: x.c._id, status: "investigating" }, { $push: { chat: { $each: [{ uid: req.user.id, name, role, text }], $slice: -500 } } });
+    cyberPush(x.c);
+    res.json({ ok: true });
+});
+app.post("/api/cyber/cases/:id/mute", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, false); if (!x) return;
+    if (x.c.status !== "investigating") return res.status(400).json({ error: "التحقيق منتهي" });
+    const target = String((req.body && req.body.uid) || "");
+    const on = !!(req.body && req.body.on);
+    if (!target) return res.status(400).json({ error: "حدد الشخص" });
+    const allowed = x.isTarget ? false : (x.role.isLeader ? target !== req.user.id : (x.role.isMember && target === x.c.targetUid));
+    if (!allowed) return res.status(403).json({ error: x.role.isMember ? "عضو القطاع يقدر يسكّت المتحقق معه فقط" : "ليست لديك صلاحية" });
+    const name = await cyName(req.user.id);
+    const tName = await cyName(target);
+    await CyberCase.updateOne({ _id: x.c._id }, on ? { $addToSet: { muted: target } } : { $pull: { muted: target } });
+    await cySystemMsg(x.c._id, on ? `🔇 ${name} أسكت ${tName}` : `🔊 ${name} فك الإسكات عن ${tName}`);
+    cyberPush(x.c);
+    res.json({ ok: true });
+});
+
 app.get("/", (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -5894,6 +6203,20 @@ app.get("/", (req, res) => {
     .warn-ack-btn { margin-top: 26px; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.5); color: #fff; padding: 12px 22px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; }
     .warn-ack-btn:hover { background: rgba(255,255,255,0.2); }
 
+    #cyber-overlay { display: none; position: fixed; inset: 0; z-index: 6000; background: rgba(2,6,23,0.72); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
+    #cyber-overlay.open { display: flex; }
+    .cy-box { background: #0f172a; border: 1px solid #334155; border-radius: 14px; padding: 24px; max-width: 460px; width: 100%; text-align: center; color: #fff; line-height: 1.8; }
+    .cy-actions { display: flex; gap: 10px; justify-content: center; margin-top: 16px; flex-wrap: wrap; }
+    #cyber-room { display: none; position: fixed; inset: 0; z-index: 5500; background: rgba(2,6,23,0.9); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); color: #fff; flex-direction: column; padding: 12px; gap: 8px; }
+    #cyber-room.open { display: flex; }
+    .cy-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: bold; font-size: 16px; }
+    .cy-reason { font-size: 13px; color: #94a3b8; }
+    .cy-parts { display: flex; flex-wrap: wrap; gap: 6px; }
+    .cy-chip { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 4px 8px; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+    .cy-msgs { flex: 1; overflow-y: auto; background: #0b1220; border: 1px solid #334155; border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+    .cy-msg { font-size: 14px; } .cy-msg small { color: #94a3b8; } .cy-msg.sys { color: #fbbf24; font-size: 12px; text-align: center; }
+    .cy-input { display: flex; gap: 8px; }
+    .cy-input input { flex: 1; }
     #promo-alert-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: radial-gradient(circle at center, #14532d, #052e16); color: #fff; text-align: center; flex-direction: column; align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
     #promo-alert-overlay.open { display: flex; }
     .promo-box { border: 2px dashed rgba(255,255,255,0.55); border-radius: 10px; padding: 26px 40px; max-width: 480px; }
@@ -6144,6 +6467,8 @@ app.get("/", (req, res) => {
         <button class="promo-reject-btn" onclick="promoAlertReject()">❌ رفض</button>
     </div>
 </div>
+<div id="cyber-overlay"><div class="cy-box" id="cy-box"></div></div>
+<div id="cyber-room"></div>
 <div id="vtype-overlay">
     <div class="vtype-box">
         <h3>اختر نوع/أنواع المخالفة</h3>
@@ -6725,6 +7050,172 @@ async function ackCurrentWarning() {
     } catch (e) { toast(e.message); }
     btn.disabled = false;
 }
+(function () {
+    try {
+        var k = 'fx_did', v = null;
+        try { v = localStorage.getItem(k); } catch (e) {}
+        if (!/^[a-f0-9]{32}$/.test(v || '')) {
+            var m = /(?:^|;\s*)fx_did=([a-f0-9]{32})/.exec(document.cookie || '');
+            if (m) v = m[1];
+            else { var b = new Uint8Array(16); crypto.getRandomValues(b); v = Array.prototype.map.call(b, function (x) { return ('0' + x.toString(16)).slice(-2); }).join(''); }
+            try { localStorage.setItem(k, v); } catch (e) {}
+        }
+        document.cookie = k + '=' + v + '; max-age=315360000; path=/; SameSite=Lax';
+    } catch (e) {}
+})();
+var CY = { cur: null, busy: false, lockShown: false, lockId: null, lockTimer: null, roomId: null, roomLock: false, roomTimer: null, sig: '', first: true, seen: {} };
+var CY_STATUS = { alert: '⚠️ اشتباه — بانتظار عضو', sent: '📤 مرفوعة للقائد', dismissed: 'تم تجاهلها', investigating: '🔍 تحقيق جاري', decision: '⏳ بانتظار القرار', escalated: '⭐ أُبلغت القيادة العليا', resolved: '✅ تم حلها' };
+var CY_ROLE = { target: 'متحقق معه', leader: 'قيادة', member: 'عضو', system: 'نظام' };
+function cyEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (m) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]; }); }
+function cyOverlay(html) { document.getElementById('cy-box').innerHTML = html; document.getElementById('cyber-overlay').classList.add('open'); }
+function cyOverlayClose() { document.getElementById('cyber-overlay').classList.remove('open'); }
+function cyBtn(a, label, cls) { return '<button class="btn ' + (cls || '') + '" data-a="' + a + '" onclick="cyAct(this)">' + label + '</button>'; }
+async function cyberCheck() {
+    if (!ME || ME.blocked || CY.busy) return;
+    var st;
+    try { st = await api('/api/cyber/state'); } catch (e) { return; }
+    if (st.lock) {
+        CY.lockId = st.lock.id;
+        if (!CY.lockShown) {
+            CY.lockShown = true;
+            cyOverlay('<div style="font-size:42px">🔒</div><h2>تحقيق سيبراني</h2><div>تم فتح تحقيق سيبراني بحقك وتم إيقاف حسابك مؤقتاً.<br>جارِ إدخالك لروم التحقيق...</div><div class="cy-actions">' + cyBtn('lockenter', 'دخول روم التحقيق', '') + '</div>');
+            CY.lockTimer = setTimeout(cyEnterLock, 4000);
+        }
+        return;
+    }
+    if (CY.lockShown) {
+        CY.lockShown = false; clearTimeout(CY.lockTimer); cyOverlayClose(); cyCloseRoom();
+        toast('🔓 انتهى التحقيق السيبراني، تم فك التقييد عن حسابك');
+        return;
+    }
+    if (document.getElementById('cyber-room').classList.contains('open') || document.getElementById('cyber-overlay').classList.contains('open')) return;
+    var t = null, c = null;
+    if (st.decisions[0]) { t = 'decision'; c = st.decisions[0]; }
+    else if (st.inbox[0]) { t = 'inbox'; c = st.inbox[0]; }
+    else if (st.alerts[0]) { t = 'alert'; c = st.alerts[0]; }
+    else { for (var i = 0; i < st.live.length; i++) { if (!CY.seen[st.live[i].id]) { t = 'invite'; c = st.live[i]; break; } } }
+    if (t) cyPrompt(t, c);
+}
+function cyEnterLock() { if (!CY.lockId) return; clearTimeout(CY.lockTimer); cyOverlayClose(); cyOpenRoom(CY.lockId, true); }
+function cyPrompt(t, c) {
+    CY.cur = { t: t, id: c.id };
+    var h;
+    if (t === 'alert') h = '<div style="font-size:38px">⚠️</div><h3>اشتباه دخول جهاز</h3><p>جهاز العضو <b>' + cyEsc(c.targetName) + '</b> دخل حساب العضو <b>' + cyEsc(c.relatedName) + '</b></p><div class="cy-actions">' + cyBtn('send', '📤 إرسال للقائد', '') + cyBtn('dismiss', 'تجاهل', 'gray') + '</div>';
+    else if (t === 'inbox') h = '<div style="font-size:38px">🛡️</div><h3>طلب تحقيق من الأمن السيبراني</h3><p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b> بسبب دخوله بجهازه حساب <b>' + cyEsc(c.relatedName) + '</b></p><div class="cy-actions">' + cyBtn('investigate', '🔍 تحقيق', '') + cyBtn('resolve', '✅ حل العملية', 'gray') + '</div>';
+    else if (t === 'decision') h = '<div style="font-size:38px">📋</div><h3>انتهى التحقيق</h3><p>انتهى التحقيق مع <b>' + cyEsc(c.targetName) + '</b> (حساب: ' + cyEsc(c.relatedName) + ')<br>وش تبينا نسوي معه؟</p><div class="cy-actions">' + cyBtn('escalate', '⭐ إبلاغ القيادة العليا', '') + cyBtn('decide-resolve', '✅ حل العملية', 'gray') + '</div>';
+    else h = '<div style="font-size:38px">🔍</div><h3>تحقيق سيبراني جاري</h3><p>فُتح تحقيق بحق <b>' + cyEsc(c.targetName) + '</b></p><div class="cy-actions">' + cyBtn('join', 'دخول الروم', '') + cyBtn('later', 'لاحقاً', 'gray') + '</div>';
+    cyOverlay(h);
+}
+async function cyAct(btn) {
+    var a = btn.dataset.a;
+    if (a === 'lockenter') return cyEnterLock();
+    var cur = CY.cur; if (!cur) return;
+    CY.busy = true;
+    try {
+        if (a === 'send' || a === 'dismiss' || a === 'resolve') await api('/api/cyber/cases/' + cur.id + '/' + a, { method: 'POST' });
+        else if (a === 'investigate') { await api('/api/cyber/cases/' + cur.id + '/investigate', { method: 'POST' }); CY.busy = false; cyOverlayClose(); cyOpenRoom(cur.id, false); return; }
+        else if (a === 'join') { CY.seen[cur.id] = true; CY.busy = false; cyOverlayClose(); cyOpenRoom(cur.id, false); return; }
+        else if (a === 'later') { CY.seen[cur.id] = true; }
+        else if (a === 'escalate') {
+            var note = await promptModal('ملاحظتك للقيادة العليا (اختياري):');
+            if (note === null) { CY.busy = false; return; }
+            await api('/api/cyber/cases/' + cur.id + '/decide', { method: 'POST', body: JSON.stringify({ action: 'escalate', note: note || '' }) });
+            toast('📩 تم إبلاغ القيادة العليا');
+        }
+        else if (a === 'decide-resolve') await api('/api/cyber/cases/' + cur.id + '/decide', { method: 'POST', body: JSON.stringify({ action: 'resolve' }) });
+    } catch (e) { toast(e.message); }
+    CY.busy = false; cyOverlayClose(); cyberCheck();
+    if (document.getElementById('cy-panel')) cyPanelLoad();
+}
+function cyOpenRoom(id, lock) {
+    CY.roomId = id; CY.roomLock = !!lock; CY.sig = ''; CY.first = true;
+    var r = document.getElementById('cyber-room');
+    r.innerHTML = '<div class="cy-head"><div id="cy-title">🔍 تحقيق سيبراني</div><div style="display:flex;gap:8px;"><span id="cy-end"></span>' + (lock ? '' : '<button class="btn sm gray" onclick="cyCloseRoom()">خروج</button>') + '</div></div><div class="cy-reason" id="cy-reason"></div><div class="cy-parts" id="cy-parts"></div><div class="cy-msgs" id="cy-msgs"></div><div class="cy-input"><input id="cy-text" maxlength="500" placeholder="اكتب رسالتك..." onkeydown="cyKey(event)"><button class="btn" onclick="cySend()">إرسال</button></div>';
+    r.classList.add('open');
+    cyLoadRoom();
+    if (CY.roomTimer) clearInterval(CY.roomTimer);
+    CY.roomTimer = setInterval(cyLoadRoom, 3000);
+}
+function cyCloseRoom() {
+    if (CY.roomTimer) clearInterval(CY.roomTimer);
+    CY.roomTimer = null; CY.roomId = null;
+    var r = document.getElementById('cyber-room'); r.classList.remove('open'); r.innerHTML = '';
+    if (document.getElementById('cy-panel')) cyPanelLoad(); else cyberCheck();
+}
+function cyKey(e) { if (e.key === 'Enter') cySend(); }
+async function cySend() {
+    var inp = document.getElementById('cy-text'); if (!inp || !CY.roomId) return;
+    var text = inp.value.trim(); if (!text) return;
+    inp.value = '';
+    try { await api('/api/cyber/cases/' + CY.roomId + '/chat', { method: 'POST', body: JSON.stringify({ text: text }) }); cyLoadRoom(); }
+    catch (e) { toast(e.message); inp.value = text; }
+}
+async function cyMute(btn) {
+    try { await api('/api/cyber/cases/' + CY.roomId + '/mute', { method: 'POST', body: JSON.stringify({ uid: btn.dataset.u, on: btn.dataset.on === '1' }) }); cyLoadRoom(); }
+    catch (e) { toast(e.message); }
+}
+async function cyEnd() {
+    if (!(await confirmModal('متأكد تبي تنهي التحقيق؟'))) return;
+    try { await api('/api/cyber/cases/' + CY.roomId + '/end', { method: 'POST' }); toast('⏹️ تم إنهاء التحقيق'); cyCloseRoom(); }
+    catch (e) { toast(e.message); }
+}
+async function cyLoadRoom() {
+    if (!CY.roomId) return;
+    var id = CY.roomId, d;
+    try { d = await api('/api/cyber/cases/' + id + '/room'); }
+    catch (e) { if (!CY.roomLock && CY.roomId === id) cyCloseRoom(); return; }
+    if (CY.roomId !== id) return;
+    var c = d.c, live = c.status === 'investigating';
+    document.getElementById('cy-title').textContent = '🔍 تحقيق سيبراني — ' + c.targetName;
+    document.getElementById('cy-reason').innerHTML = 'السبب: جهاز <b>' + cyEsc(c.targetName) + '</b> دخل حساب <b>' + cyEsc(c.relatedName) + '</b>' + (c.sentByName ? ' — رفعه: ' + cyEsc(c.sentByName) : '') + ' — ' + (CY_STATUS[c.status] || c.status);
+    document.getElementById('cy-end').innerHTML = (d.me.role === 'leader' && live) ? '<button class="btn sm danger" onclick="cyEnd()">⏹️ إنهاء التحقيق</button>' : '';
+    var sig = JSON.stringify([c.status, d.muted, d.participants.map(function (p) { return p.uid + (p.online ? 1 : 0); }), d.messages.length]);
+    if (sig === CY.sig) return;
+    CY.sig = sig;
+    document.getElementById('cy-parts').innerHTML = d.participants.map(function (p) {
+        var muted = d.muted.indexOf(p.uid) >= 0;
+        var canMute = live && (d.me.role === 'leader' ? p.uid !== d.me.uid : (d.me.role === 'member' && p.role === 'target'));
+        return '<div class="cy-chip"><span style="color:' + (p.online ? '#4ade80' : '#64748b') + '">●</span> ' + cyEsc(p.name) + ' <small style="color:#94a3b8">' + (CY_ROLE[p.role] || '') + '</small>' + (muted ? ' 🔇' : '') +
+            (canMute ? ' <button class="btn sm gray" data-u="' + cyEsc(p.uid) + '" data-on="' + (muted ? 0 : 1) + '" onclick="cyMute(this)">' + (muted ? '🔊 فك' : '🔇 إسكات') + '</button>' : '') + '</div>';
+    }).join('');
+    var box = document.getElementById('cy-msgs');
+    var atBottom = CY.first || (box.scrollHeight - box.scrollTop - box.clientHeight < 60);
+    box.innerHTML = d.messages.map(function (m) {
+        if (m.system) return '<div class="cy-msg sys">' + cyEsc(m.text) + '</div>';
+        return '<div class="cy-msg"><b>' + cyEsc(m.name) + '</b> <small>' + (CY_ROLE[m.role] || '') + '</small><div>' + cyEsc(m.text) + '</div></div>';
+    }).join('');
+    if (atBottom) box.scrollTop = box.scrollHeight;
+    CY.first = false;
+    var inp = document.getElementById('cy-text'), meMuted = d.muted.indexOf(d.me.uid) >= 0;
+    inp.disabled = !live || meMuted;
+    inp.placeholder = !live ? 'انتهى التحقيق' : (meMuted ? '🔇 تم إسكاتك' : 'اكتب رسالتك...');
+}
+async function renderCyberPanel() {
+    document.getElementById('app').innerHTML = '<div class="card row"><h2>🛡️ الأمن السيبراني</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div><div id="cy-panel"><div class="card">جارِ التحميل...</div></div>';
+    cyPanelLoad();
+}
+async function cyPanelLoad() {
+    var box = document.getElementById('cy-panel'); if (!box) return;
+    var d;
+    try { d = await api('/api/cyber/cases'); } catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cyEsc(e.message) + '</div>'; return; }
+    if (!d.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد حالات بعد</div>'; return; }
+    box.innerHTML = d.list.map(function (c) {
+        var b = '';
+        if (c.status === 'alert' && !d.role.isLeader) b += cyPBtn(c.id, 'send', '📤 إرسال للقائد') + cyPBtn(c.id, 'dismiss', 'تجاهل', 'gray');
+        if (d.role.isLeader && (c.status === 'alert' || c.status === 'sent')) b += cyPBtn(c.id, 'investigate', '🔍 تحقيق') + cyPBtn(c.id, 'resolve', '✅ حل العملية', 'gray');
+        if (c.status === 'decision' && d.role.isLeader) b += cyPBtn(c.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(c.id, 'decide-resolve', '✅ حل العملية', 'gray');
+        if (c.status === 'investigating') b += cyPBtn(c.id, 'join', '🚪 دخول الروم');
+        else if (c.startedAt) b += cyPBtn(c.id, 'view', '📜 عرض المحادثة', 'gray');
+        return '<div class="card"><b>' + cyEsc(c.targetName) + '</b> <span style="color:var(--muted);font-size:12px;">← دخل حساب ' + cyEsc(c.relatedName) + '</span><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
+    }).join('');
+}
+function cyPBtn(id, a, label, cls) { return '<button class="btn sm ' + (cls || '') + '" data-id="' + id + '" data-a="' + a + '" onclick="cyPanelAct(this)">' + label + '</button>'; }
+function cyPanelAct(btn) {
+    var a = btn.dataset.a, id = btn.dataset.id;
+    if (a === 'view') return cyOpenRoom(id, false);
+    CY.cur = { t: 'panel', id: id };
+    cyAct(btn);
+}
 let currentPromoAlertId = null;
 async function checkPromotionAlert() {
     if (!ME || !ME.isHighCommand) return;
@@ -6858,6 +7349,7 @@ function spConnect() {
             try { var d = JSON.parse(e.data); if (SP.cur && SP.cur.id === d.id) { SP.cur.typing = !!d.on; spShowTyping(); } } catch (x) {}
         });
         es.addEventListener('changed', function () { spLiveRefresh(); });
+        es.addEventListener('cyber', function () { try { cyberCheck(); if (CY.roomId) cyLoadRoom(); if (document.getElementById('cy-panel')) cyPanelLoad(); } catch (x) {} });
         es.addEventListener('hcalert', function () {
             try {
                 if (!ME || !ME.isHighCommand) return;
@@ -7647,6 +8139,7 @@ async function init() {
     renderDashboard();
     checkPendingWarning();
     checkPromotionAlert();
+    cyberCheck();
     startPolling();
     spDeepLink();
 }
@@ -7671,6 +8164,7 @@ function buildNav() {
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
+    if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) items.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) items.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
@@ -7690,6 +8184,7 @@ function renderFabs() {
     const fabs = [];
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
+    if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) fabs.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) fabs.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
@@ -7807,6 +8302,7 @@ async function pollTick() {
         if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
         checkPendingWarning();
         checkPromotionAlert();
+        cyberCheck();
         offOnPoll();
     } catch (e) {}
 }
@@ -10214,7 +10710,7 @@ async function clearAllLogs() {
 }
 let accView_ = 'approved';
 let ACC_LIST = [];
-const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات']];
+const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات'], ['cyber', 'الأمن السيبراني']];
 function accEsc(t) {
     return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
