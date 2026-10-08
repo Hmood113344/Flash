@@ -4636,18 +4636,26 @@ function offGetCfg(n) {
     if (!c) { c = { mode: "listen", speakerUid: null }; offCfg.set(n, c); }
     return c;
 }
-function offState(n) {
+function offState(n, viewerUid) {
     const cfg = offGetCfg(n);
     const m = offLive.get(n) || new Map();
+    const viewerIsOwner = !!viewerUid && isOwnerUid(viewerUid);
+    const all = Array.from(m.values());
+    // المالك المتخفي: ما يظهر لغيره بالقائمة، لكن يبقى بـ ghosts (بدون اسم) عشان الصوت ما ينقطع
+    const isGhost = p => STEALTH_MODE && isOwnerUid(p.uid) && !viewerIsOwner;
     return {
         n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
-        participants: Array.from(m.values()).filter(p => !(STEALTH_MODE && isOwnerUid(p.uid))).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
+        participants: all.filter(p => !isGhost(p)).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, joinedAt: p.joinedAt })),
+        ghosts: all.filter(isGhost).map(p => ({ uid: p.uid, isSenior: p.isSenior, joinedAt: p.joinedAt })),
     };
 }
 function offPushState(n) {
-    const st = offState(n);
-    const uids = new Set(st.participants.map(p => p.uid));
-    sseBroadcast("vsig", { t: "state", state: st }, c => c.uid && uids.has(c.uid));
+    const m = offLive.get(n);
+    if (!m) return;
+    // كل واحد داخل الروم (حتى المالك المتخفي) ياخذ نسخته من الحالة
+    for (const uid of Array.from(m.keys())) {
+        offSendTo(uid, { t: "state", state: offState(n, uid) });
+    }
 }
 function offSendTo(uid, payload) {
     sseBroadcast("vsig", payload, c => c.uid === uid);
@@ -4885,7 +4893,7 @@ app.get("/api/officers/admin/rooms", ensureSeniorAdmin, async (req, res) => {
     const apps = await OfficerApp.find({ stage: "interview" }).lean();
     const out = [];
     for (const r of rooms) {
-        const st = offState(r.n);
+        const st = offState(r.n, req.user.id);
         const logs = await OfficerRoomLog.find({ n: r.n }).sort({ at: -1 }).limit(40).lean();
         const live = offLive.get(r.n) || new Map();
         out.push({
@@ -5197,7 +5205,7 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res) => {
     if (appDoc && !appDoc.interview.enteredAt) {
         await OfficerApp.updateOne({ _id: appDoc._id }, { $set: { "interview.enteredAt": new Date() } });
     }
-    res.json({ ok: true, state: offState(n), existing, iceServers: offIce() });
+    res.json({ ok: true, state: offState(n, uid), existing, iceServers: offIce() });
 });
 
 app.post("/api/officers/rooms/:n/leave", ensureAuth, async (req, res) => {
@@ -5210,7 +5218,7 @@ app.get("/api/officers/rooms/:n/state", ensureAuth, async (req, res) => {
     const n = offParseN(req.params.n);
     const m = n ? offLive.get(n) : null;
     if (!m || !m.has(req.user.id)) return res.status(404).json({ error: "أنت لست داخل الروم" });
-    res.json({ state: offState(n) });
+    res.json({ state: offState(n, req.user.id) });
 });
 
 app.post("/api/officers/rooms/:n/signal", ensureAuth, async (req, res) => {
@@ -10691,6 +10699,8 @@ function offRejectedHtml(a) {
 /* ---------------------------- الروم الصوتي (WebRTC) ---------------------------- */
 function offFindP(st, uid) {
     for (var i = 0; i < st.participants.length; i++) if (st.participants[i].uid === uid) return st.participants[i];
+    var g = st.ghosts || [];
+    for (var j = 0; j < g.length; j++) if (g[j].uid === uid) return g[j];
     return null;
 }
 /* هل from يقدر يسمعه to ؟ */
@@ -10712,7 +10722,7 @@ function offAllowed(st, from, to) {
 }
 function offCanSpeak() {
     if (!VC) return false;
-    return VC.state.participants.some(function (p) { return p.uid !== VC.me && offAllowed(VC.state, VC.me, p.uid); });
+    return VC.state.participants.concat(VC.state.ghosts || []).some(function (p) { return p.uid !== VC.me && offAllowed(VC.state, VC.me, p.uid); });
 }
 function offCanShare() {
     if (!VC) return false;
