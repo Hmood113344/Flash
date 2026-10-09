@@ -4800,6 +4800,12 @@ const OfficerRec = mongoose.model("OfficerRec", OfficerRecSchema);
 const OfficerRecChunkSchema = new mongoose.Schema({ sid: String, seq: Number, data: Buffer });
 OfficerRecChunkSchema.index({ sid: 1, seq: 1 });
 const OfficerRecChunk = mongoose.model("OfficerRecChunk", OfficerRecChunkSchema);
+const OfficerMsgSchema = new mongoose.Schema({
+    toUid: String, fromUid: String, fromName: String, fromRole: String, text: String,
+    at: { type: Date, default: Date.now },
+});
+OfficerMsgSchema.index({ toUid: 1, at: -1 });
+const OfficerMsg = mongoose.model("OfficerMsg", OfficerMsgSchema);
 const OfficerAnnSchema = new mongoose.Schema({
     test: { type: Boolean, default: false }, createdBy: String, createdByName: String,
     createdAt: { type: Date, default: Date.now },
@@ -5432,13 +5438,61 @@ app.post("/api/officers/admin/applications/:id/interview-result", ensureSeniorAd
 // ---------- الكبار: التدريب ----------
 app.get("/api/officers/admin/training", ensureTrainerOrSenior, async (req, res) => {
     const list = await OfficerApp.find({ stage: "training" }).sort({ createdAt: 1 }).lean();
+    let trainers = [];
+    if (isSeniorAdmin(req.user.id)) {
+        const st = await getSettings();
+        const ids = (st.officerTrainers || []).map(String);
+        const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, registeredName: 1 }).lean() : [];
+        trainers = ids.map(u => ({ uid: u, name: (ps.find(p => p.discord === u) || {}).registeredName || u }));
+    }
     res.json({
         ranks: OFFICER_RANKS,
         eligible: list.filter(a => !(a.training && a.training.registered)).map(a => ({ id: String(a._id), name: a.name })),
         trainees: list.filter(a => a.training && a.training.registered).map(a => ({
-            id: String(a._id), name: a.name, registeredAt: a.training.registeredAt, attendedAt: a.training.attendedAt,
+            id: String(a._id), uid: a.uid, name: a.name, registeredAt: a.training.registeredAt, attendedAt: a.training.attendedAt,
         })),
+        trainers,
     });
+});
+
+// رسائل المدرب/الكبار: للمتدربين (المدرب والكبار) وللمدربين (الكبار فقط)
+app.post("/api/officers/admin/message", ensureTrainerOrSenior, async (req, res) => {
+    const to = String((req.body && req.body.to) || "");
+    const text = String((req.body && req.body.text) || "").trim().slice(0, 500);
+    if (!text) return res.status(400).json({ error: "اكتب الرسالة" });
+    const senior = isSeniorAdmin(req.user.id);
+    const st = await getSettings();
+    const trainerIds = (st.officerTrainers || []).map(String);
+    let uids = [];
+    if (to === "trainees") {
+        uids = (await OfficerApp.find({ stage: "training", "training.registered": true }, { uid: 1 }).lean()).map(a => a.uid);
+    } else if (to.startsWith("trainee:")) {
+        const u = to.slice(8);
+        if (!(await OfficerApp.exists({ uid: u, stage: "training", "training.registered": true }))) return res.status(404).json({ error: "هذا المتدرب غير موجود" });
+        uids = [u];
+    } else if (senior && to === "trainers") {
+        uids = trainerIds.slice();
+    } else if (senior && to.startsWith("trainer:")) {
+        const u = to.slice(8);
+        if (!trainerIds.includes(u)) return res.status(404).json({ error: "هذا المدرب غير موجود" });
+        uids = [u];
+    } else {
+        return res.status(403).json({ error: "ما عندك صلاحية الإرسال لهذا الطرف" });
+    }
+    uids = uids.filter(u => u !== req.user.id);
+    if (!uids.length) return res.status(400).json({ error: "ما فيه أحد تنرسل له" });
+    const fromName = await cyName(req.user.id);
+    const fromRole = senior ? "الكبار" : "المدرب";
+    for (const u of uids) {
+        await OfficerMsg.create({ toUid: u, fromUid: req.user.id, fromName, fromRole, text });
+        await pushNoticeTo(u, `📩 رسالة من ${fromRole} (${fromName}):\n${text}`, req.user.id, fromName);
+    }
+    await logEvent({ action: "رسالة تدريب", actorId: req.user.id, actorTag: fromName + " (" + fromRole + ")", details: `${to} (${uids.length}): ${text}` });
+    res.json({ ok: true, count: uids.length });
+});
+app.get("/api/officers/my-messages", ensureAuth, async (req, res) => {
+    const list = await OfficerMsg.find({ toUid: req.user.id }).sort({ at: -1 }).limit(30).lean();
+    res.json({ list: list.map(m => ({ fromName: m.fromName, fromRole: m.fromRole, text: m.text, at: m.at })) });
 });
 
 app.post("/api/officers/admin/applications/:id/register-trainee", ensureTrainerOrSenior, async (req, res) => {
@@ -5761,6 +5815,11 @@ app.post("/api/officers/rooms/:n/chat", ensureAuth, (req, res) => {
     const me = m ? m.get(req.user.id) : null;
     if (!me) return res.status(404).json({ error: "أنت لست داخل الروم" });
     if (STEALTH_MODE && isOwnerUid(req.user.id)) return res.status(403).json({ error: "الشات معطل أثناء التخفي" });
+    if (!me.isSenior && !offIsTrain(n)) {
+        const ivm = offIv.get(n);
+        const ive = ivm ? ivm.get(req.user.id) : null;
+        if (ive && ive.cur !== null && ive.cur !== undefined) return res.status(403).json({ error: "الشات مقفل أثناء عرض السؤال" });
+    }
     if (!me.isSenior && offGetCfg(n).mode === "mute") return res.status(403).json({ error: "الشات مقفل حالياً" });
     const text = String((req.body || {}).text || "").trim().slice(0, 500);
     if (!text) return res.status(400).json({ error: "اكتب رسالة" });
@@ -6471,6 +6530,7 @@ app.get("/", (req, res) => {
     .ov-btn.leave { background: #ef4444; border-color: #ef4444; }
     #off-voice { padding-top: 66px; }
 #off-voice.cy { z-index: 5800; }
+#off-voice.qlock .ov-chat-btn { display: none; }
     #off-voice.frozen { overflow: hidden; }
     .ov-bar { flex-wrap: wrap; }
     .ov-btn.alert { border-color: #eab308; background: rgba(234,179,8,0.2); }
@@ -11829,6 +11889,8 @@ function offTrainingHtml(a) {
     h += '<li>جهّز مايكك وحسابك قبل التدريب ولا تضيع وقت الباقين.</li>';
     h += '<li>قرار القبول أو الرفض بعد التدريب من الكبار ونهائي.</li>';
     h += '</ul></div>';
+    h += '<div id="off-tmsgs">' + offMsgsHtml() + '</div>';
+    setTimeout(offLoadMsgs, 50);
     return h;
 }
 function offOfficerHtml(a) {
@@ -12331,6 +12393,9 @@ function offPaintStage() {
 function offPaintBar() {
     var box = document.getElementById('ov-bar');
     if (!box || !VC) return;
+    var ovx = document.getElementById('off-voice');
+    if (ovx) ovx.classList.toggle('qlock', offQLocked());
+    if (offQLocked()) { try { offChatClose(); } catch (e) {} }
     var canSpeak = offCanSpeak();
     var micCls = 'ov-btn' + (!canSpeak ? ' dis' : (VC.micOn ? '' : ' off'));
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
@@ -12444,7 +12509,13 @@ function offPaintIv() {
     if (VC.ivHtml !== h) { VC.ivHtml = h; box.innerHTML = h; }
     if (autoRep) setTimeout(function () { if (VC) offIvReportShow(); }, 60);
 }
-function offIvToggle() { if (!VC) return; VC.ivHidden = !VC.ivHidden; VC.ivHtml = ''; offPaintIv(); offPaintBar(); }
+function offIvToggle() {
+    if (!VC) return;
+    VC.ivHidden = !VC.ivHidden;
+    VC.ivHtml = null;
+    if (VC.ivHidden && VC.popup === 'rep') offPopClose();
+    offPaintIv(); offPaintBar();
+}
 /* ---- النوافذ المنبثقة داخل الروم + التقرير + أسئلة المتقدم ---- */
 function offPopOpen(html, kind) {
     if (!VC) return;
@@ -12500,6 +12571,7 @@ function offReportReopen() {
     if (!r) return;
     offPopOpen(offReportHtml(r.items, '') + '<button class="btn" style="margin-top:10px;width:100%;" onclick="offPopClose()">إغلاق</button>', 'myrep');
 }
+function offQLocked() { return !!(VC && !VC.isSenior && !VC.state.training && !VC.state.cyber && VC.state.myQ); }
 function offQNew() { return !!(VC && VC.state && VC.state.myQ && VC.state.myQ !== VC.qSeen); }
 function offQHtml() {
     var h = '<h3 style="color:var(--gold-soft);margin-bottom:10px;">❓ أسئلة المقابلة</h3>';
@@ -12556,6 +12628,7 @@ function offSheetInit() {
     hd.addEventListener('pointercancel', end);
 }
 function offChatOpen() {
+    if (offQLocked()) { toast('الشات مقفل أثناء عرض السؤال'); return; }
     var sh = document.getElementById('ov-sheet'), ov = document.getElementById('off-voice');
     if (!sh || !VC) return;
     sh.classList.add('open');
@@ -13216,7 +13289,7 @@ function offTrainRoomsHtml() {
         '<button class="btn" onclick="offJoinVoice(901)">🏋️ دخول روم التدريب</button></div>';
 }
 function offaTrainHtml(d) {
-    var h = offTrainRoomsHtml() + '<div class="card"><h3>➕ تسجيل متدرب</h3><p style="color:var(--muted);font-size:13px;">المقبولين من المقابلة فقط</p>';
+    var h = offTrainRoomsHtml() + offMsgCardHtml(d) + '<div class="card"><h3>➕ تسجيل متدرب</h3><p style="color:var(--muted);font-size:13px;">المقبولين من المقابلة فقط</p>';
     if (!d.eligible.length) h += '<div style="color:var(--muted);font-size:13px;">لا يوجد مقبولين بانتظار التسجيل</div>';
     d.eligible.forEach(function (a) {
         h += '<div class="log-item"><span>' + spEsc(a.name) + '</span><button class="btn sm" data-id="' + a.id + '" onclick="offaRegTrainee(this.dataset.id)">تسجيل متدرب</button></div>';
@@ -13232,6 +13305,45 @@ function offaTrainHtml(d) {
         h += '</div>';
     });
     return h + '</div>';
+}
+function offMsgCardHtml(d) {
+    var isS = !!(ME && ME.isSeniorAdmin);
+    var opts = '<option value="trainees">📢 كل المتدربين</option>';
+    (d.trainees || []).forEach(function (a) { if (a.uid) opts += '<option value="trainee:' + spEsc(a.uid) + '">متدرب: ' + spEsc(a.name) + '</option>'; });
+    if (isS) {
+        opts += '<option value="trainers">📢 كل المدربين</option>';
+        (d.trainers || []).forEach(function (t) { opts += '<option value="trainer:' + spEsc(t.uid) + '">مدرب: ' + spEsc(t.name) + '</option>'; });
+    }
+    return '<div class="card"><h3>📩 إرسال رسالة</h3><p style="color:var(--muted);font-size:13px;">تطلع للمستلم كنافذة منبثقة وتنحفظ عنده تحت.</p>' +
+        '<label>المستلم</label><select id="offmsg-to">' + opts + '</select>' +
+        '<label style="margin-top:8px;">الرسالة</label><textarea id="offmsg-text" maxlength="500" rows="3" placeholder="مثال: موعد تدريبك الساعة 9 مساءً"></textarea>' +
+        '<button class="btn" style="margin-top:8px;" onclick="offaSendMsg()">📤 إرسال</button></div>';
+}
+async function offaSendMsg() {
+    var to = document.getElementById('offmsg-to').value;
+    var tx = document.getElementById('offmsg-text').value.trim();
+    if (!tx) return toast('اكتب الرسالة');
+    try {
+        var r = await api('/api/officers/admin/message', { method: 'POST', body: JSON.stringify({ to: to, text: tx }) });
+        toast('📤 تم الإرسال (' + r.count + ')');
+        document.getElementById('offmsg-text').value = '';
+    } catch (e) { toast(e.message); }
+}
+function offMsgsHtml() {
+    var l = (OFF && OFF.msgs) || [];
+    if (!l.length) return '';
+    return '<div class="card"><h3>📩 رسائل المدرب</h3>' + l.map(function (m) {
+        return '<div class="log-item" style="display:block;"><b>' + spEsc(m.fromName) + '</b> <small style="color:var(--muted);">' + spEsc(m.fromRole || '') + ' • ' + spEsc(offFmt(m.at)) + '</small><div style="margin-top:4px;">' + spEsc(m.text) + '</div></div>';
+    }).join('') + '</div>';
+}
+function offLoadMsgs() {
+    if (Date.now() - (OFF.msgsAt || 0) < 8000) return;
+    OFF.msgsAt = Date.now();
+    api('/api/officers/my-messages').then(function (d) {
+        OFF.msgs = d.list || [];
+        var b = document.getElementById('off-tmsgs');
+        if (b) b.innerHTML = offMsgsHtml();
+    }).catch(function () {});
 }
 async function offaRegTrainee(id) {
     try { await api('/api/officers/admin/applications/' + id + '/register-trainee', { method: 'POST', body: '{}' }); toast('تم التسجيل'); offaReload(false); }
