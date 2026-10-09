@@ -370,7 +370,8 @@ const CyberCaseSchema = new mongoose.Schema({
     endedBy: String, endedByName: String, endedAt: Date,
     decisionBy: String, decisionByName: String, decisionAt: Date, decisionAction: String, decisionNote: String,
     muted: { type: [String], default: [] },
-    chat: [{ uid: String, name: String, role: String, text: String, system: { type: Boolean, default: false }, at: { type: Date, default: Date.now } }],
+    voiceN: { type: Number, default: null },
+    chat: [{ mid: Number, uid: String, name: String, role: String, text: String, system: { type: Boolean, default: false }, at: { type: Date, default: Date.now } }],
     createdAt: { type: Date, default: Date.now },
 });
 CyberCaseSchema.index({ pairKey: 1 }, { unique: true, partialFilterExpression: { pairKey: { $type: "string" } } });
@@ -1354,6 +1355,8 @@ app.use("/api", (req, res, next) => {
     if (!req.user || !underInvestigation.has(req.user.id)) return next();
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
     if (req.path.indexOf("/cyber/") === 0) return next();
+    const vr = /^\/officers\/rooms\/(\d+)\//.exec(req.path);
+    if (vr && offIsCyber(parseInt(vr[1], 10))) return next();
     return res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً", investigation: true });
 });
 async function isSupportAdmin(uid) {
@@ -4818,9 +4821,11 @@ const FlashUpdateAckSchema = new mongoose.Schema({ uid: String, uaId: String, at
 FlashUpdateAckSchema.index({ uid: 1, uaId: 1 }, { unique: true });
 const FlashUpdateAck = mongoose.model("FlashUpdateAck", FlashUpdateAckSchema);
 const OFF_ROOMS_MAX = 5;
-// ---------- المدربين + رومات التدريب (901-903) ----------
-const OFF_TRAIN_ROOMS = [901, 902, 903];
+// ---------- المدربين + روم التدريب (901 فقط) ----------
+const OFF_TRAIN_ROOMS = [901];
 function offIsTrain(n) { return OFF_TRAIN_ROOMS.includes(n); }
+// رومات التحقيق السيبراني الصوتية (500..899)
+function offIsCyber(n) { return Number.isInteger(n) && n >= 500 && n <= 899; }
 async function offIsTrainer(uid) {
     const st = await getSettings();
     return Array.isArray(st.officerTrainers) && st.officerTrainers.includes(String(uid));
@@ -4913,7 +4918,7 @@ function offState(n, viewerUid) {
     const ch = offChat.get(n);
     return {
         n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
-        chatSeq: ch ? ch.seq : 0, iv, myQ, myReport, training: offIsTrain(n),
+        chatSeq: ch ? ch.seq : 0, iv, myQ, myReport, training: offIsTrain(n), cyber: offIsCyber(n),
         participants: all.filter(p => !isGhost(p)).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
         ghosts: all.filter(isGhost).map(p => ({ uid: p.uid, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
     };
@@ -4951,7 +4956,7 @@ function offRemove(uid, n) {
     if (cfg.speakerUid === uid) cfg.speakerUid = null;
     const rr = offRecActive.get(n);
     if (rr && rr.uid === uid) offRecEnd(n, true);
-    OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, role: p.role, action: "leave" }).catch(() => {});
+    if (!offIsCyber(n)) OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, role: p.role, action: "leave" }).catch(() => {});
     offPushState(n);
 }
 function offRemoveEverywhere(uid) {
@@ -5326,7 +5331,7 @@ app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res)
                 cur = null;
             }
             if (l.action === "join") {
-                if (!cur) cur = { room: n, training: offIsTrain(n), start: t, end: null, live: false, stays: [] };
+                if (!cur) cur = { room: n, training: offIsTrain(n) || n === 902 || n === 903, start: t, end: null, live: false, stays: [] };
                 const prev = open.get(l.uid);
                 if (prev) { prev.lost = true; open.delete(l.uid); }
                 const st = { uid: l.uid, name: l.name, isSenior: !!l.isSenior, role: l.role || (l.isSenior ? "senior" : "applicant"), start: t, end: null, lost: false, ongoing: false };
@@ -5513,6 +5518,61 @@ app.delete("/api/officers/admin/trainers/:uid", ensureSeniorAdmin, async (req, r
     for (const n of OFF_TRAIN_ROOMS) { const m = offLive.get(n); const q = m ? m.get(uid) : null; if (q && q.role === "trainer") { offSendTo(uid, { t: "kicked", n }); offRemove(uid, n); } }
     await logEvent({ action: "إزالة مدرب سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: uid });
     res.json({ ok: true });
+});
+
+// ---------- روم التحقيق السيبراني الصوتي (يستخدم نفس محرك صوت المقابلة) ----------
+let cyMidSeq = 0;
+function cyMid() { return Date.now() * 10 + (cyMidSeq++ % 10); }
+app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res, next) => {
+    const n = offParseN(req.params.n);
+    if (!n || !offIsCyber(n)) return next();
+    const uid = req.user.id;
+    const cc = await CyberCase.findOne({ voiceN: n, status: "investigating" });
+    if (!cc) return res.status(404).json({ error: "التحقيق غير موجود أو منتهي" });
+    const rl = await cyberRoleOf(uid);
+    const isT = cc.targetUid === uid;
+    if (underInvestigation.has(uid) && !isT) return res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني" });
+    if (!isT && !rl.isMember && !rl.isLeader) return res.status(403).json({ error: "ليست لديك صلاحية دخول هذا الروم" });
+    const role = isT ? "target" : (rl.isLeader ? "leader" : "member");
+    const name = await cyName(uid);
+    for (const otherN of Array.from(offLive.keys())) { if (otherN !== n) offRemove(uid, otherN); }
+    let m = offLive.get(n);
+    if (!m) { m = new Map(); offLive.set(n, m); }
+    const existing = Array.from(m.keys()).filter(u => u !== uid);
+    m.set(uid, { uid, name, isSenior: false, role, muted: (cc.muted || []).includes(uid), joinedAt: Date.now() });
+    offPushState(n);
+    const chat = (cc.chat || []).filter(x => !x.system && x.mid).slice(-50).map(x => ({ id: x.mid, uid: x.uid, name: x.name, isSenior: x.role === "leader", text: x.text, at: new Date(x.at).getTime() }));
+    res.json({ ok: true, state: offState(n, uid), existing, iceServers: offIce(), ivQuestions: null, chat, caseId: String(cc._id) });
+});
+app.post("/api/officers/rooms/:n/chat", ensureAuth, async (req, res, next) => {
+    const n = offParseN(req.params.n);
+    if (!n || !offIsCyber(n)) return next();
+    const m = offLive.get(n);
+    const me = m ? m.get(req.user.id) : null;
+    if (!me) return res.status(404).json({ error: "أنت لست داخل الروم" });
+    if (me.muted) return res.status(403).json({ error: "🔇 تم إسكاتك في هذا التحقيق" });
+    const text = String((req.body || {}).text || "").trim().slice(0, 500);
+    if (!text) return res.status(400).json({ error: "اكتب رسالة" });
+    if (Date.now() - (me.lastChatAt || 0) < 800) return res.status(429).json({ error: "على رواقك شوي" });
+    me.lastChatAt = Date.now();
+    const cc = await CyberCase.findOne({ voiceN: n, status: "investigating" }, { targetUid: 1 });
+    if (!cc) return res.status(404).json({ error: "التحقيق منتهي" });
+    const mid = cyMid();
+    await CyberCase.updateOne({ _id: cc._id }, { $push: { chat: { $each: [{ uid: me.uid, name: me.name, role: me.role, text, mid }], $slice: -500 } } });
+    const msg = { id: mid, uid: me.uid, name: me.name, isSenior: me.role === "leader", text, at: Date.now() };
+    for (const u of Array.from(m.keys())) offSendTo(u, { t: "chat", n, msg });
+    cyberPush(cc);
+    res.json({ ok: true });
+});
+app.get("/api/officers/rooms/:n/chat", ensureAuth, async (req, res, next) => {
+    const n = offParseN(req.params.n);
+    if (!n || !offIsCyber(n)) return next();
+    const m = offLive.get(n);
+    if (!m || !m.has(req.user.id)) return res.status(404).json({ error: "أنت لست داخل الروم" });
+    const after = parseInt(req.query.after, 10) || 0;
+    const cc = await CyberCase.findOne({ voiceN: n }, { chat: 1 }).lean();
+    const list = ((cc && cc.chat) || []).filter(x => !x.system && x.mid && x.mid > after);
+    res.json({ msgs: list.map(x => ({ id: x.mid, uid: x.uid, name: x.name, isSenior: x.role === "leader", text: x.text, at: new Date(x.at).getTime() })), seq: list.length ? list[list.length - 1].mid : after });
 });
 
 // ---------- الروم الصوتي ----------
@@ -5836,6 +5896,13 @@ async function cySystemMsg(id, text) {
     await CyberCase.updateOne({ _id: id }, { $push: { chat: { $each: [{ uid: "system", name: "النظام", role: "system", text, system: true }], $slice: -500 } } });
 }
 const CY_LIST_FIELDS = { chat: 0 };
+function cyberVoiceClose(c) {
+    const n = c && c.voiceN;
+    if (!n) return;
+    const m = offLive.get(n);
+    if (m) for (const u of Array.from(m.keys())) { offSendTo(u, { t: "roomdeleted", n }); offRemove(u, n); }
+    offCfg.delete(n); offLive.delete(n); offChat.delete(n);
+}
 
 app.get("/api/cyber/state", ensureAuth, async (req, res) => {
     const uid = req.user.id;
@@ -5894,7 +5961,9 @@ app.post("/api/cyber/cases/:id/investigate", ensureAuth, async (req, res) => {
     const x = await cyAccess(req, res, true); if (!x) return;
     if (x.c.targetUid === req.user.id) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
     const name = await cyName(req.user.id);
-    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent"] } }, { $set: { status: "investigating", startedBy: req.user.id, startedByName: name, startedAt: new Date() } }, { new: true });
+    const usedN = new Set((await CyberCase.find({ status: "investigating", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
+    let vn = 500; while (usedN.has(vn) && vn < 899) vn++;
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent"] } }, { $set: { status: "investigating", voiceN: vn, startedBy: req.user.id, startedByName: name, startedAt: new Date() } }, { new: true });
     if (!c) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
     underInvestigation.add(c.targetUid);
     await cySystemMsg(c._id, `🔍 فتح ${name} تحقيقاً سيبرانياً بحق ${c.targetName} — السبب: دخل بجهازه حساب ${c.relatedName}`);
@@ -5908,6 +5977,7 @@ app.post("/api/cyber/cases/:id/end", ensureAuth, async (req, res) => {
     const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: "investigating" }, { $set: { status: "decision", endedBy: req.user.id, endedByName: name, endedAt: new Date() } }, { new: true });
     if (!c) return res.status(409).json({ error: "التحقيق منتهي مسبقاً" });
     underInvestigation.delete(c.targetUid);
+    cyberVoiceClose(c);
     await cySystemMsg(c._id, `⏹️ أنهى ${name} التحقيق`);
     await pushNoticeTo(c.targetUid, "🔓 انتهى التحقيق السيبراني وتم فك التقييد عن حسابك.", req.user.id, name);
     await logEvent({ action: "إنهاء تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `${c.targetName} — بانتظار قرار القيادة` });
@@ -5943,6 +6013,11 @@ app.post("/api/cyber/cases/:id/decide", ensureAuth, async (req, res) => {
     res.json({ ok: true });
 });
 
+app.post("/api/cyber/cases/:id/voice", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, false); if (!x) return;
+    if (x.c.status !== "investigating" || !x.c.voiceN) return res.status(400).json({ error: "التحقيق غير نشط" });
+    res.json({ ok: true, n: x.c.voiceN });
+});
 app.get("/api/cyber/cases/:id/room", ensureAuth, async (req, res) => {
     const x = await cyAccess(req, res, false); if (!x) return;
     const c = x.c;
@@ -5977,7 +6052,10 @@ app.post("/api/cyber/cases/:id/chat", ensureAuth, async (req, res) => {
     if (!text) return res.status(400).json({ error: "اكتب رسالة" });
     const role = x.isTarget ? "target" : (x.role.isLeader ? "leader" : "member");
     const name = await cyName(req.user.id);
-    await CyberCase.updateOne({ _id: x.c._id, status: "investigating" }, { $push: { chat: { $each: [{ uid: req.user.id, name, role, text }], $slice: -500 } } });
+    const mid = cyMid();
+    await CyberCase.updateOne({ _id: x.c._id, status: "investigating" }, { $push: { chat: { $each: [{ uid: req.user.id, name, role, text, mid }], $slice: -500 } } });
+    const vm = x.c.voiceN ? offLive.get(x.c.voiceN) : null;
+    if (vm) { const msg = { id: mid, uid: req.user.id, name, isSenior: role === "leader", text, at: Date.now() }; for (const u of Array.from(vm.keys())) offSendTo(u, { t: "chat", n: x.c.voiceN, msg }); }
     cyberPush(x.c);
     res.json({ ok: true });
 });
@@ -5992,6 +6070,8 @@ app.post("/api/cyber/cases/:id/mute", ensureAuth, async (req, res) => {
     const name = await cyName(req.user.id);
     const tName = await cyName(target);
     await CyberCase.updateOne({ _id: x.c._id }, on ? { $addToSet: { muted: target } } : { $pull: { muted: target } });
+    const vmm = x.c.voiceN ? offLive.get(x.c.voiceN) : null;
+    if (vmm && vmm.has(target)) { vmm.get(target).muted = on; offPushState(x.c.voiceN); }
     await cySystemMsg(x.c._id, on ? `🔇 ${name} أسكت ${tName}` : `🔊 ${name} فك الإسكات عن ${tName}`);
     cyberPush(x.c);
     res.json({ ok: true });
@@ -6390,6 +6470,7 @@ app.get("/", (req, res) => {
     .ov-btn.dis { opacity: 0.45; }
     .ov-btn.leave { background: #ef4444; border-color: #ef4444; }
     #off-voice { padding-top: 66px; }
+#off-voice.cy { z-index: 5800; }
     #off-voice.frozen { overflow: hidden; }
     .ov-bar { flex-wrap: wrap; }
     .ov-btn.alert { border-color: #eab308; background: rgba(234,179,8,0.2); }
@@ -7130,7 +7211,7 @@ async function cyAct(btn) {
 function cyOpenRoom(id, lock) {
     CY.roomId = id; CY.roomLock = !!lock; CY.sig = ''; CY.first = true;
     var r = document.getElementById('cyber-room');
-    r.innerHTML = '<div class="cy-head"><div id="cy-title">🔍 تحقيق سيبراني</div><div style="display:flex;gap:8px;"><span id="cy-end"></span>' + (lock ? '' : '<button class="btn sm gray" onclick="cyCloseRoom()">خروج</button>') + '</div></div><div class="cy-reason" id="cy-reason"></div><div class="cy-parts" id="cy-parts"></div><div class="cy-msgs" id="cy-msgs"></div><div class="cy-input"><input id="cy-text" maxlength="500" placeholder="اكتب رسالتك..." onkeydown="cyKey(event)"><button class="btn" onclick="cySend()">إرسال</button></div>';
+    r.innerHTML = '<div class="cy-head"><div id="cy-title">🔍 تحقيق سيبراني</div><div style="display:flex;gap:8px;"><button class="btn sm" onclick="cyJoinVoice()">🎙️ الصوت</button><span id="cy-end"></span>' + (lock ? '' : '<button class="btn sm gray" onclick="cyCloseRoom()">خروج</button>') + '</div></div><div class="cy-reason" id="cy-reason"></div><div class="cy-parts" id="cy-parts"></div><div class="cy-msgs" id="cy-msgs"></div><div class="cy-input"><input id="cy-text" maxlength="500" placeholder="اكتب رسالتك..." onkeydown="cyKey(event)"><button class="btn" onclick="cySend()">إرسال</button></div>';
     r.classList.add('open');
     cyLoadRoom();
     if (CY.roomTimer) clearInterval(CY.roomTimer);
@@ -7141,6 +7222,13 @@ function cyCloseRoom() {
     CY.roomTimer = null; CY.roomId = null;
     var r = document.getElementById('cyber-room'); r.classList.remove('open'); r.innerHTML = '';
     if (document.getElementById('cy-panel')) cyPanelLoad(); else cyberCheck();
+}
+async function cyJoinVoice() {
+    if (!CY.roomId) return;
+    try {
+        var d = await api('/api/cyber/cases/' + CY.roomId + '/voice', { method: 'POST' });
+        offJoinVoice(d.n);
+    } catch (e) { toast(e.message); }
 }
 function cyKey(e) { if (e.key === 'Enter') cySend(); }
 async function cySend() {
@@ -8331,25 +8419,36 @@ function authField(label, id, type, ph, dir) {
         '<input id="' + id + '" class="auth-input" type="' + type + '" placeholder="' + ph + '"' + (dir ? ' dir="' + dir + '"' : '') + ' autocomplete="off">' +
         '<span class="auth-req">* حقل إجباري</span></div>';
 }
-var SAVED_LOGIN_KEY = 'moi_saved_login';
+var SAVED_LOGIN_KEY = 'moi_saved_logins';
+var SAVED_LOGIN_OLD = 'moi_saved_login';
+var SAVED_MAX = 2;
 var SAVED_LOCK = null;
+function readSavedList() {
+    var list = [];
+    try {
+        var raw = localStorage.getItem(SAVED_LOGIN_KEY);
+        if (raw) { var v = JSON.parse(raw); if (Array.isArray(v)) list = v; }
+        else {
+            var old = JSON.parse(localStorage.getItem(SAVED_LOGIN_OLD) || 'null');
+            if (old && old.email && old.password) { list = [old]; localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify(list)); }
+        }
+        try { localStorage.removeItem(SAVED_LOGIN_OLD); } catch (e) {}
+    } catch (e) { list = []; }
+    return list.filter(function (x) { return x && x.email && x.password; }).slice(0, SAVED_MAX);
+}
+function writeSavedList(list) { try { localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify(list.slice(0, SAVED_MAX))); } catch (e) {} }
 function wipeSavedLogin(keepOwner) {
     try {
-        if (keepOwner) {
-            var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
-            if (v && v.owner === true) return;
-        }
-        localStorage.removeItem(SAVED_LOGIN_KEY);
+        var list = readSavedList();
+        writeSavedList(keepOwner ? list.filter(function (x) { return x.owner === true; }) : []);
     } catch (e) {}
 }
 function markOwnerSaved() {
     try {
         if (!ME || !ME.isOwner || !ME.accountEmail) return;
-        var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
-        if (v && v.email && String(v.email).toLowerCase() === String(ME.accountEmail).toLowerCase() && v.owner !== true) {
-            v.owner = true;
-            localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify(v));
-        }
+        var list = readSavedList(), ch = false;
+        list.forEach(function (x) { if (String(x.email).toLowerCase() === String(ME.accountEmail).toLowerCase() && x.owner !== true) { x.owner = true; ch = true; } });
+        if (ch) writeSavedList(list);
     } catch (e) {}
 }
 async function loadSavedLock() {
@@ -8362,73 +8461,100 @@ async function loadSavedLock() {
     SAVED_LOCK = !!(d && d.locked);
     if (SAVED_LOCK) wipeSavedLogin(true);
 }
-function getSavedLogin() {
-    if (SAVED_LOCK === null) return null;
-    try {
-        var v = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || 'null');
-        if (v && v.email && v.password) {
-            if (SAVED_LOCK === true && v.owner !== true) return null;
-            return v;
-        }
-    } catch (e) { }
-    return null;
+function getSavedLogins() {
+    if (SAVED_LOCK === null) return [];
+    return readSavedList().filter(function (x) { return !(SAVED_LOCK === true && x.owner !== true); });
 }
+function getSavedLogin() { var l = getSavedLogins(); return l.length ? l[0] : null; }
+function accPosition() {
+    var m = ME || {};
+    if (m.isOwner) return 'مالك الموقع';
+    if (m.isSeniorAdmin) return 'كبير مسؤولين';
+    if (m.isHighCommand) return 'القيادة العليا';
+    if (m.sectorInfo && m.sectorInfo.role === 'commander') return 'قائد ' + (m.sectorInfo.sectorLabel || 'القطاع');
+    if (m.sectorInfo && m.sectorInfo.role === 'deputy') return 'نائب قائد ' + (m.sectorInfo.sectorLabel || 'القطاع');
+    if (m.personnelOfficerInfo) return 'مسؤول أفراد ' + (m.personnelOfficerInfo.sectorLabel || '');
+    if (m.mpInfo) return (m.mpInfo.role === 'commander' ? 'قائد' : 'نائب قائد') + ' الشرطة العسكرية';
+    if (m.mpPersonnelOfficer) return 'مسؤول أفراد الشرطة العسكرية';
+    if (m.isViolationsOfficer) return 'مسؤول المخالفات';
+    if (m.isTrainer) return 'مدرب سلك الضباط';
+    if (m.isMilitaryPolice) return 'شرطة عسكرية';
+    return m.unit ? 'عضو ' + m.unit : 'عسكري';
+}
+function savedInfoFromMe() { return { name: (ME && (ME.registeredName || ME.discordTag)) || '', rank: (ME && ME.rank) || '', position: accPosition() }; }
 function setSavedLogin(email, password) {
-    try { localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify({ email: email, password: password, owner: !!(ME && ME.isOwner) })); } catch (e) { }
+    try {
+        var list = readSavedList(), low = String(email).toLowerCase(), info = savedInfoFromMe();
+        var entry = { email: email, password: password, owner: !!(ME && ME.isOwner), name: info.name, rank: info.rank, position: info.position };
+        var idx = -1;
+        list.forEach(function (x, i) { if (String(x.email).toLowerCase() === low) idx = i; });
+        if (idx >= 0) list[idx] = entry;
+        else { if (list.length >= SAVED_MAX) list.shift(); list.push(entry); }
+        writeSavedList(list);
+    } catch (e) { }
 }
-function renderSavedLogin(saved) {
+function refreshSavedInfo(email) {
+    try {
+        var list = readSavedList(), low = String(email).toLowerCase(), info = savedInfoFromMe(), ch = false;
+        list.forEach(function (x) { if (String(x.email).toLowerCase() === low) { x.name = info.name; x.rank = info.rank; x.position = info.position; ch = true; } });
+        if (ch) writeSavedList(list);
+    } catch (e) {}
+}
+function renderSavedLogin(list) {
+    var cards = list.map(function (s, i) {
+        return '<div class="card" style="margin-top:10px;text-align:center;">' +
+            '<div style="font-size:17px;font-weight:800;color:var(--gold-soft);">' + accEsc(s.name || s.email) + '</div>' +
+            '<div style="margin-top:6px;font-size:13px;">الرتبة: <b>' + accEsc(s.rank || '—') + '</b></div>' +
+            '<div style="margin-top:2px;font-size:13px;">المنصب: <b>' + accEsc(s.position || '—') + '</b></div>' +
+            '<button class="auth-btn" style="margin-top:12px;" data-i="' + i + '" onclick="doSavedLogin(this.dataset.i)">دخول بهذا الحساب</button>' +
+            '<a class="auth-link" style="display:block;margin-top:8px;font-size:12px;" data-i="' + i + '" onclick="removeSavedLogin(this.dataset.i)">إزالة من هذا الجهاز</a></div>';
+    }).join('');
     authShell(
         '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
         '<div class="auth-sub">Ministry of Interior Server</div>' +
         '<div id="auth-err" class="auth-err"></div>' +
-        '<label class="auth-label">تبي تدخل حسابك هذا؟</label>' +
-        '<div class="card" style="margin-top:8px;">' +
-            '<div style="font-size:12px;color:var(--muted);">البريد الإلكتروني</div>' +
-            '<div dir="ltr" style="text-align:left;font-weight:700;word-break:break-all;">' + accEsc(saved.email) + '</div>' +
-            '<div style="font-size:12px;color:var(--muted);margin-top:10px;">كلمة المرور</div>' +
-            '<div class="row"><div id="sv-pw" dir="ltr" style="font-weight:700;letter-spacing:2px;">••••••••</div>' +
-            '<button type="button" class="pw-eye" style="position:static;" id="sv-eye" onclick="toggleSavedPw()">👁</button></div>' +
-        '</div>' +
-        '<button class="auth-btn" id="lg-btn" onclick="doSavedLogin()">دخول بهذا الحساب</button>' +
+        '<label class="auth-label">اختر الحساب اللي تبي تدخله :</label>' + cards +
         '<div class="auth-sep"></div>' +
-        '<a class="auth-link" onclick="renderLogin(true)">الدخول بحساب ثاني</a>'
+        '<button class="auth-btn" style="background:#334155;" onclick="renderLogin(true)">➕ دخول بحساب ثاني</button>'
     );
 }
-function toggleSavedPw() {
-    var saved = getSavedLogin();
-    var box = document.getElementById('sv-pw');
-    var eye = document.getElementById('sv-eye');
-    if (!saved || !box) return;
-    var hidden = box.textContent.indexOf('•') === 0;
-    box.textContent = hidden ? saved.password : '••••••••';
-    box.style.letterSpacing = hidden ? '0' : '2px';
-    eye.textContent = hidden ? '🙈' : '👁';
+function removeSavedLogin(i) {
+    var s = getSavedLogins()[parseInt(i, 10) || 0];
+    if (!s) return;
+    var all = readSavedList().filter(function (x) { return String(x.email).toLowerCase() !== String(s.email).toLowerCase(); });
+    writeSavedList(all);
+    renderLogin();
 }
-async function doSavedLogin() {
-    var saved = getSavedLogin();
+async function doSavedLogin(i) {
+    var saved = getSavedLogins()[parseInt(i, 10) || 0];
     if (!saved) return renderLogin(true);
     authErr('');
     try {
         await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: saved.email, password: saved.password }) });
         await init();
+        refreshSavedInfo(saved.email);
         if (SAVED_LOCK === true && !(ME && ME.isOwner)) wipeSavedLogin();
-    } catch (e) { authErr(e.message + ' — لو غيّرت كلمة المرور اضغط "الدخول بحساب ثاني" وسجّل من جديد'); }
+    } catch (e) { authErr(e.message + ' — لو غيّرت كلمة المرور اضغط "دخول بحساب ثاني" وسجّل من جديد'); }
 }
 async function offerSaveLogin(email, pw) {
     try {
         if (SAVED_LOCK === null) return;
         if (SAVED_LOCK === true && !(ME && ME.isOwner)) return;
         if (ME && ME.seniorTemp) return;
-        var cur = getSavedLogin();
-        if (cur && cur.email.toLowerCase() === email.toLowerCase() && cur.password === pw) return;
-        var yes = await _fmOpen('هل تريد حفظ بيانات الدخول (البريد وكلمة المرور) في هذا الجهاز؟ بالمرة الجاية يسألك تبي تدخل حسابك هذا مباشرة.', { isPrompt: false, okText: 'نعم، احفظ' });
+        var list = readSavedList(), low = String(email).toLowerCase(), cur = null;
+        list.forEach(function (x) { if (String(x.email).toLowerCase() === low) cur = x; });
+        if (cur && cur.password === pw) { refreshSavedInfo(email); return; }
+        var msg = (!cur && list.length >= SAVED_MAX)
+            ? 'عندك حسابين محفوظين بهذا الجهاز. تبي نستبدل أقدم حساب محفوظ بهذا الحساب؟'
+            : 'هل تريد حفظ بيانات الدخول في هذا الجهاز؟ بالمرة الجاية يطلع لك حسابك باسمك ورتبتك ومنصبك وتدخل بضغطة وحدة، وتقدر تحفظ حسابين.';
+        var yes = await _fmOpen(msg, { isPrompt: false, okText: 'نعم، احفظ' });
         if (yes) { setSavedLogin(email, pw); toast('✅ تم حفظ الحساب بالجهاز'); }
     } catch (e) { }
 }
 function renderLogin(forceForm) {
     if (!forceForm) {
-        var saved = getSavedLogin();
-        if (saved) { renderSavedLogin(saved); return; }
+        var savedList = getSavedLogins();
+        if (savedList.length) { renderSavedLogin(savedList); return; }
     }
     authShell(
         '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
@@ -11694,6 +11820,7 @@ function offTrainingHtml(a) {
     if (!t.registered) h += '<div class="off-res">⏳ بانتظار الكبار يسجلونك متدرب.</div>';
     else if (!t.attended) h += '<div class="off-res">📝 تم تسجيلك متدرب، انتظر موعد التدريب من الكبار.</div>';
     else h += '<div class="off-res">✅ تم تسجيل حضورك للتدريب، بانتظار قرار الكبار النهائي.</div>';
+    if (t.registered) h += '<button class="btn" style="margin-top:12px;width:100%;" onclick="offJoinVoice(901)">🎙️ دخول روم التدريب الصوتي</button>';
     h += '<h3 style="margin-top:16px;">⚠️ تعليمات التدريب (صارمة)</h3><ul class="off-rules strict">';
     h += '<li>لازم تدخل بدري قبل موعد التدريب، والتأخير يعرضك للرفض.</li>';
     h += '<li>لازم تكون حاضر وموجود طول التدريب، ممنوع الغياب أو الانسحاب.</li>';
@@ -11726,7 +11853,7 @@ function offAllowed(st, from, to) {
     if (from === to) return false;
     var f = offFindP(st, from), t = offFindP(st, to);
     if (!f || !t) return false;
-    if (st.training) return !f.muted;
+    if (st.training || st.cyber) return !f.muted;
     if (f.isSenior && t.isSenior) return true;
     var sp = st.speakerUid, mode = st.mode;
     if (mode === 'mute') return false;
@@ -11785,11 +11912,12 @@ async function offJoinVoice(n) {
         state: j.state, ice: j.iceServers, peers: {}, q: {}, earlyIce: {}, shareFlags: {}, speaking: {},
         sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0,
         ivQ: j.ivQuestions || [], chat: [], chatSeq: 0, chatBusy: false, ivTarget: null, profiles: {}, profBusy: {}, profOpen: false, ansOpen: false, ivHtml: '',
-        training: !!(j.state && j.state.training), qSeen: '', repSeen: 0, repShown: {}, ivHidden: false, chatUnread: 0, popup: null
+        training: !!(j.state && j.state.training), cyber: !!(j.state && j.state.cyber), caseId: j.caseId || null, qSeen: '', repSeen: 0, repShown: {}, ivHidden: true, chatUnread: 0, popup: null
     };
     var ov = document.createElement('div');
     ov.id = 'off-voice';
-    ov.innerHTML = '<div class="ov-head"><b>' + (VC.training ? '🏋️ تدريب رقم ' + (n - 900) : '🎙️ مقابلة رقم ' + n) + '</b><span style="font-size:12px;color:var(--muted);">' + offRoleLabel(myRole) + '</span></div>' +
+    if (VC.cyber) ov.className = 'cy';
+    ov.innerHTML = '<div class="ov-head"><b>' + (VC.cyber ? '🔍 تحقيق سيبراني — روم صوتي' : (VC.training ? '🏋️ روم التدريب' : '🎙️ مقابلة رقم ' + n)) + '</b><span style="font-size:12px;color:var(--muted);">' + offRoleLabel(myRole) + '</span></div>' +
         '<div id="ov-modes" class="ov-modes"></div><div id="ov-note" class="ov-note"></div>' +
         '<div id="ov-iv"></div>' +
         '<div id="ov-stage" class="ov-stage"></div><div id="ov-grid" class="ov-grid"></div>' +
@@ -12025,7 +12153,7 @@ function offOnVsig(d) {
     if (!VC || !d) return;
     if (d.t === 'state') offApplyState(d.state);
     else if (d.t === 'kicked' && d.n === VC.n) { toast('🚫 تم طردك من الروم'); offLeaveVoice(true); }
-    else if (d.t === 'roomdeleted' && d.n === VC.n) { toast('🗑️ تم حذف هذا الروم'); offLeaveVoice(true); }
+    else if (d.t === 'roomdeleted' && d.n === VC.n) { toast(VC.state && VC.state.cyber ? '⏹️ انتهى التحقيق السيبراني' : '🗑️ تم حذف هذا الروم'); offLeaveVoice(true); }
     else if (d.t === 'chat' && d.n === VC.n) offChatAdd(d.msg);
     else if (d.t === 'signal' && d.n === VC.n) offQueue(d.from, function () { return offOnSignal(d.from, d.data); });
 }
@@ -12111,6 +12239,11 @@ function offPaintModes() {
 function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
+    if (VC.state.cyber) {
+        var cme = offFindP(VC.state, VC.me);
+        box.textContent = (cme && cme.muted) ? '🔇 تم إسكاتك في التحقيق — تسمع الباقي فقط.' : '🔍 روم تحقيق سيبراني — الكل يتكلم. القيادة تسكّت أي أحد، وأعضاء القطاع يسكّتون المتحقق معه فقط.';
+        return;
+    }
     if (VC.state.training) {
         var tme = offFindP(VC.state, VC.me), trole = tme ? tme.role : '';
         if (trole === 'senior') box.textContent = 'روم تدريب — الكل مكتوم إلا المدرب. تقدر تسكت أو تفتح مايك أي أحد (حتى المدرب).';
@@ -12147,6 +12280,11 @@ function offPaintGrid() {
                 } else if (myR === 'trainer' && p.role === 'trainee' && !p.muted) {
                     h += '<button class="btn sm danger" data-u="' + p.uid + '" data-m="1" onclick="offTrainMute(this.dataset.u, this.dataset.m)">🔇 إسكات</button>';
                 }
+            }
+        } else if (st.cyber) {
+            var cr = offMyRole();
+            if (!isMe && cr !== 'target' && (cr === 'leader' || (cr === 'member' && p.role === 'target'))) {
+                h += '<button class="btn sm' + (p.muted ? '' : ' danger') + '" data-u="' + p.uid + '" data-m="' + (p.muted ? '0' : '1') + '" onclick="offCyMute(this.dataset.u, this.dataset.m)">' + (p.muted ? '🎙️ فك الإسكات' : '🔇 إسكات') + '</button>';
             }
         } else if (VC.isSenior && !p.isSenior) {
             h += '<button class="btn sm' + (sel ? ' danger' : '') + '" data-u="' + p.uid + '" onclick="offSetSpeaker(this.dataset.u)">' + (sel ? '🔇 إسكات' : '🎙️ فتح المايك') + '</button>';
@@ -12197,7 +12335,7 @@ function offPaintBar() {
     var micCls = 'ov-btn' + (!canSpeak ? ' dis' : (VC.micOn ? '' : ' off'));
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
     var qb = '';
-    if (!VC.isSenior && !VC.state.training) qb = '<button class="ov-btn' + (offQNew() ? ' alert' : '') + '" onclick="offQOpen()">❓ أسئلة المقابلة' + (offQNew() ? ' 🔴' : '') + '</button>';
+    if (VC.isSenior && !VC.state.training && !VC.state.cyber) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
 }
@@ -12253,12 +12391,19 @@ function offPaintIv() {
     var box = document.getElementById('ov-iv');
     if (!box || !VC) return;
     var st = VC.state, h = '';
-    if (st.training) { box.innerHTML = ''; return; }
-    if (!VC.isSenior) { box.innerHTML = ''; offQRefresh(); offReportCheck(); return; }
+    if (st.training || st.cyber) { box.innerHTML = ''; return; }
+    if (!VC.isSenior) {
+        var ah = '';
+        if (st.myQ) ah += '<div class="ov-card"><div class="ov-hrow"><b>❓ السؤال</b></div><div class="ov-myq"><div class="ov-myq-t">' + spEsc(st.myQ) + '</div></div></div>';
+        if (st.myReport) ah += '<div class="ov-card"><button class="btn gold sm" onclick="offReportReopen()">📄 عرض تقريري</button></div>';
+        if (VC.ivHtml !== ah) { VC.ivHtml = ah; box.innerHTML = ah; }
+        offReportCheck();
+        return;
+    }
     var t = offIvTarget();
     var autoRep = false;
     if (VC.ivHidden) {
-        h = '<div class="ov-card"><div class="ov-hrow"><b>🎯 لوحة المقابلة (مخفية)</b><button class="btn gold sm" onclick="offIvToggle()">👁️ إظهار الأسئلة</button></div></div>';
+        h = '';
     } else {
         h = '<div class="ov-card"><div class="ov-hrow"><b>🎯 لوحة المقابلة</b><button class="btn gray sm" onclick="offIvToggle()">🙈 إخفاء الأسئلة</button></div>';
         if (!t) h += '<div class="ov-note">ما فيه متقدم داخل الروم حالياً.</div>';
@@ -12299,7 +12444,7 @@ function offPaintIv() {
     if (VC.ivHtml !== h) { VC.ivHtml = h; box.innerHTML = h; }
     if (autoRep) setTimeout(function () { if (VC) offIvReportShow(); }, 60);
 }
-function offIvToggle() { if (!VC) return; VC.ivHidden = !VC.ivHidden; VC.ivHtml = ''; offPaintIv(); }
+function offIvToggle() { if (!VC) return; VC.ivHidden = !VC.ivHidden; VC.ivHtml = ''; offPaintIv(); offPaintBar(); }
 /* ---- النوافذ المنبثقة داخل الروم + التقرير + أسئلة المتقدم ---- */
 function offPopOpen(html, kind) {
     if (!VC) return;
@@ -12381,7 +12526,11 @@ function offQRefresh() {
 }
 /* ---- روم التدريب ---- */
 function offMyRole() { var p = VC ? offFindP(VC.state, VC.me) : null; return p ? p.role : ''; }
-function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : 'متقدم')); }
+function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : (r === 'leader' ? '🛡️ قيادة السيبراني' : (r === 'member' ? '🛡️ عضو سيبراني' : (r === 'target' ? '⚠️ متحقق معه' : 'متقدم'))))); }
+function offCyMute(uid, m) {
+    if (!VC || !VC.caseId) return;
+    api('/api/cyber/cases/' + VC.caseId + '/mute', { method: 'POST', body: JSON.stringify({ uid: uid, on: String(m) === '1' }) }).catch(function (e) { toast(e.message); });
+}
 function offTrainMute(uid, m) {
     if (!VC) return;
     offPost('/api/officers/rooms/' + VC.n + '/mute', { uid: uid, muted: String(m) === '1' }).catch(function (e) { toast(e.message); });
@@ -13063,10 +13212,8 @@ async function offaInterviewResult(id, ok) {
     } catch (e) { toast(e.message); }
 }
 function offTrainRoomsHtml() {
-    return '<div class="card"><h3>🎙️ روم التدريب الصوتي</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">أول ما يدخلون الكل مكتوم ويسمعون المدرب فقط. المدرب يسكت المتدربين، والكبار يتحكمون بالكل (حتى المدرب).</p>' +
-        '<div style="display:flex;gap:8px;flex-wrap:wrap;">' + [1, 2, 3].map(function (i) {
-            return '<button class="btn sm" data-n="' + (900 + i) + '" onclick="offJoinVoice(parseInt(this.dataset.n, 10))">🏋️ دخول روم تدريب ' + i + '</button>';
-        }).join('') + '</div></div>';
+    return '<div class="card"><h3>🎙️ روم التدريب الصوتي</h3><p style="color:var(--muted);font-size:13px;line-height:1.8;">روم واحد للتدريب. المتدربين يدخلون مكتومين ويسمعون المدرب فقط. المدرب يسكّت المتدربين، والكبار يتحكمون بالكل (حتى المدرب). 🔴 الصوت يتسجل تلقائياً أول ما يدخل متدرب مع مدرب أو كبير، وتلقى التسجيل في سجل المقابلات.</p>' +
+        '<button class="btn" onclick="offJoinVoice(901)">🏋️ دخول روم التدريب</button></div>';
 }
 function offaTrainHtml(d) {
     var h = offTrainRoomsHtml() + '<div class="card"><h3>➕ تسجيل متدرب</h3><p style="color:var(--muted);font-size:13px;">المقبولين من المقابلة فقط</p>';
