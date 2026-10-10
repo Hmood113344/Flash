@@ -7514,18 +7514,29 @@ let pollTimer = null;
 let blockedPollTimer = null;
 
 let __lastClickedBtn = null;
+let __lastClickedAt = 0;
 document.addEventListener('click', function (e) {
     const b = e.target.closest('button, .tab, [onclick]');
-    if (b) __lastClickedBtn = b;
+    if (b) { __lastClickedBtn = b; __lastClickedAt = Date.now(); }
 }, true);
 
 async function api(url, opts) {
     const noLock = !!(opts && opts.noLock);
     if (noLock) { opts = Object.assign({}, opts); delete opts.noLock; }
-    const btn = noLock ? null : __lastClickedBtn;
+    // القفل يصير فقط للطلبات اللي تعدّل (POST/PUT/DELETE...) وفقط إذا جت مباشرة بعد ضغطة زر.
+    // طلبات القراءة (GET) والتحديث التلقائي (polling) ما تقفل أي زر أبداً.
+    const method = String((opts && opts.method) || 'GET').toUpperCase();
+    let btn = null;
+    if (!noLock && method !== 'GET' && __lastClickedBtn && (Date.now() - __lastClickedAt) < 3000 && document.body.contains(__lastClickedBtn)) {
+        btn = __lastClickedBtn;
+        __lastClickedBtn = null; // استهلكنا الضغطة، ما أحد ثاني يقفل نفس الزر
+    }
     if (btn) {
-        if (btn.dataset.busy === '1') throw new Error('لحظة، طلبك السابق لسا قيد التنفيذ');
+        const since = parseInt(btn.dataset.busyAt || '0', 10);
+        // لو القفل عالق أكثر من 20 ثانية نتجاهله (حماية من التعليق)
+        if (btn.dataset.busy === '1' && since && (Date.now() - since) < 20000) throw new Error('لحظة، طلبك السابق لسا قيد التنفيذ');
         btn.dataset.busy = '1';
+        btn.dataset.busyAt = String(Date.now());
         btn.dataset.prevOpacity = btn.style.opacity || '';
         btn.disabled = true;
         btn.style.opacity = '0.55';
@@ -7534,11 +7545,12 @@ async function api(url, opts) {
     try {
         const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
         const data = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(data.error || 'خطأ');
+        if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; throw err; }
         return data;
     } finally {
         if (btn) {
             btn.dataset.busy = '0';
+            btn.dataset.busyAt = '';
             btn.disabled = false;
             btn.style.opacity = btn.dataset.prevOpacity || '';
             btn.style.cursor = '';
@@ -8100,7 +8112,11 @@ async function cyLoadRoom() {
     if (!CY.roomId) return;
     var id = CY.roomId, d;
     try { d = await api('/api/cyber/cases/' + id + '/room'); }
-    catch (e) { if (!CY.roomLock && CY.roomId === id) cyCloseRoom(); return; }
+    catch (e) {
+        // نطلع من الروم فقط إذا فعلاً ما عاد لك صلاحية/انحذف التحقيق (403/404)، أي خطأ مؤقت (نت/سيرفر) نتجاهله ونعيد المحاولة
+        if (!CY.roomLock && CY.roomId === id && (e.status === 403 || e.status === 404)) { toast(e.message); cyCloseRoom(); }
+        return;
+    }
     if (CY.roomId !== id) return;
     var c = d.c, live = c.status === 'investigating';
     CY.roomTarget = c.targetUid;
