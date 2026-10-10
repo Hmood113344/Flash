@@ -5955,6 +5955,9 @@ async function cyberAudience(c) {
     cyAudCache.set(key, { t: Date.now(), set });
     return set;
 }
+function cyberReloadTarget(uid) {
+    try { if (uid) sseBroadcast("cyreload", { t: Date.now() }, cl => cl.uid === uid); } catch (e) {}
+}
 async function cyberPush(c) {
     try {
         const set = await cyberAudience(c);
@@ -6065,6 +6068,7 @@ app.post("/api/cyber/cases/:id/investigate", ensureAuth, async (req, res) => {
     if (c.flagId) CyberFlag.updateOne({ _id: c.flagId, status: "open" }, { $set: { status: "investigated", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }).catch(() => {});
     await logEvent({ action: "بدء تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: c.kind === "manual" ? `${c.targetName} — ${c.reason || ""}` : `جهاز ${c.targetName} دخل حساب ${c.relatedName}` });
     cyberPush(c);
+    cyberReloadTarget(c.targetUid);
     res.json({ ok: true, id: String(c._id), mode });
 });
 app.post("/api/cyber/cases/:id/end", ensureAuth, async (req, res) => {
@@ -6792,6 +6796,7 @@ app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
         if (flagId) CyberFlag.updateOne({ _id: flagId, status: "open" }, { $set: { status: "investigated", handledBy: uid, handledByName: name, handledAt: new Date() } }).catch(() => {});
         await logEvent({ action: "بدء تحقيق سيبراني", discordId: targetUid, actorId: uid, actorTag: name + " (قيادة الأمن السيبراني)", details: `${targetName} — ${reason}` });
         cyberPush(c);
+        cyberReloadTarget(c.targetUid);
         res.json({ ok: true, started: true, id: String(c._id), mode });
     } catch (e) { res.status(500).json({ error: "تعذر فتح التحقيق" }); }
 });
@@ -7520,20 +7525,48 @@ document.addEventListener('click', function (e) {
     if (b) { __lastClickedBtn = b; __lastClickedAt = Date.now(); }
 }, true);
 
+const __inflight = new Map();
+function __cloneData(d) { try { return structuredClone(d); } catch (e) { try { return JSON.parse(JSON.stringify(d)); } catch (e2) { return d; } } }
+async function __rawFetch(url, opts, timeoutMs) {
+    let ctrl = null, timer = null;
+    if (timeoutMs && typeof AbortController !== 'undefined') {
+        ctrl = new AbortController();
+        timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, timeoutMs);
+    }
+    try {
+        const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts, ctrl ? { signal: ctrl.signal } : {}));
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; throw err; }
+        return data;
+    } catch (e) {
+        if (e && e.name === 'AbortError') { const err = new Error('انتهت مهلة الاتصال، حاول مرة ثانية'); err.status = 0; throw err; }
+        throw e;
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
 async function api(url, opts) {
     const noLock = !!(opts && opts.noLock);
     if (noLock) { opts = Object.assign({}, opts); delete opts.noLock; }
-    // القفل يصير فقط للطلبات اللي تعدّل (POST/PUT/DELETE...) وفقط إذا جت مباشرة بعد ضغطة زر.
-    // طلبات القراءة (GET) والتحديث التلقائي (polling) ما تقفل أي زر أبداً.
     const method = String((opts && opts.method) || 'GET').toUpperCase();
+
+    // طلبات القراءة: ما تقفل أي زر، ولو نفس الطلب شغال حالياً نشاركه بدل ما نكرره (يمنع تراكم الطلبات على السيرفر)
+    if (method === 'GET' && !(opts && opts.body)) {
+        const hit = __inflight.get(url);
+        if (hit) return hit.then(__cloneData);
+        const p = __rawFetch(url, opts, 25000).finally(function () { __inflight.delete(url); });
+        __inflight.set(url, p);
+        return p;
+    }
+
+    // طلبات التعديل: نقفل الزر اللي انضغط للتو فقط (خلال 3 ثواني من الضغطة)
     let btn = null;
-    if (!noLock && method !== 'GET' && __lastClickedBtn && (Date.now() - __lastClickedAt) < 3000 && document.body.contains(__lastClickedBtn)) {
+    if (!noLock && __lastClickedBtn && (Date.now() - __lastClickedAt) < 3000 && document.body.contains(__lastClickedBtn)) {
         btn = __lastClickedBtn;
-        __lastClickedBtn = null; // استهلكنا الضغطة، ما أحد ثاني يقفل نفس الزر
+        __lastClickedBtn = null;
     }
     if (btn) {
         const since = parseInt(btn.dataset.busyAt || '0', 10);
-        // لو القفل عالق أكثر من 20 ثانية نتجاهله (حماية من التعليق)
         if (btn.dataset.busy === '1' && since && (Date.now() - since) < 20000) throw new Error('لحظة، طلبك السابق لسا قيد التنفيذ');
         btn.dataset.busy = '1';
         btn.dataset.busyAt = String(Date.now());
@@ -7543,10 +7576,7 @@ async function api(url, opts) {
         btn.style.cursor = 'wait';
     }
     try {
-        const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; throw err; }
-        return data;
+        return await __rawFetch(url, opts, 0);
     } finally {
         if (btn) {
             btn.dataset.busy = '0';
@@ -8109,6 +8139,13 @@ async function cyEnd() {
     catch (e) { toast(e.message); }
 }
 async function cyLoadRoom() {
+    if (CY.roomBusy) { CY.roomAgain = true; return; }
+    CY.roomBusy = true;
+    try { await cyLoadRoomInner(); } catch (e) {}
+    CY.roomBusy = false;
+    if (CY.roomAgain) { CY.roomAgain = false; setTimeout(cyLoadRoom, 50); }
+}
+async function cyLoadRoomInner() {
     if (!CY.roomId) return;
     var id = CY.roomId, d;
     try { d = await api('/api/cyber/cases/' + id + '/room'); }
@@ -8574,6 +8611,15 @@ function spConnect() {
         });
         es.addEventListener('changed', function () { spLiveRefresh(); });
         es.addEventListener('cyber', function () { try { cyberCheck(); if (CY.roomId) cyLoadRoom(); if (document.getElementById('cy-panel')) cyPanelLoad(); } catch (x) {} });
+        es.addEventListener('cyreload', function () {
+            try {
+                if (CY.roomId) return;
+                var last = 0; try { last = parseInt(sessionStorage.getItem('cyReloadAt') || '0', 10); } catch (x) {}
+                if (Date.now() - last < 20000) { cyberCheck(); return; }
+                try { sessionStorage.setItem('cyReloadAt', String(Date.now())); } catch (x) {}
+                location.reload();
+            } catch (x) {}
+        });
         es.addEventListener('hcalert', function () {
             try {
                 if (!ME || !ME.isHighCommand) return;
@@ -9490,8 +9536,14 @@ function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
 }
+let __pollRunning = false;
+document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { try { pollTick(); } catch (e) {} }
+});
 async function pollTick() {
     if (!ME || ME.blocked) return;
+    if (__pollRunning || document.hidden) return;
+    __pollRunning = true;
     try {
         const fresh = await api('/api/me');
         if (fresh.blocked) {
@@ -9529,6 +9581,7 @@ async function pollTick() {
         cyberCheck();
         offOnPoll();
     } catch (e) {}
+    finally { __pollRunning = false; }
 }
 function startBlockedRecheck() {
     if (blockedPollTimer) clearInterval(blockedPollTimer);
