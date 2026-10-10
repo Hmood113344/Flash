@@ -370,6 +370,14 @@ const CyberCaseSchema = new mongoose.Schema({
     endedBy: String, endedByName: String, endedAt: Date,
     decisionBy: String, decisionByName: String, decisionAt: Date, decisionAction: String, decisionNote: String,
     muted: { type: [String], default: [] },
+    kind: { type: String, default: "device" },
+    reason: { type: String, default: null },
+    evidence: { type: String, default: null },
+    evidenceVio: { type: String, default: null },
+    flagId: { type: String, default: null },
+    mode: { type: String, default: "voice" },
+    kicked: { type: [String], default: [] },
+    shown: { type: mongoose.Schema.Types.Mixed, default: null },
     voiceN: { type: Number, default: null },
     chat: [{ mid: Number, uid: String, name: String, role: String, text: String, system: { type: Boolean, default: false }, at: { type: Date, default: Date.now } }],
     createdAt: { type: Date, default: Date.now },
@@ -377,6 +385,23 @@ const CyberCaseSchema = new mongoose.Schema({
 CyberCaseSchema.index({ pairKey: 1 }, { unique: true, partialFilterExpression: { pairKey: { $type: "string" } } });
 CyberCaseSchema.index({ status: 1, createdAt: -1 });
 const CyberCase = mongoose.model("CyberCase", CyberCaseSchema);
+const cyShownMap = new Map();
+
+const CyberFlagSchema = new mongoose.Schema({
+    key: { type: String, unique: true },
+    kind: { type: String, default: "dup" },
+    status: { type: String, default: "open" },
+    targetUid: String, targetName: String,
+    title: String, details: String,
+    count: { type: Number, default: 2 },
+    violationIds: { type: [String], default: [] },
+    approvedBy: { type: [String], default: [] },
+    firstAt: Date, lastAt: Date,
+    handledBy: String, handledByName: String, handledAt: Date,
+    createdAt: { type: Date, default: Date.now },
+});
+CyberFlagSchema.index({ status: 1, lastAt: -1 });
+const CyberFlag = mongoose.model("CyberFlag", CyberFlagSchema);
 
 async function loadInvestigations() {
     try {
@@ -4924,7 +4949,7 @@ function offState(n, viewerUid) {
     const ch = offChat.get(n);
     return {
         n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
-        chatSeq: ch ? ch.seq : 0, iv, myQ, myReport, training: offIsTrain(n), cyber: offIsCyber(n),
+        chatSeq: ch ? ch.seq : 0, iv, myQ, myReport, training: offIsTrain(n), cyber: offIsCyber(n), cyShow: offIsCyber(n) ? (cyShownMap.get(n) || null) : null,
         participants: all.filter(p => !isGhost(p)).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
         ghosts: all.filter(isGhost).map(p => ({ uid: p.uid, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
     };
@@ -5587,6 +5612,8 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res, next) => {
     const isT = cc.targetUid === uid;
     if (underInvestigation.has(uid) && !isT) return res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني" });
     if (!isT && !rl.isMember && !rl.isLeader) return res.status(403).json({ error: "ليست لديك صلاحية دخول هذا الروم" });
+    if (!isT && (cc.kicked || []).includes(uid)) return res.status(403).json({ error: "🚫 تم طردك من هذا التحقيق" });
+    if (cc.shown && !cyShownMap.has(n)) cyShownMap.set(n, cc.shown);
     const role = isT ? "target" : (rl.isLeader ? "leader" : "member");
     const name = await cyName(uid);
     for (const otherN of Array.from(offLive.keys())) { if (otherN !== n) offRemove(uid, otherN); }
@@ -5935,7 +5962,9 @@ async function cyberPush(c) {
 }
 function cyPublic(c) {
     return {
-        id: String(c._id), status: c.status, targetUid: c.targetUid, targetName: c.targetName, relatedName: c.relatedName,
+        id: String(c._id), status: c.status, kind: c.kind || "device", mode: c.mode || "voice",
+        reason: c.reason || null, evidence: c.evidence || null, evidencePhoto: !!c.evidenceVio,
+        targetUid: c.targetUid, targetName: c.targetName, relatedName: c.relatedName || null,
         sentByName: c.sentByName || null, startedByName: c.startedByName || null, decisionAction: c.decisionAction || null,
         createdAt: c.createdAt, startedAt: c.startedAt || null, endedAt: c.endedAt || null,
     };
@@ -5947,6 +5976,7 @@ async function cyAccess(req, res, needLeader) {
     const role = await cyberRoleOf(req.user.id);
     const isTarget = c.targetUid === req.user.id;
     if (underInvestigation.has(req.user.id) && !isTarget) { res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني" }); return null; }
+    if (!isTarget && (c.kicked || []).includes(req.user.id)) { res.status(403).json({ error: "🚫 تم طردك من هذا التحقيق" }); return null; }
     if (needLeader && (!role.isLeader || isTarget)) { res.status(403).json({ error: "هذا الإجراء لقائد ونائب الأمن السيبراني فقط" }); return null; }
     if (!role.isLeader && !role.isMember && !(isTarget && c.status === "investigating")) { res.status(403).json({ error: "ليست لديك صلاحية" }); return null; }
     return { c, role, isTarget };
@@ -5960,7 +5990,7 @@ function cyberVoiceClose(c) {
     if (!n) return;
     const m = offLive.get(n);
     if (m) for (const u of Array.from(m.keys())) { offSendTo(u, { t: "roomdeleted", n }); offRemove(u, n); }
-    offCfg.delete(n); offLive.delete(n); offChat.delete(n);
+    offCfg.delete(n); offLive.delete(n); offChat.delete(n); cyShownMap.delete(n);
 }
 
 app.get("/api/cyber/state", ensureAuth, async (req, res) => {
@@ -6012,23 +6042,29 @@ app.post("/api/cyber/cases/:id/resolve", ensureAuth, async (req, res) => {
     const name = await cyName(req.user.id);
     const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent", "decision"] } }, { $set: { status: "resolved", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }, { new: true });
     if (!c) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
-    await logEvent({ action: "حل عملية سيبرانية", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `جهاز ${c.targetName} / حساب ${c.relatedName}` });
+    await logEvent({ action: "حل عملية سيبرانية", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: c.kind === "manual" ? `${c.targetName} — ${c.reason || ""}` : `جهاز ${c.targetName} / حساب ${c.relatedName}` });
     cyberPush(c);
     res.json({ ok: true });
 });
 app.post("/api/cyber/cases/:id/investigate", ensureAuth, async (req, res) => {
     const x = await cyAccess(req, res, true); if (!x) return;
     if (x.c.targetUid === req.user.id) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
+    const mode = (req.body && req.body.mode) === "text" ? "text" : "voice";
     const name = await cyName(req.user.id);
-    const usedN = new Set((await CyberCase.find({ status: "investigating", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
-    let vn = 500; while (usedN.has(vn) && vn < 899) vn++;
-    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent"] } }, { $set: { status: "investigating", voiceN: vn, startedBy: req.user.id, startedByName: name, startedAt: new Date() } }, { new: true });
+    let vn = null;
+    if (mode === "voice") {
+        const usedN = new Set((await CyberCase.find({ status: "investigating", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
+        vn = 500; while (usedN.has(vn) && vn < 899) vn++;
+    }
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent"] } }, { $set: { status: "investigating", mode, voiceN: vn, startedBy: req.user.id, startedByName: name, startedAt: new Date() } }, { new: true });
     if (!c) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
     underInvestigation.add(c.targetUid);
-    await cySystemMsg(c._id, `🔍 فتح ${name} تحقيقاً سيبرانياً بحق ${c.targetName} — السبب: دخل بجهازه حساب ${c.relatedName}`);
-    await logEvent({ action: "بدء تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `جهاز ${c.targetName} دخل حساب ${c.relatedName}` });
+    const why = c.kind === "manual" ? ("السبب: " + (c.reason || "-")) : ("السبب: دخل بجهازه حساب " + c.relatedName);
+    await cySystemMsg(c._id, `🔍 فتح ${name} تحقيقاً سيبرانياً (${mode === "text" ? "كتابي" : "صوتي"}) بحق ${c.targetName} — ${why}`);
+    if (c.flagId) CyberFlag.updateOne({ _id: c.flagId, status: "open" }, { $set: { status: "investigated", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }).catch(() => {});
+    await logEvent({ action: "بدء تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: c.kind === "manual" ? `${c.targetName} — ${c.reason || ""}` : `جهاز ${c.targetName} دخل حساب ${c.relatedName}` });
     cyberPush(c);
-    res.json({ ok: true, id: String(c._id) });
+    res.json({ ok: true, id: String(c._id), mode });
 });
 app.post("/api/cyber/cases/:id/end", ensureAuth, async (req, res) => {
     const x = await cyAccess(req, res, true); if (!x) return;
@@ -6055,12 +6091,12 @@ app.post("/api/cyber/cases/:id/decide", ensureAuth, async (req, res) => {
         const settings = await getSettings();
         const full = await CyberCase.findById(c._id, { chat: 1 }).lean();
         const msgs = ((full && full.chat) || []).filter(m => !m.system).length;
-        const text = `🔍 تقرير تحقيق سيبراني\nالعضو: ${c.targetName}\nالسبب: دخل بجهازه حساب ${c.relatedName}\nرفعه: ${c.sentByName || "-"} • قاد التحقيق: ${c.startedByName || "-"}\nعدد رسائل التحقيق: ${msgs}${note ? "\nملاحظة القيادة: " + note : ""}\nأُبلغتم بقرار من ${name}.`;
+        const text = `🔍 تقرير تحقيق سيبراني\nالعضو: ${c.targetName}\nالسبب: ${c.kind === "manual" ? c.reason : "دخل بجهازه حساب " + c.relatedName}\nرفعه: ${c.sentByName || "-"} • قاد التحقيق: ${c.startedByName || "-"}\nعدد رسائل التحقيق: ${msgs}${note ? "\nملاحظة القيادة: " + note : ""}\nأُبلغتم بقرار من ${name}.`;
         for (const m of (settings.highCommand || [])) await pushNoticeTo(m.id, text, req.user.id, name);
         if (botReady) {
             const embed = new EmbedBuilder().setTitle("🔍 تقرير تحقيق سيبراني").setColor(0xef4444).addFields(
                 { name: "العضو", value: c.targetName || "-", inline: true },
-                { name: "الحساب المدخول", value: c.relatedName || "-", inline: true },
+                { name: c.kind === "manual" ? "السبب" : "الحساب المدخول", value: (c.kind === "manual" ? c.reason : c.relatedName) || "-", inline: true },
                 { name: "قاد التحقيق", value: c.startedByName || "-", inline: true },
                 { name: "ملاحظة القيادة", value: note || "-", inline: false },
             ).setTimestamp(new Date());
@@ -6099,7 +6135,7 @@ app.get("/api/cyber/cases/:id/room", ensureAuth, async (req, res) => {
     const participants = uids.map(u => ({ uid: u, name: names.get(u) || u, role: roleOf.get(u), online: online.has(u) })).sort((a, b) => order[a.role] - order[b.role]);
     const meRole = x.isTarget ? "target" : (x.role.isLeader ? "leader" : "member");
     res.json({
-        c: cyPublic(c), me: { uid: req.user.id, role: meRole }, participants, muted: c.muted || [],
+        c: Object.assign(cyPublic(c), { shown: c.shown || null }), me: { uid: req.user.id, role: meRole }, participants, muted: c.muted || [], kicked: c.kicked || [],
         messages: (c.chat || []).slice(-200).map(m => ({ uid: m.uid, name: m.name, role: m.role, text: m.text, system: !!m.system, at: m.at })),
     });
 });
@@ -6134,6 +6170,364 @@ app.post("/api/cyber/cases/:id/mute", ensureAuth, async (req, res) => {
     await cySystemMsg(x.c._id, on ? `🔇 ${name} أسكت ${tName}` : `🔊 ${name} فك الإسكات عن ${tName}`);
     cyberPush(x.c);
     res.json({ ok: true });
+});
+
+const CY_DAY = 86400000;
+const CY_ST_LABEL = { pending: "معلّقة", approved: "مقبولة", rejected: "مرفوضة" };
+async function cyGuard(req, res) {
+    const uid = req.user.id;
+    if (underInvestigation.has(uid)) { res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني" }); return null; }
+    const role = await cyberRoleOf(uid);
+    if (!role.isMember && !role.isLeader) { res.status(403).json({ error: "هذا القسم لقطاع الأمن السيبراني فقط" }); return null; }
+    return role;
+}
+function cyIsProtected(uid, acc) {
+    return !!(isSeniorAdmin(uid) || isOwnerUid(uid) || (acc && (acc.isSenior || acc.isOwner || acc.tempSenior)));
+}
+function cyVioLine(v) {
+    const parts = [];
+    if (v.violationType) parts.push(v.violationType);
+    if (v.kind === "report" && v.suspectName) parts.push("المشتبه: " + v.suspectName);
+    if (v.vehicle) parts.push(v.vehicle);
+    if (v.plateNumber) parts.push(v.plateNumber);
+    parts.push(CY_ST_LABEL[v.status] || v.status || "");
+    return parts.filter(Boolean).join(" — ");
+}
+async function cyMemberInfo(accs) {
+    const uids = accs.map(a => a.uid);
+    const pers = await Personnel.aggregate([
+        { $match: { discord: { $in: uids } } },
+        { $project: { discord: 1, discordTag: 1, registeredName: 1, unit: 1, rank: 1, points: 1, sector: 1, isBlocked: 1, isDismissed: 1, leaveBalance: 1, cardNumber: 1, notesCount: { $size: { $ifNull: ["$notes", []] } }, warningsCount: { $size: { $ifNull: ["$warnings", []] } } } },
+    ]).option({ maxTimeMS: 10000 });
+    const pmap = new Map(pers.map(p => [p.discord, p]));
+    const logins = await DeviceSession.aggregate([
+        { $match: { uid: { $in: uids } } },
+        { $group: { _id: "$uid", last: { $max: "$loginAt" } } },
+    ]).option({ maxTimeMS: 10000 });
+    const lmap = new Map(logins.map(l => [l._id, l.last]));
+    const online = new Set();
+    for (const cl of sseClients) if (cl.uid) online.add(cl.uid);
+    return accs.map(a => {
+        const p = pmap.get(a.uid) || {};
+        const sec = a.sector || p.sector || null;
+        return {
+            uid: a.uid,
+            name: p.registeredName || a.fullName || a.uid,
+            age: a.age || null,
+            nationality: a.nationality || null,
+            rank: p.rank || null,
+            unit: p.unit || null,
+            points: typeof p.points === "number" ? p.points : null,
+            sectorLabel: sec ? (CONFIG.SECTORS[sec] || sec) : null,
+            cardNumber: p.cardNumber || null,
+            discordTag: p.discordTag || null,
+            joinedAt: a.createdAt || null,
+            lastLogin: lmap.get(a.uid) || null,
+            warnings: p.warningsCount || 0,
+            notes: p.notesCount || 0,
+            leaveBalance: typeof p.leaveBalance === "number" ? p.leaveBalance : null,
+            blocked: !!(p.isBlocked || p.isDismissed),
+            online: online.has(a.uid),
+            investigated: underInvestigation.has(a.uid),
+            isSenior: cyIsProtected(a.uid, a),
+        };
+    });
+}
+async function cyOpsOf(uid) {
+    const since = new Date(Date.now() - 7 * CY_DAY);
+    const logs = await Log.find({ actorId: uid, createdAt: { $gte: since } }).sort({ createdAt: -1 }).limit(60).maxTimeMS(8000).lean();
+    const vios = await Violation.aggregate([
+        { $match: { reporterDiscord: uid, createdAt: { $gte: since } } },
+        { $sort: { createdAt: -1 } },
+        { $limit: 40 },
+        { $project: { kind: 1, violationType: 1, vehicle: 1, plateNumber: 1, status: 1, suspectName: 1, createdAt: 1, hasPhoto: { $gt: [{ $strLenCP: { $ifNull: ["$photo", ""] } }, 0] } } },
+    ]).option({ maxTimeMS: 10000 });
+    const out = [];
+    logs.forEach(l => out.push({ id: "log:" + l._id, kind: "log", title: l.action, details: l.details || "", at: l.createdAt }));
+    vios.forEach(v => out.push({ id: "vio:" + v._id, kind: "vio", title: v.kind === "report" ? "تقديم بلاغ" : "تقديم مخالفة", details: cyVioLine(v), at: v.createdAt, hasPhoto: !!v.hasPhoto }));
+    out.sort((a, b) => new Date(b.at) - new Date(a.at));
+    return out.slice(0, 80);
+}
+async function cyResolveOp(ref, targetUid) {
+    const m = /^(log|vio):([a-f0-9]{24})$/.exec(String(ref || ""));
+    if (!m) return null;
+    if (m[1] === "log") {
+        const l = await Log.findById(m[2]).lean();
+        if (!l || l.actorId !== targetUid) return null;
+        const lines = [];
+        if (l.details) lines.push(l.details);
+        if (l.discordTag || l.discordId) lines.push("الشخص: " + (l.discordTag || l.discordId));
+        return { ref, title: l.action, lines, opAt: l.createdAt, hasPhoto: false };
+    }
+    const v = await Violation.findById(m[2]).lean();
+    if (!v || v.reporterDiscord !== targetUid) return null;
+    const lines = [];
+    if (v.violationType) lines.push("النوع: " + v.violationType);
+    if (v.kind === "report" && v.suspectName) lines.push("المشتبه: " + v.suspectName);
+    if (v.vehicle) lines.push("المركبة: " + v.vehicle);
+    if (v.plateNumber) lines.push("اللوحة: " + v.plateNumber);
+    lines.push("الحالة: " + (CY_ST_LABEL[v.status] || v.status || "-"));
+    if (v.reviewedByTag) lines.push("راجعها: " + v.reviewedByTag);
+    return { ref, title: v.kind === "report" ? "بلاغ" : "مخالفة", lines, opAt: v.createdAt, hasPhoto: !!v.photo };
+}
+
+let cyScanAt = 0;
+let cyScanBusy = false;
+async function cyScanFlags(force) {
+    if (cyScanBusy) return;
+    if (!force && Date.now() - cyScanAt < 45000) return;
+    cyScanBusy = true;
+    try {
+        const since = new Date(Date.now() - 14 * CY_DAY);
+        const groups = await Violation.aggregate([
+            { $match: { createdAt: { $gte: since } } },
+            { $project: {
+                reporterDiscord: 1, reporterName: 1, violationType: 1, vehicle: 1, plateNumber: 1, suspectName: 1, kind: 1, status: 1, reviewedByTag: 1, createdAt: 1,
+                sig: { $cond: [
+                    { $gt: [{ $strLenCP: { $ifNull: ["$photo", ""] } }, 0] },
+                    { $concat: [{ $toString: { $strLenCP: "$photo" } }, ":", { $substrCP: ["$photo", 3000, 240] }] },
+                    "nophoto",
+                ] },
+            } },
+            { $group: {
+                _id: { r: "$reporterDiscord", k: "$kind", t: "$violationType", v: "$vehicle", p: "$plateNumber", s: "$suspectName", sig: "$sig" },
+                count: { $sum: 1 },
+                ids: { $push: { $toString: "$_id" } },
+                name: { $first: "$reporterName" },
+                first: { $min: "$createdAt" },
+                last: { $max: "$createdAt" },
+                reviewers: { $push: { $cond: [{ $eq: ["$status", "approved"] }, "$reviewedByTag", null] } },
+            } },
+            { $match: { count: { $gte: 2 }, "_id.sig": { $ne: "nophoto" } } },
+            { $limit: 200 },
+        ]).allowDiskUse(true).option({ maxTimeMS: 20000 });
+        for (const g of groups) {
+            const key = "dup:" + crypto.createHash("sha1").update(JSON.stringify(g._id)).digest("hex");
+            const approved = Array.from(new Set((g.reviewers || []).filter(Boolean)));
+            const label = g._id.k === "report" ? "بلاغ" : "مخالفة";
+            const bits = [];
+            if (g._id.t) bits.push(g._id.t);
+            if (g._id.v) bits.push(g._id.v);
+            if (g._id.p) bits.push(g._id.p);
+            const details = `قدّم ${label} ${g.count} مرات بنفس المعلومات والصورة` + (bits.length ? " — " + bits.join(" • ") : "") + (approved.length ? " — قبلها: " + approved.join("، ") : "");
+            await CyberFlag.updateOne({ key }, {
+                $setOnInsert: { key, kind: "dup", status: "open", targetUid: g._id.r, createdAt: new Date() },
+                $set: { targetName: g.name || g._id.r, title: "تكرار " + label + " بنفس المعلومات والصورة", details, count: g.count, violationIds: (g.ids || []).slice(0, 20), approvedBy: approved, firstAt: g.first, lastAt: g.last },
+            }, { upsert: true });
+        }
+        cyScanAt = Date.now();
+    } catch (e) { console.error("❌ cyScanFlags:", e.message); }
+    finally { cyScanBusy = false; }
+}
+
+app.get("/api/cyber/members", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        const accs = (await Account.find(
+            { status: "approved", isSenior: { $ne: true }, isOwner: { $ne: true }, tempSenior: { $ne: true } },
+            { uid: 1, fullName: 1, age: 1, nationality: 1, sector: 1, createdAt: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }
+        ).sort({ createdAt: 1 }).limit(800).maxTimeMS(10000).lean()).filter(a => !isSeniorAdmin(a.uid) && !isOwnerUid(a.uid));
+        const list = await cyMemberInfo(accs);
+        list.forEach(m => { m.me = m.uid === req.user.id; });
+        res.json({ list });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل الأعضاء" }); }
+});
+
+app.get("/api/cyber/sector", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        if (!role.isLeader) return res.status(403).json({ error: "هذا القسم للقيادة فقط" });
+        const settings = await getSettings();
+        const sl = (settings.sectorLeadership || {}).cyber || {};
+        const order = [];
+        const roleOf = new Map();
+        const add = (u, r) => { if (u && !roleOf.has(u)) { roleOf.set(u, r); order.push(u); } };
+        add(sl.commanderId, "commander");
+        add(sl.deputyId, "deputy");
+        add(sl.personnelOfficerId, "officer");
+        (await Account.find({ status: "approved", sector: "cyber" }, { uid: 1 }).lean()).forEach(a => add(a.uid, "member"));
+        const accs = await Account.find({ uid: { $in: order } }, { uid: 1, fullName: 1, age: 1, nationality: 1, sector: 1, createdAt: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).lean();
+        const amap = new Map(accs.map(a => [a.uid, a]));
+        const full = order.map(u => amap.get(u) || { uid: u, fullName: null });
+        const list = await cyMemberInfo(full);
+        list.forEach(m => { m.me = m.uid === req.user.id; m.role = roleOf.get(m.uid); });
+        const rank = { commander: 0, deputy: 1, officer: 2, member: 3 };
+        list.sort((a, b) => rank[a.role] - rank[b.role]);
+        res.json({ list });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل أعضاء القطاع" }); }
+});
+
+app.get("/api/cyber/members/:uid/ops", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        const uid = String(req.params.uid || "");
+        const acc = await Account.findOne({ uid }, { isSenior: 1, isOwner: 1, tempSenior: 1 }).lean();
+        if (!acc || cyIsProtected(uid, acc)) return res.status(403).json({ error: "ما يمديك تشوف عمليات هذا الشخص" });
+        res.json({ list: await cyOpsOf(uid) });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل العمليات" }); }
+});
+
+app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        const uid = req.user.id;
+        const b = req.body || {};
+        const targetUid = String(b.targetUid || "");
+        const reason = String(b.reason || "").trim().slice(0, 600);
+        const evidence = String(b.evidence || "").trim().slice(0, 1200);
+        const mode = b.mode === "text" ? "text" : "voice";
+        if (!targetUid || targetUid === uid) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
+        if (reason.length < 3) return res.status(400).json({ error: "اكتب سبب التحقيق" });
+        const ta = await Account.findOne({ uid: targetUid, status: "approved" }, { isSenior: 1, isOwner: 1, tempSenior: 1 }).lean();
+        if (!ta || cyIsProtected(targetUid, ta)) return res.status(403).json({ error: "ما يمديك تفتح تحقيق على هذا الشخص" });
+        if (underInvestigation.has(targetUid)) return res.status(409).json({ error: "هذا العضو تحت التحقيق حالياً" });
+        const open = await CyberCase.findOne({ targetUid, status: { $in: ["sent", "investigating"] } }, { _id: 1 }).lean();
+        if (open) return res.status(409).json({ error: "فيه تحقيق مفتوح على هذا العضو" });
+        let evidenceVio = null;
+        const vioId = String(b.vioId || "");
+        if (vioId && mongoose.isValidObjectId(vioId)) {
+            const vv = await Violation.findById(vioId, { reporterDiscord: 1 }).lean();
+            if (vv && vv.reporterDiscord === targetUid) evidenceVio = vioId;
+        }
+        let flagId = null;
+        const fid = String(b.flagId || "");
+        if (fid && mongoose.isValidObjectId(fid)) {
+            const fl = await CyberFlag.findById(fid, { targetUid: 1 }).lean();
+            if (fl && fl.targetUid === targetUid) flagId = fid;
+        }
+        const name = await cyName(uid);
+        const targetName = await cyName(targetUid);
+        const base = { kind: "manual", reason, evidence: evidence || null, evidenceVio, flagId, targetUid, targetName, relatedUid: null, relatedName: null, sentBy: uid, sentByName: name, sentAt: new Date() };
+        if (!role.isLeader) {
+            const c = await CyberCase.create({ ...base, status: "sent", mode: "voice" });
+            await logEvent({ action: "رفع تحقيق سيبراني", discordId: targetUid, actorId: uid, actorTag: name + " (الأمن السيبراني)", details: `${targetName} — ${reason}` });
+            cyberPush(c);
+            return res.json({ ok: true, started: false, id: String(c._id) });
+        }
+        let vn = null;
+        if (mode === "voice") {
+            const usedN = new Set((await CyberCase.find({ status: "investigating", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
+            vn = 500;
+            while (usedN.has(vn) && vn < 899) vn++;
+        }
+        const c = await CyberCase.create({ ...base, status: "investigating", mode, voiceN: vn, startedBy: uid, startedByName: name, startedAt: new Date() });
+        underInvestigation.add(targetUid);
+        await cySystemMsg(c._id, `🔍 فتح ${name} تحقيقاً سيبرانياً (${mode === "text" ? "كتابي" : "صوتي"}) بحق ${targetName} — السبب: ${reason}`);
+        if (flagId) CyberFlag.updateOne({ _id: flagId, status: "open" }, { $set: { status: "investigated", handledBy: uid, handledByName: name, handledAt: new Date() } }).catch(() => {});
+        await logEvent({ action: "بدء تحقيق سيبراني", discordId: targetUid, actorId: uid, actorTag: name + " (قيادة الأمن السيبراني)", details: `${targetName} — ${reason}` });
+        cyberPush(c);
+        res.json({ ok: true, started: true, id: String(c._id), mode });
+    } catch (e) { res.status(500).json({ error: "تعذر فتح التحقيق" }); }
+});
+
+app.get("/api/cyber/suspicious", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        const all = req.query.scope === "all";
+        if (all && !role.isLeader) return res.status(403).json({ error: "هذا القسم للقيادة فقط" });
+        await cyScanFlags(false);
+        const me = req.user.id;
+        const flags = await CyberFlag.find(all ? {} : { status: "open", targetUid: { $ne: me } }).sort({ lastAt: -1 }).limit(150).maxTimeMS(8000).lean();
+        const devQ = all
+            ? { kind: { $ne: "manual" } }
+            : { kind: { $ne: "manual" }, status: { $in: ["alert", "sent", "investigating", "decision"] }, targetUid: { $ne: me }, relatedUid: { $ne: me } };
+        const devs = await CyberCase.find(devQ, CY_LIST_FIELDS).sort({ createdAt: -1 }).limit(100).maxTimeMS(8000).lean();
+        const items = [];
+        flags.forEach(f => items.push({
+            src: "flag", id: String(f._id), status: f.status, title: f.title, details: f.details,
+            targetUid: f.targetUid, targetName: f.targetName, count: f.count, approvedBy: f.approvedBy || [],
+            vioId: (f.violationIds || [])[0] || null, at: f.lastAt || f.createdAt,
+            protectedTarget: isSeniorAdmin(f.targetUid) || isOwnerUid(f.targetUid), handledByName: f.handledByName || null,
+        }));
+        devs.forEach(c => items.push({
+            src: "device", id: String(c._id), status: c.status, title: "دخول جهاز على حساب عضو ثاني",
+            details: `جهاز ${c.targetName} دخل حساب ${c.relatedName}`,
+            targetUid: c.targetUid, targetName: c.targetName, relatedName: c.relatedName,
+            sentByName: c.sentByName || null, startedByName: c.startedByName || null, startedAt: c.startedAt || null, at: c.createdAt,
+        }));
+        items.sort((a, b) => new Date(b.at) - new Date(a.at));
+        res.json({ list: items.slice(0, 200), role });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل العمليات المشبوهة" }); }
+});
+
+app.post("/api/cyber/flags/:id/resolve", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        if (!role.isLeader) return res.status(403).json({ error: "هذا الإجراء لقائد ونائب الأمن السيبراني فقط" });
+        if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+        const name = await cyName(req.user.id);
+        const f = await CyberFlag.findOneAndUpdate({ _id: req.params.id, status: { $in: ["open", "investigated"] } }, { $set: { status: "resolved", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }, { new: true });
+        if (!f) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
+        await logEvent({ action: "حل عملية سيبرانية", discordId: f.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `${f.targetName} — ${f.title}` });
+        cyberPush(f);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر التنفيذ" }); }
+});
+
+app.get("/api/cyber/flags/:id/photo", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+        const f = await CyberFlag.findById(req.params.id, { violationIds: 1 }).lean();
+        const vid = f && (f.violationIds || [])[0];
+        if (!vid || !mongoose.isValidObjectId(vid)) return res.status(404).json({ error: "لا توجد صورة" });
+        const v = await Violation.findById(vid, { photo: 1 }).lean();
+        if (!v || !v.photo) return res.status(404).json({ error: "لا توجد صورة" });
+        res.json({ image: v.photo });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل الصورة" }); }
+});
+
+app.get("/api/cyber/cases/:id/photo", ensureAuth, async (req, res) => {
+    try {
+        const x = await cyAccess(req, res, false); if (!x) return;
+        let vid = null;
+        if (req.query.w === "evidence") vid = x.c.evidenceVio;
+        else if (x.c.shown && typeof x.c.shown.ref === "string" && x.c.shown.ref.indexOf("vio:") === 0) vid = x.c.shown.ref.slice(4);
+        if (!vid || !mongoose.isValidObjectId(vid)) return res.status(404).json({ error: "لا توجد صورة" });
+        const v = await Violation.findById(vid, { photo: 1 }).lean();
+        if (!v || !v.photo) return res.status(404).json({ error: "لا توجد صورة" });
+        res.json({ image: v.photo });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل الصورة" }); }
+});
+
+app.post("/api/cyber/cases/:id/show", ensureAuth, async (req, res) => {
+    try {
+        const x = await cyAccess(req, res, true); if (!x) return;
+        if (x.c.status !== "investigating") return res.status(400).json({ error: "التحقيق منتهي" });
+        const ref = String((req.body && req.body.ref) || "");
+        const name = await cyName(req.user.id);
+        let shown = null;
+        if (ref) {
+            const op = await cyResolveOp(ref, x.c.targetUid);
+            if (!op) return res.status(404).json({ error: "العملية غير موجودة أو مو تابعة للعضو" });
+            shown = { ref: op.ref, title: op.title, lines: op.lines, opAt: op.opAt, hasPhoto: op.hasPhoto, byName: name, at: new Date() };
+        }
+        await CyberCase.updateOne({ _id: x.c._id }, { $set: { shown } });
+        if (x.c.voiceN) {
+            if (shown) cyShownMap.set(x.c.voiceN, shown); else cyShownMap.delete(x.c.voiceN);
+            offPushState(x.c.voiceN);
+        }
+        await cySystemMsg(x.c._id, shown ? `📋 عرض ${name} على ${x.c.targetName} عملية: ${shown.title}` : `🙈 أخفى ${name} العملية المعروضة`);
+        cyberPush(x.c);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر عرض العملية" }); }
+});
+
+app.post("/api/cyber/cases/:id/kick", ensureAuth, async (req, res) => {
+    try {
+        const x = await cyAccess(req, res, true); if (!x) return;
+        if (x.c.status !== "investigating") return res.status(400).json({ error: "التحقيق منتهي" });
+        const target = String((req.body && req.body.uid) || "");
+        if (!target || target === req.user.id) return res.status(400).json({ error: "حدد الشخص" });
+        if (isOwnerUid(target) && !isOwnerUid(req.user.id)) return res.status(403).json({ error: "ما يمديك تطرد المالك" });
+        const name = await cyName(req.user.id);
+        const tName = await cyName(target);
+        if (target !== x.c.targetUid) await CyberCase.updateOne({ _id: x.c._id }, { $addToSet: { kicked: target } });
+        if (x.c.voiceN) { offSendTo(target, { t: "kicked", n: x.c.voiceN }); offRemove(target, x.c.voiceN); }
+        await cySystemMsg(x.c._id, `🚫 ${name} طرد ${tName} من التحقيق`);
+        cyberPush(x.c);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر الطرد" }); }
 });
 
 app.get("/", (req, res) => {
@@ -6356,6 +6750,19 @@ app.get("/", (req, res) => {
     .cy-msg { font-size: 14px; } .cy-msg small { color: #94a3b8; } .cy-msg.sys { color: #fbbf24; font-size: 12px; text-align: center; }
     .cy-input { display: flex; gap: 8px; }
     .cy-input input { flex: 1; }
+    .cy-tabs { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 10px; padding-bottom: 4px; }
+    .cy-tab { flex: 0 0 auto; background: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 10px; padding: 8px 12px; font-family: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; }
+    .cy-tab.on { background: #2563eb; color: #fff; border-color: #3b82f6; }
+    .cy-mem { display: flex; gap: 12px; align-items: flex-start; background: #14213d; border: 1px solid rgba(59,130,246,0.25); border-radius: 14px; padding: 14px; margin-bottom: 10px; cursor: pointer; }
+    .cy-av { flex: 0 0 52px; height: 52px; border-radius: 50%; background: #1e3a8a; border: 2px solid #3b82f6; display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: bold; color: #fff; }
+    .cy-mem-b { flex: 1; min-width: 0; font-size: 13px; color: #94a3b8; line-height: 1.9; }
+    .cy-mem-n { font-size: 17px; font-weight: bold; color: #fff; }
+    .cy-badge { display: inline-block; font-size: 12px; padding: 2px 12px; border-radius: 999px; border: 1px solid; margin-right: 6px; font-weight: bold; }
+    .b-red { color: #fca5a5; border-color: #ef4444; background: rgba(239,68,68,0.15); }
+    .b-gold { color: #fde047; border-color: #eab308; background: rgba(234,179,8,0.12); }
+    .b-blue { color: #93c5fd; border-color: #3b82f6; background: rgba(59,130,246,0.12); }
+    .b-gray { color: #cbd5e1; border-color: #64748b; background: rgba(100,116,139,0.15); }
+    .cy-showcard { background: rgba(251,191,36,0.08); border: 1px solid #eab308; border-radius: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.8; color: #e2e8f0; margin: 6px 0; text-align: right; }
     #promo-alert-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: radial-gradient(circle at center, #14532d, #052e16); color: #fff; text-align: center; flex-direction: column; align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
     #promo-alert-overlay.open { display: flex; }
     .promo-box { border: 2px dashed rgba(255,255,255,0.55); border-radius: 10px; padding: 26px 40px; max-width: 480px; }
@@ -7242,19 +7649,21 @@ function cyPrompt(t, c) {
     CY.cur = { t: t, id: c.id };
     var h;
     if (t === 'alert') h = '<div style="font-size:38px">⚠️</div><h3>اشتباه دخول جهاز</h3><p>جهاز العضو <b>' + cyEsc(c.targetName) + '</b> دخل حساب العضو <b>' + cyEsc(c.relatedName) + '</b></p><div class="cy-actions">' + cyBtn('send', '📤 إرسال للقائد', '') + cyBtn('dismiss', 'تجاهل', 'gray') + '</div>';
-    else if (t === 'inbox') h = '<div style="font-size:38px">🛡️</div><h3>طلب تحقيق من الأمن السيبراني</h3><p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b> بسبب دخوله بجهازه حساب <b>' + cyEsc(c.relatedName) + '</b></p><div class="cy-actions">' + cyBtn('investigate', '🔍 تحقيق', '') + cyBtn('resolve', '✅ حل العملية', 'gray') + '</div>';
-    else if (t === 'decision') h = '<div style="font-size:38px">📋</div><h3>انتهى التحقيق</h3><p>انتهى التحقيق مع <b>' + cyEsc(c.targetName) + '</b> (حساب: ' + cyEsc(c.relatedName) + ')<br>وش تبينا نسوي معه؟</p><div class="cy-actions">' + cyBtn('escalate', '⭐ إبلاغ القيادة العليا', '') + cyBtn('decide-resolve', '✅ حل العملية', 'gray') + '</div>';
+    else if (t === 'inbox') h = '<div style="font-size:38px">🛡️</div><h3>طلب تحقيق من الأمن السيبراني</h3>' + (c.kind === 'manual' ? '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b><br>السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '') + '</p>' : '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b> بسبب دخوله بجهازه حساب <b>' + cyEsc(c.relatedName) + '</b></p>') + '<div class="cy-actions">' + cyBtn('investigate', '🔍 تحقيق', '') + cyBtn('resolve', '✅ حل العملية', 'gray') + '</div>';
+    else if (t === 'decision') h = '<div style="font-size:38px">📋</div><h3>انتهى التحقيق</h3><p>انتهى التحقيق مع <b>' + cyEsc(c.targetName) + '</b> ' + (c.kind === 'manual' ? '' : '(حساب: ' + cyEsc(c.relatedName) + ')') + '<br>وش تبينا نسوي معه؟</p><div class="cy-actions">' + cyBtn('escalate', '⭐ إبلاغ القيادة العليا', '') + cyBtn('decide-resolve', '✅ حل العملية', 'gray') + '</div>';
     else h = '<div style="font-size:38px">🔍</div><h3>تحقيق سيبراني جاري</h3><p>فُتح تحقيق بحق <b>' + cyEsc(c.targetName) + '</b></p><div class="cy-actions">' + cyBtn('join', 'دخول الروم', '') + cyBtn('later', 'لاحقاً', 'gray') + '</div>';
     cyOverlay(h);
 }
 async function cyAct(btn) {
     var a = btn.dataset.a;
     if (a === 'lockenter') return cyEnterLock();
+    if (a === 'investigate') { cyModeChoose(); return; }
+    if (a === 'inv-back') { cyOverlayClose(); return; }
     var cur = CY.cur; if (!cur) return;
     CY.busy = true;
     try {
         if (a === 'send' || a === 'dismiss' || a === 'resolve') await api('/api/cyber/cases/' + cur.id + '/' + a, { method: 'POST' });
-        else if (a === 'investigate') { await api('/api/cyber/cases/' + cur.id + '/investigate', { method: 'POST' }); CY.busy = false; cyOverlayClose(); cyOpenRoom(cur.id, false); return; }
+        else if (a === 'inv-voice' || a === 'inv-text') { await api('/api/cyber/cases/' + cur.id + '/investigate', { method: 'POST', body: JSON.stringify({ mode: a === 'inv-text' ? 'text' : 'voice' }) }); CY.busy = false; cyOverlayClose(); cyOpenRoom(cur.id, false); return; }
         else if (a === 'join') { CY.seen[cur.id] = true; CY.busy = false; cyOverlayClose(); cyOpenRoom(cur.id, false); return; }
         else if (a === 'later') { CY.seen[cur.id] = true; }
         else if (a === 'escalate') {
@@ -7271,7 +7680,7 @@ async function cyAct(btn) {
 function cyOpenRoom(id, lock) {
     CY.roomId = id; CY.roomLock = !!lock; CY.sig = ''; CY.first = true;
     var r = document.getElementById('cyber-room');
-    r.innerHTML = '<div class="cy-head"><div id="cy-title">🔍 تحقيق سيبراني</div><div style="display:flex;gap:8px;"><button class="btn sm" onclick="cyJoinVoice()">🎙️ الصوت</button><span id="cy-end"></span>' + (lock ? '' : '<button class="btn sm gray" onclick="cyCloseRoom()">خروج</button>') + '</div></div><div class="cy-reason" id="cy-reason"></div><div class="cy-parts" id="cy-parts"></div><div class="cy-msgs" id="cy-msgs"></div><div class="cy-input"><input id="cy-text" maxlength="500" placeholder="اكتب رسالتك..." onkeydown="cyKey(event)"><button class="btn" onclick="cySend()">إرسال</button></div>';
+    r.innerHTML = '<div class="cy-head"><div id="cy-title">🔍 تحقيق سيبراني</div><div style="display:flex;gap:8px;flex-wrap:wrap;"><button class="btn sm" id="cy-voice-btn" onclick="cyJoinVoice()">🎙️ الصوت</button><span id="cy-ops"></span><span id="cy-end"></span>' + (lock ? '' : '<button class="btn sm gray" onclick="cyCloseRoom()">خروج</button>') + '</div></div><div class="cy-reason" id="cy-reason"></div><div id="cy-show"></div><div class="cy-parts" id="cy-parts"></div><div class="cy-msgs" id="cy-msgs"></div><div class="cy-input"><input id="cy-text" maxlength="500" placeholder="اكتب رسالتك..." onkeydown="cyKey(event)"><button class="btn" onclick="cySend()">إرسال</button></div>';
     r.classList.add('open');
     cyLoadRoom();
     if (CY.roomTimer) clearInterval(CY.roomTimer);
@@ -7314,17 +7723,22 @@ async function cyLoadRoom() {
     catch (e) { if (!CY.roomLock && CY.roomId === id) cyCloseRoom(); return; }
     if (CY.roomId !== id) return;
     var c = d.c, live = c.status === 'investigating';
+    CY.roomTarget = c.targetUid;
     document.getElementById('cy-title').textContent = '🔍 تحقيق سيبراني — ' + c.targetName;
-    document.getElementById('cy-reason').innerHTML = 'السبب: جهاز <b>' + cyEsc(c.targetName) + '</b> دخل حساب <b>' + cyEsc(c.relatedName) + '</b>' + (c.sentByName ? ' — رفعه: ' + cyEsc(c.sentByName) : '') + ' — ' + (CY_STATUS[c.status] || c.status);
+    document.getElementById('cy-reason').innerHTML = (c.kind === 'manual' ? 'السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? ' — الدليل: ' + cyEsc(c.evidence) : '') + (c.evidencePhoto ? ' <button class="btn sm gray" onclick="cyEvPhoto()">🖼️ صورة الدليل</button>' : '') + (c.sentByName ? ' — رفعه: ' + cyEsc(c.sentByName) : '') : 'السبب: جهاز <b>' + cyEsc(c.targetName) + '</b> دخل حساب <b>' + cyEsc(c.relatedName) + '</b>' + (c.sentByName ? ' — رفعه: ' + cyEsc(c.sentByName) : '')) + ' — ' + (c.mode === 'text' ? '⌨️ كتابي' : '🎙️ صوتي') + ' — ' + (CY_STATUS[c.status] || c.status);
     document.getElementById('cy-end').innerHTML = (d.me.role === 'leader' && live) ? '<button class="btn sm danger" onclick="cyEnd()">⏹️ إنهاء التحقيق</button>' : '';
-    var sig = JSON.stringify([c.status, d.muted, d.participants.map(function (p) { return p.uid + (p.online ? 1 : 0); }), d.messages.length]);
+    document.getElementById('cy-ops').innerHTML = (d.me.role === 'leader' && live) ? '<button class="btn sm" onclick="cyOpsOpen()">📋 عملياته</button>' : '';
+    var cyVb = document.getElementById('cy-voice-btn'); if (cyVb) cyVb.style.display = (c.mode === 'text') ? 'none' : '';
+    document.getElementById('cy-show').innerHTML = c.shown ? cyShowCardHtml(c.shown, d.me.role === 'leader' && live) : '';
+    var sig = JSON.stringify([c.status, d.muted, d.participants.map(function (p) { return p.uid + (p.online ? 1 : 0); }), d.messages.length, d.kicked]);
     if (sig === CY.sig) return;
     CY.sig = sig;
     document.getElementById('cy-parts').innerHTML = d.participants.map(function (p) {
         var muted = d.muted.indexOf(p.uid) >= 0;
+        var kicked = (d.kicked || []).indexOf(p.uid) >= 0;
         var canMute = live && (d.me.role === 'leader' ? p.uid !== d.me.uid : (d.me.role === 'member' && p.role === 'target'));
         return '<div class="cy-chip"><span style="color:' + (p.online ? '#4ade80' : '#64748b') + '">●</span> ' + cyEsc(p.name) + ' <small style="color:#94a3b8">' + (CY_ROLE[p.role] || '') + '</small>' + (muted ? ' 🔇' : '') +
-            (canMute ? ' <button class="btn sm gray" data-u="' + cyEsc(p.uid) + '" data-on="' + (muted ? 0 : 1) + '" onclick="cyMute(this)">' + (muted ? '🔊 فك' : '🔇 إسكات') + '</button>' : '') + '</div>';
+            (canMute ? ' <button class="btn sm gray" data-u="' + cyEsc(p.uid) + '" data-on="' + (muted ? 0 : 1) + '" onclick="cyMute(this)">' + (muted ? '🔊 فك' : '🔇 إسكات') + '</button>' : '') + (kicked ? ' 🚫' : '') + (live && d.me.role === 'leader' && p.uid !== d.me.uid && !kicked ? ' <button class="btn sm danger" data-u="' + cyEsc(p.uid) + '" onclick="cyKick(this)">🚫 طرد</button>' : '') + '</div>';
     }).join('');
     var box = document.getElementById('cy-msgs');
     var atBottom = CY.first || (box.scrollHeight - box.scrollTop - box.clientHeight < 60);
@@ -7338,24 +7752,150 @@ async function cyLoadRoom() {
     inp.disabled = !live || meMuted;
     inp.placeholder = !live ? 'انتهى التحقيق' : (meMuted ? '🔇 تم إسكاتك' : 'اكتب رسالتك...');
 }
-async function renderCyberPanel() {
-    document.getElementById('app').innerHTML = '<div class="card row"><h2>🛡️ الأمن السيبراني</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div><div id="cy-panel"><div class="card">جارِ التحميل...</div></div>';
-    cyPanelLoad();
-}
-async function cyPanelLoad() {
-    var box = document.getElementById('cy-panel'); if (!box) return;
-    var d;
-    try { d = await api('/api/cyber/cases'); } catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cyEsc(e.message) + '</div>'; return; }
-    if (!d.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد حالات بعد</div>'; return; }
-    box.innerHTML = d.list.map(function (c) {
-        var b = '';
-        if (c.status === 'alert' && !d.role.isLeader) b += cyPBtn(c.id, 'send', '📤 إرسال للقائد') + cyPBtn(c.id, 'dismiss', 'تجاهل', 'gray');
-        if (d.role.isLeader && (c.status === 'alert' || c.status === 'sent')) b += cyPBtn(c.id, 'investigate', '🔍 تحقيق') + cyPBtn(c.id, 'resolve', '✅ حل العملية', 'gray');
-        if (c.status === 'decision' && d.role.isLeader) b += cyPBtn(c.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(c.id, 'decide-resolve', '✅ حل العملية', 'gray');
-        if (c.status === 'investigating') b += cyPBtn(c.id, 'join', '🚪 دخول الروم');
-        else if (c.startedAt) b += cyPBtn(c.id, 'view', '📜 عرض المحادثة', 'gray');
-        return '<div class="card"><b>' + cyEsc(c.targetName) + '</b> <span style="color:var(--muted);font-size:12px;">← دخل حساب ' + cyEsc(c.relatedName) + '</span><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
+var CYP = { tab: 'members', data: {}, sig: {}, lastFetch: {} };
+var CY_TABS_LEAD = [['members', '👥 أعضاء السيرفر'], ['review', '⏳ تحقيقات قيد المراجعة'], ['log', '📜 لوق المشبوهات'], ['sector', '🛡️ أعضاء القطاع'], ['current', '🚨 المشبوهة الآن']];
+var CY_TABS_MEM = [['members', '👥 أعضاء السيرفر'], ['current', '🚨 المشبوهة الآن']];
+function cyIsLead() { return !!(ME && ME.cyber && ME.cyber.isLeader); }
+function cyTabList() { return cyIsLead() ? CY_TABS_LEAD : CY_TABS_MEM; }
+function cyFmt(d) { if (!d) return '-'; try { return new Date(d).toLocaleString('ar'); } catch (e) { return '-'; } }
+function cyPaintTabs() {
+    var box = document.getElementById('cy-tabs'); if (!box) return;
+    box.innerHTML = cyTabList().map(function (t) {
+        return '<button class="cy-tab' + (CYP.tab === t[0] ? ' on' : '') + '" data-t="' + t[0] + '" onclick="cySetTab(this.dataset.t)">' + t[1] + '</button>';
     }).join('');
+}
+function cySetTab(t) {
+    CYP.tab = t; CYP.sig = {};
+    cyPaintTabs();
+    var b = document.getElementById('cy-panel');
+    if (b) b.innerHTML = '<div class="card center" style="color:var(--muted);">جارِ التحميل...</div>';
+    cyPanelLoad(true);
+}
+async function renderCyberPanel() {
+    if (!cyTabList().some(function (t) { return t[0] === CYP.tab; })) CYP.tab = 'members';
+    CYP.sig = {};
+    document.getElementById('app').innerHTML = '<div class="card row"><h2>🛡️ الأمن السيبراني</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div><div id="cy-tabs" class="cy-tabs"></div><div id="cy-panel"><div class="card center" style="color:var(--muted);">جارِ التحميل...</div></div>';
+    cyPaintTabs();
+    cyPanelLoad(true);
+}
+async function cyPanelLoad(force) {
+    var box = document.getElementById('cy-panel'); if (!box) return;
+    var tab = CYP.tab, now = Date.now();
+    if (!force && (tab === 'members' || tab === 'sector') && now - (CYP.lastFetch[tab] || 0) < 25000) return;
+    var d;
+    try {
+        if (tab === 'members') d = await api('/api/cyber/members');
+        else if (tab === 'sector') d = await api('/api/cyber/sector');
+        else if (tab === 'review') d = await api('/api/cyber/cases');
+        else if (tab === 'log') d = await api('/api/cyber/suspicious?scope=all');
+        else d = await api('/api/cyber/suspicious?scope=current');
+    } catch (e) {
+        if (CYP.tab === tab && !CYP.sig[tab]) box.innerHTML = '<div class="card" style="color:#f87171;">' + cyEsc(e.message) + '</div>';
+        return;
+    }
+    if (CYP.tab !== tab || !document.getElementById('cy-panel')) return;
+    CYP.lastFetch[tab] = Date.now();
+    var sig = JSON.stringify(d);
+    if (CYP.sig[tab] === sig) return;
+    CYP.sig[tab] = sig; CYP.data[tab] = d;
+    if (tab === 'members') cyDrawMembers();
+    else if (tab === 'sector') cyDrawSector();
+    else if (tab === 'review') cyDrawReview();
+    else if (tab === 'log') cyDrawLog();
+    else cyDrawCurrent();
+}
+function cyInfoRows(m) {
+    var r = '';
+    function row(ic, label, v) { if (v !== null && v !== undefined && v !== '') r += '<div>' + ic + ' ' + label + ': <span style="color:#e2e8f0;">' + cyEsc(v) + '</span></div>'; }
+    row('🎂', 'العمر', m.age);
+    row('🌍', 'الجنسية', m.nationality);
+    row('🎖️', 'الرتبة', m.rank);
+    row('🪖', 'اليونت', m.unit);
+    row('⭐', 'النقاط', m.points);
+    row('🏷️', 'القطاع', m.sectorLabel);
+    row('🪪', 'رقم البطاقة', m.cardNumber);
+    row('💬', 'الديسكورد', m.discordTag);
+    row('📅', 'تاريخ التسجيل', m.joinedAt ? cyFmt(m.joinedAt) : '');
+    row('🕒', 'آخر دخول', m.lastLogin ? cyFmt(m.lastLogin) : '');
+    row('⚠️', 'التحذيرات', m.warnings);
+    row('📝', 'الملاحظات', m.notes);
+    row('🏖️', 'رصيد الإجازات', m.leaveBalance);
+    if (m.blocked) r += '<div style="color:#fca5a5;">🚫 موقوف / مفصول</div>';
+    return r;
+}
+function cyMemCard(m, badge) {
+    var dot = '<span style="color:' + (m.online ? '#4ade80' : '#64748b') + ';">●</span> ';
+    return '<div class="cy-mem" data-u="' + cyEsc(m.uid) + '" onclick="cyOpenMember(this.dataset.u)"><div class="cy-av">' + cyEsc((m.name || '?').trim().charAt(0)) + '</div><div class="cy-mem-b"><div class="cy-mem-n">' + dot + cyEsc(m.name) + ' ' + (badge || '<span class="cy-badge b-blue">عضو</span>') + (m.investigated ? ' <span class="cy-badge b-red">🔒 تحت التحقيق</span>' : '') + (m.me ? ' <small style="color:var(--muted);">(أنت)</small>' : '') + '</div>' + cyInfoRows(m) + '<div style="color:#60a5fa;margin-top:2px;">👆 اضغط لعرض نشاطه</div></div></div>';
+}
+function cyDrawMembers() {
+    var box = document.getElementById('cy-panel'); if (!box) return;
+    if (!document.getElementById('cy-q')) box.innerHTML = '<input id="cy-q" placeholder="🔍 ابحث بالاسم..." oninput="cyDrawMembers()" style="margin-bottom:10px;font-size:16px;"><div id="cy-list"></div>';
+    var q = (document.getElementById('cy-q').value || '').trim().toLowerCase();
+    var list = ((CYP.data.members || {}).list || []).filter(function (m) { return !q || String(m.name || '').toLowerCase().indexOf(q) >= 0; });
+    document.getElementById('cy-list').innerHTML = list.length ? list.map(function (m) { return cyMemCard(m); }).join('') : '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء</div>';
+}
+function cyDrawSector() {
+    var box = document.getElementById('cy-panel'); if (!box) return;
+    var list = (CYP.data.sector || {}).list || [];
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء في القطاع</div>'; return; }
+    box.innerHTML = list.map(function (m) {
+        var badge = m.role === 'commander' ? '<span class="cy-badge b-red">قائد 👑</span>' : (m.role === 'deputy' ? '<span class="cy-badge b-gold">نائب 🥈</span>' : (m.role === 'officer' ? '<span class="cy-badge b-gray">مسؤول أفراد</span>' : '<span class="cy-badge b-blue">عضو</span>'));
+        return cyMemCard(m, badge);
+    }).join('');
+}
+function cyFindMember(uid) {
+    var all = [].concat((CYP.data.members || {}).list || [], (CYP.data.sector || {}).list || []);
+    for (var i = 0; i < all.length; i++) if (all[i].uid === uid) return all[i];
+    return null;
+}
+function cyOpsHtml(list, clickable) {
+    if (!list || !list.length) return '<div style="color:var(--muted);text-align:center;padding:10px;">ما فيه عمليات خلال آخر 7 أيام</div>';
+    return list.map(function (o) {
+        var meta = (typeof LOG_META !== 'undefined' && LOG_META[o.title]) || null;
+        var ic = o.kind === 'vio' ? '🚗' : (meta ? meta.icon : 'ℹ️');
+        var col = o.kind === 'vio' ? '#3b82f6' : (meta ? meta.border : '#64748b');
+        var tc = meta ? meta.color : '#e2e8f0';
+        var attrs = clickable ? ' data-ref="' + cyEsc(o.id) + '" onclick="cyShowOp(this.dataset.ref)" style="display:block;cursor:pointer;border-color:' + col + ';"' : ' style="display:block;border-color:' + col + ';"';
+        return '<div class="log-item"' + attrs + '><div style="color:' + tc + ';font-weight:bold;">' + ic + ' ' + cyEsc((meta && meta.label) || o.title) + (o.hasPhoto ? ' 🖼️' : '') + '</div>' + (o.details ? '<div style="color:#93c5fd;font-size:13px;">' + cyEsc(o.details) + '</div>' : '') + '<div style="font-size:12px;color:#64748b;">' + cyEsc(cyFmt(o.at)) + '</div></div>';
+    }).join('');
+}
+function cyOpenMember(uid) {
+    var m = cyFindMember(uid); if (!m) return;
+    CY.prof = uid;
+    var canInv = !m.me && !m.isSenior && !m.investigated;
+    cyOverlay('<div style="text-align:right;max-height:78vh;overflow-y:auto;"><div style="font-size:18px;font-weight:bold;text-align:center;">' + cyEsc(m.name) + '</div><div style="color:#94a3b8;font-size:13px;margin-top:6px;">' + cyInfoRows(m) + '</div><div class="cy-actions">' + (canInv ? '<button class="btn" onclick="cyInvForm(CY.prof)">🔍 تحقيق</button>' : '') + '<button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div><div style="font-weight:bold;margin:12px 0 6px;">📋 عملياته آخر 7 أيام</div><div id="cy-prof-ops" style="color:var(--muted);text-align:center;">جارِ التحميل...</div></div>');
+    api('/api/cyber/members/' + encodeURIComponent(uid) + '/ops').then(function (d) {
+        var b = document.getElementById('cy-prof-ops');
+        if (b && CY.prof === uid) { b.style.textAlign = 'right'; b.innerHTML = cyOpsHtml(d.list, false); }
+    }).catch(function (e) {
+        var b = document.getElementById('cy-prof-ops');
+        if (b && CY.prof === uid) b.textContent = e.message;
+    });
+}
+function cyInvForm(uid, pre) {
+    pre = pre || {};
+    var m = cyFindMember(uid);
+    var name = m ? m.name : (pre.name || '');
+    CY.inv = { uid: uid, vioId: pre.vioId || null, flagId: pre.flagId || null };
+    var lead = cyIsLead();
+    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-size:18px;font-weight:bold;">🔍 فتح تحقيق</div><div style="text-align:center;color:#94a3b8;margin-bottom:10px;">مع: <b style="color:#fff;">' + cyEsc(name) + '</b></div><label style="font-size:13px;">سبب التحقيق</label><textarea id="cy-f-reason" rows="3" maxlength="600" style="width:100%;font-size:16px;margin-bottom:8px;">' + cyEsc(pre.reason || '') + '</textarea><label style="font-size:13px;">الدلائل (اختياري — إذا توفرت)</label><textarea id="cy-f-evid" rows="3" maxlength="1200" style="width:100%;font-size:16px;">' + cyEsc(pre.evidence || '') + '</textarea><div class="cy-actions">' + (lead ? '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">🎙️ صوتي</button><button class="btn" data-m="text" onclick="cyInvSubmit(this)">⌨️ كتابي</button>' : '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">📤 إرسال للقيادة</button>') + '<button class="btn gray" onclick="cyOverlayClose()">إلغاء</button></div></div>');
+}
+async function cyInvSubmit(btn) {
+    var inv = CY.inv; if (!inv) return;
+    var reason = (document.getElementById('cy-f-reason').value || '').trim();
+    var evid = (document.getElementById('cy-f-evid').value || '').trim();
+    if (reason.length < 3) { toast('اكتب سبب التحقيق'); return; }
+    try {
+        var d = await api('/api/cyber/investigations', { method: 'POST', body: JSON.stringify({ targetUid: inv.uid, reason: reason, evidence: evid, mode: btn.dataset.m, vioId: inv.vioId, flagId: inv.flagId }) });
+        CY.inv = null; cyOverlayClose();
+        if (d.started) { toast('🔍 بدأ التحقيق'); cyOpenRoom(d.id, false); }
+        else toast('📤 انرسل التحقيق للقيادة');
+        CYP.sig = {};
+        cyPanelLoad(true);
+    } catch (e) { toast(e.message); }
+}
+function cyModeChoose() {
+    cyOverlay('<div style="font-size:34px;">🔍</div><h3>نوع التحقيق</h3><div>اختر طريقة التحقيق</div><div class="cy-actions"><button class="btn" data-a="inv-voice" onclick="cyAct(this)">🎙️ صوتي</button><button class="btn" data-a="inv-text" onclick="cyAct(this)">⌨️ كتابي</button><button class="btn gray" data-a="inv-back" onclick="cyAct(this)">رجوع</button></div>');
 }
 function cyPBtn(id, a, label, cls) { return '<button class="btn sm ' + (cls || '') + '" data-id="' + id + '" data-a="' + a + '" onclick="cyPanelAct(this)">' + label + '</button>'; }
 function cyPanelAct(btn) {
@@ -7363,6 +7903,135 @@ function cyPanelAct(btn) {
     if (a === 'view') return cyOpenRoom(id, false);
     CY.cur = { t: 'panel', id: id };
     cyAct(btn);
+}
+function cyDrawReview() {
+    var box = document.getElementById('cy-panel'); if (!box) return;
+    var lead = cyIsLead();
+    var list = ((CYP.data.review || {}).list || []).filter(function (c) { return c.status === 'sent' || c.status === 'investigating' || c.status === 'decision'; });
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تحقيقات قيد المراجعة</div>'; return; }
+    box.innerHTML = list.map(function (c) {
+        var b = '';
+        if (c.status === 'sent' && lead) b += cyPBtn(c.id, 'investigate', '✅ قبول وتحقيق') + cyPBtn(c.id, 'resolve', '❌ رفض', 'gray');
+        if (c.status === 'decision' && lead) b += cyPBtn(c.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(c.id, 'decide-resolve', '✅ حل العملية', 'gray');
+        if (c.status === 'investigating') b += cyPBtn(c.id, 'join', '🚪 دخول الروم');
+        var why = c.kind === 'manual' ? ('السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '')) : ('جهازه دخل حساب ' + cyEsc(c.relatedName));
+        return '<div class="card"><b>' + cyEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:13px;margin-top:4px;">' + why + '</div><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + (c.status === 'investigating' ? ' • ' + (c.mode === 'text' ? '⌨️ كتابي' : '🎙️ صوتي') : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
+    }).join('');
+}
+var CY_FLAG_ST = { open: '⚠️ مفتوحة', investigated: '🔍 تم فتح تحقيق', resolved: '✅ تم حلها' };
+function cySuspItem(it, withActions) {
+    var lead = cyIsLead();
+    var closed = it.status === 'resolved' || it.status === 'dismissed' || it.status === 'escalated';
+    var border = closed ? '#64748b' : '#ef4444';
+    var color = closed ? '#94a3b8' : '#fca5a5';
+    var st = it.src === 'flag' ? (CY_FLAG_ST[it.status] || it.status) : (CY_STATUS[it.status] || it.status);
+    var h = '<div class="log-item" style="border-color:' + border + ';flex-wrap:wrap;"><div><span style="color:' + color + ';font-weight:bold;">🚨 ' + cyEsc(it.title) + '</span><div style="font-size:12px;color:#94a3b8;margin-top:2px;">' + st + '</div></div><div style="text-align:left;color:#94a3b8;font-size:0.85rem;">';
+    h += '<div>الشخص: <b style="color:#60a5fa;">' + cyEsc(it.targetName) + '</b></div>';
+    if (it.details) h += '<div style="color:#93c5fd;">' + cyEsc(it.details) + '</div>';
+    if (it.src === 'flag' && it.approvedBy && it.approvedBy.length) h += '<div>قبلها: <b style="color:#e2e8f0;">' + cyEsc(it.approvedBy.join('، ')) + '</b></div>';
+    if (it.handledByName) h += '<div>تعامل معها: ' + cyEsc(it.handledByName) + '</div>';
+    h += '<div style="font-size:0.78rem;color:#64748b;">' + cyEsc(cyFmt(it.at)) + '</div></div>';
+    if (withActions) {
+        var b = '';
+        if (it.src === 'flag') {
+            if (it.vioId) b += '<button class="btn sm gray" data-id="' + it.id + '" onclick="cyFlagPhoto(this.dataset.id)">🖼️ الصورة</button>';
+            if (it.status === 'open' && !it.protectedTarget) b += '<button class="btn sm" data-u="' + cyEsc(it.targetUid) + '" data-n="' + cyEsc(it.targetName) + '" data-v="' + cyEsc(it.vioId || '') + '" data-f="' + it.id + '" data-d="' + cyEsc(it.details || '') + '" onclick="cyFlagInv(this)">🔍 تحقيق</button>';
+            if (lead && (it.status === 'open' || it.status === 'investigated')) b += '<button class="btn sm gray" data-id="' + it.id + '" onclick="cyFlagResolve(this.dataset.id)">✅ حل العملية</button>';
+        } else {
+            var isMemberOnly = !lead;
+            if (it.status === 'alert' && isMemberOnly) b += cyPBtn(it.id, 'send', '📤 إرسال للقائد') + cyPBtn(it.id, 'dismiss', 'تجاهل', 'gray');
+            if (lead && (it.status === 'alert' || it.status === 'sent')) b += cyPBtn(it.id, 'investigate', '🔍 تحقيق') + cyPBtn(it.id, 'resolve', '✅ حل العملية', 'gray');
+            if (lead && it.status === 'decision') b += cyPBtn(it.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(it.id, 'decide-resolve', '✅ حل العملية', 'gray');
+            if (it.status === 'investigating') b += cyPBtn(it.id, 'join', '🚪 دخول الروم');
+        }
+        if (b) h += '<div class="row" style="gap:6px;width:100%;margin-top:8px;flex-wrap:wrap;">' + b + '</div>';
+    }
+    return h + '</div>';
+}
+function cyDrawLog() {
+    var box = document.getElementById('cy-panel'); if (!box) return;
+    if (!document.getElementById('cy-lq')) box.innerHTML = '<div class="card"><input id="cy-lq" placeholder="🔍 ابحث بالاسم أو نوع العملية..." oninput="cyDrawLog()" style="margin-bottom:12px;font-size:16px;"><div id="cy-loglist"></div></div>';
+    var q = (document.getElementById('cy-lq').value || '').trim().toLowerCase();
+    var list = ((CYP.data.log || {}).list || []).filter(function (it) {
+        return !q || [it.targetName, it.title, it.details].some(function (v) { return String(v || '').toLowerCase().indexOf(q) >= 0; });
+    });
+    document.getElementById('cy-loglist').innerHTML = list.length ? list.map(function (it) { return cySuspItem(it, false); }).join('') : '<p style="text-align:center;color:var(--muted);padding:20px;">لا توجد نتائج.</p>';
+}
+function cyDrawCurrent() {
+    var box = document.getElementById('cy-panel'); if (!box) return;
+    var list = (CYP.data.current || {}).list || [];
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">ما فيه عمليات مشبوهة حالياً ✅</div>'; return; }
+    box.innerHTML = '<div class="card">' + list.map(function (it) { return cySuspItem(it, true); }).join('') + '</div>';
+}
+function cyFlagInv(btn) {
+    var d = btn.dataset;
+    cyInvForm(d.u, { name: d.n, vioId: d.v || null, flagId: d.f, reason: 'عملية مشبوهة: ' + (d.d || ''), evidence: '' });
+}
+async function cyFlagResolve(id) {
+    if (!(await confirmModal('متأكد تبي تحل هذي العملية؟'))) return;
+    try { await api('/api/cyber/flags/' + id + '/resolve', { method: 'POST' }); toast('✅ تم حلها'); CYP.sig = {}; cyPanelLoad(true); }
+    catch (e) { toast(e.message); }
+}
+async function cyShowImage(url) {
+    try {
+        var d = await api(url);
+        cyOverlay('<div style="max-height:80vh;overflow-y:auto;"><img src="' + d.image + '" style="max-width:100%;border-radius:10px;"><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
+    } catch (e) { toast(e.message); }
+}
+function cyFlagPhoto(id) { cyShowImage('/api/cyber/flags/' + id + '/photo'); }
+function cyCtx() {
+    var vcOn = (typeof VC !== 'undefined' && VC) ? VC : null;
+    var id = (vcOn && vcOn.caseId) || CY.roomId, t = null;
+    if (CY.roomId && CY.roomId === id && CY.roomTarget) t = CY.roomTarget;
+    if (!t && vcOn && vcOn.state && vcOn.state.participants) {
+        var p = vcOn.state.participants.filter(function (x) { return x.role === 'target'; })[0];
+        if (p) t = p.uid;
+    }
+    return { id: id, target: t };
+}
+async function cyOpsOpen() {
+    var c = cyCtx();
+    if (!c.id || !c.target) { toast('ما قدرت أحدد العضو'); return; }
+    CY.opsCase = c.id;
+    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-weight:bold;">📋 عمليات العضو — آخر 7 أيام</div><div style="text-align:center;font-size:12px;color:#94a3b8;">اضغط على أي عملية تنعرض قدام العضو</div><div id="cy-ops-box" style="max-height:60vh;overflow-y:auto;margin-top:10px;color:var(--muted);text-align:center;">جارِ التحميل...</div><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
+    try {
+        var d = await api('/api/cyber/members/' + encodeURIComponent(c.target) + '/ops');
+        var b = document.getElementById('cy-ops-box');
+        if (b) { b.style.textAlign = 'right'; b.innerHTML = cyOpsHtml(d.list, true); }
+    } catch (e) {
+        var b2 = document.getElementById('cy-ops-box');
+        if (b2) b2.textContent = e.message;
+    }
+}
+async function cyShowOp(ref) {
+    var id = CY.opsCase; if (!id) return;
+    try {
+        await api('/api/cyber/cases/' + id + '/show', { method: 'POST', body: JSON.stringify({ ref: ref }) });
+        toast('📋 انعرضت قدام العضو');
+        cyOverlayClose();
+        if (CY.roomId) { CY.sig = ''; cyLoadRoom(); }
+    } catch (e) { toast(e.message); }
+}
+async function cyShowClear() {
+    var c = cyCtx(); if (!c.id) return;
+    try {
+        await api('/api/cyber/cases/' + c.id + '/show', { method: 'POST', body: JSON.stringify({ ref: '' }) });
+        if (CY.roomId) { CY.sig = ''; cyLoadRoom(); }
+    } catch (e) { toast(e.message); }
+}
+function cyShownPhoto() { var c = cyCtx(); if (c.id) cyShowImage('/api/cyber/cases/' + c.id + '/photo?w=shown'); }
+function cyEvPhoto() { var c = cyCtx(); if (c.id) cyShowImage('/api/cyber/cases/' + c.id + '/photo?w=evidence'); }
+function cyShowCardHtml(sh, leader) {
+    var lines = (sh.lines || []).map(function (l) { return '<div>' + cyEsc(l) + '</div>'; }).join('');
+    var h = '<div class="cy-showcard"><div style="font-weight:bold;color:#fbbf24;">📋 عملية معروضة: ' + cyEsc(sh.title) + '</div>' + lines + '<div style="font-size:12px;color:#94a3b8;">' + cyEsc(cyFmt(sh.opAt)) + (sh.byName ? ' — عرضها: ' + cyEsc(sh.byName) : '') + '</div><div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">';
+    if (sh.hasPhoto) h += '<button class="btn sm gray" onclick="cyShownPhoto()">🖼️ عرض الصورة</button>';
+    if (leader) h += '<button class="btn sm danger" onclick="cyShowClear()">🙈 إخفاء</button>';
+    return h + '</div></div>';
+}
+async function cyKick(btn) {
+    if (!(await confirmModal('متأكد تبي تطرده من التحقيق؟'))) return;
+    try { await api('/api/cyber/cases/' + CY.roomId + '/kick', { method: 'POST', body: JSON.stringify({ uid: btn.dataset.u }) }); cyLoadRoom(); }
+    catch (e) { toast(e.message); }
 }
 let currentPromoAlertId = null;
 async function checkPromotionAlert() {
@@ -12345,6 +13014,7 @@ function offPaintGrid() {
             }
         } else if (st.cyber) {
             var cr = offMyRole();
+            if (!isMe && cr === 'leader') h += '<button class="btn sm danger" data-u="' + p.uid + '" onclick="offCyKick(this.dataset.u)">🚫 طرد</button>';
             if (!isMe && cr !== 'target' && (cr === 'leader' || (cr === 'member' && p.role === 'target'))) {
                 h += '<button class="btn sm' + (p.muted ? '' : ' danger') + '" data-u="' + p.uid + '" data-m="' + (p.muted ? '0' : '1') + '" onclick="offCyMute(this.dataset.u, this.dataset.m)">' + (p.muted ? '🎙️ فك الإسكات' : '🔇 إسكات') + '</button>';
             }
@@ -12401,6 +13071,7 @@ function offPaintBar() {
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
     var qb = '';
     if (VC.isSenior && !VC.state.training && !VC.state.cyber) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
+    if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 عملياته</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
 }
@@ -12456,7 +13127,8 @@ function offPaintIv() {
     var box = document.getElementById('ov-iv');
     if (!box || !VC) return;
     var st = VC.state, h = '';
-    if (st.training || st.cyber) { box.innerHTML = ''; return; }
+    if (st.training) { box.innerHTML = ''; return; }
+    if (st.cyber) { var cyh = st.cyShow ? cyShowCardHtml(st.cyShow, offMyRole() === 'leader') : ''; if (VC.cyHtml !== cyh) { VC.cyHtml = cyh; box.innerHTML = cyh; } return; }
     if (!VC.isSenior) {
         var ah = '';
         if (st.myQ) ah += '<div class="ov-card"><div class="ov-hrow"><b>❓ السؤال</b></div><div class="ov-myq"><div class="ov-myq-t">' + spEsc(st.myQ) + '</div></div></div>';
@@ -12599,6 +13271,13 @@ function offQRefresh() {
 /* ---- روم التدريب ---- */
 function offMyRole() { var p = VC ? offFindP(VC.state, VC.me) : null; return p ? p.role : ''; }
 function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : (r === 'leader' ? '🛡️ قيادة السيبراني' : (r === 'member' ? '🛡️ عضو سيبراني' : (r === 'target' ? '⚠️ متحقق معه' : 'متقدم'))))); }
+function offCyKick(uid) {
+    if (!VC || !VC.caseId) return;
+    confirmModal('متأكد تبي تطرده من التحقيق؟').then(function (ok) {
+        if (!ok) return;
+        api('/api/cyber/cases/' + VC.caseId + '/kick', { method: 'POST', body: JSON.stringify({ uid: uid }) }).catch(function (e) { toast(e.message); });
+    });
+}
 function offCyMute(uid, m) {
     if (!VC || !VC.caseId) return;
     api('/api/cyber/cases/' + VC.caseId + '/mute', { method: 'POST', body: JSON.stringify({ uid: uid, on: String(m) === '1' }) }).catch(function (e) { toast(e.message); });
