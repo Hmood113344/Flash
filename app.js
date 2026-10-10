@@ -6933,7 +6933,7 @@ app.get("/", (req, res) => {
     body { background: linear-gradient(135deg, #0a1628 0%, #0d1f3c 40%, #0a2744 70%, #0d3060 100%); color: var(--text); min-height: 100vh; }
     #warn-banner { position: sticky; top: 0; z-index: 1000; width: 100%; background: linear-gradient(90deg,#7f1d1d,#991b1b); color: #fecaca; text-align: center; padding: 10px 14px; font-weight: bold; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,0.4); }
     nav { background: rgba(5,15,30,0.95); backdrop-filter: blur(15px); border-bottom: 1px solid rgba(59,130,246,0.3); padding: 0 1.2rem; display: flex; align-items: center; justify-content: space-between; height: 62px; position: sticky; top: 37px; z-index: 900; }
-    #fm-overlay { position: fixed; inset: 0; background: rgba(5,10,20,0.72); backdrop-filter: blur(3px); z-index: 5000; display: none; align-items: center; justify-content: center; padding: 16px; }
+    #fm-overlay { position: fixed; inset: 0; background: rgba(5,10,20,0.72); backdrop-filter: blur(3px); z-index: 7000; display: none; align-items: center; justify-content: center; padding: 16px; }
     #fm-overlay.open { display: flex; }
     #fm-box { background: linear-gradient(160deg, #0d1f3c, #0a1628); border: 1px solid var(--border); border-radius: 14px; width: 100%; max-width: 380px; padding: 20px; box-shadow: 0 15px 45px rgba(0,0,0,0.5); animation: fmPop .15s ease; }
     @keyframes fmPop { from { transform: scale(0.94); opacity: 0; } to { transform: scale(1); opacity: 1; } }
@@ -7000,7 +7000,7 @@ app.get("/", (req, res) => {
     .id-card { background: linear-gradient(135deg, #1e3a5f, #0f2848); border: 2px solid var(--gold); border-radius: 20px; padding: 22px; max-width: 400px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
     .rank-line { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 15px; color: var(--gold-soft); margin: 10px 0; font-weight: bold; }
     .hidden { display: none !important; }
-    #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0d1f3c; padding: 10px 20px; border-radius: 10px; border: 1px solid var(--gold); z-index: 999; display: none; }
+    #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0d1f3c; padding: 10px 20px; border-radius: 10px; border: 1px solid var(--gold); z-index: 7500; display: none; }
     .fab { position: fixed; bottom: 25px; right: 25px; z-index: 998; background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; border: 2px solid rgba(255,255,255,0.2); padding: 14px 24px; border-radius: 50px; font-weight: bold; font-family: inherit; font-size: 14px; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.4); transition: 0.3s; }
     .fab:hover { transform: scale(1.05); }
     .vgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -8130,12 +8130,15 @@ async function cySend() {
     catch (e) { toast(e.message); inp.value = text; }
 }
 async function cyMute(btn) {
-    try { await api('/api/cyber/cases/' + CY.roomId + '/mute', { method: 'POST', body: JSON.stringify({ uid: btn.dataset.u, on: btn.dataset.on === '1' }) }); cyLoadRoom(); }
+    var id = CY.roomId; if (!id) return;
+    try { await api('/api/cyber/cases/' + id + '/mute', { method: 'POST', body: JSON.stringify({ uid: btn.dataset.u, on: btn.dataset.on === '1' }) }); CY.sig = ''; cyLoadRoom(); }
     catch (e) { toast(e.message); }
 }
 async function cyEnd() {
+    var id = CY.roomId;
+    if (!id) return;
     if (!(await confirmModal('متأكد تبي تنهي التحقيق؟'))) return;
-    try { await api('/api/cyber/cases/' + CY.roomId + '/end', { method: 'POST' }); toast('⏹️ تم إنهاء التحقيق'); cyCloseRoom(); }
+    try { await api('/api/cyber/cases/' + id + '/end', { method: 'POST' }); toast('⏹️ تم إنهاء التحقيق'); if (CY.roomId === id) cyCloseRoom(); }
     catch (e) { toast(e.message); }
 }
 async function cyLoadRoom() {
@@ -8473,8 +8476,10 @@ function cyShowCardHtml(sh, leader) {
     return h + '</div></div>';
 }
 async function cyKick(btn) {
+    var id = CY.roomId, uid = btn.dataset.u;
+    if (!id) return;
     if (!(await confirmModal('متأكد تبي تطرده من التحقيق؟'))) return;
-    try { await api('/api/cyber/cases/' + CY.roomId + '/kick', { method: 'POST', body: JSON.stringify({ uid: btn.dataset.u }) }); cyLoadRoom(); }
+    try { await api('/api/cyber/cases/' + id + '/kick', { method: 'POST', body: JSON.stringify({ uid: uid }) }); toast('🚫 تم الطرد'); if (CY.roomId === id) { CY.sig = ''; cyLoadRoom(); } }
     catch (e) { toast(e.message); }
 }
 let currentPromoAlertId = null;
@@ -13733,9 +13738,10 @@ function offMyRole() { var p = VC ? offFindP(VC.state, VC.me) : null; return p ?
 function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : (r === 'leader' ? '🛡️ قيادة السيبراني' : (r === 'member' ? '🛡️ عضو سيبراني' : (r === 'target' ? '⚠️ متحقق معه' : 'متقدم'))))); }
 function offCyKick(uid) {
     if (!VC || !VC.caseId) return;
+    var cid = VC.caseId;
     confirmModal('متأكد تبي تطرده من التحقيق؟').then(function (ok) {
         if (!ok) return;
-        api('/api/cyber/cases/' + VC.caseId + '/kick', { method: 'POST', body: JSON.stringify({ uid: uid }) }).catch(function (e) { toast(e.message); });
+        api('/api/cyber/cases/' + cid + '/kick', { method: 'POST', body: JSON.stringify({ uid: uid }) }).catch(function (e) { toast(e.message); });
     });
 }
 function offCyMute(uid, m) {
