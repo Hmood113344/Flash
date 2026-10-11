@@ -6994,6 +6994,12 @@ app.get("/", (req, res) => {
     .cy-actions { display: flex; gap: 10px; justify-content: center; margin-top: 16px; flex-wrap: wrap; }
     #cyber-room { display: none; position: fixed; inset: 0; z-index: 5500; background: rgba(2,6,23,0.9); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); color: #fff; flex-direction: column; padding: 12px; gap: 8px; }
     #cyber-room.open { display: flex; }
+    body.cy-frozen #app, body.cy-frozen nav, body.cy-frozen #warn-banner, body.cy-frozen #owner-toolbar, body.cy-frozen #sp-fab, body.cy-frozen #sp-modal, body.cy-frozen #mobile-menu, body.cy-frozen #menu-backdrop { display: none !important; }
+    body.cy-frozen { overflow: hidden; background: #060d1a; }
+    #cy-hardlock { position: fixed; inset: 0; z-index: 5000; background: radial-gradient(circle at 50% 35%, #12305e 0%, #060d1a 72%); display: flex; align-items: center; justify-content: center; padding: 20px; text-align: center; color: #e2e8f0; }
+    #cy-hardlock .cy-hl-box { max-width: 420px; width: 100%; line-height: 1.9; }
+    #cy-hardlock h2 { margin: 6px 0 10px; }
+    #cy-hardlock .btn { margin-top: 14px; }
     .cy-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: bold; font-size: 16px; }
     .cy-reason { font-size: 13px; color: #94a3b8; }
     .cy-parts { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -7288,6 +7294,16 @@ app.get("/", (req, res) => {
 <script>
 (function () {
     var d = document.documentElement;
+    try {
+        if (localStorage.getItem('cy_lock') === '1') {
+            var s0 = document.getElementById('fl-splash'); if (s0) s0.remove();
+            document.body.classList.add('cy-frozen');
+            var h0 = document.createElement('div'); h0.id = 'cy-hardlock';
+            h0.innerHTML = '<div class="cy-hl-box"><div style="font-size:52px">🔒</div><h2>تحقيق سيبراني</h2><div>جارِ التحقق من حالة حسابك...</div></div>';
+            document.body.appendChild(h0);
+            return;
+        }
+    } catch (e) {}
     d.classList.add('fl-splash-on');
     setTimeout(function () {
         var s = document.getElementById('fl-splash');
@@ -7376,7 +7392,7 @@ function homeStatusTick(keep) {
     if (!keep) HOME_ST_I = 1 - HOME_ST_I;
     el.textContent = HOME_ST_I === 0 ? '✅ فعّال' : (ME.rank || '✅ فعّال');
 }
-setInterval(function () { homeStatusTick(false); }, 3000);
+setInterval(function () { if (window.CY && CY.frozen) return; homeStatusTick(false); }, 3000);
 function odToggle() {
     if (!REAL_OWNER || !ME) return;
     OWNER_DISGUISE = !OWNER_DISGUISE;
@@ -7929,17 +7945,19 @@ async function cyberCheck() {
     try { st = await api('/api/cyber/state'); } catch (e) { return; }
     if (st.lock) {
         CY.lockId = st.lock.id; CY.lockMode = st.lock.mode || 'voice';
-        if (CY.lockShown && !CY.entering && !(typeof VC !== 'undefined' && VC) && !document.getElementById('cyber-room').classList.contains('open') && !document.getElementById('cyber-overlay').classList.contains('open')) { cyEnterLock(); return; }
+        cyHardLock();
         if (!CY.lockShown) {
             CY.lockShown = true;
-            cyOverlay('<div style="font-size:42px">🔒</div><h2>تحقيق سيبراني</h2><div>تم فتح تحقيق سيبراني بحقك وتم إيقاف حسابك مؤقتاً.<br>جارِ إدخالك لروم التحقيق...</div><div class="cy-actions">' + cyBtn('lockenter', 'دخول روم التحقيق', '') + '</div>');
-            CY.lockTimer = setTimeout(cyEnterLock, 4000);
+            CY.lockTimer = setTimeout(cyEnterLock, 2500);
         }
         return;
     }
-    if (CY.lockShown) {
-        CY.lockShown = false; clearTimeout(CY.lockTimer); cyOverlayClose(); cyCloseRoom();
+    if (CY.lockShown || CY.frozen) {
+        CY.lockShown = false; clearTimeout(CY.lockTimer);
+        cyHardClear();
+        try { cyOverlayClose(); cyCloseRoom(); if (typeof VC !== 'undefined' && VC) offLeaveVoice(true); } catch (e) {}
         toast('🔓 انتهى التحقيق السيبراني، تم فك التقييد عن حسابك');
+        setTimeout(function () { location.reload(); }, 700);
         return;
     }
     if (document.getElementById('cyber-room').classList.contains('open') || document.getElementById('cyber-overlay').classList.contains('open')) return;
@@ -7950,6 +7968,34 @@ async function cyberCheck() {
     else if (st.alerts[0]) { t = 'alert'; c = st.alerts[0]; }
     else { for (var i = 0; i < st.live.length; i++) { if (!CY.seen[st.live[i].id]) { t = 'invite'; c = st.live[i]; break; } } }
     if (t) cyPrompt(t, c);
+}
+function cyHardLock() {
+    if (!CY.frozen) {
+        CY.frozen = true;
+        try { if (typeof pollTimer !== 'undefined' && pollTimer) clearInterval(pollTimer); } catch (e) {}
+        try { if (typeof blockedPollTimer !== 'undefined' && blockedPollTimer) clearInterval(blockedPollTimer); } catch (e) {}
+        try { if (typeof CC_TIMER !== 'undefined' && CC_TIMER) clearInterval(CC_TIMER); } catch (e) {}
+        try { if (typeof OFFA !== 'undefined' && OFFA.timer) clearInterval(OFFA.timer); } catch (e) {}
+        try { if (typeof OFF !== 'undefined' && OFF.tick) clearInterval(OFF.tick); } catch (e) {}
+        try { localStorage.setItem('cy_lock', '1'); } catch (e) {}
+        var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+        document.body.classList.add('cy-frozen');
+        if (CY.freezeTimer) clearInterval(CY.freezeTimer);
+        CY.freezeTimer = setInterval(function () { cyberCheck(); }, 4000);
+    }
+    var h = document.getElementById('cy-hardlock');
+    if (!h) { h = document.createElement('div'); h.id = 'cy-hardlock'; document.body.appendChild(h); }
+    if (!h.getAttribute('data-ready')) {
+        h.setAttribute('data-ready', '1');
+        h.innerHTML = '<div class="cy-hl-box"><div style="font-size:52px">🔒</div><h2>تحقيق سيبراني</h2><div>تم فتح تحقيق سيبراني بحقك وتم إيقاف حسابك مؤقتاً.<br>هذي النافذة تبقى لين تنهي القيادة التحقيق.</div><button class="btn" onclick="cyEnterLock()">🚪 دخول روم التحقيق</button></div>';
+    }
+}
+function cyHardClear() {
+    CY.frozen = false;
+    try { localStorage.removeItem('cy_lock'); } catch (e) {}
+    if (CY.freezeTimer) { clearInterval(CY.freezeTimer); CY.freezeTimer = null; }
+    var h = document.getElementById('cy-hardlock'); if (h) h.remove();
+    document.body.classList.remove('cy-frozen');
 }
 function cyEnterLock() { if (!CY.lockId) return; clearTimeout(CY.lockTimer); cyOverlayClose(); cyEnterCase(CY.lockId, CY.lockMode, true); }
 async function cyEnterCase(id, mode, lock) {
@@ -9331,6 +9377,7 @@ async function init() {
     spConnect();
     var lockLoad = loadSavedLock();
     try { ME = await api('/api/me'); odFix(); } catch (e) {
+        try { cyHardClear(); } catch (e0) {}
         await lockLoad;
         spBadges();
         var pendTicket = spPendingTicket();
@@ -9345,6 +9392,8 @@ async function init() {
         renderLogin(); return;
     }
     spReconnect(); spBadges();
+    if (ME.cyberLocked) { cyHardLock(); cyberCheck(); return; }
+    cyHardClear();
     markOwnerSaved();
     if (ME.blocked) { renderBlocked(ME.reason); return; }
     if (ME.isOwner) {
@@ -9491,7 +9540,7 @@ document.addEventListener('visibilitychange', function () {
     if (!document.hidden) { try { pollTick(); } catch (e) {} }
 });
 async function pollTick() {
-    if (!ME || ME.blocked) return;
+    if (!ME || ME.blocked || (window.CY && CY.frozen)) return;
     if (__pollRunning || document.hidden) return;
     __pollRunning = true;
     try {
