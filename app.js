@@ -4960,7 +4960,7 @@ function offIvDrop(n, uid) {
 const offCfg = new Map();    // n -> { mode, speakerUid }
 function offGetCfg(n) {
     let c = offCfg.get(n);
-    if (!c) { c = { mode: "listen", speakerUid: null }; offCfg.set(n, c); }
+    if (!c) { c = { mode: offIsCyber(n) ? "open" : "listen", speakerUid: null }; offCfg.set(n, c); }
     return c;
 }
 function offState(n, viewerUid) {
@@ -5804,6 +5804,19 @@ app.post("/api/officers/rooms/:n/signal", ensureAuth, async (req, res) => {
     res.json({ ok: true });
 });
 
+app.post("/api/officers/rooms/:n/mode", ensureAuth, async (req, res, next) => {
+    const n = offParseN(req.params.n);
+    if (!n || !offIsCyber(n)) return next();
+    const rl = await cyberRoleOf(req.user.id);
+    if (!rl.isLeader && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "تغيير وضع الروم لقيادة الأمن السيبراني فقط" });
+    const mode = String((req.body || {}).mode || "");
+    if (mode !== "open" && mode !== "mute") return res.status(400).json({ error: "وضع غير صحيح" });
+    const m = offLive.get(n);
+    if (!m || !m.has(req.user.id)) return res.status(404).json({ error: "أنت لست داخل الروم" });
+    offGetCfg(n).mode = mode;
+    offPushState(n);
+    res.json({ ok: true });
+});
 app.post("/api/officers/rooms/:n/mode", ensureSeniorAdmin, async (req, res) => {
     const n = offParseN(req.params.n);
     const mode = String((req.body || {}).mode || "");
@@ -6339,15 +6352,29 @@ async function cyOpsOf(uid, from, to) {
     const range = { $gte: t0, $lte: t1 };
     const logs = await Log.find({ actorId: uid, createdAt: range, $or: [{ action: { $in: CY_OP_ACTIONS } }, { action: /سيبراني/ }] }).sort({ createdAt: -1 }).limit(100).maxTimeMS(8000).lean();
     const sess = await DeviceSession.find({ uid, loginAt: range }, { ip: 1, ua: 1, loginAt: 1 }).sort({ loginAt: -1 }).limit(100).maxTimeMS(8000).lean();
+    const flags = await CyberFlag.find({ targetUid: uid, kind: { $in: CY_FLAG_KINDS }, $or: [{ lastAt: range }, { createdAt: range }] }).sort({ lastAt: -1 }).limit(100).maxTimeMS(8000).lean();
+    const devs = await CyberCase.find({ targetUid: uid, kind: { $ne: "manual" }, createdAt: range }, { targetName: 1, relatedName: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(100).maxTimeMS(8000).lean();
     const out = [];
+    flags.forEach(f => out.push({ id: "flag:" + f._id, kind: "flag", title: f.title || CY_RULE_TITLE[f.kind] || "عملية مشبوهة", details: f.details || "", at: f.lastAt || f.createdAt }));
+    devs.forEach(c => out.push({ id: "case:" + c._id, kind: "case", title: "دخول جهاز على حساب عضو ثاني", details: "جهاز " + (c.targetName || "") + " دخل حساب " + (c.relatedName || ""), at: c.createdAt }));
     logs.forEach(l => out.push({ id: "log:" + l._id, kind: "log", title: l.action, details: l.details || "", at: l.createdAt }));
     sess.forEach(s => out.push({ id: "ses:" + s._id, kind: "ses", title: "تسجيل دخول للموقع", details: "IP: " + (s.ip || "-") + " — " + cyUaLabel(s.ua), at: s.loginAt }));
     out.sort((a, b) => new Date(b.at) - new Date(a.at));
     return out.slice(0, 150);
 }
 async function cyResolveOp(ref, targetUid) {
-    const m = /^(log|ses):([a-f0-9]{24})$/.exec(String(ref || ""));
+    const m = /^(log|ses|flag|case):([a-f0-9]{24})$/.exec(String(ref || ""));
     if (!m) return null;
+    if (m[1] === "flag") {
+        const f = await CyberFlag.findById(m[2]).lean();
+        if (!f || f.targetUid !== targetUid) return null;
+        return { ref, title: f.title || CY_RULE_TITLE[f.kind] || "عملية مشبوهة", lines: [f.details || ""].filter(Boolean), opAt: f.lastAt || f.createdAt, hasPhoto: false };
+    }
+    if (m[1] === "case") {
+        const c = await CyberCase.findById(m[2], { targetUid: 1, targetName: 1, relatedName: 1, createdAt: 1 }).lean();
+        if (!c || c.targetUid !== targetUid) return null;
+        return { ref, title: "دخول جهاز على حساب عضو ثاني", lines: ["جهاز " + (c.targetName || "") + " دخل حساب " + (c.relatedName || "")], opAt: c.createdAt, hasPhoto: false };
+    }
     if (m[1] === "log") {
         const l = await Log.findById(m[2]).lean();
         if (!l || l.actorId !== targetUid) return null;
@@ -8099,23 +8126,48 @@ async function cyEnterCase(id, mode, lock) {
         }
     } finally { CY.entering = false; }
 }
+function cyMicSteps() {
+    var u = navigator.userAgent || '', host = location.hostname, s;
+    if (/iPhone|iPad|iPod/i.test(u)) s = ['افتح إعدادات الآيفون ← Safari ← الميكروفون', 'اختر "اسأل" أو "السماح"', 'ارجع للموقع'];
+    else if (/Android/i.test(u)) s = ['اضغط ⋮ (النقاط الثلاث) فوق', 'افتح الإعدادات ← إعدادات الموقع ← الميكروفون', 'دور على ' + host + ' واختر السماح', 'ارجع للموقع'];
+    else s = ['اضغط أيقونة القفل جنب رابط الموقع', 'غيّر الميكروفون إلى السماح', 'ارجع للموقع'];
+    return '<ol style="text-align:right;margin:8px 0 0;padding-right:20px;color:#fbbf24;font-size:13px;line-height:1.9;">' + s.map(function (x) { return '<li>' + x + '</li>'; }).join('') + '</ol>';
+}
 async function cyMicPrompt(id, lock) {
     CY.micCase = { id: id, lock: lock };
-    var hint = '';
+    var denied = false;
     try {
         if (navigator.permissions && navigator.permissions.query) {
             var st = await navigator.permissions.query({ name: 'microphone' });
-            if (st.state === 'denied') hint = '<div style="margin-top:8px;color:#fbbf24;font-size:13px;">المايك محظور من المتصفح: اضغط على أيقونة القفل (أو الإعدادات) جنب رابط الموقع، واختر السماح بالمايك، ثم اضغط الزر.</div>';
+            denied = st.state === 'denied';
+            st.onchange = function () { cyMicCheck(); };
         }
     } catch (e) {}
+    var hint = denied ? '<div style="margin-top:8px;color:#fbbf24;font-size:13px;font-weight:bold;">المايك محظور من المتصفح، فعّله بهالخطوات:</div>' + cyMicSteps() + '<div style="margin-top:6px;color:#94a3b8;font-size:12px;">أول ما تسمح، ينفتح الروم لحاله.</div>' : '';
     cyOverlay('<div style="text-align:center;"><div style="font-size:42px;">🎤</div><div style="font-weight:bold;margin:6px 0;">لازم تسمح بالمايك عشان تدخل روم التحقيق</div><div style="color:#94a3b8;font-size:13px;">لما يطلع لك طلب المايك اختر "السماح".</div>' + hint + '<div class="cy-actions"><button class="btn" onclick="cyMicRetry()">🎤 السماح بالمايك</button><button class="btn gray" onclick="cyMicText()">⌨️ دخول الكتابي</button></div></div>');
+    if (CY.micTimer) clearInterval(CY.micTimer);
+    CY.micTimer = setInterval(cyMicCheck, 2000);
+    if (!CY.micVis) { CY.micVis = true; document.addEventListener('visibilitychange', function () { if (!document.hidden) cyMicCheck(); }); }
+}
+async function cyMicCheck() {
+    var m = CY.micCase, ov = document.getElementById('cyber-overlay');
+    if (!m || !ov || !ov.classList.contains('open')) { if (CY.micTimer) { clearInterval(CY.micTimer); CY.micTimer = null; } return; }
+    try {
+        var st = await navigator.permissions.query({ name: 'microphone' });
+        if (st.state === 'granted') cyMicRetry();
+    } catch (e) {}
 }
 function cyMicRetry() {
     var m = CY.micCase; if (!m) return;
+    if (CY.entering) { setTimeout(cyMicRetry, 300); return; }
+    CY.micCase = null;
+    if (CY.micTimer) { clearInterval(CY.micTimer); CY.micTimer = null; }
     cyOverlayClose(); cyEnterCase(m.id, 'voice', m.lock);
 }
 function cyMicText() {
     var m = CY.micCase; if (!m) return;
+    CY.micCase = null;
+    if (CY.micTimer) { clearInterval(CY.micTimer); CY.micTimer = null; }
     cyOverlayClose(); cyOpenRoom(m.id, m.lock);
 }
 async function offCyEnd() {
@@ -8341,10 +8393,10 @@ function cyOpsHtml(list, clickable) {
     if (!list || !list.length) return '<div style="color:var(--muted);text-align:center;padding:10px;">ما فيه نشاط خلال الوقت المحدد</div>';
     return list.map(function (o) {
         var meta = (typeof LOG_META !== 'undefined' && LOG_META[o.title]) || null;
-        var ses = o.kind === 'ses';
-        var ic = ses ? '🖥️' : (meta ? meta.icon : 'ℹ️');
-        var col = ses ? '#22c55e' : (meta ? meta.border : '#64748b');
-        var tc = ses ? '#86efac' : (meta ? meta.color : '#e2e8f0');
+        var ses = o.kind === 'ses', sus = o.kind === 'flag' || o.kind === 'case';
+        var ic = ses ? '🖥️' : (sus ? '🚨' : (meta ? meta.icon : 'ℹ️'));
+        var col = ses ? '#22c55e' : (sus ? '#f59e0b' : (meta ? meta.border : '#64748b'));
+        var tc = ses ? '#86efac' : (sus ? '#fcd34d' : (meta ? meta.color : '#e2e8f0'));
         var attrs = clickable ? ' data-ref="' + cyEsc(o.id) + '" onclick="cyShowOp(this.dataset.ref)" style="display:block;cursor:pointer;border-color:' + col + ';"' : ' style="display:block;border-color:' + col + ';"';
         return '<div class="log-item"' + attrs + '><div style="color:' + tc + ';font-weight:bold;">' + ic + ' ' + cyEsc((meta && meta.label) || o.title) + '</div>' + (o.details ? '<div style="color:#93c5fd;font-size:13px;">' + cyEsc(o.details) + '</div>' : '') + '<div style="font-size:12px;color:#64748b;">' + cyEsc(cyFmt(o.at)) + '</div></div>';
     }).join('');
@@ -8353,20 +8405,30 @@ function cyDtLocal(d) {
     var p = function (n) { return ('0' + n).slice(-2); };
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
+function cyDateLocal(d) {
+    var p = function (n) { return ('0' + n).slice(-2); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
 function cyOpsFormHtml() {
-    var now = new Date(), ago = new Date(now.getTime() - 86400000);
-    return '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin:8px 0;">' +
-        '<label style="font-size:12px;flex:1;min-width:140px;">من<input type="datetime-local" id="cy-ops-from" value="' + cyDtLocal(ago) + '" style="width:100%;font-size:14px;"></label>' +
-        '<label style="font-size:12px;flex:1;min-width:140px;">إلى<input type="datetime-local" id="cy-ops-to" value="' + cyDtLocal(now) + '" style="width:100%;font-size:14px;"></label>' +
-        '<button class="btn sm" onclick="cyOpsGo()">🔎 عرض</button></div>';
+    var today = cyDateLocal(new Date());
+    var lb = 'font-size:12px;flex:1;min-width:120px;';
+    var inp = 'width:100%;font-size:15px;';
+    return '<div style="margin:8px 0;">' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;"><label style="' + lb + '">من تاريخ <b style="color:#f87171;">*</b><input type="date" id="cy-ops-fd" value="' + today + '" style="' + inp + '"></label>' +
+        '<label style="' + lb + '">الوقت (اختياري)<input type="time" id="cy-ops-ft" style="' + inp + '"></label></div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;"><label style="' + lb + '">إلى تاريخ <b style="color:#f87171;">*</b><input type="date" id="cy-ops-td" value="' + today + '" style="' + inp + '"></label>' +
+        '<label style="' + lb + '">الوقت (اختياري)<input type="time" id="cy-ops-tt" style="' + inp + '"></label></div>' +
+        '<div style="font-size:11px;color:#94a3b8;margin-top:4px;">بدون وقت: من بداية اليوم إلى آخره.</div>' +
+        '<button class="btn sm" style="margin-top:6px;width:100%;" onclick="cyOpsGo()">🔎 عرض</button></div>';
 }
 async function cyOpsGo() {
     var uid = CY.opsUid; if (!uid) return;
-    var f = (document.getElementById('cy-ops-from') || {}).value, to = (document.getElementById('cy-ops-to') || {}).value;
-    if (!f || !to) { toast('حدد الوقت من وإلى'); return; }
-    var fd = new Date(f), td = new Date(to);
-    if (isNaN(fd.getTime()) || isNaN(td.getTime())) { toast('الوقت غير صحيح'); return; }
-    if (fd.getTime() > td.getTime()) { toast('وقت البداية لازم يكون قبل وقت النهاية'); return; }
+    var g = function (id) { return (document.getElementById(id) || {}).value || ''; };
+    var fdv = g('cy-ops-fd'), ftv = g('cy-ops-ft'), tdv = g('cy-ops-td'), ttv = g('cy-ops-tt');
+    if (!fdv || !tdv) { toast('حدد التاريخ (من وإلى)'); return; }
+    var fd = new Date(fdv + 'T' + (ftv || '00:00')), td = new Date(tdv + 'T' + (ttv ? ttv + ':59' : '23:59:59'));
+    if (isNaN(fd.getTime()) || isNaN(td.getTime())) { toast('التاريخ غير صحيح'); return; }
+    if (fd.getTime() > td.getTime()) { toast('تاريخ البداية لازم يكون قبل تاريخ النهاية'); return; }
     var b = document.getElementById('cy-ops-box'); if (!b) return;
     b.style.textAlign = 'center'; b.textContent = 'جارِ التحميل...';
     try {
@@ -8382,7 +8444,7 @@ function cyOpenMember(uid) {
     var m = cyFindMember(uid); if (!m) return;
     CY.prof = uid; CY.opsUid = uid; CY.opsClick = false;
     var canInv = !m.me && !m.isSenior && !m.investigated;
-    cyOverlay('<div style="text-align:right;max-height:78vh;overflow-y:auto;"><div style="font-size:18px;font-weight:bold;text-align:center;">' + cyEsc(m.name) + '</div><div style="color:#94a3b8;font-size:13px;margin-top:6px;">' + cyInfoRows(m) + '</div><div class="cy-actions">' + (canInv ? '<button class="btn" onclick="cyInvForm(CY.prof)">🔍 تحقيق</button>' : '') + '<button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div><div style="font-weight:bold;margin:12px 0 2px;">📋 نشاطه في الموقع</div>' + cyOpsFormHtml() + '<div id="cy-ops-box" style="color:var(--muted);text-align:center;">حدد الوقت واضغط عرض</div></div>');
+    cyOverlay('<div style="text-align:right;max-height:78vh;overflow-y:auto;"><div style="font-size:18px;font-weight:bold;text-align:center;">' + cyEsc(m.name) + '</div><div style="color:#94a3b8;font-size:13px;margin-top:6px;">' + cyInfoRows(m) + '</div><div class="cy-actions">' + (canInv ? '<button class="btn" onclick="cyInvForm(CY.prof)">🔍 تحقيق</button>' : '') + '<button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div><div style="font-weight:bold;margin:12px 0 2px;">📋 نشاطه في الموقع</div>' + cyOpsFormHtml() + '<div id="cy-ops-box" style="color:var(--muted);text-align:center;">حدد التاريخ واضغط عرض</div></div>');
 }
 function cyInvForm(uid, pre) {
     pre = pre || {};
@@ -8546,7 +8608,7 @@ async function cyOpsOpen() {
     var c = cyCtx();
     if (!c.id || !c.target) { toast('ما قدرت أحدد العضو'); return; }
     CY.opsCase = c.id; CY.opsUid = c.target; CY.opsClick = true;
-    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-weight:bold;">📋 نشاط العضو في الموقع</div><div style="text-align:center;font-size:12px;color:#94a3b8;">حدد الوقت، واضغط على أي نشاط ينعرض قدام العضو</div>' + cyOpsFormHtml() + '<div id="cy-ops-box" style="max-height:55vh;overflow-y:auto;margin-top:6px;color:var(--muted);text-align:center;">حدد الوقت واضغط عرض</div><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
+    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-weight:bold;">📋 نشاط العضو في الموقع</div><div style="text-align:center;font-size:12px;color:#94a3b8;">حدد التاريخ (الوقت اختياري)، واضغط على أي عملية تنعرض قدام العضو</div>' + cyOpsFormHtml() + '<div id="cy-ops-box" style="max-height:55vh;overflow-y:auto;margin-top:6px;color:var(--muted);text-align:center;">حدد التاريخ واضغط عرض</div><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
 }
 async function cyShowOp(ref) {
     var id = CY.opsCase; if (!id) return;
@@ -12923,6 +12985,10 @@ async function saveSettings() {
 var OFF = { my: null, locked: false, questions: [], offset: 0, sig: '', tick: null };
 var OFFA = { tab: 'apps', sig: '', timer: null, data: null, checks: {} };
 var VC = null;
+var CY_MODES = [
+    { k: 'open', t: '🗣️ الجميع يتكلم ويسمع (إلا اللي القيادة كاتمة مايكه)' },
+    { k: 'mute', t: '🔇 محد يتكلم ولا يسمع — فقط القيادة والأعضاء' }
+];
 var OFF_MODES = [
     { k: 'private', t: '🔒 خاص (الكبار والمتحدث فقط)' },
     { k: 'listen', t: '👂 الكبار يتكلمون والباقي يسمعون' },
@@ -13153,7 +13219,12 @@ function offAllowed(st, from, to) {
     if (from === to) return false;
     var f = offFindP(st, from), t = offFindP(st, to);
     if (!f || !t) return false;
-    if (st.training || st.cyber) return !f.muted;
+    if (st.training) return !f.muted;
+    if (st.cyber) {
+        if (f.muted) return false;
+        if (st.mode === 'mute') return (f.role === 'leader' || f.role === 'member') && (t.role === 'leader' || t.role === 'member');
+        return true;
+    }
     if (f.isSenior && t.isSenior) return true;
     var sp = st.speakerUid, mode = st.mode;
     if (mode === 'mute') return false;
@@ -13533,6 +13604,14 @@ function offPaintAll() { offPaintModes(); offPaintNote(); offPaintIv(); offPaint
 function offPaintModes() {
     var box = document.getElementById('ov-modes');
     if (!box || !VC) return;
+    if (VC.state.cyber) {
+        var cmp = offFindP(VC.state, VC.me);
+        if (!(VC.isSenior || (cmp && cmp.role === 'leader'))) { box.innerHTML = ''; return; }
+        box.innerHTML = CY_MODES.map(function (m) {
+            return '<button class="ov-mode' + (VC.state.mode === m.k ? ' on' : '') + '" data-m="' + m.k + '" onclick="offSetMode(this.dataset.m)">' + m.t + '</button>';
+        }).join('');
+        return;
+    }
     if (!VC.isSenior || VC.state.training) { box.innerHTML = ''; return; }
     box.innerHTML = OFF_MODES.map(function (m) {
         return '<button class="ov-mode' + (VC.state.mode === m.k ? ' on' : '') + '" data-m="' + m.k + '" onclick="offSetMode(this.dataset.m)">' + m.t + '</button>';
@@ -13543,7 +13622,9 @@ function offPaintNote() {
     if (!box || !VC) return;
     if (VC.state.cyber) {
         var cme = offFindP(VC.state, VC.me);
-        box.textContent = (cme && cme.muted) ? '🔇 تم إسكاتك في التحقيق — تسمع الباقي فقط.' : '🔍 روم تحقيق سيبراني — الكل يتكلم. القيادة تسكّت أي أحد، وأعضاء القطاع يسكّتون المتحقق معه فقط.';
+        var cstaff = cme && (cme.role === 'leader' || cme.role === 'member');
+        if (VC.state.mode === 'mute') box.textContent = cstaff ? '🔇 الروم صامت — الكل ما يتكلم ولا يسمع، إلا القيادة والأعضاء بينهم.' : '🔇 الروم صامت — ما أحد يسمعك ولا تسمع شي حالياً.';
+        else box.textContent = (cme && cme.muted) ? '🔇 تم إسكاتك في التحقيق — تسمع الباقي فقط.' : '🔍 روم تحقيق سيبراني — الجميع يتكلم ويسمع. القيادة تكتم أي أحد، وأعضاء القطاع يكتمون المتحقق معه فقط.';
         return;
     }
     if (VC.state.training) {
