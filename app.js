@@ -1225,7 +1225,7 @@ client.on("interactionCreate", async interaction => {
 
             if (id.startsWith("approve_") || id.startsWith("reject_")) {
                 const [action, vid] = id.split("_");
-                const allowed = await isAnyAdmin(interaction.user.id);
+                const allowed = isSeniorAdmin(interaction.user.id);
                 const isDiscordAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
                 if (!allowed && !isDiscordAdmin) {
                     return interaction.reply({ content: "🚫 ما تملك صلاحية.", ephemeral: true });
@@ -2018,7 +2018,7 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
         const v = await Violation.findById(req.params.id).select("photo photoChannelId photoMessageId reporterDiscord");
         if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
         const settings = await getSettings();
-        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id)
+        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id)
             || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
             || isViolationsOfficer(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
@@ -2179,7 +2179,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
     }
 });
 
-app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
+app.get("/api/admin/pending", ensureSeniorAdmin, async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: "pending" } },
         { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
@@ -2189,7 +2189,7 @@ app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
     res.json({ list });
 });
 
-app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) => {
+app.post("/api/admin/violations/:id/approve", ensureSeniorAdmin, async (req, res) => {
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
@@ -2197,7 +2197,7 @@ app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) =
     res.json({ ok: true });
 });
 
-app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) => {
+app.post("/api/admin/violations/:id/reject", ensureSeniorAdmin, async (req, res) => {
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
     const v = await Violation.findById(req.params.id);
@@ -10422,6 +10422,7 @@ function renderCard() {
 }
 function renderAdmin(startTab) {
     if (typeof startTab !== 'string') startTab = null;
+    if (!ME.isSeniorAdmin && (startTab === 'pending' || !startTab)) startTab = 'regs';
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
@@ -10440,7 +10441,7 @@ function renderAdmin(startTab) {
             <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
-        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div><div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
+        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
         \${tabsHtml}
