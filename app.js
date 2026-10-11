@@ -1378,13 +1378,15 @@ app.use("/api", (req, res, next) => {
     }
     next();
 });
-app.use("/api", (req, res, next) => {
-    if (!req.user || !underInvestigation.has(req.user.id)) return next();
+app.use("/api", async (req, res, next) => {
+    if (!req.user) return next();
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+    const acctLocked = underInvestigation.has(req.user.id);
+    if (!acctLocked && !(await cyDevLocked(req))) return next();
     if (req.path.indexOf("/cyber/") === 0) return next();
     const vr = /^\/officers\/rooms\/(\d+)\//.exec(req.path);
     if (vr && offIsCyber(parseInt(vr[1], 10))) return next();
-    return res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً", investigation: true });
+    return res.status(403).json({ error: acctLocked ? "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً" : "🔒 هذا الجهاز تحت التحقيق السيبراني، ما تقدر تسوي أي شي منه", investigation: true });
 });
 const unassignedCache = new Map();
 async function isUnassignedUid(uid) {
@@ -1906,6 +1908,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isHighCommand: isHighCommand(req.user.id, settings),
         cyber: await cyberRoleOf(req.user.id),
         cyberLocked: underInvestigation.has(req.user.id),
+        deviceLocked: await cyDevLocked(req),
         unassigned: await isUnassignedUid(req.user.id),
         isViolationsOfficer: isViolationsOfficer(req.user.id, settings),
         isOwner: isOwnerUid(req.user.id),
@@ -5982,6 +5985,20 @@ function cyDeviceId(req) {
     const m = /(?:^|;\s*)fx_did=([a-f0-9]{32})/.exec(String(req.headers.cookie || ""));
     return m ? m[1] : null;
 }
+// الأجهزة الي دخلت على حساب عضو ثاني وانفتح عليها تحقيق (شغال) — ما تقدر تسوي أي شي
+let cyDevLockSet = new Set(), cyDevLockAt = 0;
+async function cyDevLocked(req) {
+    const did = cyDeviceId(req);
+    if (!did) return false;
+    if (Date.now() - cyDevLockAt > 5000) {
+        cyDevLockAt = Date.now();
+        try {
+            const list = await CyberCase.find({ status: "investigating", kind: { $ne: "manual" }, pairKey: { $ne: null } }, { pairKey: 1 }).lean();
+            cyDevLockSet = new Set(list.map(c => String(c.pairKey).split(":")[0]));
+        } catch (e) {}
+    }
+    return cyDevLockSet.has(did);
+}
 async function cyName(uid) {
     const p = await Personnel.findOne({ discord: uid }, { registeredName: 1 }).lean();
     if (p && p.registeredName) return p.registeredName;
@@ -8087,6 +8104,30 @@ function uaHardLock() {
         h.innerHTML = '<div class="ua-box"><div style="font-size:50px">🚫</div><h2>ما يمديك تدخل</h2><div>حسابك متوقف لأنه ما عندك رتبة أو قطاع، ومخالفاتك ما تنقبل.</div><div style="margin-top:8px;color:#cbd5e1;">افتح تكت بخدمة العملاء، وشف التعليمات الي منزّلينها في تعميم الأمن العام.</div><button class="btn" onclick="spOpen()">🎧 خدمة العملاء — افتح تكت</button></div>';
     }
 }
+function dvHardLock() {
+    try { if (typeof pollTimer !== 'undefined' && pollTimer) clearInterval(pollTimer); } catch (e) {}
+    try { if (typeof blockedPollTimer !== 'undefined' && blockedPollTimer) clearInterval(blockedPollTimer); } catch (e) {}
+    try { if (typeof CC_TIMER !== 'undefined' && CC_TIMER) clearInterval(CC_TIMER); } catch (e) {}
+    try { if (typeof OFFA !== 'undefined' && OFFA.timer) clearInterval(OFFA.timer); } catch (e) {}
+    try { if (typeof OFF !== 'undefined' && OFF.tick) clearInterval(OFF.tick); } catch (e) {}
+    UA.frozen = true;
+    try { localStorage.setItem('ua_lock', '1'); } catch (e) {}
+    var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+    document.body.classList.add('ua-frozen');
+    if (UA.timer) clearInterval(UA.timer);
+    UA.timer = setInterval(async function () {
+        try {
+            var f = await api('/api/me');
+            if (f && !f.deviceLocked) { uaHardClear(); location.reload(); }
+        } catch (e) {}
+    }, 6000);
+    var h = document.getElementById('ua-hardlock');
+    if (!h) { h = document.createElement('div'); h.id = 'ua-hardlock'; document.body.appendChild(h); }
+    if (h.getAttribute('data-kind') !== 'device') {
+        h.setAttribute('data-kind', 'device'); h.setAttribute('data-ready', '1');
+        h.innerHTML = '<div class="ua-box"><div style="font-size:50px">🔒</div><h2>هذا الجهاز تحت التحقيق</h2><div>هذا الجهاز دخل على حساب عضو ثاني، وانفتح عليه تحقيق سيبراني.<br>ما تقدر تسوي أي شي من هذا الجهاز لين ينتهي التحقيق.</div></div>';
+    }
+}
 function uaHardClear() {
     UA.frozen = false;
     try { localStorage.removeItem('ua_lock'); } catch (e) {}
@@ -9591,6 +9632,7 @@ async function init() {
     spReconnect(); spBadges();
     if (ME.cyberLocked) { uaHardClear(); cyHardLock(); cyberCheck(); return; }
     cyHardClear();
+    if (ME.deviceLocked) { dvHardLock(); return; }
     if (ME.unassigned) { uaHardLock(); return; }
     uaHardClear();
     markOwnerSaved();
@@ -9756,6 +9798,7 @@ async function pollTick() {
         }
         lastKnownRank = fresh.rank;
         ME = fresh; odFix();
+        if (fresh.deviceLocked && !fresh.cyberLocked) { dvHardLock(); return; }
         if (fresh.unassigned && !fresh.cyberLocked) { uaHardLock(); return; }
         buildNav();
         const rp = document.getElementById('home-points');
