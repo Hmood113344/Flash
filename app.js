@@ -1131,6 +1131,7 @@ async function syncViolationMessage(v) {
 
 async function approveViolation(v, actorId, actorTag) {
     if (underInvestigation.has(v.reporterDiscord)) return { blocked: true, investigation: true };
+    if (await isUnassignedUid(v.reporterDiscord)) return { blocked: true, unassigned: true };
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
     v.status = "approved"; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
@@ -1235,7 +1236,7 @@ client.on("interactionCreate", async interaction => {
                 }
                 if (action === "approve") {
                     const ar = await approveViolation(v, interaction.user.id, interaction.user.username);
-                    if (ar && ar.blocked) return interaction.reply({ content: ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حالياً.", ephemeral: true });
+                    if (ar && ar.blocked) return interaction.reply({ content: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون رتبة أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حالياً.", ephemeral: true });
                     return interaction.deferUpdate();
                 }
                 if (action === "reject") {
@@ -1384,6 +1385,38 @@ app.use("/api", (req, res, next) => {
     const vr = /^\/officers\/rooms\/(\d+)\//.exec(req.path);
     if (vr && offIsCyber(parseInt(vr[1], 10))) return next();
     return res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً", investigation: true });
+});
+const unassignedCache = new Map();
+async function isUnassignedUid(uid) {
+    const hit = unassignedCache.get(uid);
+    if (hit && Date.now() - hit.t < 15000) return hit.v;
+    let v = false;
+    try {
+        if (uid && !isSeniorAdmin(uid) && !isOwnerUid(uid)) {
+            const p = await Personnel.findOne({ discord: uid }, { unit: 1, rank: 1, sector: 1, registeredName: 1 }).lean();
+            if (p && p.registeredName && !p.unit && !p.sector && (p.rank || CONFIG.MILITARY_RANKS[0]) === CONFIG.MILITARY_RANKS[0]) {
+                const acc = await Account.findOne({ uid }, { sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1, isMP: 1 }).lean();
+                const settings = await getSettings();
+                const special = !!(acc && (acc.sector || acc.isSenior || acc.isOwner || acc.tempSenior || acc.isMP))
+                    || settings.adminList.includes(uid) || isHighCommand(uid, settings) || !!getSectorRole(uid, settings)
+                    || !!getPersonnelOfficerSector(uid, settings) || !!getMPRole(uid, settings) || isMPPersonnelOfficer(uid, settings)
+                    || isViolationsOfficer(uid, settings);
+                if (!special) {
+                    const cy = await cyberRoleOf(uid);
+                    if (!cy.isLeader && !cy.isMember) v = true;
+                }
+            }
+        }
+    } catch (e) { v = false; }
+    unassignedCache.set(uid, { t: Date.now(), v });
+    return v;
+}
+app.use("/api", async (req, res, next) => {
+    if (!req.user) return next();
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+    if (req.path.indexOf("/support/") === 0) return next();
+    if (!(await isUnassignedUid(req.user.id))) return next();
+    return res.status(403).json({ error: "🔒 حسابك متوقف: ما عندك رتبة أو قطاع. افتح تكت بخدمة العملاء.", unassigned: true });
 });
 async function isSupportAdmin(uid) {
     if (!uid) return false;
@@ -1873,6 +1906,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isHighCommand: isHighCommand(req.user.id, settings),
         cyber: await cyberRoleOf(req.user.id),
         cyberLocked: underInvestigation.has(req.user.id),
+        unassigned: await isUnassignedUid(req.user.id),
         isViolationsOfficer: isViolationsOfficer(req.user.id, settings),
         isOwner: isOwnerUid(req.user.id),
         seniorTemp,
@@ -2156,7 +2190,7 @@ app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) =
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
-    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3303,7 +3337,7 @@ app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, r
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
-    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3689,7 +3723,7 @@ app.post("/api/violations-officer/violations/:id/approve", ensureViolationsOffic
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)");
-    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 app.post("/api/violations-officer/violations/:id/reject", ensureViolationsOfficer, async (req, res) => {
@@ -3806,7 +3840,7 @@ app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
     const r = await approveViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`);
-    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -7000,6 +7034,13 @@ app.get("/", (req, res) => {
     #cy-hardlock .cy-hl-box { max-width: 420px; width: 100%; line-height: 1.9; }
     #cy-hardlock h2 { margin: 6px 0 10px; }
     #cy-hardlock .btn { margin-top: 14px; }
+    body.ua-frozen #app, body.ua-frozen nav, body.ua-frozen #warn-banner, body.ua-frozen #owner-toolbar, body.ua-frozen #sp-fab, body.ua-frozen #mobile-menu, body.ua-frozen #menu-backdrop { display: none !important; }
+    body.ua-frozen { overflow: hidden; background: #060d1a; }
+    body.ua-frozen #sp-modal { z-index: 5600; }
+    #ua-hardlock { position: fixed; inset: 0; z-index: 5000; background: radial-gradient(circle at 50% 35%, #12305e 0%, #060d1a 72%); display: flex; align-items: center; justify-content: center; padding: 20px; text-align: center; color: #e2e8f0; }
+    #ua-hardlock .ua-box { max-width: 440px; width: 100%; line-height: 1.9; background: rgba(13,31,60,0.92); border: 1px solid rgba(239,68,68,0.5); border-radius: 16px; padding: 24px 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+    #ua-hardlock h2 { margin: 6px 0 10px; color: #fca5a5; }
+    #ua-hardlock .btn { margin-top: 14px; width: 100%; }
     .cy-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: bold; font-size: 16px; }
     .cy-reason { font-size: 13px; color: #94a3b8; }
     .cy-parts { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -7304,6 +7345,16 @@ app.get("/", (req, res) => {
             return;
         }
     } catch (e) {}
+    try {
+        if (localStorage.getItem('ua_lock') === '1') {
+            var s1 = document.getElementById('fl-splash'); if (s1) s1.remove();
+            document.body.classList.add('ua-frozen');
+            var h1 = document.createElement('div'); h1.id = 'ua-hardlock';
+            h1.innerHTML = '<div class="ua-box"><div style="font-size:46px">🚫</div><h2>جارِ التحقق من حسابك...</h2></div>';
+            document.body.appendChild(h1);
+            return;
+        }
+    } catch (e) {}
     d.classList.add('fl-splash-on');
     setTimeout(function () {
         var s = document.getElementById('fl-splash');
@@ -7392,7 +7443,7 @@ function homeStatusTick(keep) {
     if (!keep) HOME_ST_I = 1 - HOME_ST_I;
     el.textContent = HOME_ST_I === 0 ? '✅ فعّال' : (ME.rank || '✅ فعّال');
 }
-setInterval(function () { if (window.CY && CY.frozen) return; homeStatusTick(false); }, 3000);
+setInterval(function () { if ((window.CY && CY.frozen) || (window.UA && UA.frozen)) return; homeStatusTick(false); }, 3000);
 function odToggle() {
     if (!REAL_OWNER || !ME) return;
     OWNER_DISGUISE = !OWNER_DISGUISE;
@@ -7969,6 +8020,40 @@ async function cyberCheck() {
     else { for (var i = 0; i < st.live.length; i++) { if (!CY.seen[st.live[i].id]) { t = 'invite'; c = st.live[i]; break; } } }
     if (t) cyPrompt(t, c);
 }
+var UA = { frozen: false, timer: null };
+function uaHardLock() {
+    if (!UA.frozen) {
+        UA.frozen = true;
+        try { if (typeof pollTimer !== 'undefined' && pollTimer) clearInterval(pollTimer); } catch (e) {}
+        try { if (typeof blockedPollTimer !== 'undefined' && blockedPollTimer) clearInterval(blockedPollTimer); } catch (e) {}
+        try { if (typeof CC_TIMER !== 'undefined' && CC_TIMER) clearInterval(CC_TIMER); } catch (e) {}
+        try { if (typeof OFFA !== 'undefined' && OFFA.timer) clearInterval(OFFA.timer); } catch (e) {}
+        try { if (typeof OFF !== 'undefined' && OFF.tick) clearInterval(OFF.tick); } catch (e) {}
+        try { localStorage.setItem('ua_lock', '1'); } catch (e) {}
+        var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+        document.body.classList.add('ua-frozen');
+        if (UA.timer) clearInterval(UA.timer);
+        UA.timer = setInterval(async function () {
+            try {
+                var f = await api('/api/me');
+                if (f && !f.unassigned) { uaHardClear(); location.reload(); }
+            } catch (e) {}
+        }, 6000);
+    }
+    var h = document.getElementById('ua-hardlock');
+    if (!h) { h = document.createElement('div'); h.id = 'ua-hardlock'; document.body.appendChild(h); }
+    if (!h.getAttribute('data-ready')) {
+        h.setAttribute('data-ready', '1');
+        h.innerHTML = '<div class="ua-box"><div style="font-size:50px">🚫</div><h2>ما يمديك تدخل</h2><div>حسابك متوقف لأنه ما عندك رتبة أو قطاع، ومخالفاتك ما تنقبل.</div><div style="margin-top:8px;color:#cbd5e1;">افتح تكت بخدمة العملاء، وشف التعليمات الي منزّلينها في تعميم الأمن العام.</div><button class="btn" onclick="spOpen()">🎧 خدمة العملاء — افتح تكت</button></div>';
+    }
+}
+function uaHardClear() {
+    UA.frozen = false;
+    try { localStorage.removeItem('ua_lock'); } catch (e) {}
+    if (UA.timer) { clearInterval(UA.timer); UA.timer = null; }
+    var h = document.getElementById('ua-hardlock'); if (h) h.remove();
+    document.body.classList.remove('ua-frozen');
+}
 function cyHardLock() {
     if (!CY.frozen) {
         CY.frozen = true;
@@ -8008,8 +8093,30 @@ async function cyEnterCase(id, mode, lock) {
             var v = await api('/api/cyber/cases/' + id + '/voice', { method: 'POST' });
             await offJoinVoice(v.n);
         } catch (e) { toast(e.message); }
-        if (!(typeof VC !== 'undefined' && VC)) cyOpenRoom(id, lock);
+        if (!(typeof VC !== 'undefined' && VC)) {
+            if (OFF_MICFAIL) await cyMicPrompt(id, lock);
+            else cyOpenRoom(id, lock);
+        }
     } finally { CY.entering = false; }
+}
+async function cyMicPrompt(id, lock) {
+    CY.micCase = { id: id, lock: lock };
+    var hint = '';
+    try {
+        if (navigator.permissions && navigator.permissions.query) {
+            var st = await navigator.permissions.query({ name: 'microphone' });
+            if (st.state === 'denied') hint = '<div style="margin-top:8px;color:#fbbf24;font-size:13px;">المايك محظور من المتصفح: اضغط على أيقونة القفل (أو الإعدادات) جنب رابط الموقع، واختر السماح بالمايك، ثم اضغط الزر.</div>';
+        }
+    } catch (e) {}
+    cyOverlay('<div style="text-align:center;"><div style="font-size:42px;">🎤</div><div style="font-weight:bold;margin:6px 0;">لازم تسمح بالمايك عشان تدخل روم التحقيق</div><div style="color:#94a3b8;font-size:13px;">لما يطلع لك طلب المايك اختر "السماح".</div>' + hint + '<div class="cy-actions"><button class="btn" onclick="cyMicRetry()">🎤 السماح بالمايك</button><button class="btn gray" onclick="cyMicText()">⌨️ دخول الكتابي</button></div></div>');
+}
+function cyMicRetry() {
+    var m = CY.micCase; if (!m) return;
+    cyOverlayClose(); cyEnterCase(m.id, 'voice', m.lock);
+}
+function cyMicText() {
+    var m = CY.micCase; if (!m) return;
+    cyOverlayClose(); cyOpenRoom(m.id, m.lock);
 }
 async function offCyEnd() {
     var id = (typeof VC !== 'undefined' && VC) ? VC.caseId : null;
@@ -9377,7 +9484,7 @@ async function init() {
     spConnect();
     var lockLoad = loadSavedLock();
     try { ME = await api('/api/me'); odFix(); } catch (e) {
-        try { cyHardClear(); } catch (e0) {}
+        try { cyHardClear(); uaHardClear(); } catch (e0) {}
         await lockLoad;
         spBadges();
         var pendTicket = spPendingTicket();
@@ -9392,8 +9499,10 @@ async function init() {
         renderLogin(); return;
     }
     spReconnect(); spBadges();
-    if (ME.cyberLocked) { cyHardLock(); cyberCheck(); return; }
+    if (ME.cyberLocked) { uaHardClear(); cyHardLock(); cyberCheck(); return; }
     cyHardClear();
+    if (ME.unassigned) { uaHardLock(); return; }
+    uaHardClear();
     markOwnerSaved();
     if (ME.blocked) { renderBlocked(ME.reason); return; }
     if (ME.isOwner) {
@@ -9540,7 +9649,7 @@ document.addEventListener('visibilitychange', function () {
     if (!document.hidden) { try { pollTick(); } catch (e) {} }
 });
 async function pollTick() {
-    if (!ME || ME.blocked || (window.CY && CY.frozen)) return;
+    if (!ME || ME.blocked || (window.CY && CY.frozen) || (window.UA && UA.frozen)) return;
     if (__pollRunning || document.hidden) return;
     __pollRunning = true;
     try {
@@ -9557,6 +9666,7 @@ async function pollTick() {
         }
         lastKnownRank = fresh.rank;
         ME = fresh; odFix();
+        if (fresh.unassigned && !fresh.cyberLocked) { uaHardLock(); return; }
         buildNav();
         const rp = document.getElementById('home-points');
         if (rp) {
@@ -13082,7 +13192,9 @@ function offQueue(uid, fn) {
     VC.q[uid] = (VC.q[uid] || Promise.resolve()).then(fn).catch(function () {});
 }
 
+var OFF_MICFAIL = false;
 async function offJoinVoice(n) {
+    OFF_MICFAIL = false;
     if (VC) { toast('أنت داخل روم حالياً'); return; }
     if (!window.RTCPeerConnection || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         toast('متصفحك لا يدعم الصوت، استخدم Chrome أو Safari حديث');
@@ -13091,7 +13203,7 @@ async function offJoinVoice(n) {
     var stream;
     try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
-    } catch (e) { toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
+    } catch (e) { OFF_MICFAIL = true; toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
     var j;
     try { j = await offPost('/api/officers/rooms/' + n + '/join', {}); }
     catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); toast(e.message); return; }
