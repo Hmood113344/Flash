@@ -6955,6 +6955,21 @@ app.get("/", (req, res) => {
     .cs-option.selected { color: var(--gold-soft); font-weight: bold; }
     .cs-check { color: var(--gold-soft); }
     .logo { font-size: 1.3rem; font-weight: 900; background: linear-gradient(90deg, #3b82f6, #60a5fa, #93c5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: 2px; }
+    .logo svg { width: 24px; height: 24px; vertical-align: -5px; margin-inline-end: 6px; }
+    html.fl-splash-on, html.fl-splash-on body { overflow: hidden; }
+    #fl-splash { position: fixed; inset: 0; z-index: 2147483000; background: radial-gradient(circle at 50% 42%, #12305e 0%, #0a1628 62%); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; transition: opacity .45s; }
+    #fl-splash.out { opacity: 0; pointer-events: none; }
+    #fl-splash svg { width: 120px; height: 120px; filter: drop-shadow(0 0 22px rgba(59,130,246,.55)); }
+    #fl-splash path { fill: url(#flSplashG); fill-opacity: 0; stroke: #60a5fa; stroke-width: 1.6; stroke-linejoin: round; stroke-dasharray: 1; stroke-dashoffset: 1; animation: flDraw .7s ease-out forwards, flFill .4s .6s ease-out forwards; }
+    #fl-splash .fl-name { font-size: 34px; font-weight: 800; letter-spacing: .5px; color: #e2e8f0; opacity: 0; animation: flFade .4s .75s forwards; }
+    @keyframes flDraw { to { stroke-dashoffset: 0; } }
+    @keyframes flFill { to { fill-opacity: 1; stroke-opacity: 0; } }
+    @keyframes flFade { to { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+        #fl-splash path { animation: none; stroke-dashoffset: 0; fill-opacity: 1; stroke-opacity: 0; }
+        #fl-splash .fl-name { animation: none; opacity: 1; }
+        #fl-splash { transition: none; }
+    }
     .nav-links { display: flex; gap: 0.3rem; list-style: none; flex-wrap: wrap; }
     .nav-links button { background: transparent; border: 1px solid transparent; color: #94a3b8; padding: 0.4rem 0.8rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-size: 0.85rem; transition: all 0.2s; }
     .nav-links button:hover { background: rgba(59,130,246,0.2); border-color: #3b82f6; color: #60a5fa; }
@@ -7414,9 +7429,25 @@ app.get("/", (req, res) => {
 </div>
 </head>
 <body>
+<div id="fl-splash">
+    <svg viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="flSplashG" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs><path pathLength="1" d="M58 8 L26 55 L46 55 L40 92 L74 42 L54 42 L64 8 Z"/></svg>
+    <div class="fl-name">${CONFIG.SITE_NAME}</div>
+</div>
+<script>
+(function () {
+    var d = document.documentElement;
+    d.classList.add('fl-splash-on');
+    setTimeout(function () {
+        var s = document.getElementById('fl-splash');
+        if (!s) { d.classList.remove('fl-splash-on'); return; }
+        s.classList.add('out');
+        setTimeout(function () { s.remove(); d.classList.remove('fl-splash-on'); }, 450);
+    }, 2000);
+})();
+</script>
 <div id="warn-banner">⚠️ تنبيه: هذا الموقع مخصص للمحاكاة واللعب فقط، ولا يمت للواقع بصلة.</div>
 <nav>
-    <div class="logo" onclick="odToggle()" style="-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;">🚨 ${CONFIG.SITE_NAME}</div>
+    <div class="logo" onclick="odToggle()" style="-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;"><svg viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="flLogoG" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs><path fill="url(#flLogoG)" d="M58 8 L26 55 L46 55 L40 92 L74 42 L54 42 L64 8 Z"/></svg>${CONFIG.SITE_NAME}</div>
     <ul class="nav-links" id="nav-links"></ul>
     <button class="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
 </nav>
