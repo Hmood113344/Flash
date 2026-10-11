@@ -6142,6 +6142,16 @@ app.post("/api/cyber/cases/:id/investigate", ensureAuth, async (req, res) => {
     if (x.c.targetUid === req.user.id) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
     const mode = (req.body && req.body.mode) === "text" ? "text" : "voice";
     const name = await cyName(req.user.id);
+    const ap = cyParseAppt(req.body || {});
+    if (ap.error) return res.status(400).json({ error: ap.error });
+    if (!ap.startNow) {
+        const sc = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: { $in: ["alert", "sent"] } }, { $set: { status: "scheduled", mode, scheduledAt: ap.at, startedBy: req.user.id, startedByName: name } }, { new: true });
+        if (!sc) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
+        if (sc.flagId) CyberFlag.updateOne({ _id: sc.flagId, status: "open" }, { $set: { status: "investigated", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }).catch(() => {});
+        await logEvent({ action: "جدولة تحقيق سيبراني", discordId: sc.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `${sc.targetName} — الموعد: ${ap.at.toISOString()}` });
+        cyberPush(sc);
+        return res.json({ ok: true, scheduled: true, id: String(sc._id), at: ap.at });
+    }
     let vn = null;
     if (mode === "voice") {
         const usedN = new Set((await CyberCase.find({ status: "investigating", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
@@ -6619,6 +6629,12 @@ app.get("/api/cyber/members/:uid/ops", ensureAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: "تعذر تحميل العمليات" }); }
 });
 
+function cyParseAppt(b) {
+    const at = offBuildDate(b && b.date, b && b.hour, b && b.minute);
+    if (!at) return { error: "حدد اليوم والساعة والدقيقة بشكل صحيح" };
+    if (+at < Date.now() - 30 * 60000) return { error: "الوقت المحدد مضى، حدد وقت قادم" };
+    return { at, startNow: +at <= Date.now() };
+}
 app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
     try {
         const role = await cyGuard(req, res); if (!role) return;
@@ -6628,12 +6644,9 @@ app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
         const reason = String(b.reason || "").trim().slice(0, 600);
         const evidence = String(b.evidence || "").trim().slice(0, 1200);
         const mode = b.mode === "text" ? "text" : "voice";
-        let schedAt = null;
-        if (b.scheduled === true && role.isLeader) {
-            schedAt = offBuildDate(b.date, b.hour, b.minute);
-            if (!schedAt) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
-            if (+schedAt < Date.now() - 60000) return res.status(400).json({ error: "الوقت المحدد مضى، حدد وقت قادم" });
-        }
+        const ap = cyParseAppt(b);
+        if (ap.error) return res.status(400).json({ error: ap.error });
+        const schedAt = ap.startNow ? null : ap.at;
         if (!targetUid || targetUid === uid) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
         if (reason.length < 3) return res.status(400).json({ error: "اكتب سبب التحقيق" });
         const ta = await Account.findOne({ uid: targetUid, status: "approved" }, { isSenior: 1, isOwner: 1, tempSenior: 1 }).lean();
@@ -6652,8 +6665,8 @@ app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
         const targetName = await cyName(targetUid);
         const base = { kind: "manual", reason, evidence: evidence || null, evidenceVio, flagId, targetUid, targetName, relatedUid: null, relatedName: null, sentBy: uid, sentByName: name, sentAt: new Date() };
         if (!role.isLeader) {
-            const c = await CyberCase.create({ ...base, status: "sent", mode: "voice" });
-            await logEvent({ action: "رفع تحقيق سيبراني", discordId: targetUid, actorId: uid, actorTag: name + " (الأمن السيبراني)", details: `${targetName} — ${reason}` });
+            const c = await CyberCase.create({ ...base, status: "sent", mode: "voice", scheduledAt: ap.at });
+            await logEvent({ action: "رفع تحقيق سيبراني", discordId: targetUid, actorId: uid, actorTag: name + " (الأمن السيبراني)", details: `${targetName} — ${reason} — الموعد المقترح: ${ap.at.toISOString()}` });
             cyberPush(c);
             return res.json({ ok: true, started: false, id: String(c._id) });
         }
@@ -8178,10 +8191,10 @@ async function offCyEnd() {
     catch (e) { toast(e.message); }
 }
 function cyPrompt(t, c) {
-    CY.cur = { t: t, id: c.id, mode: c.mode };
+    CY.cur = { t: t, id: c.id, mode: c.mode, at: c.scheduledAt || null };
     var h;
     if (t === 'alert') h = '<div style="font-size:38px">⚠️</div><h3>اشتباه دخول جهاز</h3><p>جهاز العضو <b>' + cyEsc(c.targetName) + '</b> دخل حساب العضو <b>' + cyEsc(c.relatedName) + '</b></p><div class="cy-actions">' + cyBtn('send', '📤 إرسال للقائد', '') + cyBtn('dismiss', 'تجاهل', 'gray') + '</div>';
-    else if (t === 'inbox') h = '<div style="font-size:38px">🛡️</div><h3>طلب تحقيق من الأمن السيبراني</h3>' + (c.kind === 'manual' ? '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b><br>السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '') + '</p>' : '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b> بسبب دخوله بجهازه حساب <b>' + cyEsc(c.relatedName) + '</b></p>') + '<div class="cy-actions">' + cyBtn('investigate', '🔍 تحقيق', '') + cyBtn('resolve', '✅ حل العملية', 'gray') + '</div>';
+    else if (t === 'inbox') h = '<div style="font-size:38px">🛡️</div><h3>طلب تحقيق من الأمن السيبراني</h3>' + (c.kind === 'manual' ? '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b><br>السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '') + '</p>' : '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b> بسبب دخوله بجهازه حساب <b>' + cyEsc(c.relatedName) + '</b></p>') + (c.scheduledAt ? '<p>📅 الموعد المقترح: <b>' + cyEsc(cyFmt(c.scheduledAt)) + '</b></p>' : '') + '<div class="cy-actions">' + cyBtn('investigate', '🔍 تحقيق', '') + cyBtn('resolve', '✅ حل العملية', 'gray') + '</div>';
     else if (t === 'decision') h = '<div style="font-size:38px">📋</div><h3>انتهى التحقيق</h3><p>انتهى التحقيق مع <b>' + cyEsc(c.targetName) + '</b> ' + (c.kind === 'manual' ? '' : '(حساب: ' + cyEsc(c.relatedName) + ')') + '<br>وش تبينا نسوي معه؟</p><div class="cy-actions">' + cyBtn('escalate', '⭐ إبلاغ القيادة العليا', '') + cyBtn('decide-resolve', '✅ حل العملية', 'gray') + '</div>';
     else h = '<div style="font-size:38px">🔍</div><h3>تحقيق سيبراني جاري</h3><p>فُتح تحقيق بحق <b>' + cyEsc(c.targetName) + '</b></p><div class="cy-actions">' + cyBtn('join', 'دخول الروم', '') + cyBtn('later', 'لاحقاً', 'gray') + '</div>';
     cyOverlay(h);
@@ -8195,7 +8208,15 @@ async function cyAct(btn) {
     CY.busy = true;
     try {
         if (a === 'send' || a === 'dismiss' || a === 'resolve') await api('/api/cyber/cases/' + cur.id + '/' + a, { method: 'POST' });
-        else if (a === 'inv-voice' || a === 'inv-text') { await api('/api/cyber/cases/' + cur.id + '/investigate', { method: 'POST', body: JSON.stringify({ mode: a === 'inv-text' ? 'text' : 'voice' }) }); CY.busy = false; cyOverlayClose(); cyEnterCase(cur.id, a === 'inv-text' ? 'text' : 'voice', false); return; }
+        else if (a === 'inv-voice' || a === 'inv-text') {
+            var md = a === 'inv-text' ? 'text' : 'voice';
+            var ad = (document.getElementById('cy-f-date') || {}).value, ah = (document.getElementById('cy-f-hour') || {}).value, am = (document.getElementById('cy-f-min') || {}).value;
+            if (!ad || am === '' || am === undefined) { toast('حدد اليوم والدقيقة'); CY.busy = false; return; }
+            var rr = await api('/api/cyber/cases/' + cur.id + '/investigate', { method: 'POST', body: JSON.stringify({ mode: md, date: ad, hour: ah, minute: am }) });
+            CY.busy = false; cyOverlayClose();
+            if (rr.scheduled) { toast('📅 تم جدولة التحقيق، يبدأ في الموعد المحدد'); if (document.getElementById('cy-panel')) { CYP.sig = {}; cyPanelLoad(true); } cyberCheck(); return; }
+            cyEnterCase(cur.id, md, false); return;
+        }
         else if (a === 'join') { CY.seen[cur.id] = true; CY.busy = false; cyOverlayClose(); cyEnterCase(cur.id, cur.mode, false); return; }
         else if (a === 'later') { CY.seen[cur.id] = true; }
         else if (a === 'escalate') {
@@ -8446,20 +8467,26 @@ function cyOpenMember(uid) {
     var canInv = !m.me && !m.isSenior && !m.investigated;
     cyOverlay('<div style="text-align:right;max-height:78vh;overflow-y:auto;"><div style="font-size:18px;font-weight:bold;text-align:center;">' + cyEsc(m.name) + '</div><div style="color:#94a3b8;font-size:13px;margin-top:6px;">' + cyInfoRows(m) + '</div><div class="cy-actions">' + (canInv ? '<button class="btn" onclick="cyInvForm(CY.prof)">🔍 تحقيق</button>' : '') + '<button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div><div style="font-weight:bold;margin:12px 0 2px;">📋 نشاطه في الموقع</div>' + cyOpsFormHtml() + '<div id="cy-ops-box" style="color:var(--muted);text-align:center;">حدد التاريخ واضغط عرض</div></div>');
 }
+function cySchedFieldsHtml(title, at) {
+    var d = at ? new Date(at) : new Date();
+    if (isNaN(d.getTime()) || d.getTime() < Date.now()) d = new Date();
+    var dateS = '', hh = 0, mm = 0;
+    try {
+        dateS = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Riyadh' });
+        var tp = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Riyadh', hour12: false, hour: '2-digit', minute: '2-digit' }).split(':');
+        hh = parseInt(tp[0], 10) % 24; mm = parseInt(tp[1], 10) || 0;
+    } catch (e) {}
+    var hrs = '';
+    for (var hi = 0; hi < 24; hi++) { hrs += '<option value="' + hi + '"' + (hi === hh ? ' selected' : '') + '>' + (hi % 12 === 0 ? 12 : hi % 12) + ' ' + (hi < 12 ? 'صباحاً' : 'مساءً') + '</option>'; }
+    return '<div style="margin-top:10px;border-top:1px solid #334155;padding-top:8px;text-align:right;"><div style="font-weight:bold;margin-bottom:4px;">' + title + '</div><label style="font-size:13px;">اليوم</label><input type="date" id="cy-f-date" value="' + dateS + '" style="width:100%;font-size:16px;"><label style="font-size:13px;">الساعة</label><select id="cy-f-hour" style="width:100%;font-size:16px;">' + hrs + '</select><label style="font-size:13px;">الدقيقة (اكتبها أنت)</label><input type="number" id="cy-f-min" min="0" max="59" value="' + mm + '" style="width:100%;font-size:16px;"><div style="font-size:11px;color:#94a3b8;margin-top:4px;">إذا الموعد الحين أو مضى، يبدأ التحقيق على طول.</div></div>';
+}
 function cyInvForm(uid, pre) {
     pre = pre || {};
     var m = cyFindMember(uid);
     var name = m ? m.name : (pre.name || '');
-    CY.inv = { uid: uid, vioId: pre.vioId || null, flagId: pre.flagId || null, scheduled: !!pre.scheduled };
+    CY.inv = { uid: uid, vioId: pre.vioId || null, flagId: pre.flagId || null, scheduled: true };
     var lead = cyIsLead();
-    var sched = '';
-    if (pre.scheduled && lead) {
-        var today = '';
-        try { today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Riyadh' }); } catch (e) {}
-        var hrs = '';
-        for (var hi = 0; hi < 24; hi++) { hrs += '<option value="' + hi + '">' + (hi % 12 === 0 ? 12 : hi % 12) + ' ' + (hi < 12 ? 'صباحاً' : 'مساءً') + '</option>'; }
-        sched = '<div style="margin-top:10px;border-top:1px solid #334155;padding-top:8px;"><div style="font-weight:bold;margin-bottom:4px;">📅 موعد التحقيق</div><label style="font-size:13px;">اليوم</label><input type="date" id="cy-f-date" value="' + today + '" style="width:100%;font-size:16px;"><label style="font-size:13px;">الساعة</label><select id="cy-f-hour" style="width:100%;font-size:16px;">' + hrs + '</select><label style="font-size:13px;">الدقيقة (اكتبها أنت)</label><input type="number" id="cy-f-min" min="0" max="59" value="0" style="width:100%;font-size:16px;"></div>';
-    }
+    var sched = cySchedFieldsHtml(lead ? '📅 موعد التحقيق' : '📅 الموعد المقترح للتحقيق', null);
     cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-size:18px;font-weight:bold;">🔍 فتح تحقيق</div><div style="text-align:center;color:#94a3b8;margin-bottom:10px;">مع: <b style="color:#fff;">' + cyEsc(name) + '</b></div><label style="font-size:13px;">سبب التحقيق</label><textarea id="cy-f-reason" rows="3" maxlength="600" style="width:100%;font-size:16px;margin-bottom:8px;">' + cyEsc(pre.reason || '') + '</textarea><label style="font-size:13px;">الدلائل (اختياري — إذا توفرت)</label><textarea id="cy-f-evid" rows="3" maxlength="1200" style="width:100%;font-size:16px;">' + cyEsc(pre.evidence || '') + '</textarea>' + sched + '<div class="cy-actions">' + (lead ? '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">🎙️ صوتي</button><button class="btn" data-m="text" onclick="cyInvSubmit(this)">⌨️ كتابي</button>' : '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">📤 إرسال للقيادة</button>') + '<button class="btn gray" onclick="cyOverlayClose()">إلغاء</button></div></div>');
 }
 async function cyInvSubmit(btn) {
@@ -8485,9 +8512,10 @@ async function cyInvSubmit(btn) {
     } catch (e) { toast(e.message); }
 }
 function cyModeChoose() {
-    cyOverlay('<div style="font-size:34px;">🔍</div><h3>نوع التحقيق</h3><div>اختر طريقة التحقيق</div><div class="cy-actions"><button class="btn" data-a="inv-voice" onclick="cyAct(this)">🎙️ صوتي</button><button class="btn" data-a="inv-text" onclick="cyAct(this)">⌨️ كتابي</button><button class="btn gray" data-a="inv-back" onclick="cyAct(this)">رجوع</button></div>');
+    var at = CY.cur ? CY.cur.at : null;
+    cyOverlay('<div style="text-align:center;"><div style="font-size:34px;">🔍</div><h3>نوع التحقيق وموعده</h3>' + cySchedFieldsHtml('📅 موعد التحقيق', at) + '<div class="cy-actions"><button class="btn" data-a="inv-voice" onclick="cyAct(this)">🎙️ صوتي</button><button class="btn" data-a="inv-text" onclick="cyAct(this)">⌨️ كتابي</button><button class="btn gray" data-a="inv-back" onclick="cyAct(this)">رجوع</button></div></div>');
 }
-function cyPBtn(id, a, label, cls, mode) { return '<button class="btn sm ' + (cls || '') + '" data-id="' + id + '" data-a="' + a + '"' + (mode ? ' data-mode="' + mode + '"' : '') + ' onclick="cyPanelAct(this)">' + label + '</button>'; }
+function cyPBtn(id, a, label, cls, mode, at) { return '<button class="btn sm ' + (cls || '') + '" data-id="' + id + '" data-a="' + a + '"' + (mode ? ' data-mode="' + mode + '"' : '') + (at ? ' data-at="' + cyEsc(at) + '"' : '') + ' onclick="cyPanelAct(this)">' + label + '</button>'; }
 async function cySchedCancel(id) {
     if (!(await confirmModal('متأكد تبي تلغي جدولة هذا التحقيق؟'))) return;
     try { await api('/api/cyber/cases/' + id + '/cancel', { method: 'POST' }); toast('🗑️ تم إلغاء الجدولة'); CYP.sig = {}; cyPanelLoad(true); }
@@ -8503,7 +8531,7 @@ function cyPanelAct(btn) {
     if (a === 'stop') return cyStopInv(id);
     if (a === 'cancelsched') return cySchedCancel(id);
     if (a === 'view') return cyEnterCase(id, null, false);
-    CY.cur = { t: 'panel', id: id, mode: btn.dataset.mode || null };
+    CY.cur = { t: 'panel', id: id, mode: btn.dataset.mode || null, at: btn.dataset.at || null };
     cyAct(btn);
 }
 function cyDrawReview() {
@@ -8514,12 +8542,12 @@ function cyDrawReview() {
     box.innerHTML = list.map(function (c) {
         var b = '';
         if (c.status === 'scheduled' && lead) b += cyPBtn(c.id, 'cancelsched', '🗑️ إلغاء الجدولة', 'danger');
-        if (c.status === 'sent' && lead) b += cyPBtn(c.id, 'investigate', '✅ قبول وتحقيق') + cyPBtn(c.id, 'resolve', '❌ رفض', 'gray');
+        if (c.status === 'sent' && lead) b += cyPBtn(c.id, 'investigate', '✅ قبول وتحقيق', '', null, c.scheduledAt) + cyPBtn(c.id, 'resolve', '❌ رفض', 'gray');
         if (c.status === 'decision' && lead) b += cyPBtn(c.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(c.id, 'decide-resolve', '✅ حل العملية', 'gray');
         if (c.status === 'investigating') b += cyPBtn(c.id, 'join', '🚪 دخول الروم', '', c.mode);
         if (c.status === 'investigating' && lead) b += cyPBtn(c.id, 'stop', '⏹️ إيقاف التحقيق', 'danger');
         var why = c.kind === 'manual' ? ('السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '')) : ('جهازه دخل حساب ' + cyEsc(c.relatedName));
-        return '<div class="card"><b>' + cyEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:13px;margin-top:4px;">' + why + '</div><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + ((c.status === 'investigating' || c.status === 'scheduled') ? ' • ' + (c.mode === 'text' ? '⌨️ كتابي' : '🎙️ صوتي') : '') + (c.status === 'scheduled' ? ' • 📅 ' + cyEsc(cyFmt(c.scheduledAt)) : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
+        return '<div class="card"><b>' + cyEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:13px;margin-top:4px;">' + why + '</div><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + ((c.status === 'investigating' || c.status === 'scheduled') ? ' • ' + (c.mode === 'text' ? '⌨️ كتابي' : '🎙️ صوتي') : '') + ((c.status === 'scheduled' || c.status === 'sent') && c.scheduledAt ? ' • 📅 ' + cyEsc(cyFmt(c.scheduledAt)) : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
     }).join('');
 }
 var CY_FLAG_ST = { open: '⚠️ مفتوحة', investigated: '🔍 تم فتح تحقيق', resolved: '✅ تم حلها' };
