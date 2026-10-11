@@ -366,7 +366,7 @@ const CyberCaseSchema = new mongoose.Schema({
     relatedUid: String, relatedName: String,
     sentBy: String, sentByName: String, sentAt: Date,
     handledBy: String, handledByName: String, handledAt: Date,
-    startedBy: String, startedByName: String, startedAt: Date,
+    startedBy: String, startedByName: String, startedAt: Date, scheduledAt: { type: Date, default: null },
     endedBy: String, endedByName: String, endedAt: Date,
     decisionBy: String, decisionByName: String, decisionAt: Date, decisionAction: String, decisionNote: String,
     muted: { type: [String], default: [] },
@@ -5025,8 +5025,28 @@ function offPublicApp(a) {
     };
 }
 
-async function offDiscordLookup(raw) {
-    const q = String(raw || "").trim().replace(/^@/, "");
+function offNormName(s) {
+    return String(s || "").normalize("NFKC").replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "").trim().replace(/^@+/, "").toLowerCase();
+}
+let offMemIdx = { at: 0, map: null };
+// فهرس كامل لأعضاء السيرفر (يوزر / تاق / الاسم العام / اللقب) — يتحدّث كل دقيقة
+async function offGuildIndex(guild) {
+    if (offMemIdx.map && Date.now() - offMemIdx.at < 60000) return offMemIdx.map;
+    await ensureGuildMembersFetched(guild);
+    const map = new Map();
+    const put = (k, m) => { k = offNormName(k); if (k && !map.has(k)) map.set(k, m); };
+    const all = Array.from(guild.members.cache.values());
+    all.forEach(m => { put(m.user.username, m); put(m.user.tag, m); });
+    all.forEach(m => put(m.user.globalName, m));
+    all.forEach(m => { put(m.nickname, m); put(m.displayName, m); });
+    offMemIdx = { at: Date.now(), map };
+    return map;
+}
+async function offDiscordLookup(raw, idx) {
+    let q = String(raw || "").normalize("NFKC").replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "").trim();
+    const mention = /^<@!?(\d{15,22})>$/.exec(q);
+    if (mention) q = mention[1];
+    q = q.replace(/^@+/, "").trim();
     if (!q) return { error: "ما فيه يوزر مكتوب" };
     if (!botReady) return { error: "البوت غير متصل حالياً، حاول بعد شوي" };
     const guild = client.guilds.cache.get(CONFIG.GUILD_ID) || await client.guilds.fetch(CONFIG.GUILD_ID).catch(() => null);
@@ -5036,16 +5056,21 @@ async function offDiscordLookup(raw) {
         member = await guild.members.fetch(q).catch(() => null);
         if (!member) user = await client.users.fetch(q).catch(() => null);
     } else {
-        const lower = q.toLowerCase();
-        const base = lower.split("#")[0];
-        const found = await guild.members.search({ query: base, limit: 10 }).catch(() => null);
-        if (found) {
-            const list = Array.from(found.values());
-            member = list.find(m => m.user.username.toLowerCase() === base)
-                || list.find(m => (m.user.tag || "").toLowerCase() === lower)
-                || list.find(m => (m.user.globalName || "").toLowerCase() === base)
-                || list.find(m => (m.nickname || "").toLowerCase() === base)
-                || null;
+        const lower = offNormName(q);
+        const base = lower.split("#")[0].trim();
+        const keys = Array.from(new Set([lower, base, base.replace(/\s+/g, "")].filter(Boolean)));
+        const hit = m => keys.some(k => [m.user.username, m.user.tag, m.user.globalName, m.nickname, m.displayName].some(n => offNormName(n) === k));
+        // 1) بحث سريع من الديسكورد
+        if (!idx) {
+            const found = await guild.members.search({ query: base, limit: 25 }).catch(() => null);
+            if (found) member = Array.from(found.values()).find(hit) || null;
+        }
+        // 2) إذا ما لقاه: نبحث بقائمة كل الأعضاء (يلقى الاسم حتى لو البحث السريع فاته)
+        if (!member) {
+            try {
+                const map = idx || await offGuildIndex(guild);
+                for (const k of keys) { if (map.has(k)) { member = map.get(k); break; } }
+            } catch (e) { return { error: "تعذر فحص قائمة أعضاء السيرفر حالياً، حاول بعد شوي" }; }
         }
     }
     if (member) {
@@ -5156,9 +5181,24 @@ app.get("/api/officers/admin/applications", ensureSeniorAdmin, async (req, res) 
         answers: a.answers, createdAt: a.createdAt,
     }));
     const history = all.filter(a => a.stage !== "pending").reverse().map(a => ({
-        id: String(a._id), name: a.name, stage: a.stage, rejectedAt: a.rejectedAt, officerRank: a.officerRank,
+        id: String(a._id), name: a.name, stage: a.stage, rejectedAt: a.rejectedAt, officerRank: a.officerRank, discordUser: a.discordUser || "",
     }));
     res.json({ pending, history, questions: OFFICER_QUESTIONS });
+});
+
+// فحص يوزر كل التقديمات (الجديدة والحالية والقديمة) دفعة وحدة
+app.get("/api/officers/admin/applications/checks", ensureSeniorAdmin, async (req, res) => {
+    try {
+        if (!botReady) return res.status(503).json({ error: "البوت غير متصل حالياً، حاول بعد شوي" });
+        const guild = client.guilds.cache.get(CONFIG.GUILD_ID) || await client.guilds.fetch(CONFIG.GUILD_ID).catch(() => null);
+        if (!guild) return res.status(503).json({ error: "تعذر الوصول لسيرفر الديسكورد" });
+        let idx;
+        try { idx = await offGuildIndex(guild); } catch (e) { return res.status(503).json({ error: "تعذر جلب أعضاء السيرفر حالياً، حاول بعد شوي" }); }
+        const apps = await OfficerApp.find({}, { discordUser: 1 }).lean();
+        const out = {};
+        for (const a of apps) out[String(a._id)] = await offDiscordLookup(a.discordUser, idx);
+        res.json(out);
+    } catch (e) { res.status(500).json({ error: "تعذر فحص اليوزرات" }); }
 });
 
 app.post("/api/officers/admin/applications/:id/check-user", ensureSeniorAdmin, async (req, res) => {
@@ -5970,7 +6010,7 @@ function cyPublic(c) {
         reason: c.reason || null, evidence: c.evidence || null, evidencePhoto: !!c.evidenceVio,
         targetUid: c.targetUid, targetName: c.targetName, relatedName: c.relatedName || null,
         sentByName: c.sentByName || null, startedByName: c.startedByName || null, decisionAction: c.decisionAction || null,
-        createdAt: c.createdAt, startedAt: c.startedAt || null, endedAt: c.endedAt || null,
+        createdAt: c.createdAt, startedAt: c.startedAt || null, endedAt: c.endedAt || null, scheduledAt: c.scheduledAt || null,
     };
 }
 async function cyAccess(req, res, needLeader) {
@@ -6527,12 +6567,18 @@ app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
         const reason = String(b.reason || "").trim().slice(0, 600);
         const evidence = String(b.evidence || "").trim().slice(0, 1200);
         const mode = b.mode === "text" ? "text" : "voice";
+        let schedAt = null;
+        if (b.scheduled === true && role.isLeader) {
+            schedAt = offBuildDate(b.date, b.hour, b.minute);
+            if (!schedAt) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
+            if (+schedAt < Date.now() - 60000) return res.status(400).json({ error: "الوقت المحدد مضى، حدد وقت قادم" });
+        }
         if (!targetUid || targetUid === uid) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
         if (reason.length < 3) return res.status(400).json({ error: "اكتب سبب التحقيق" });
         const ta = await Account.findOne({ uid: targetUid, status: "approved" }, { isSenior: 1, isOwner: 1, tempSenior: 1 }).lean();
         if (!ta || cyIsProtected(targetUid, ta)) return res.status(403).json({ error: "ما يمديك تفتح تحقيق على هذا الشخص" });
         if (underInvestigation.has(targetUid)) return res.status(409).json({ error: "هذا العضو تحت التحقيق حالياً" });
-        const open = await CyberCase.findOne({ targetUid, status: { $in: ["sent", "investigating"] } }, { _id: 1 }).lean();
+        const open = await CyberCase.findOne({ targetUid, status: { $in: ["sent", "investigating", "scheduled"] } }, { _id: 1 }).lean();
         if (open) return res.status(409).json({ error: "فيه تحقيق مفتوح على هذا العضو" });
         const evidenceVio = null;
         let flagId = null;
@@ -6550,6 +6596,13 @@ app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
             cyberPush(c);
             return res.json({ ok: true, started: false, id: String(c._id) });
         }
+        if (schedAt) {
+            const sc = await CyberCase.create({ ...base, status: "scheduled", mode, scheduledAt: schedAt, startedBy: uid, startedByName: name });
+            if (flagId) CyberFlag.updateOne({ _id: flagId, status: "open" }, { $set: { status: "investigated", handledBy: uid, handledByName: name, handledAt: new Date() } }).catch(() => {});
+            await logEvent({ action: "جدولة تحقيق سيبراني", discordId: targetUid, actorId: uid, actorTag: name + " (قيادة الأمن السيبراني)", details: `${targetName} — ${reason} — الموعد: ${schedAt.toISOString()}` });
+            cyberPush(sc);
+            return res.json({ ok: true, scheduled: true, id: String(sc._id), at: schedAt });
+        }
         let vn = null;
         if (mode === "voice") {
             const usedN = new Set((await CyberCase.find({ status: "investigating", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
@@ -6565,6 +6618,40 @@ app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
         cyberReloadTarget(c.targetUid);
         res.json({ ok: true, started: true, id: String(c._id), mode });
     } catch (e) { res.status(500).json({ error: "تعذر فتح التحقيق" }); }
+});
+
+
+// ================= تحقيقات سيبرانية مجدولة (تبدأ في الموعد المحدد) =================
+async function cyRunScheduled() {
+    try {
+        const due = await CyberCase.find({ status: "scheduled", scheduledAt: { $lte: new Date() } }, CY_LIST_FIELDS).sort({ scheduledAt: 1 }).limit(10).lean();
+        for (const d of due) {
+            if (underInvestigation.has(d.targetUid)) continue;
+            let vn = null;
+            if (d.mode === "voice") {
+                const usedN = new Set((await CyberCase.find({ status: "investigating", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
+                vn = 500; while (usedN.has(vn) && vn < 899) vn++;
+            }
+            const c = await CyberCase.findOneAndUpdate({ _id: d._id, status: "scheduled" }, { $set: { status: "investigating", voiceN: vn, startedAt: new Date() } }, { new: true });
+            if (!c) continue;
+            underInvestigation.add(c.targetUid);
+            await cySystemMsg(c._id, `🔍 بدأ التحقيق السيبراني المجدول (${c.mode === "text" ? "كتابي" : "صوتي"}) بحق ${c.targetName} — السبب: ${c.reason || "-"}`);
+            await logEvent({ action: "بدء تحقيق سيبراني", discordId: c.targetUid, actorId: c.startedBy || c.sentBy, actorTag: (c.startedByName || c.sentByName || "") + " (قيادة الأمن السيبراني — تحقيق مجدول)", details: `${c.targetName} — ${c.reason || ""}` });
+            cyberPush(c);
+            cyberReloadTarget(c.targetUid);
+        }
+    } catch (e) { console.error("❌ cyRunScheduled:", e.message); }
+}
+setInterval(() => { cyRunScheduled().catch(() => {}); }, 15000);
+setTimeout(() => { cyRunScheduled().catch(() => {}); }, 20000);
+app.post("/api/cyber/cases/:id/cancel", ensureAuth, async (req, res) => {
+    const x = await cyAccess(req, res, true); if (!x) return;
+    const name = await cyName(req.user.id);
+    const c = await CyberCase.findOneAndUpdate({ _id: x.c._id, status: "scheduled" }, { $set: { status: "resolved", decisionAction: "cancelled", decisionBy: req.user.id, decisionByName: name, decisionAt: new Date() } }, { new: true });
+    if (!c) return res.status(409).json({ error: "هذا التحقيق ما عاد مجدول" });
+    await logEvent({ action: "إيقاف تحقيق سيبراني", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `${c.targetName} — إلغاء الجدولة` });
+    cyberPush(c);
+    res.json({ ok: true });
 });
 
 app.get("/api/cyber/suspicious", ensureAuth, async (req, res) => {
@@ -7830,7 +7917,7 @@ async function ackCurrentWarning() {
     } catch (e) {}
 })();
 var CY = { entering: false, lockMode: null, cur: null, busy: false, lockShown: false, lockId: null, lockTimer: null, roomId: null, roomLock: false, roomTimer: null, sig: '', first: true, seen: {} };
-var CY_STATUS = { alert: '⚠️ اشتباه — بانتظار عضو', sent: '📤 مرفوعة للقائد', dismissed: 'تم تجاهلها', investigating: '🔍 تحقيق جاري', decision: '⏳ بانتظار القرار', escalated: '⭐ أُبلغت القيادة العليا', resolved: '✅ تم حلها' };
+var CY_STATUS = { scheduled: '📅 تحقيق مجدول', alert: '⚠️ اشتباه — بانتظار عضو', sent: '📤 مرفوعة للقائد', dismissed: 'تم تجاهلها', investigating: '🔍 تحقيق جاري', decision: '⏳ بانتظار القرار', escalated: '⭐ أُبلغت القيادة العليا', resolved: '✅ تم حلها' };
 var CY_ROLE = { target: 'متحقق معه', leader: 'قيادة', member: 'عضو', system: 'نظام' };
 function cyEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (m) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]; }); }
 function cyOverlay(html) { document.getElementById('cy-box').innerHTML = html; document.getElementById('cyber-overlay').classList.add('open'); }
@@ -8148,18 +8235,34 @@ function cyInvForm(uid, pre) {
     pre = pre || {};
     var m = cyFindMember(uid);
     var name = m ? m.name : (pre.name || '');
-    CY.inv = { uid: uid, vioId: pre.vioId || null, flagId: pre.flagId || null };
+    CY.inv = { uid: uid, vioId: pre.vioId || null, flagId: pre.flagId || null, scheduled: !!pre.scheduled };
     var lead = cyIsLead();
-    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-size:18px;font-weight:bold;">🔍 فتح تحقيق</div><div style="text-align:center;color:#94a3b8;margin-bottom:10px;">مع: <b style="color:#fff;">' + cyEsc(name) + '</b></div><label style="font-size:13px;">سبب التحقيق</label><textarea id="cy-f-reason" rows="3" maxlength="600" style="width:100%;font-size:16px;margin-bottom:8px;">' + cyEsc(pre.reason || '') + '</textarea><label style="font-size:13px;">الدلائل (اختياري — إذا توفرت)</label><textarea id="cy-f-evid" rows="3" maxlength="1200" style="width:100%;font-size:16px;">' + cyEsc(pre.evidence || '') + '</textarea><div class="cy-actions">' + (lead ? '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">🎙️ صوتي</button><button class="btn" data-m="text" onclick="cyInvSubmit(this)">⌨️ كتابي</button>' : '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">📤 إرسال للقيادة</button>') + '<button class="btn gray" onclick="cyOverlayClose()">إلغاء</button></div></div>');
+    var sched = '';
+    if (pre.scheduled && lead) {
+        var today = '';
+        try { today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Riyadh' }); } catch (e) {}
+        var hrs = '';
+        for (var hi = 0; hi < 24; hi++) { hrs += '<option value="' + hi + '">' + (hi % 12 === 0 ? 12 : hi % 12) + ' ' + (hi < 12 ? 'صباحاً' : 'مساءً') + '</option>'; }
+        sched = '<div style="margin-top:10px;border-top:1px solid #334155;padding-top:8px;"><div style="font-weight:bold;margin-bottom:4px;">📅 موعد التحقيق</div><label style="font-size:13px;">اليوم</label><input type="date" id="cy-f-date" value="' + today + '" style="width:100%;font-size:16px;"><label style="font-size:13px;">الساعة</label><select id="cy-f-hour" style="width:100%;font-size:16px;">' + hrs + '</select><label style="font-size:13px;">الدقيقة (اكتبها أنت)</label><input type="number" id="cy-f-min" min="0" max="59" value="0" style="width:100%;font-size:16px;"></div>';
+    }
+    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-size:18px;font-weight:bold;">🔍 فتح تحقيق</div><div style="text-align:center;color:#94a3b8;margin-bottom:10px;">مع: <b style="color:#fff;">' + cyEsc(name) + '</b></div><label style="font-size:13px;">سبب التحقيق</label><textarea id="cy-f-reason" rows="3" maxlength="600" style="width:100%;font-size:16px;margin-bottom:8px;">' + cyEsc(pre.reason || '') + '</textarea><label style="font-size:13px;">الدلائل (اختياري — إذا توفرت)</label><textarea id="cy-f-evid" rows="3" maxlength="1200" style="width:100%;font-size:16px;">' + cyEsc(pre.evidence || '') + '</textarea>' + sched + '<div class="cy-actions">' + (lead ? '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">🎙️ صوتي</button><button class="btn" data-m="text" onclick="cyInvSubmit(this)">⌨️ كتابي</button>' : '<button class="btn" data-m="voice" onclick="cyInvSubmit(this)">📤 إرسال للقيادة</button>') + '<button class="btn gray" onclick="cyOverlayClose()">إلغاء</button></div></div>');
 }
 async function cyInvSubmit(btn) {
     var inv = CY.inv; if (!inv) return;
     var reason = (document.getElementById('cy-f-reason').value || '').trim();
     var evid = (document.getElementById('cy-f-evid').value || '').trim();
     if (reason.length < 3) { toast('اكتب سبب التحقيق'); return; }
+    var body = { targetUid: inv.uid, reason: reason, evidence: evid, mode: btn.dataset.m, vioId: inv.vioId, flagId: inv.flagId };
+    if (inv.scheduled) {
+        var sd = (document.getElementById('cy-f-date') || {}).value, sh = (document.getElementById('cy-f-hour') || {}).value, sm = (document.getElementById('cy-f-min') || {}).value;
+        if (!sd) { toast('حدد اليوم'); return; }
+        if (sm === '' || sm === undefined) { toast('اكتب الدقيقة'); return; }
+        body.scheduled = true; body.date = sd; body.hour = sh; body.minute = sm;
+    }
     try {
-        var d = await api('/api/cyber/investigations', { method: 'POST', body: JSON.stringify({ targetUid: inv.uid, reason: reason, evidence: evid, mode: btn.dataset.m, vioId: inv.vioId, flagId: inv.flagId }) });
+        var d = await api('/api/cyber/investigations', { method: 'POST', body: JSON.stringify(body) });
         CY.inv = null; cyOverlayClose();
+        if (d.scheduled) { toast('📅 تم جدولة التحقيق، يبدأ في الموعد المحدد'); CYP.sig = {}; cyPanelLoad(true); return; }
         if (d.started) { toast('🔍 بدأ التحقيق'); cyEnterCase(d.id, d.mode, false); }
         else toast('📤 انرسل التحقيق للقيادة');
         CYP.sig = {};
@@ -8170,6 +8273,11 @@ function cyModeChoose() {
     cyOverlay('<div style="font-size:34px;">🔍</div><h3>نوع التحقيق</h3><div>اختر طريقة التحقيق</div><div class="cy-actions"><button class="btn" data-a="inv-voice" onclick="cyAct(this)">🎙️ صوتي</button><button class="btn" data-a="inv-text" onclick="cyAct(this)">⌨️ كتابي</button><button class="btn gray" data-a="inv-back" onclick="cyAct(this)">رجوع</button></div>');
 }
 function cyPBtn(id, a, label, cls, mode) { return '<button class="btn sm ' + (cls || '') + '" data-id="' + id + '" data-a="' + a + '"' + (mode ? ' data-mode="' + mode + '"' : '') + ' onclick="cyPanelAct(this)">' + label + '</button>'; }
+async function cySchedCancel(id) {
+    if (!(await confirmModal('متأكد تبي تلغي جدولة هذا التحقيق؟'))) return;
+    try { await api('/api/cyber/cases/' + id + '/cancel', { method: 'POST' }); toast('🗑️ تم إلغاء الجدولة'); CYP.sig = {}; cyPanelLoad(true); }
+    catch (e) { toast(e.message); }
+}
 async function cyStopInv(id) {
     if (!(await confirmModal('متأكد تبي توقف التحقيق؟ بيتفك التقييد عن العضو ويتسكر الروم.'))) return;
     try { await api('/api/cyber/cases/' + id + '/stop', { method: 'POST' }); toast('⏹️ تم إيقاف التحقيق'); CYP.sig = {}; cyberCheck(); cyPanelLoad(true); }
@@ -8178,6 +8286,7 @@ async function cyStopInv(id) {
 function cyPanelAct(btn) {
     var a = btn.dataset.a, id = btn.dataset.id;
     if (a === 'stop') return cyStopInv(id);
+    if (a === 'cancelsched') return cySchedCancel(id);
     if (a === 'view') return cyEnterCase(id, null, false);
     CY.cur = { t: 'panel', id: id, mode: btn.dataset.mode || null };
     cyAct(btn);
@@ -8185,16 +8294,17 @@ function cyPanelAct(btn) {
 function cyDrawReview() {
     var box = document.getElementById('cy-panel'); if (!box) return;
     var lead = cyIsLead();
-    var list = ((CYP.data.review || {}).list || []).filter(function (c) { return c.status === 'sent' || c.status === 'investigating' || c.status === 'decision'; });
+    var list = ((CYP.data.review || {}).list || []).filter(function (c) { return c.status === 'scheduled' || c.status === 'sent' || c.status === 'investigating' || c.status === 'decision'; });
     if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تحقيقات قيد المراجعة</div>'; return; }
     box.innerHTML = list.map(function (c) {
         var b = '';
+        if (c.status === 'scheduled' && lead) b += cyPBtn(c.id, 'cancelsched', '🗑️ إلغاء الجدولة', 'danger');
         if (c.status === 'sent' && lead) b += cyPBtn(c.id, 'investigate', '✅ قبول وتحقيق') + cyPBtn(c.id, 'resolve', '❌ رفض', 'gray');
         if (c.status === 'decision' && lead) b += cyPBtn(c.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(c.id, 'decide-resolve', '✅ حل العملية', 'gray');
         if (c.status === 'investigating') b += cyPBtn(c.id, 'join', '🚪 دخول الروم', '', c.mode);
         if (c.status === 'investigating' && lead) b += cyPBtn(c.id, 'stop', '⏹️ إيقاف التحقيق', 'danger');
         var why = c.kind === 'manual' ? ('السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '')) : ('جهازه دخل حساب ' + cyEsc(c.relatedName));
-        return '<div class="card"><b>' + cyEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:13px;margin-top:4px;">' + why + '</div><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + (c.status === 'investigating' ? ' • ' + (c.mode === 'text' ? '⌨️ كتابي' : '🎙️ صوتي') : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
+        return '<div class="card"><b>' + cyEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:13px;margin-top:4px;">' + why + '</div><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + ((c.status === 'investigating' || c.status === 'scheduled') ? ' • ' + (c.mode === 'text' ? '⌨️ كتابي' : '🎙️ صوتي') : '') + (c.status === 'scheduled' ? ' • 📅 ' + cyEsc(cyFmt(c.scheduledAt)) : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
     }).join('');
 }
 var CY_FLAG_ST = { open: '⚠️ مفتوحة', investigated: '🔍 تم فتح تحقيق', resolved: '✅ تم حلها' };
@@ -8251,7 +8361,7 @@ function cyDrawCurrent() {
 }
 function cyLogInv(btn) {
     var d = btn.dataset;
-    cyInvForm(d.u, { name: d.n, flagId: d.f || null, reason: 'إعادة فتح: ' + (d.d || ''), evidence: '' });
+    cyInvForm(d.u, { name: d.n, flagId: d.f || null, reason: 'إعادة فتح: ' + (d.d || ''), evidence: '', scheduled: true });
 }
 function cyFlagInv(btn) {
     var d = btn.dataset;
@@ -13798,6 +13908,7 @@ async function offaReload(silent) {
         if (silent && sig === OFFA.sig) return;
         OFFA.sig = sig; OFFA.data = d;
         offaPaint();
+        if (tab === 'apps') offaAutoCheck(false);
     } catch (e) { if (!silent) toast(e.message); }
 }
 function offaPaint() {
@@ -13816,6 +13927,23 @@ function offaStageText(a) {
     if (a.stage === 'rejected') return 'مرفوض (' + (a.rejectedAt === 'application' ? 'التقديم' : (a.rejectedAt === 'interview' ? 'المقابلة' : 'التدريب')) + ')';
     return a.stage;
 }
+function offaCheckHtml(chk) {
+    if (chk.error) return '<div class="off-res">⚠️ ' + spEsc(chk.error) + '</div>';
+    return '<div class="off-res">' + (chk.inServer ? '✅ داخل السيرفر' : '❌ غير موجود داخل السيرفر') +
+        '<br>الاسم في الديسكورد: <b>' + spEsc(chk.discordName || 'غير معروف') + '</b></div>';
+}
+async function offaAutoCheck(force) {
+    if (OFFA.autoBusy) return;
+    if (!force && Date.now() - (OFFA.autoAt || 0) < 60000) return;
+    OFFA.autoBusy = true;
+    try {
+        var r = await offFetch('/api/officers/admin/applications/checks');
+        OFFA.checks = Object.assign(OFFA.checks || {}, r);
+        OFFA.autoAt = Date.now();
+        if (OFFA.tab === 'apps') offaPaint();
+    } catch (e) {}
+    OFFA.autoBusy = false;
+}
 function offaAppsHtml(d) {
     var h = '';
     if (!d.pending.length) h += '<div class="card" style="color:var(--muted);">لا توجد تقديمات جديدة حالياً</div>';
@@ -13826,11 +13954,7 @@ function offaAppsHtml(d) {
         h += '<div class="acc-row"><span>الخبرات السابقة</span><b>' + spEsc(a.prevExperience) + '</b></div>';
         h += '<div class="acc-row"><span>يوزر الديسكورد</span><b dir="ltr">' + spEsc(a.discordUser) + '</b></div>';
         h += '<div style="margin:8px 0;"><button class="btn sm gold" data-id="' + a.id + '" onclick="offaCheck(this.dataset.id)">🔍 فحص اليوزر</button></div>';
-        if (chk) {
-            if (chk.error) h += '<div class="off-res">⚠️ ' + spEsc(chk.error) + '</div>';
-            else h += '<div class="off-res">' + (chk.inServer ? '✅ داخل السيرفر' : '❌ غير موجود داخل السيرفر') +
-                '<br>الاسم في الديسكورد: <b>' + spEsc(chk.discordName || 'غير معروف') + '</b></div>';
-        }
+        if (chk) h += offaCheckHtml(chk);
         h += '<details style="margin:10px 0;"><summary style="cursor:pointer;color:var(--gold-soft);">📄 عرض إجابات الاستبيان</summary>';
         a.answers.forEach(function (ans, i) {
             h += '<div class="off-qa"><b>' + (i + 1) + '- ' + spEsc(d.questions[i] || '') + '</b><div>' + spEsc(ans) + '</div></div>';
@@ -13842,8 +13966,12 @@ function offaAppsHtml(d) {
     if (d.history.length) {
         h += '<div class="card"><h3>📚 السجل</h3>';
         d.history.forEach(function (a) {
-            h += '<div class="log-item"><span>' + spEsc(a.name) + ' — ' + spEsc(offaStageText(a)) + '</span>' +
-                '<button class="btn danger sm" data-id="' + a.id + '" onclick="offaDelete(this.dataset.id)">🗑️</button></div>';
+            var hc = OFFA.checks[a.id];
+            h += '<div class="log-item" style="flex-wrap:wrap;"><span>' + spEsc(a.name) + ' — ' + spEsc(offaStageText(a)) + '</span>' +
+                '<span style="display:flex;gap:6px;"><button class="btn gold sm" data-id="' + a.id + '" onclick="offaCheck(this.dataset.id)">🔍 فحص اليوزر</button>' +
+                '<button class="btn danger sm" data-id="' + a.id + '" onclick="offaDelete(this.dataset.id)">🗑️</button></span>' +
+                '<div style="width:100%;font-size:12px;color:var(--muted);margin-top:4px;">يوزر الديسكورد: <span dir="ltr">' + spEsc(a.discordUser || '') + '</span></div>' +
+                (hc ? '<div style="width:100%;">' + offaCheckHtml(hc) + '</div>' : '') + '</div>';
         });
         h += '</div>';
     }
