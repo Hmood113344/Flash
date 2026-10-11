@@ -6191,7 +6191,6 @@ app.post("/api/cyber/cases/:id/mute", ensureAuth, async (req, res) => {
 });
 
 const CY_DAY = 86400000;
-const CY_ST_LABEL = { pending: "معلّقة", approved: "مقبولة", rejected: "مرفوضة" };
 async function cyGuard(req, res) {
     const uid = req.user.id;
     if (underInvestigation.has(uid)) { res.status(403).json({ error: "🔒 حسابك تحت التحقيق السيبراني" }); return null; }
@@ -6202,48 +6201,37 @@ async function cyGuard(req, res) {
 function cyIsProtected(uid, acc) {
     return !!(isSeniorAdmin(uid) || isOwnerUid(uid) || (acc && (acc.isSenior || acc.isOwner || acc.tempSenior)));
 }
-function cyVioLine(v) {
-    const parts = [];
-    if (v.violationType) parts.push(v.violationType);
-    if (v.kind === "report" && v.suspectName) parts.push("المشتبه: " + v.suspectName);
-    if (v.vehicle) parts.push(v.vehicle);
-    if (v.plateNumber) parts.push(v.plateNumber);
-    parts.push(CY_ST_LABEL[v.status] || v.status || "");
-    return parts.filter(Boolean).join(" — ");
-}
 async function cyMemberInfo(accs) {
     const uids = accs.map(a => a.uid);
     const pers = await Personnel.aggregate([
         { $match: { discord: { $in: uids } } },
-        { $project: { discord: 1, discordTag: 1, registeredName: 1, unit: 1, rank: 1, points: 1, sector: 1, isBlocked: 1, isDismissed: 1, leaveBalance: 1, cardNumber: 1, notesCount: { $size: { $ifNull: ["$notes", []] } }, warningsCount: { $size: { $ifNull: ["$warnings", []] } } } },
+        { $project: { discord: 1, discordTag: 1, registeredName: 1, isBlocked: 1, isDismissed: 1 } },
     ]).option({ maxTimeMS: 10000 });
     const pmap = new Map(pers.map(p => [p.discord, p]));
     const logins = await DeviceSession.aggregate([
         { $match: { uid: { $in: uids } } },
-        { $group: { _id: "$uid", last: { $max: "$loginAt" } } },
-    ]).option({ maxTimeMS: 10000 });
-    const lmap = new Map(logins.map(l => [l._id, l.last]));
+        { $sort: { loginAt: -1 } },
+        { $group: { _id: "$uid", last: { $first: "$loginAt" }, lastIp: { $first: "$ip" }, ips: { $addToSet: { $cond: [{ $gte: ["$loginAt", new Date(Date.now() - 7 * CY_DAY)] }, "$ip", null] } }, uas: { $addToSet: { $cond: [{ $gte: ["$loginAt", new Date(Date.now() - 7 * CY_DAY)] }, "$ua", null] } } } },
+    ]).allowDiskUse(true).option({ maxTimeMS: 10000 });
+    const lmap = new Map(logins.map(l => [l._id, l]));
     const online = new Set();
     for (const cl of sseClients) if (cl.uid) online.add(cl.uid);
     return accs.map(a => {
         const p = pmap.get(a.uid) || {};
-        const sec = a.sector || p.sector || null;
+        const l = lmap.get(a.uid) || {};
+        const ips = (l.ips || []).filter(Boolean);
+        const devs = new Set((l.uas || []).filter(Boolean).map(cyUaLabel));
         return {
             uid: a.uid,
             name: p.registeredName || a.fullName || a.uid,
             age: a.age || null,
             nationality: a.nationality || null,
-            rank: p.rank || null,
-            unit: p.unit || null,
-            points: typeof p.points === "number" ? p.points : null,
-            sectorLabel: sec ? (CONFIG.SECTORS[sec] || sec) : null,
-            cardNumber: p.cardNumber || null,
             discordTag: p.discordTag || null,
             joinedAt: a.createdAt || null,
-            lastLogin: lmap.get(a.uid) || null,
-            warnings: p.warningsCount || 0,
-            notes: p.notesCount || 0,
-            leaveBalance: typeof p.leaveBalance === "number" ? p.leaveBalance : null,
+            lastLogin: l.last || null,
+            lastIp: l.lastIp || null,
+            ipCount: ips.length,
+            deviceCount: devs.size,
             blocked: !!(p.isBlocked || p.isDismissed),
             online: online.has(a.uid),
             investigated: underInvestigation.has(a.uid),
@@ -6251,23 +6239,40 @@ async function cyMemberInfo(accs) {
         };
     });
 }
-async function cyOpsOf(uid) {
-    const since = new Date(Date.now() - 7 * CY_DAY);
-    const logs = await Log.find({ actorId: uid, createdAt: { $gte: since } }).sort({ createdAt: -1 }).limit(60).maxTimeMS(8000).lean();
-    const vios = await Violation.aggregate([
-        { $match: { reporterDiscord: uid, createdAt: { $gte: since } } },
-        { $sort: { createdAt: -1 } },
-        { $limit: 40 },
-        { $project: { kind: 1, violationType: 1, vehicle: 1, plateNumber: 1, status: 1, suspectName: 1, createdAt: 1, hasPhoto: { $gt: [{ $strLenCP: { $ifNull: ["$photo", ""] } }, 0] } } },
-    ]).option({ maxTimeMS: 10000 });
+function cyUaLabel(ua) {
+    ua = String(ua || "");
+    let os = "جهاز";
+    if (/iPhone|iPad|iPod/i.test(ua)) os = "آيفون/آيباد";
+    else if (/Android/i.test(ua)) os = "أندرويد";
+    else if (/Windows/i.test(ua)) os = "ويندوز";
+    else if (/Macintosh|Mac OS/i.test(ua)) os = "ماك";
+    else if (/Linux/i.test(ua)) os = "لينكس";
+    let br = "";
+    if (/Edg\//i.test(ua)) br = "Edge";
+    else if (/OPR\/|Opera/i.test(ua)) br = "Opera";
+    else if (/Firefox/i.test(ua)) br = "Firefox";
+    else if (/Chrome|CriOS/i.test(ua)) br = "Chrome";
+    else if (/Safari/i.test(ua)) br = "Safari";
+    return br ? os + " — " + br : os;
+}
+// العمليات اللي تظهر للأمن السيبراني: نشاط العضو داخل الموقع نفسه (دخول/أجهزة/حسابات/إعدادات) — بدون أي شي عسكري
+const CY_OP_ACTIONS = ["تعديل إعدادات الموقع", "تعديل حساب", "قبول حساب جديد", "رفض حساب جديد", "طلب تسجيل جديد", "حذف حساب نهائي", "إنشاء حساب كبير مسؤولين جديد", "حظر من الدعم الفني", "فك حظر من الدعم الفني", "حذف اللوق الشامل", "إضافة عضو للقيادة العليا", "إزالة عضو من القيادة العليا", "حذف التكتات المغلقة", "حذف تكت دعم", "نشر تحديث جديد بفلاش"];
+async function cyOpsOf(uid, from, to) {
+    let t1 = (to instanceof Date && !isNaN(+to)) ? to : new Date();
+    let t0 = (from instanceof Date && !isNaN(+from)) ? from : new Date(+t1 - CY_DAY);
+    if (t0 > t1) { const x = t0; t0 = t1; t1 = x; }
+    if (t1 - t0 > 90 * CY_DAY) t0 = new Date(+t1 - 90 * CY_DAY);
+    const range = { $gte: t0, $lte: t1 };
+    const logs = await Log.find({ actorId: uid, createdAt: range, $or: [{ action: { $in: CY_OP_ACTIONS } }, { action: /سيبراني/ }] }).sort({ createdAt: -1 }).limit(100).maxTimeMS(8000).lean();
+    const sess = await DeviceSession.find({ uid, loginAt: range }, { ip: 1, ua: 1, loginAt: 1 }).sort({ loginAt: -1 }).limit(100).maxTimeMS(8000).lean();
     const out = [];
     logs.forEach(l => out.push({ id: "log:" + l._id, kind: "log", title: l.action, details: l.details || "", at: l.createdAt }));
-    vios.forEach(v => out.push({ id: "vio:" + v._id, kind: "vio", title: v.kind === "report" ? "تقديم بلاغ" : "تقديم مخالفة", details: cyVioLine(v), at: v.createdAt, hasPhoto: !!v.hasPhoto }));
+    sess.forEach(s => out.push({ id: "ses:" + s._id, kind: "ses", title: "تسجيل دخول للموقع", details: "IP: " + (s.ip || "-") + " — " + cyUaLabel(s.ua), at: s.loginAt }));
     out.sort((a, b) => new Date(b.at) - new Date(a.at));
-    return out.slice(0, 80);
+    return out.slice(0, 150);
 }
 async function cyResolveOp(ref, targetUid) {
-    const m = /^(log|vio):([a-f0-9]{24})$/.exec(String(ref || ""));
+    const m = /^(log|ses):([a-f0-9]{24})$/.exec(String(ref || ""));
     if (!m) return null;
     if (m[1] === "log") {
         const l = await Log.findById(m[2]).lean();
@@ -6277,119 +6282,30 @@ async function cyResolveOp(ref, targetUid) {
         if (l.discordTag || l.discordId) lines.push("الشخص: " + (l.discordTag || l.discordId));
         return { ref, title: l.action, lines, opAt: l.createdAt, hasPhoto: false };
     }
-    const v = await Violation.findById(m[2]).lean();
-    if (!v || v.reporterDiscord !== targetUid) return null;
-    const lines = [];
-    if (v.violationType) lines.push("النوع: " + v.violationType);
-    if (v.kind === "report" && v.suspectName) lines.push("المشتبه: " + v.suspectName);
-    if (v.vehicle) lines.push("المركبة: " + v.vehicle);
-    if (v.plateNumber) lines.push("اللوحة: " + v.plateNumber);
-    lines.push("الحالة: " + (CY_ST_LABEL[v.status] || v.status || "-"));
-    if (v.reviewedByTag) lines.push("راجعها: " + v.reviewedByTag);
-    return { ref, title: v.kind === "report" ? "بلاغ" : "مخالفة", lines, opAt: v.createdAt, hasPhoto: !!v.photo };
+    const s = await DeviceSession.findById(m[2]).lean();
+    if (!s || s.uid !== targetUid) return null;
+    const lines = ["عنوان الـ IP: " + (s.ip || "-"), "الجهاز: " + cyUaLabel(s.ua)];
+    return { ref, title: "تسجيل دخول للموقع", lines, opAt: s.loginAt, hasPhoto: false };
 }
 
-let cyScanAt = 0;
-let cyScanBusy = false;
-async function cyScanFlags(force) {
-    if (cyScanBusy) return;
-    if (!force && Date.now() - cyScanAt < 45000) return;
-    cyScanBusy = true;
-    try {
-        const since = new Date(Date.now() - 14 * CY_DAY);
-        const groups = await Violation.aggregate([
-            { $match: { createdAt: { $gte: since } } },
-            { $project: {
-                reporterDiscord: 1, reporterName: 1, violationType: 1, vehicle: 1, plateNumber: 1, suspectName: 1, kind: 1, status: 1, reviewedByTag: 1, createdAt: 1,
-                sig: { $cond: [
-                    { $gt: [{ $strLenCP: { $ifNull: ["$photo", ""] } }, 0] },
-                    { $concat: [{ $toString: { $strLenCP: "$photo" } }, ":", { $substrCP: ["$photo", 3000, 240] }] },
-                    "nophoto",
-                ] },
-            } },
-            { $group: {
-                _id: { r: "$reporterDiscord", k: "$kind", t: "$violationType", v: "$vehicle", p: "$plateNumber", s: "$suspectName", sig: "$sig" },
-                count: { $sum: 1 },
-                ids: { $push: { $toString: "$_id" } },
-                name: { $first: "$reporterName" },
-                first: { $min: "$createdAt" },
-                last: { $max: "$createdAt" },
-                reviewers: { $push: { $cond: [{ $eq: ["$status", "approved"] }, "$reviewedByTag", null] } },
-            } },
-            { $match: { count: { $gte: 2 }, "_id.sig": { $ne: "nophoto" } } },
-            { $limit: 200 },
-        ]).allowDiskUse(true).option({ maxTimeMS: 20000 });
-        for (const g of groups) {
-            const key = "dup:" + crypto.createHash("sha1").update(JSON.stringify(g._id)).digest("hex");
-            const approved = Array.from(new Set((g.reviewers || []).filter(Boolean)));
-            const label = g._id.k === "report" ? "بلاغ" : "مخالفة";
-            const bits = [];
-            if (g._id.t) bits.push(g._id.t);
-            if (g._id.v) bits.push(g._id.v);
-            if (g._id.p) bits.push(g._id.p);
-            const details = `قدّم ${label} ${g.count} مرات بنفس المعلومات والصورة` + (bits.length ? " — " + bits.join(" • ") : "") + (approved.length ? " — قبلها: " + approved.join("، ") : "");
-            await CyberFlag.updateOne({ key }, {
-                $setOnInsert: { key, kind: "dup", status: "open", targetUid: g._id.r, createdAt: new Date() },
-                $set: { targetName: g.name || g._id.r, title: "تكرار " + label + " بنفس المعلومات والصورة", details, count: g.count, violationIds: (g.ids || []).slice(0, 20), approvedBy: approved, firstAt: g.first, lastAt: g.last },
-            }, { upsert: true });
-        }
-        cyScanAt = Date.now();
-    } catch (e) { console.error("❌ cyScanFlags:", e.message); }
-    finally { cyScanBusy = false; }
-}
 
 // ================= قواعد العمليات المشبوهة (30 نوع) =================
 // عدّل الأرقام من هنا إذا تبي الحساسية أقل أو أكثر
 const CY_CFG = {
-    burstN: 8, burstMs: 10 * 60000,          // مخالفات متتابعة بنفس الوقت
-    dailyN: 40,                              // مخالفات باليوم
-    sameFormN: 6, sameSuspectN: 3,           // تكرار نفس النموذج / نفس المشتبه خلال 24 ساعة
-    rejectMin: 8, rejectN: 5, rejectRate: 0.6,
-    favMin: 10, favRate: 0.95, favOthersMin: 10, favOthersMax: 0.7,
-    rapidN: 15, rapidMs: 5 * 60000,
-    farmDays: 3, farmN: 10,
-    delN: 5, delMs: 30 * 60000,
-    ptsN: 5, ptsMs: 3600000,
-    blockN: 4, blockMs: 3600000,
-    warnN: 4, warnMs: 3600000,
-    tamperN: 3,
-    roleN: 4, roleMs: 3600000,
-    purgeN: 3, ptsReqN: 4, hopN: 2, summonN: 2, leaveN: 2,
     ipN: 4, loginN: 6, sharedIpN: 4, ringN: 3, pileN: 3,
+    devN: 3, hopIpN: 3, hopMs: 30 * 60000,
     perRuleCap: 15,
 };
 const CY_RULE_TITLE = {
-    "photo-reuse": "نفس الصورة بمعلومات مختلفة",
-    "photo-cross": "نفس الصورة قدّمها أكثر من عضو",
-    "burst-vio": "تقديم مخالفات بسرعة غير طبيعية",
-    "daily-vol": "كمية مخالفات يومية مرتفعة جداً",
-    "same-form": "تكرار نفس نوع المخالفة والمركبة",
-    "same-suspect": "بلاغات متكررة على نفس المشتبه",
-    "reject-rate": "نسبة رفض عالية على مخالفاته",
-    "reviewer-fav": "مخالفاته تُقبل دائماً من نفس المراجع",
-    "rapid-review": "قبول عدد ضخم من المخالفات بسرعة",
-    "self-review": "قبول مخالفته بنفسه",
-    "blocked-active": "موقوف/مفصول وما زال يقدّم مخالفات",
-    "new-acct-farm": "حساب جديد يجمع مخالفات بكثرة",
-    "mass-delete": "حذف جماعي بوقت قصير",
-    "points-abuse": "تعديل نقاط متكرر",
-    "points-self": "تعديل نقاط على حسابه",
-    "block-churn": "حظر وفك حظر متكرر",
-    "mass-warn": "عقوبات تحذير بالجملة",
-    "warn-tamper": "تلاعب بعقوبات التحذير",
-    "note-wipe": "حذف ملاحظات متكرر",
-    "role-shuffle": "تعيينات وإزالة مناصب متكررة",
-    "purge": "حذف حسابات / فصل إداري متكرر",
-    "points-req-spam": "طلبات نقاط متكررة",
-    "sector-hop": "تنقّل متكرر بين القطاعات",
-    "summon-stop": "إيقاف استدعاءات متكرر",
-    "leave-abuse": "إجازة تنتهي بالدخول للموقع بشكل متكرر",
     "multi-ip": "دخول من عدة عناوين IP",
     "login-burst": "تسجيل دخول متكرر بسرعة",
     "shared-ip": "عدة حسابات من نفس الشبكة",
     "device-ring": "جهاز واحد على 3 حسابات أو أكثر",
+    "multi-device": "دخول من عدة أجهزة مختلفة",
+    "ip-hop": "تغيير IP بسرعة غير طبيعية",
     "flag-pile": "تراكم عمليات مشبوهة على نفس الشخص",
 };
+const CY_FLAG_KINDS = ["multi-ip", "login-burst", "shared-ip", "device-ring", "multi-device", "ip-hop", "flag-pile"];
 const cyH = s => crypto.createHash("sha1").update(String(s)).digest("hex").slice(0, 10);
 function cySpan(ms) {
     if (ms < 60000) return "أقل من دقيقة";
@@ -6476,174 +6392,13 @@ async function cyScanRules() {
         const add = (rule, uid, anchor, det, x) => { if (!skip(uid)) out.push(Object.assign({ rule, uid, anchor, det }, x || {})); };
         const run = async (rule, fn) => { try { await fn(); } catch (e) { console.error("❌ cyRule " + rule + ":", e.message); } };
 
-        // ---------- تحميل البيانات (مرة وحدة لكل القواعد) ----------
-        let V = [], Lx = [], S = [];
-        await run("load-vio", async () => {
-            const rows = await Violation.aggregate([
-                { $match: { createdAt: { $gte: since7 } } },
-                { $project: {
-                    _id: 0, id: { $toString: "$_id" }, r: "$reporterDiscord", rn: "$reporterName", k: "$kind", t: "$violationType", v: "$vehicle", s: "$suspectName",
-                    st: "$status", rb: "$reviewedBy", rbt: "$reviewedByTag", ra: "$reviewedAt", at: "$createdAt",
-                    sig: { $cond: [
-                        { $gt: [{ $strLenCP: { $ifNull: ["$photo", ""] } }, 0] },
-                        { $concat: [{ $toString: { $strLenCP: "$photo" } }, ":", { $substrCP: ["$photo", 3000, 240] }] },
-                        "nophoto",
-                    ] },
-                } },
-                { $sort: { at: -1 } },
-                { $limit: 6000 },
-            ]).allowDiskUse(true).option({ maxTimeMS: 25000 });
-            V = rows.map(x => ({ id: x.id, r: x.r, rn: x.rn || "", k: x.k || "violation", t: x.t || "", v: x.v || "", s: String(x.s || "").trim(), st: x.st, rb: x.rb || null, rbt: x.rbt || "", ra: x.ra ? +new Date(x.ra) : null, at: +new Date(x.at), sig: x.sig })).sort((a, b) => a.at - b.at);
-        });
-        await run("load-log", async () => {
-            const rows = await Log.find({ createdAt: { $gte: since7 } }, { action: 1, actorId: 1, actorTag: 1, discordId: 1, discordTag: 1, details: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(8000).maxTimeMS(15000).lean();
-            Lx = rows.map(l => ({ t: +new Date(l.createdAt), a: l.action || "", actor: l.actorId || null, tag: l.actorTag || "", sub: l.discordId || null, subTag: l.discordTag || "", d: l.details || "" })).sort((a, b) => a.t - b.t);
-        });
+        // ---------- تحميل بيانات الدخول ----------
+        let S = [];
         await run("load-sess", async () => {
             const rows = await DeviceSession.find({ loginAt: { $gte: new Date(now - 2 * CY_DAY) } }, { uid: 1, ip: 1, ua: 1, loginAt: 1 }).limit(10000).maxTimeMS(10000).lean();
             S = rows.map(s => ({ uid: s.uid, ip: s.ip || "", ua: s.ua || "", t: +new Date(s.loginAt) })).sort((a, b) => a.t - b.t);
         });
-
-        const vBy = cyGroup(V, x => x.r);
-        const vioIds = g => g.slice(0, 20).map(x => x.id);
         const weekAnchor = Math.floor(now / (7 * CY_DAY)) * 7 * CY_DAY;
-        const A = (...names) => x => names.indexOf(x.a) >= 0;
-        const lAct = pred => cyGroup(Lx.filter(pred), x => x.actor);
-        const logBurst = (rule, pred, win, min, label) => {
-            for (const [actor, arr] of lAct(pred)) {
-                const h = cyHit(arr, win, min);
-                if (h) add(rule, actor, h[0].t, label + ": " + h.length + " عملية خلال " + cySpan(h[h.length - 1].t - h[0].t), { name: h[0].tag, count: h.length, first: h[0].t, last: h[h.length - 1].t });
-            }
-        };
-
-        // ================= 1-10: المخالفات والبلاغات =================
-        await run("photo-reuse", () => {
-            for (const [r, arr] of vBy) {
-                for (const [sig, g] of cyGroup(arr.filter(x => x.sig !== "nophoto"), x => x.sig)) {
-                    const infos = new Set(g.map(x => [x.k, x.t, x.v, x.s].join("|")));
-                    if (infos.size < 2) continue;
-                    add("photo-reuse", r, g[0].at, "استخدم نفس الصورة في " + g.length + " سجلات بمعلومات مختلفة", { disc: cyH(sig), vio: vioIds(g), count: g.length, name: g[0].rn, first: g[0].at, last: g[g.length - 1].at });
-                }
-            }
-        });
-        await run("photo-cross", () => {
-            for (const [sig, g] of cyGroup(V.filter(x => x.sig !== "nophoto"), x => x.sig)) {
-                const reps = Array.from(new Set(g.map(x => x.r)));
-                if (reps.length < 2) continue;
-                const first = g[0];
-                for (const u of reps.filter(z => z !== first.r).slice(0, 3)) {
-                    add("photo-cross", u, first.at, nm => "نفس الصورة قدّمها " + reps.length + " أعضاء (" + reps.map(z => nm.get(z) || z).join("، ") + ") — أولهم " + (nm.get(first.r) || first.rn), { disc: cyH(sig), vio: vioIds(g), uids: reps, count: g.length, first: first.at, last: g[g.length - 1].at });
-                }
-            }
-        });
-        await run("burst-vio", () => {
-            for (const [r, arr] of vBy) {
-                const h = cyHit(arr, C.burstMs, C.burstN, x => x.at);
-                if (h) add("burst-vio", r, h[0].at, h.length + " سجل خلال " + cySpan(h[h.length - 1].at - h[0].at), { vio: vioIds(h), count: h.length, name: h[0].rn, first: h[0].at, last: h[h.length - 1].at });
-            }
-        });
-        await run("daily-vol", () => {
-            for (const [r, arr] of vBy) {
-                for (const [day, g] of cyGroup(arr, x => Math.floor((x.at + 3 * 3600000) / CY_DAY))) {
-                    if (g.length >= C.dailyN) add("daily-vol", r, g[0].at, "قدّم " + g.length + " سجل خلال يوم واحد", { vio: vioIds(g), count: g.length, name: g[0].rn, first: g[0].at, last: g[g.length - 1].at });
-                }
-            }
-        });
-        await run("same-form", () => {
-            for (const [r, arr] of vBy) {
-                for (const [k, g] of cyGroup(arr.filter(x => x.t && x.v), x => [x.k, x.t, x.v].join("|"))) {
-                    const h = cyHit(g, CY_DAY, C.sameFormN, x => x.at);
-                    if (h) add("same-form", r, h[0].at, "كرر نفس النوع (" + h[0].t + " — " + h[0].v + ") " + h.length + " مرات خلال " + cySpan(h[h.length - 1].at - h[0].at), { disc: cyH(k), vio: vioIds(h), count: h.length, name: h[0].rn, first: h[0].at, last: h[h.length - 1].at });
-                }
-            }
-        });
-        await run("same-suspect", () => {
-            for (const [r, arr] of vBy) {
-                for (const [s, g] of cyGroup(arr.filter(x => x.k === "report" && x.s), x => x.s.toLowerCase())) {
-                    const h = cyHit(g, CY_DAY, C.sameSuspectN, x => x.at);
-                    if (h) add("same-suspect", r, h[0].at, "قدّم " + h.length + " بلاغات على المشتبه \"" + h[0].s + "\" خلال " + cySpan(h[h.length - 1].at - h[0].at), { disc: cyH(s), vio: vioIds(h), count: h.length, name: h[0].rn, first: h[0].at, last: h[h.length - 1].at });
-                }
-            }
-        });
-        await run("reject-rate", () => {
-            for (const [r, arr] of vBy) {
-                const rev = arr.filter(x => x.st === "approved" || x.st === "rejected");
-                const rej = rev.filter(x => x.st === "rejected");
-                if (rev.length >= C.rejectMin && rej.length >= C.rejectN && rej.length / rev.length >= C.rejectRate)
-                    add("reject-rate", r, weekAnchor, "رُفض " + rej.length + " من " + rev.length + " (" + Math.round(rej.length / rev.length * 100) + "%) خلال آخر 7 أيام", { vio: vioIds(rej), count: rej.length, name: arr[0].rn, first: rev[0].at, last: rev[rev.length - 1].at });
-            }
-        });
-        await run("reviewer-fav", () => {
-            for (const [rb, arr] of cyGroup(V.filter(x => x.rb && x.rb !== "system" && (x.st === "approved" || x.st === "rejected")), x => x.rb)) {
-                for (const [r, g] of cyGroup(arr, x => x.r)) {
-                    if (r === rb || g.length < C.favMin) continue;
-                    const ap = g.filter(x => x.st === "approved").length;
-                    if (ap / g.length < C.favRate) continue;
-                    const oth = arr.filter(x => x.r !== r);
-                    if (oth.length < C.favOthersMin) continue;
-                    const oap = oth.filter(x => x.st === "approved").length;
-                    if (oap / oth.length > C.favOthersMax) continue;
-                    add("reviewer-fav", r, g[0].at, "المراجع " + (g[g.length - 1].rbt || rb) + " قبل " + ap + " من " + g.length + " من مخالفاته (" + Math.round(ap / g.length * 100) + "%) بينما نسبة قبوله لغيره " + Math.round(oap / oth.length * 100) + "%", { disc: cyH(rb), vio: vioIds(g), count: g.length, name: g[0].rn, first: g[0].at, last: g[g.length - 1].at });
-                }
-            }
-        });
-        await run("rapid-review", () => {
-            const appr = V.filter(x => x.rb && x.rb !== "system" && x.st === "approved" && x.ra).sort((a, b) => a.ra - b.ra);
-            for (const [rb, arr] of cyGroup(appr, x => x.rb)) {
-                const h = cyHit(arr, C.rapidMs, C.rapidN, x => x.ra);
-                if (h) add("rapid-review", rb, h[0].ra, "قبل " + h.length + " مخالفة خلال " + cySpan(h[h.length - 1].ra - h[0].ra), { count: h.length, name: h[0].rbt, first: h[0].ra, last: h[h.length - 1].ra });
-            }
-        });
-        await run("self-review", () => {
-            for (const [r, g] of cyGroup(V.filter(x => x.rb && x.rb === x.r && x.st === "approved"), x => x.r))
-                add("self-review", r, g[0].at, "قبل " + g.length + " من مخالفاته/بلاغاته بنفسه", { vio: vioIds(g), count: g.length, name: g[0].rn, first: g[0].at, last: g[g.length - 1].at });
-        });
-
-        // ================= 11-12: الحسابات =================
-        await run("blocked-active", async () => {
-            const bl = await Personnel.find({ $or: [{ isBlocked: true }, { isDismissed: true }] }, { discord: 1, registeredName: 1 }).limit(500).maxTimeMS(8000).lean();
-            const lSub = cyGroup(Lx, l => l.sub);
-            for (const p of bl) {
-                const arr = (vBy.get(p.discord) || []).filter(x => x.at >= now - 6 * 3600000);
-                if (!arr.length) continue;
-                const bAt = (lSub.get(p.discord) || []).filter(l => /حظر|فصل/.test(l.a) && !/فك/.test(l.a)).reduce((m, l) => Math.max(m, l.t), 0);
-                const after = arr.filter(x => x.at > bAt);
-                if (after.length) add("blocked-active", p.discord, after[0].at, "حسابه موقوف/مفصول ومع ذلك قدّم " + after.length + " سجل خلال آخر 6 ساعات", { vio: vioIds(after), count: after.length, name: p.registeredName, first: after[0].at, last: after[after.length - 1].at });
-            }
-        });
-        await run("new-acct-farm", async () => {
-            const accs = await Account.find({ status: "approved", createdAt: { $gte: new Date(now - C.farmDays * CY_DAY) } }, { uid: 1, fullName: 1, createdAt: 1 }).limit(300).maxTimeMS(8000).lean();
-            for (const a of accs) {
-                const arr = vBy.get(a.uid) || [];
-                if (arr.length >= C.farmN) add("new-acct-farm", a.uid, +new Date(a.createdAt), "حساب عمره أقل من " + C.farmDays + " أيام وقدّم " + arr.length + " سجل", { vio: vioIds(arr), count: arr.length, name: a.fullName, first: arr[0].at, last: arr[arr.length - 1].at });
-            }
-        });
-
-        // ================= 13-25: سجل العمليات (اللوق) =================
-        await run("mass-delete", () => logBurst("mass-delete", x => x.a.indexOf("حذف") === 0, C.delMs, C.delN, "حذف"));
-        await run("points-abuse", () => logBurst("points-abuse", A("تعديل نقاط"), C.ptsMs, C.ptsN, "تعديل نقاط"));
-        await run("points-self", () => {
-            for (const [u, arr] of lAct(x => x.a === "تعديل نقاط" && x.sub && x.sub === x.actor))
-                add("points-self", u, arr[0].t, "عدّل نقاط حسابه بنفسه " + arr.length + " مرة", { count: arr.length, name: arr[0].tag, first: arr[0].t, last: arr[arr.length - 1].t });
-        });
-        await run("block-churn", () => logBurst("block-churn", A("حظر عسكري (أمر)", "فك حظر عسكري (أمر)", "حظر من الدعم الفني", "فك حظر من الدعم الفني"), C.blockMs, C.blockN, "حظر/فك حظر"));
-        await run("mass-warn", () => logBurst("mass-warn", A("إضافة عقوبة تحذير"), C.warnMs, C.warnN, "إضافة عقوبات"));
-        await run("warn-tamper", () => logBurst("warn-tamper", A("حذف عقوبة تحذير", "تعديل عقوبة تحذير"), CY_DAY, C.tamperN, "حذف/تعديل عقوبات"));
-        await run("note-wipe", () => logBurst("note-wipe", A("حذف ملاحظة", "حذف كل ملاحظات القطاع", "حذف ملاحظات القطاع باستثناء"), CY_DAY, C.tamperN, "حذف ملاحظات"));
-        await run("role-shuffle", () => logBurst("role-shuffle", x => /^(تعيين|إزالة)/.test(x.a) || x.a === "إضافة عضو للقيادة العليا", C.roleMs, C.roleN, "تعيين/إزالة مناصب"));
-        await run("purge", () => logBurst("purge", A("حذف حساب نهائي", "فصل إداري"), CY_DAY, C.purgeN, "حذف حسابات/فصل"));
-        await run("points-req-spam", () => logBurst("points-req-spam", A("طلب نقاط"), CY_DAY, C.ptsReqN, "طلبات نقاط"));
-        await run("sector-hop", () => {
-            for (const [u, arr] of cyGroup(Lx.filter(x => x.a === "تغيير قطاع"), x => x.sub)) {
-                const h = cyHit(arr, 7 * CY_DAY, C.hopN);
-                if (h) add("sector-hop", u, h[0].t, "تغيّر قطاعه " + h.length + " مرات خلال " + cySpan(h[h.length - 1].t - h[0].t), { count: h.length, name: h[0].subTag, first: h[0].t, last: h[h.length - 1].t });
-            }
-        });
-        await run("summon-stop", () => logBurst("summon-stop", A("إيقاف استدعاء"), CY_DAY, C.summonN, "إيقاف استدعاءات"));
-        await run("leave-abuse", () => {
-            for (const [u, arr] of cyGroup(Lx.filter(x => x.a === "إنهاء إجازة تلقائي" && x.d.indexOf("دخول") >= 0), x => x.sub))
-                if (arr.length >= C.leaveN) add("leave-abuse", u, arr[0].t, "انتهت إجازته " + arr.length + " مرات بسبب دخوله للموقع خلال 7 أيام", { count: arr.length, name: arr[0].subTag, first: arr[0].t, last: arr[arr.length - 1].t });
-        });
 
         // ================= 26-29: الدخول والأجهزة =================
         const S24 = S.filter(s => s.t >= now - CY_DAY);
@@ -6676,6 +6431,21 @@ async function cyScanRules() {
                 const newest = accs[0], nt = +new Date(newest.firstSeen);
                 if (!nt || nt < now - 7 * CY_DAY) continue;
                 add("device-ring", newest.uid, nt, nm => "جهاز واحد دخلت منه " + accs.length + " حسابات: " + accs.slice(0, 6).map(a => nm.get(a.uid) || a.uid).join("، "), { disc: cyH(d._id), uids: accs.map(a => a.uid), count: accs.length, first: +new Date(accs[accs.length - 1].firstSeen), last: nt });
+            }
+        });
+
+        await run("multi-device", () => {
+            for (const [u, arr] of cyGroup(S24, s => s.uid)) {
+                const devs = Array.from(new Set(arr.map(s => cyUaLabel(s.ua))));
+                if (devs.length >= C.devN) add("multi-device", u, arr[0].t, "دخل من " + devs.length + " أجهزة مختلفة خلال 24 ساعة: " + devs.slice(0, 4).join("، "), { count: devs.length, first: arr[0].t, last: arr[arr.length - 1].t });
+            }
+        });
+        await run("ip-hop", () => {
+            for (const [u, arr] of cyGroup(S24, s => s.uid)) {
+                const h = cyHit(arr, C.hopMs, C.hopIpN);
+                if (!h) continue;
+                const ips = Array.from(new Set(h.map(s => s.ip).filter(Boolean)));
+                if (ips.length >= C.hopIpN) add("ip-hop", u, h[0].t, "غيّر الـ IP " + ips.length + " مرات خلال " + cySpan(h[h.length - 1].t - h[0].t), { count: ips.length, first: h[0].t, last: h[h.length - 1].t });
             }
         });
 
@@ -6743,7 +6513,8 @@ app.get("/api/cyber/members/:uid/ops", ensureAuth, async (req, res) => {
         const uid = String(req.params.uid || "");
         const acc = await Account.findOne({ uid }, { isSenior: 1, isOwner: 1, tempSenior: 1 }).lean();
         if (!acc || cyIsProtected(uid, acc)) return res.status(403).json({ error: "ما يمديك تشوف عمليات هذا الشخص" });
-        res.json({ list: await cyOpsOf(uid) });
+        const fq = req.query.from ? new Date(String(req.query.from)) : null, tq = req.query.to ? new Date(String(req.query.to)) : null;
+        res.json({ list: await cyOpsOf(uid, fq, tq) });
     } catch (e) { res.status(500).json({ error: "تعذر تحميل العمليات" }); }
 });
 
@@ -6763,12 +6534,7 @@ app.post("/api/cyber/investigations", ensureAuth, async (req, res) => {
         if (underInvestigation.has(targetUid)) return res.status(409).json({ error: "هذا العضو تحت التحقيق حالياً" });
         const open = await CyberCase.findOne({ targetUid, status: { $in: ["sent", "investigating"] } }, { _id: 1 }).lean();
         if (open) return res.status(409).json({ error: "فيه تحقيق مفتوح على هذا العضو" });
-        let evidenceVio = null;
-        const vioId = String(b.vioId || "");
-        if (vioId && mongoose.isValidObjectId(vioId)) {
-            const vv = await Violation.findById(vioId, { reporterDiscord: 1 }).lean();
-            if (vv && vv.reporterDiscord === targetUid) evidenceVio = vioId;
-        }
+        const evidenceVio = null;
         let flagId = null;
         const fid = String(b.flagId || "");
         if (fid && mongoose.isValidObjectId(fid)) {
@@ -6806,10 +6572,9 @@ app.get("/api/cyber/suspicious", ensureAuth, async (req, res) => {
         const role = await cyGuard(req, res); if (!role) return;
         const all = req.query.scope === "all";
         if (all && !role.isLeader) return res.status(403).json({ error: "هذا القسم للقيادة فقط" });
-        await cyScanFlags(false);
         cyScanRules().catch(() => {});
         const me = req.user.id;
-        const flags = await CyberFlag.find(all ? {} : { status: "open", targetUid: { $ne: me } }).sort({ lastAt: -1 }).limit(300).maxTimeMS(8000).lean();
+        const flags = await CyberFlag.find(all ? { kind: { $in: CY_FLAG_KINDS } } : { kind: { $in: CY_FLAG_KINDS }, status: "open", targetUid: { $ne: me } }).sort({ lastAt: -1 }).limit(300).maxTimeMS(8000).lean();
         const devQ = all
             ? { kind: { $ne: "manual" } }
             : { kind: { $ne: "manual" }, status: { $in: ["alert", "sent", "investigating", "decision"] }, targetUid: { $ne: me }, relatedUid: { $ne: me } };
@@ -6821,7 +6586,7 @@ app.get("/api/cyber/suspicious", ensureAuth, async (req, res) => {
         flags.forEach(f => items.push({
             src: "flag", id: String(f._id), status: f.status, title: f.title, details: f.details,
             targetUid: f.targetUid, targetName: f.targetName, count: f.count, approvedBy: f.approvedBy || [],
-            vioId: (f.violationIds || [])[0] || null, at: f.lastAt || f.createdAt, rule: f.kind, caseId: caseMap.get(String(f._id)) || null,
+            vioId: null, at: f.lastAt || f.createdAt, rule: f.kind, caseId: caseMap.get(String(f._id)) || null,
             protectedTarget: isSeniorAdmin(f.targetUid) || isOwnerUid(f.targetUid), handledByName: f.handledByName || null,
         }));
         devs.forEach(c => items.push({
@@ -8064,7 +7829,7 @@ async function ackCurrentWarning() {
         document.cookie = k + '=' + v + '; max-age=315360000; path=/; SameSite=Lax';
     } catch (e) {}
 })();
-var CY = { cur: null, busy: false, lockShown: false, lockId: null, lockTimer: null, roomId: null, roomLock: false, roomTimer: null, sig: '', first: true, seen: {} };
+var CY = { entering: false, lockMode: null, cur: null, busy: false, lockShown: false, lockId: null, lockTimer: null, roomId: null, roomLock: false, roomTimer: null, sig: '', first: true, seen: {} };
 var CY_STATUS = { alert: '⚠️ اشتباه — بانتظار عضو', sent: '📤 مرفوعة للقائد', dismissed: 'تم تجاهلها', investigating: '🔍 تحقيق جاري', decision: '⏳ بانتظار القرار', escalated: '⭐ أُبلغت القيادة العليا', resolved: '✅ تم حلها' };
 var CY_ROLE = { target: 'متحقق معه', leader: 'قيادة', member: 'عضو', system: 'نظام' };
 function cyEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (m) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]; }); }
@@ -8076,7 +7841,8 @@ async function cyberCheck() {
     var st;
     try { st = await api('/api/cyber/state'); } catch (e) { return; }
     if (st.lock) {
-        CY.lockId = st.lock.id;
+        CY.lockId = st.lock.id; CY.lockMode = st.lock.mode || 'voice';
+        if (CY.lockShown && !CY.entering && !(typeof VC !== 'undefined' && VC) && !document.getElementById('cyber-room').classList.contains('open') && !document.getElementById('cyber-overlay').classList.contains('open')) { cyEnterLock(); return; }
         if (!CY.lockShown) {
             CY.lockShown = true;
             cyOverlay('<div style="font-size:42px">🔒</div><h2>تحقيق سيبراني</h2><div>تم فتح تحقيق سيبراني بحقك وتم إيقاف حسابك مؤقتاً.<br>جارِ إدخالك لروم التحقيق...</div><div class="cy-actions">' + cyBtn('lockenter', 'دخول روم التحقيق', '') + '</div>');
@@ -8090,6 +7856,7 @@ async function cyberCheck() {
         return;
     }
     if (document.getElementById('cyber-room').classList.contains('open') || document.getElementById('cyber-overlay').classList.contains('open')) return;
+    if (CY.entering || (typeof VC !== 'undefined' && VC)) return;
     var t = null, c = null;
     if (st.decisions[0]) { t = 'decision'; c = st.decisions[0]; }
     else if (st.inbox[0]) { t = 'inbox'; c = st.inbox[0]; }
@@ -8097,9 +7864,29 @@ async function cyberCheck() {
     else { for (var i = 0; i < st.live.length; i++) { if (!CY.seen[st.live[i].id]) { t = 'invite'; c = st.live[i]; break; } } }
     if (t) cyPrompt(t, c);
 }
-function cyEnterLock() { if (!CY.lockId) return; clearTimeout(CY.lockTimer); cyOverlayClose(); cyOpenRoom(CY.lockId, true); }
+function cyEnterLock() { if (!CY.lockId) return; clearTimeout(CY.lockTimer); cyOverlayClose(); cyEnterCase(CY.lockId, CY.lockMode, true); }
+async function cyEnterCase(id, mode, lock) {
+    if (CY.entering) return;
+    CY.entering = true;
+    try {
+        if (!mode) { try { var rd = await api('/api/cyber/cases/' + id + '/room'); mode = rd.c.mode; } catch (e) { mode = 'text'; } }
+        if (mode === 'text') { cyOpenRoom(id, lock); return; }
+        try {
+            var v = await api('/api/cyber/cases/' + id + '/voice', { method: 'POST' });
+            await offJoinVoice(v.n);
+        } catch (e) { toast(e.message); }
+        if (!(typeof VC !== 'undefined' && VC)) cyOpenRoom(id, lock);
+    } finally { CY.entering = false; }
+}
+async function offCyEnd() {
+    var id = (typeof VC !== 'undefined' && VC) ? VC.caseId : null;
+    if (!id) return;
+    if (!(await confirmModal('متأكد تبي تنهي التحقيق؟'))) return;
+    try { await api('/api/cyber/cases/' + id + '/end', { method: 'POST' }); toast('⏹️ تم إنهاء التحقيق'); }
+    catch (e) { toast(e.message); }
+}
 function cyPrompt(t, c) {
-    CY.cur = { t: t, id: c.id };
+    CY.cur = { t: t, id: c.id, mode: c.mode };
     var h;
     if (t === 'alert') h = '<div style="font-size:38px">⚠️</div><h3>اشتباه دخول جهاز</h3><p>جهاز العضو <b>' + cyEsc(c.targetName) + '</b> دخل حساب العضو <b>' + cyEsc(c.relatedName) + '</b></p><div class="cy-actions">' + cyBtn('send', '📤 إرسال للقائد', '') + cyBtn('dismiss', 'تجاهل', 'gray') + '</div>';
     else if (t === 'inbox') h = '<div style="font-size:38px">🛡️</div><h3>طلب تحقيق من الأمن السيبراني</h3>' + (c.kind === 'manual' ? '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b><br>السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '') + '</p>' : '<p>العضو <b>' + cyEsc(c.sentByName) + '</b> يرفع لك تحقيقاً بحق العضو <b>' + cyEsc(c.targetName) + '</b> بسبب دخوله بجهازه حساب <b>' + cyEsc(c.relatedName) + '</b></p>') + '<div class="cy-actions">' + cyBtn('investigate', '🔍 تحقيق', '') + cyBtn('resolve', '✅ حل العملية', 'gray') + '</div>';
@@ -8116,8 +7903,8 @@ async function cyAct(btn) {
     CY.busy = true;
     try {
         if (a === 'send' || a === 'dismiss' || a === 'resolve') await api('/api/cyber/cases/' + cur.id + '/' + a, { method: 'POST' });
-        else if (a === 'inv-voice' || a === 'inv-text') { await api('/api/cyber/cases/' + cur.id + '/investigate', { method: 'POST', body: JSON.stringify({ mode: a === 'inv-text' ? 'text' : 'voice' }) }); CY.busy = false; cyOverlayClose(); cyOpenRoom(cur.id, false); return; }
-        else if (a === 'join') { CY.seen[cur.id] = true; CY.busy = false; cyOverlayClose(); cyOpenRoom(cur.id, false); return; }
+        else if (a === 'inv-voice' || a === 'inv-text') { await api('/api/cyber/cases/' + cur.id + '/investigate', { method: 'POST', body: JSON.stringify({ mode: a === 'inv-text' ? 'text' : 'voice' }) }); CY.busy = false; cyOverlayClose(); cyEnterCase(cur.id, a === 'inv-text' ? 'text' : 'voice', false); return; }
+        else if (a === 'join') { CY.seen[cur.id] = true; CY.busy = false; cyOverlayClose(); cyEnterCase(cur.id, cur.mode, false); return; }
         else if (a === 'later') { CY.seen[cur.id] = true; }
         else if (a === 'escalate') {
             var note = await promptModal('ملاحظتك للقيادة العليا (اختياري):');
@@ -8276,18 +8063,13 @@ function cyInfoRows(m) {
     function row(ic, label, v) { if (v !== null && v !== undefined && v !== '') r += '<div>' + ic + ' ' + label + ': <span style="color:#e2e8f0;">' + cyEsc(v) + '</span></div>'; }
     row('🎂', 'العمر', m.age);
     row('🌍', 'الجنسية', m.nationality);
-    row('🎖️', 'الرتبة', m.rank);
-    row('🪖', 'اليونت', m.unit);
-    row('⭐', 'النقاط', m.points);
-    row('🏷️', 'القطاع', m.sectorLabel);
-    row('🪪', 'رقم البطاقة', m.cardNumber);
     row('💬', 'الديسكورد', m.discordTag);
     row('📅', 'تاريخ التسجيل', m.joinedAt ? cyFmt(m.joinedAt) : '');
     row('🕒', 'آخر دخول', m.lastLogin ? cyFmt(m.lastLogin) : '');
-    row('⚠️', 'التحذيرات', m.warnings);
-    row('📝', 'الملاحظات', m.notes);
-    row('🏖️', 'رصيد الإجازات', m.leaveBalance);
-    if (m.blocked) r += '<div style="color:#fca5a5;">🚫 موقوف / مفصول</div>';
+    row('🌐', 'آخر IP', m.lastIp);
+    row('📡', 'عدد الـ IP (آخر 7 أيام)', m.ipCount);
+    row('📱', 'عدد الأجهزة (آخر 7 أيام)', m.deviceCount);
+    if (m.blocked) r += '<div style="color:#fca5a5;">🚫 حسابه موقوف</div>';
     return r;
 }
 function cyMemCard(m, badge) {
@@ -8316,28 +8098,51 @@ function cyFindMember(uid) {
     return null;
 }
 function cyOpsHtml(list, clickable) {
-    if (!list || !list.length) return '<div style="color:var(--muted);text-align:center;padding:10px;">ما فيه عمليات خلال آخر 7 أيام</div>';
+    if (!list || !list.length) return '<div style="color:var(--muted);text-align:center;padding:10px;">ما فيه نشاط خلال الوقت المحدد</div>';
     return list.map(function (o) {
         var meta = (typeof LOG_META !== 'undefined' && LOG_META[o.title]) || null;
-        var ic = o.kind === 'vio' ? '🚗' : (meta ? meta.icon : 'ℹ️');
-        var col = o.kind === 'vio' ? '#3b82f6' : (meta ? meta.border : '#64748b');
-        var tc = meta ? meta.color : '#e2e8f0';
+        var ses = o.kind === 'ses';
+        var ic = ses ? '🖥️' : (meta ? meta.icon : 'ℹ️');
+        var col = ses ? '#22c55e' : (meta ? meta.border : '#64748b');
+        var tc = ses ? '#86efac' : (meta ? meta.color : '#e2e8f0');
         var attrs = clickable ? ' data-ref="' + cyEsc(o.id) + '" onclick="cyShowOp(this.dataset.ref)" style="display:block;cursor:pointer;border-color:' + col + ';"' : ' style="display:block;border-color:' + col + ';"';
-        return '<div class="log-item"' + attrs + '><div style="color:' + tc + ';font-weight:bold;">' + ic + ' ' + cyEsc((meta && meta.label) || o.title) + (o.hasPhoto ? ' 🖼️' : '') + '</div>' + (o.details ? '<div style="color:#93c5fd;font-size:13px;">' + cyEsc(o.details) + '</div>' : '') + '<div style="font-size:12px;color:#64748b;">' + cyEsc(cyFmt(o.at)) + '</div></div>';
+        return '<div class="log-item"' + attrs + '><div style="color:' + tc + ';font-weight:bold;">' + ic + ' ' + cyEsc((meta && meta.label) || o.title) + '</div>' + (o.details ? '<div style="color:#93c5fd;font-size:13px;">' + cyEsc(o.details) + '</div>' : '') + '<div style="font-size:12px;color:#64748b;">' + cyEsc(cyFmt(o.at)) + '</div></div>';
     }).join('');
+}
+function cyDtLocal(d) {
+    var p = function (n) { return ('0' + n).slice(-2); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function cyOpsFormHtml() {
+    var now = new Date(), ago = new Date(now.getTime() - 86400000);
+    return '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin:8px 0;">' +
+        '<label style="font-size:12px;flex:1;min-width:140px;">من<input type="datetime-local" id="cy-ops-from" value="' + cyDtLocal(ago) + '" style="width:100%;font-size:14px;"></label>' +
+        '<label style="font-size:12px;flex:1;min-width:140px;">إلى<input type="datetime-local" id="cy-ops-to" value="' + cyDtLocal(now) + '" style="width:100%;font-size:14px;"></label>' +
+        '<button class="btn sm" onclick="cyOpsGo()">🔎 عرض</button></div>';
+}
+async function cyOpsGo() {
+    var uid = CY.opsUid; if (!uid) return;
+    var f = (document.getElementById('cy-ops-from') || {}).value, to = (document.getElementById('cy-ops-to') || {}).value;
+    if (!f || !to) { toast('حدد الوقت من وإلى'); return; }
+    var fd = new Date(f), td = new Date(to);
+    if (isNaN(fd.getTime()) || isNaN(td.getTime())) { toast('الوقت غير صحيح'); return; }
+    if (fd.getTime() > td.getTime()) { toast('وقت البداية لازم يكون قبل وقت النهاية'); return; }
+    var b = document.getElementById('cy-ops-box'); if (!b) return;
+    b.style.textAlign = 'center'; b.textContent = 'جارِ التحميل...';
+    try {
+        var d = await api('/api/cyber/members/' + encodeURIComponent(uid) + '/ops?from=' + encodeURIComponent(fd.toISOString()) + '&to=' + encodeURIComponent(td.toISOString()));
+        var b2 = document.getElementById('cy-ops-box');
+        if (b2 && CY.opsUid === uid) { b2.style.textAlign = 'right'; b2.innerHTML = cyOpsHtml(d.list, !!CY.opsClick); }
+    } catch (e) {
+        var b3 = document.getElementById('cy-ops-box');
+        if (b3) { b3.style.textAlign = 'center'; b3.textContent = e.message; }
+    }
 }
 function cyOpenMember(uid) {
     var m = cyFindMember(uid); if (!m) return;
-    CY.prof = uid;
+    CY.prof = uid; CY.opsUid = uid; CY.opsClick = false;
     var canInv = !m.me && !m.isSenior && !m.investigated;
-    cyOverlay('<div style="text-align:right;max-height:78vh;overflow-y:auto;"><div style="font-size:18px;font-weight:bold;text-align:center;">' + cyEsc(m.name) + '</div><div style="color:#94a3b8;font-size:13px;margin-top:6px;">' + cyInfoRows(m) + '</div><div class="cy-actions">' + (canInv ? '<button class="btn" onclick="cyInvForm(CY.prof)">🔍 تحقيق</button>' : '') + '<button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div><div style="font-weight:bold;margin:12px 0 6px;">📋 عملياته آخر 7 أيام</div><div id="cy-prof-ops" style="color:var(--muted);text-align:center;">جارِ التحميل...</div></div>');
-    api('/api/cyber/members/' + encodeURIComponent(uid) + '/ops').then(function (d) {
-        var b = document.getElementById('cy-prof-ops');
-        if (b && CY.prof === uid) { b.style.textAlign = 'right'; b.innerHTML = cyOpsHtml(d.list, false); }
-    }).catch(function (e) {
-        var b = document.getElementById('cy-prof-ops');
-        if (b && CY.prof === uid) b.textContent = e.message;
-    });
+    cyOverlay('<div style="text-align:right;max-height:78vh;overflow-y:auto;"><div style="font-size:18px;font-weight:bold;text-align:center;">' + cyEsc(m.name) + '</div><div style="color:#94a3b8;font-size:13px;margin-top:6px;">' + cyInfoRows(m) + '</div><div class="cy-actions">' + (canInv ? '<button class="btn" onclick="cyInvForm(CY.prof)">🔍 تحقيق</button>' : '') + '<button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div><div style="font-weight:bold;margin:12px 0 2px;">📋 نشاطه في الموقع</div>' + cyOpsFormHtml() + '<div id="cy-ops-box" style="color:var(--muted);text-align:center;">حدد الوقت واضغط عرض</div></div>');
 }
 function cyInvForm(uid, pre) {
     pre = pre || {};
@@ -8355,7 +8160,7 @@ async function cyInvSubmit(btn) {
     try {
         var d = await api('/api/cyber/investigations', { method: 'POST', body: JSON.stringify({ targetUid: inv.uid, reason: reason, evidence: evid, mode: btn.dataset.m, vioId: inv.vioId, flagId: inv.flagId }) });
         CY.inv = null; cyOverlayClose();
-        if (d.started) { toast('🔍 بدأ التحقيق'); cyOpenRoom(d.id, false); }
+        if (d.started) { toast('🔍 بدأ التحقيق'); cyEnterCase(d.id, d.mode, false); }
         else toast('📤 انرسل التحقيق للقيادة');
         CYP.sig = {};
         cyPanelLoad(true);
@@ -8364,7 +8169,7 @@ async function cyInvSubmit(btn) {
 function cyModeChoose() {
     cyOverlay('<div style="font-size:34px;">🔍</div><h3>نوع التحقيق</h3><div>اختر طريقة التحقيق</div><div class="cy-actions"><button class="btn" data-a="inv-voice" onclick="cyAct(this)">🎙️ صوتي</button><button class="btn" data-a="inv-text" onclick="cyAct(this)">⌨️ كتابي</button><button class="btn gray" data-a="inv-back" onclick="cyAct(this)">رجوع</button></div>');
 }
-function cyPBtn(id, a, label, cls) { return '<button class="btn sm ' + (cls || '') + '" data-id="' + id + '" data-a="' + a + '" onclick="cyPanelAct(this)">' + label + '</button>'; }
+function cyPBtn(id, a, label, cls, mode) { return '<button class="btn sm ' + (cls || '') + '" data-id="' + id + '" data-a="' + a + '"' + (mode ? ' data-mode="' + mode + '"' : '') + ' onclick="cyPanelAct(this)">' + label + '</button>'; }
 async function cyStopInv(id) {
     if (!(await confirmModal('متأكد تبي توقف التحقيق؟ بيتفك التقييد عن العضو ويتسكر الروم.'))) return;
     try { await api('/api/cyber/cases/' + id + '/stop', { method: 'POST' }); toast('⏹️ تم إيقاف التحقيق'); CYP.sig = {}; cyberCheck(); cyPanelLoad(true); }
@@ -8373,8 +8178,8 @@ async function cyStopInv(id) {
 function cyPanelAct(btn) {
     var a = btn.dataset.a, id = btn.dataset.id;
     if (a === 'stop') return cyStopInv(id);
-    if (a === 'view') return cyOpenRoom(id, false);
-    CY.cur = { t: 'panel', id: id };
+    if (a === 'view') return cyEnterCase(id, null, false);
+    CY.cur = { t: 'panel', id: id, mode: btn.dataset.mode || null };
     cyAct(btn);
 }
 function cyDrawReview() {
@@ -8386,7 +8191,7 @@ function cyDrawReview() {
         var b = '';
         if (c.status === 'sent' && lead) b += cyPBtn(c.id, 'investigate', '✅ قبول وتحقيق') + cyPBtn(c.id, 'resolve', '❌ رفض', 'gray');
         if (c.status === 'decision' && lead) b += cyPBtn(c.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(c.id, 'decide-resolve', '✅ حل العملية', 'gray');
-        if (c.status === 'investigating') b += cyPBtn(c.id, 'join', '🚪 دخول الروم');
+        if (c.status === 'investigating') b += cyPBtn(c.id, 'join', '🚪 دخول الروم', '', c.mode);
         if (c.status === 'investigating' && lead) b += cyPBtn(c.id, 'stop', '⏹️ إيقاف التحقيق', 'danger');
         var why = c.kind === 'manual' ? ('السبب: ' + cyEsc(c.reason || '-') + (c.evidence ? '<br>الدليل: ' + cyEsc(c.evidence) : '')) : ('جهازه دخل حساب ' + cyEsc(c.relatedName));
         return '<div class="card"><b>' + cyEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:13px;margin-top:4px;">' + why + '</div><div style="margin-top:4px;font-size:13px;">' + (CY_STATUS[c.status] || c.status) + (c.sentByName ? ' • رفعه: ' + cyEsc(c.sentByName) : '') + (c.status === 'investigating' ? ' • ' + (c.mode === 'text' ? '⌨️ كتابي' : '🎙️ صوتي') : '') + '</div><div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">' + b + '</div></div>';
@@ -8417,12 +8222,15 @@ function cySuspItem(it, withActions) {
             if (it.status === 'alert' && isMemberOnly) b += cyPBtn(it.id, 'send', '📤 إرسال للقائد') + cyPBtn(it.id, 'dismiss', 'تجاهل', 'gray');
             if (lead && (it.status === 'alert' || it.status === 'sent')) b += cyPBtn(it.id, 'investigate', '🔍 تحقيق') + cyPBtn(it.id, 'resolve', '✅ حل العملية', 'gray');
             if (lead && it.status === 'decision') b += cyPBtn(it.id, 'escalate', '⭐ إبلاغ القيادة العليا') + cyPBtn(it.id, 'decide-resolve', '✅ حل العملية', 'gray');
-            if (it.status === 'investigating') b += cyPBtn(it.id, 'join', '🚪 دخول الروم');
+            if (it.status === 'investigating') b += cyPBtn(it.id, 'join', '🚪 دخول الروم', '', it.mode);
         }
         if (lead && stopId) b += cyPBtn(stopId, 'stop', '⏹️ إيقاف التحقيق', 'danger');
         if (b) h += '<div class="row" style="gap:6px;width:100%;margin-top:8px;flex-wrap:wrap;">' + b + '</div>';
-    } else if (lead && stopId) {
-        h += '<div class="row" style="gap:6px;width:100%;margin-top:8px;flex-wrap:wrap;">' + cyPBtn(stopId, 'stop', '⏹️ إيقاف التحقيق', 'danger') + '</div>';
+    } else {
+        var lb = '';
+        if (lead && stopId) lb += cyPBtn(stopId, 'stop', '⏹️ إيقاف التحقيق', 'danger');
+        if (lead && closed && it.targetUid && !it.protectedTarget) lb += '<button class="btn sm" data-u="' + cyEsc(it.targetUid) + '" data-n="' + cyEsc(it.targetName) + '" data-f="' + (it.src === 'flag' ? it.id : '') + '" data-d="' + cyEsc(it.details || it.title || '') + '" onclick="cyLogInv(this)">🔍 رفع تحقيق</button>';
+        if (lb) h += '<div class="row" style="gap:6px;width:100%;margin-top:8px;flex-wrap:wrap;">' + lb + '</div>';
     }
     return h + '</div>';
 }
@@ -8440,6 +8248,10 @@ function cyDrawCurrent() {
     var list = (CYP.data.current || {}).list || [];
     if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">ما فيه عمليات مشبوهة حالياً ✅</div>'; return; }
     box.innerHTML = '<div class="card">' + list.map(function (it) { return cySuspItem(it, true); }).join('') + '</div>';
+}
+function cyLogInv(btn) {
+    var d = btn.dataset;
+    cyInvForm(d.u, { name: d.n, flagId: d.f || null, reason: 'إعادة فتح: ' + (d.d || ''), evidence: '' });
 }
 function cyFlagInv(btn) {
     var d = btn.dataset;
@@ -8470,16 +8282,8 @@ function cyCtx() {
 async function cyOpsOpen() {
     var c = cyCtx();
     if (!c.id || !c.target) { toast('ما قدرت أحدد العضو'); return; }
-    CY.opsCase = c.id;
-    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-weight:bold;">📋 عمليات العضو — آخر 7 أيام</div><div style="text-align:center;font-size:12px;color:#94a3b8;">اضغط على أي عملية تنعرض قدام العضو</div><div id="cy-ops-box" style="max-height:60vh;overflow-y:auto;margin-top:10px;color:var(--muted);text-align:center;">جارِ التحميل...</div><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
-    try {
-        var d = await api('/api/cyber/members/' + encodeURIComponent(c.target) + '/ops');
-        var b = document.getElementById('cy-ops-box');
-        if (b) { b.style.textAlign = 'right'; b.innerHTML = cyOpsHtml(d.list, true); }
-    } catch (e) {
-        var b2 = document.getElementById('cy-ops-box');
-        if (b2) b2.textContent = e.message;
-    }
+    CY.opsCase = c.id; CY.opsUid = c.target; CY.opsClick = true;
+    cyOverlay('<div style="text-align:right;"><div style="text-align:center;font-weight:bold;">📋 نشاط العضو في الموقع</div><div style="text-align:center;font-size:12px;color:#94a3b8;">حدد الوقت، واضغط على أي نشاط ينعرض قدام العضو</div>' + cyOpsFormHtml() + '<div id="cy-ops-box" style="max-height:55vh;overflow-y:auto;margin-top:6px;color:var(--muted);text-align:center;">حدد الوقت واضغط عرض</div><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
 }
 async function cyShowOp(ref) {
     var id = CY.opsCase; if (!id) return;
@@ -13567,7 +13371,7 @@ function offPaintBar() {
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
     var qb = '';
     if (VC.isSenior && !VC.state.training && !VC.state.cyber) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
-    if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 عملياته</button>';
+    if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 نشاطه</button><button class="ov-btn" onclick="offCyEnd()">⏹️ إنهاء</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
 }
