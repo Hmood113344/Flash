@@ -7168,9 +7168,6 @@ app.get("/", (req, res) => {
     #cy-hardlock .cy-hl-box { max-width: 420px; width: 100%; line-height: 1.9; }
     #cy-hardlock h2 { margin: 6px 0 10px; }
     #cy-hardlock .btn { margin-top: 14px; }
-    #fl-refresh { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 22px); right: 14px; z-index: 900; width: 38px; height: 38px; border-radius: 50%; border: 1px solid rgba(59,130,246,0.45); background: rgba(10,22,40,0.75); color: #93c5fd; font-size: 17px; line-height: 1; display: none; align-items: center; justify-content: center; cursor: pointer; }
-    html.fl-standalone #fl-refresh { display: flex; }
-    body.cy-frozen #fl-refresh, body.ua-frozen #fl-refresh { display: none !important; }
     body.ua-frozen #app, body.ua-frozen nav, body.ua-frozen #warn-banner, body.ua-frozen #owner-toolbar, body.ua-frozen #sp-fab, body.ua-frozen #mobile-menu, body.ua-frozen #menu-backdrop { display: none !important; }
     body.ua-frozen { overflow: hidden; background: #060d1a; }
     body.ua-frozen #sp-modal { z-index: 5600; }
@@ -7476,10 +7473,6 @@ app.get("/", (req, res) => {
         var sa = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
         if (sa) {
             d.classList.add('fl-standalone');
-            var rb = document.createElement('button');
-            rb.id = 'fl-refresh'; rb.type = 'button'; rb.setAttribute('aria-label', 'تحديث'); rb.textContent = '🔄';
-            rb.onclick = function () { location.reload(); };
-            document.body.appendChild(rb);
         }
     } catch (e) {}
     try {
@@ -9775,6 +9768,7 @@ function buildNav() {
     if (ME.isTrainer && !ME.isSeniorAdmin) items.push({ label: '🏋️ صفحة المدرب', fn: 'renderTrainerPage()' });
     items.push({ label: '🎧 الدعم', fn: 'spOpen()', cls: 'sp-nav-user' });
     if (ME.isAdmin) items.push({ label: '🎧 تذاكر الدعم', fn: 'renderSupportAdmin()', cls: 'sp-nav-admin' });
+    if (document.documentElement.classList.contains('fl-standalone')) items.push({ label: '🔄 تحديث', fn: 'location.reload()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button class="\${i.cls || ''}" onclick="\${i.fn}">\${i.label}</button>\`).join('');
     mobile.innerHTML = items.map(i => \`<button class="\${i.cls || ''}" onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
