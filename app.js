@@ -1351,6 +1351,69 @@ const app = express();
 });
 
 app.use(express.json({ limit: "8mb" }));
+// ================= تثبيت الموقع كتطبيق (إضافة للشاشة الرئيسية) =================
+const FLASH_ICONS = (function () {
+    const zlib = require("zlib");
+const CRC = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(buf) { let c = 0xffffffff; for (let i = 0; i < buf.length; i++) c = CRC[(c ^ buf[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+function chunk(type, data) {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+    return Buffer.concat([len, td, crc]);
+}
+const BOLT = [[58, 8], [26, 55], [46, 55], [40, 92], [74, 42], [54, 42], [64, 8]].map(p => [p[0] / 100, p[1] / 100]);
+function inPoly(x, y, poly) {
+    let ins = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, yi] = poly[i], [xj, yj] = poly[j];
+        if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) ins = !ins;
+    }
+    return ins;
+}
+function makeIcon(size) {
+    const S = 2, stride = size * 3 + 1, raw = Buffer.alloc(stride * size);
+    const poly = BOLT.map(p => [0.5 + (p[0] - 0.5) * 0.74, 0.5 + (p[1] - 0.5) * 0.74]);
+    const mix = (a, b, t) => a + (b - a) * t;
+    for (let y = 0; y < size; y++) {
+        const ty = y / size;
+        const bg = [mix(15, 10, ty), mix(37, 22, ty), mix(71, 40, ty)];
+        const bl = [mix(96, 29, ty), mix(165, 78, ty), mix(250, 216, ty)];
+        for (let x = 0; x < size; x++) {
+            let cov = 0;
+            for (let sy = 0; sy < S; sy++) for (let sx = 0; sx < S; sx++)
+                if (inPoly((x + (sx + 0.5) / S) / size, (y + (sy + 0.5) / S) / size, poly)) cov++;
+            cov /= S * S;
+            const o = y * stride + 1 + x * 3;
+            for (let k = 0; k < 3; k++) raw[o + k] = Math.round(bg[k] * (1 - cov) + bl[k] * cov);
+        }
+    }
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4); ihdr[8] = 8; ihdr[9] = 2;
+    return Buffer.concat([
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+        chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0)),
+    ]);
+}
+    return { 180: makeIcon(180), 192: makeIcon(192), 512: makeIcon(512) };
+})();
+const FLASH_MANIFEST = JSON.stringify({
+    id: "/", name: "فلاش", short_name: "فلاش",
+    start_url: "/", scope: "/", display: "standalone",
+    background_color: "#0a1628", theme_color: "#0a1628", lang: "ar", dir: "rtl",
+    icons: [
+        { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
+        { src: "/icon-512.png", sizes: "512x512", type: "image/png" },
+    ],
+});
+const FLASH_SW = 'self.addEventListener("install", function () { self.skipWaiting(); });\nself.addEventListener("activate", function (e) { e.waitUntil(self.clients.claim()); });\nself.addEventListener("fetch", function () {});\n';
+app.get("/manifest.json", (req, res) => { res.set("Cache-Control", "no-cache"); res.type("application/manifest+json").send(FLASH_MANIFEST); });
+app.get("/sw.js", (req, res) => { res.set({ "Content-Type": "application/javascript", "Cache-Control": "no-cache", "Service-Worker-Allowed": "/" }); res.send(FLASH_SW); });
+[180, 192, 512].forEach(n => app.get("/icon-" + n + ".png", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(FLASH_ICONS[n]); }));
+app.get("/apple-touch-icon.png", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(FLASH_ICONS[180]); });
+app.get("/apple-touch-icon-precomposed.png", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(FLASH_ICONS[180]); });
+app.get("/favicon.ico", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(FLASH_ICONS[192]); });
+
 const sessionStore = new session.MemoryStore();
 app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false, store: sessionStore }));
 app.use(passport.initialize());
@@ -6865,6 +6928,15 @@ app.get("/", (req, res) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${CONFIG.SITE_NAME}</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/png" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="فلاش">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0a1628">
+<script>if ('serviceWorker' in navigator) { window.addEventListener('load', function () { navigator.serviceWorker.register('/sw.js').catch(function () {}); }); }</script>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
     :root {
