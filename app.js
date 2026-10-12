@@ -1414,6 +1414,10 @@ app.get("/apple-touch-icon.png", (req, res) => { res.set("Cache-Control", "publi
 app.get("/apple-touch-icon-precomposed.png", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(FLASH_ICONS[180]); });
 app.get("/favicon.ico", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(FLASH_ICONS[192]); });
 
+app.use("/api", (req, res, next) => {
+    res.set({ "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0" });
+    next();
+});
 const sessionStore = new session.MemoryStore();
 app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false, store: sessionStore }));
 app.use(passport.initialize());
@@ -6922,6 +6926,7 @@ app.post("/api/cyber/cases/:id/kick", ensureAuth, async (req, res) => {
 });
 
 app.get("/", (req, res) => {
+    res.set("Cache-Control", "no-store, must-revalidate");
     res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -7163,6 +7168,9 @@ app.get("/", (req, res) => {
     #cy-hardlock .cy-hl-box { max-width: 420px; width: 100%; line-height: 1.9; }
     #cy-hardlock h2 { margin: 6px 0 10px; }
     #cy-hardlock .btn { margin-top: 14px; }
+    #fl-refresh { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 22px); right: 14px; z-index: 900; width: 38px; height: 38px; border-radius: 50%; border: 1px solid rgba(59,130,246,0.45); background: rgba(10,22,40,0.75); color: #93c5fd; font-size: 17px; line-height: 1; display: none; align-items: center; justify-content: center; cursor: pointer; }
+    html.fl-standalone #fl-refresh { display: flex; }
+    body.cy-frozen #fl-refresh, body.ua-frozen #fl-refresh { display: none !important; }
     body.ua-frozen #app, body.ua-frozen nav, body.ua-frozen #warn-banner, body.ua-frozen #owner-toolbar, body.ua-frozen #sp-fab, body.ua-frozen #mobile-menu, body.ua-frozen #menu-backdrop { display: none !important; }
     body.ua-frozen { overflow: hidden; background: #060d1a; }
     body.ua-frozen #sp-modal { z-index: 5600; }
@@ -7465,6 +7473,16 @@ app.get("/", (req, res) => {
 (function () {
     var d = document.documentElement;
     try {
+        var sa = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+        if (sa) {
+            d.classList.add('fl-standalone');
+            var rb = document.createElement('button');
+            rb.id = 'fl-refresh'; rb.type = 'button'; rb.setAttribute('aria-label', 'تحديث'); rb.textContent = '🔄';
+            rb.onclick = function () { location.reload(); };
+            document.body.appendChild(rb);
+        }
+    } catch (e) {}
+    try {
         if (localStorage.getItem('cy_lock') === '1') {
             var s0 = document.getElementById('fl-splash'); if (s0) s0.remove();
             document.body.classList.add('cy-frozen');
@@ -7613,7 +7631,7 @@ async function __rawFetch(url, opts, timeoutMs) {
         timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, timeoutMs);
     }
     try {
-        const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts, ctrl ? { signal: ctrl.signal } : {}));
+        const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' }, cache: 'no-store' }, opts, ctrl ? { signal: ctrl.signal } : {}));
         const data = await r.json().catch(() => ({}));
         if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; throw err; }
         return data;
@@ -9848,14 +9866,34 @@ function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
 }
-let __pollRunning = false;
+let __pollRunning = false, __pollStartedAt = 0, __hiddenAt = 0, __resumeAt = 0;
+// لما التطبيق يرجع من الخلفية (آيفون/أندرويد يوقفون الاتصال): نجدد كل شي
+function resumeRefresh(deep) {
+    var now = Date.now();
+    if (now - __resumeAt < 1500) return;
+    __resumeAt = now;
+    try { __inflight.clear(); } catch (e) {}
+    __pollRunning = false;
+    if (deep) {
+        try { if (typeof spReconnect === 'function') spReconnect(); } catch (e) {}
+        try { if (ME && !ME.blocked && !(window.CY && CY.frozen) && !(window.UA && UA.frozen)) startPolling(); } catch (e) {}
+    }
+    try { if (window.CY && CY.frozen) cyberCheck(); } catch (e) {}
+    try { pollTick(); } catch (e) {}
+    try { if (typeof spLiveRefresh === 'function') spLiveRefresh(); } catch (e) {}
+}
 document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { try { pollTick(); } catch (e) {} }
+    if (document.hidden) { __hiddenAt = Date.now(); return; }
+    resumeRefresh(Date.now() - __hiddenAt > 4000);
 });
+window.addEventListener('pageshow', function (e) { resumeRefresh(true); });
+window.addEventListener('online', function () { resumeRefresh(true); });
+window.addEventListener('focus', function () { resumeRefresh(false); });
 async function pollTick() {
     if (!ME || ME.blocked || (window.CY && CY.frozen) || (window.UA && UA.frozen)) return;
+    if (__pollRunning && Date.now() - __pollStartedAt > 30000) __pollRunning = false;
     if (__pollRunning || document.hidden) return;
-    __pollRunning = true;
+    __pollRunning = true; __pollStartedAt = Date.now();
     try {
         const fresh = await api('/api/me');
         if (fresh.blocked) {
