@@ -16215,7 +16215,7 @@ function flPipToggle() {
     setTimeout(function () { FLPIP.self = false; }, 400);
 }
 function flPipOpen() {
-    if (!document.pictureInPictureEnabled) { toast('جهازك ما يدعم النافذة العائمة'); return; }
+    if (!flPipSupported()) { toast('جهازك ما يدعم النافذة العائمة'); return; }
     var seen = false; try { seen = localStorage.getItem('fl_pip_help') === '1'; } catch (e) {}
     if (seen) { flPipGo(); return; }
     cyOverlay('<div style="text-align:center;line-height:1.9;"><div style="font-size:40px;">🪟</div><h3 style="margin:6px 0 10px;">طريقة التحكم بالمايك</h3>' +
@@ -16228,31 +16228,52 @@ function flPipOpen() {
         '</div><button class="btn" style="width:100%;margin-top:12px;" onclick="flPipGo()">فتح النافذة</button>' +
         '<button class="btn gray" style="width:100%;margin-top:8px;" onclick="cyOverlayClose()">إغلاق</button></div>');
 }
+function flPipSupported() {
+    var v = document.createElement('video');
+    return !!document.pictureInPictureEnabled || !!(v.webkitSupportsPresentationMode && v.webkitSupportsPresentationMode('picture-in-picture'));
+}
 async function flPipGo() {
     try { localStorage.setItem('fl_pip_help', '1'); } catch (e) {}
     try { cyOverlayClose(); } catch (e) {}
     try {
-        if (!FLPIP.cv) {
+        if (!FLPIP.cv || !FLPIP.vid) {
             FLPIP.cv = document.createElement('canvas'); FLPIP.cv.width = 320; FLPIP.cv.height = 180;
-            FLPIP.vid = document.createElement('video'); FLPIP.vid.muted = true; FLPIP.vid.playsInline = true;
-            FLPIP.vid.setAttribute('playsinline', ''); FLPIP.vid.style.cssText = 'position:fixed;width:2px;height:2px;opacity:0;pointer-events:none;';
-            document.body.appendChild(FLPIP.vid);
-            FLPIP.vid.srcObject = FLPIP.cv.captureStream(5);
-            FLPIP.vid.addEventListener('pause', function () { if (!FLPIP.self && document.pictureInPictureElement === FLPIP.vid) flPipToggle(); });
+            if (!FLPIP.cv.captureStream) throw new Error('captureStream');
+            var v = document.createElement('video');
+            v.muted = true; v.autoplay = true; v.playsInline = true; v.disablePictureInPicture = false;
+            v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
+            v.width = 320; v.height = 180;
+            v.style.cssText = 'position:fixed;left:-400px;top:0;width:320px;height:180px;pointer-events:none;';
+            document.body.appendChild(v);
+            FLPIP.vid = v;
+            flPipDraw();
+            v.srcObject = FLPIP.cv.captureStream(15);
+            v.addEventListener('pause', function () { if (!FLPIP.self && (document.pictureInPictureElement === v || v.webkitPresentationMode === 'picture-in-picture')) flPipToggle(); });
         }
+        var vid = FLPIP.vid;
         flPipDraw();
         FLPIP.self = true;
-        await FLPIP.vid.play();
-        setTimeout(function () { FLPIP.self = false; }, 400);
-        if (document.pictureInPictureElement !== FLPIP.vid) await FLPIP.vid.requestPictureInPicture();
-    } catch (e) { toast('تعذر فتح النافذة العائمة'); }
+        await vid.play();
+        if (vid.readyState < 2) await new Promise(function (r) { var t = setTimeout(r, 2500); vid.addEventListener('loadeddata', function () { clearTimeout(t); r(); }, { once: true }); });
+        setTimeout(function () { FLPIP.self = false; }, 600);
+        if (vid.requestPictureInPicture) {
+            if (document.pictureInPictureElement !== vid) await vid.requestPictureInPicture();
+        } else if (vid.webkitSetPresentationMode) {
+            vid.webkitSetPresentationMode('picture-in-picture');
+        } else throw new Error('unsupported');
+    } catch (e) {
+        FLPIP.self = false;
+        var nm = (e && e.name) ? e.name : (e && e.message) ? e.message : '';
+        toast('تعذر فتح النافذة العائمة (' + nm + ')');
+        flPipClose();
+    }
 }
 function flPipClose() {
     try { if (document.pictureInPictureElement) document.exitPictureInPicture(); } catch (e) {}
     try { if (FLPIP.vid) { FLPIP.vid.pause(); FLPIP.vid.remove(); } } catch (e) {}
     FLPIP.cv = null; FLPIP.vid = null;
 }
-setInterval(function () { if (FLPIP.cv) flPipDraw(); }, 1000);
+setInterval(function () { if (FLPIP.cv) flPipDraw(); }, 250);
 
 /* ---------------- المحكمة العسكرية ---------------- */
 var COURT = { frozen: false, timer: null, lock: null, busy: false, panelTimer: null };
