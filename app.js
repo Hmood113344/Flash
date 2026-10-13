@@ -1460,8 +1460,49 @@ app.use("/api", (req, res, next) => {
     res.set({ "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0" });
     next();
 });
-const sessionStore = new session.MemoryStore();
-app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false, store: sessionStore }));
+// جلسات محفوظة بالداتابيس: تبقى حتى لو السيرفر انعاد تشغيله أو قفلت التطبيق، وتنتهي بعد 5 أيام بدون استخدام
+const SESSION_MS = 5 * 24 * 60 * 60 * 1000;
+const SessionDoc = mongoose.model("AppSession", new mongoose.Schema({
+    _id: { type: String },
+    data: { type: String, default: "{}" },
+    expires: { type: Date, index: { expireAfterSeconds: 0 } },
+}, { versionKey: false }));
+class MongoSessionStore extends session.Store {
+    constructor() { super(); this.cache = new Map(); this.touched = new Map(); }
+    get(sid, cb) {
+        const c = this.cache.get(sid);
+        if (c && Date.now() - c.t < 20000) { try { return cb(null, JSON.parse(c.data)); } catch (e) {} }
+        SessionDoc.findById(sid).lean().then(d => {
+            if (!d || !d.expires || d.expires < new Date()) { this.cache.delete(sid); return cb(null, null); }
+            this.cache.set(sid, { data: d.data, t: Date.now() });
+            try { cb(null, JSON.parse(d.data)); } catch (e) { cb(null, null); }
+        }).catch(e => cb(e));
+    }
+    set(sid, sess, cb) {
+        const data = JSON.stringify(sess);
+        const exp = new Date(Date.now() + SESSION_MS);
+        this.cache.set(sid, { data, t: Date.now() });
+        this.touched.set(sid, Date.now());
+        SessionDoc.updateOne({ _id: sid }, { $set: { data, expires: exp } }, { upsert: true }).then(() => cb && cb(null)).catch(e => cb && cb(e));
+    }
+    destroy(sid, cb) {
+        this.cache.delete(sid); this.touched.delete(sid);
+        SessionDoc.deleteOne({ _id: sid }).then(() => cb && cb(null)).catch(e => cb && cb(e));
+    }
+    touch(sid, sess, cb) {
+        // نجدّد مدة الجلسة بالداتابيس كل 10 دقايق بالكثير عشان ما نضغط الداتابيس
+        const last = this.touched.get(sid) || 0;
+        if (Date.now() - last < 10 * 60 * 1000) return cb && cb(null);
+        this.touched.set(sid, Date.now());
+        SessionDoc.updateOne({ _id: sid }, { $set: { expires: new Date(Date.now() + SESSION_MS) } }).then(() => cb && cb(null)).catch(e => cb && cb(e));
+    }
+}
+const sessionStore = new MongoSessionStore();
+app.use(session({
+    secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false, store: sessionStore,
+    rolling: true,
+    cookie: { maxAge: SESSION_MS, httpOnly: true, sameSite: "lax" },
+}));
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -10440,7 +10481,7 @@ async function init() {
     buildNav();
     if (checkSummonGate()) return;
     if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
-    renderDashboard();
+    if (!navRestore()) renderDashboard();
     checkPendingWarning();
     checkPromotionAlert();
     cyberCheck();
@@ -10448,6 +10489,20 @@ async function init() {
     spDeepLink();
     flPushInit();
     try { fetch('/api/pwa/ping?sa=' + (flStandalone() ? 1 : 0)); } catch (e) {}
+}
+var NAV_FNS = [];
+function navMark(n) {
+    var f = NAV_FNS[n] || '';
+    try {
+        if (f.indexOf('render') === 0) localStorage.setItem('nav_last', JSON.stringify({ u: ME && ME.discordId, f: f }));
+    } catch (e) {}
+}
+function navRestore() {
+    try {
+        var o = JSON.parse(localStorage.getItem('nav_last') || 'null');
+        if (o && ME && o.u === ME.discordId && o.f && o.f !== 'renderDashboard()' && NAV_FNS.indexOf(o.f) > -1) { (new Function(o.f))(); return true; }
+    } catch (e) {}
+    return false;
 }
 function buildNav() {
     const links = document.getElementById('nav-links');
@@ -10484,8 +10539,9 @@ function buildNav() {
     if (ME.isAdmin) items.push({ label: '🎧 تذاكر الدعم', fn: 'renderSupportAdmin()', cls: 'sp-nav-admin' });
     if (document.documentElement.classList.contains('fl-standalone')) items.push({ label: '🔄 تحديث', fn: 'location.reload()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
-    links.innerHTML = items.map(i => \`<button class="\${i.cls || ''}" onclick="\${i.fn}">\${i.label}</button>\`).join('');
-    mobile.innerHTML = items.map(i => \`<button class="\${i.cls || ''}" onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
+    NAV_FNS = items.map(i => i.fn);
+    links.innerHTML = items.map((i, n) => \`<button class="\${i.cls || ''}" onclick="navMark(\${n}); \${i.fn}">\${i.label}</button>\`).join('');
+    mobile.innerHTML = items.map((i, n) => \`<button class="\${i.cls || ''}" onclick="navMark(\${n}); \${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
     spPaintBadges();
 }
 function renderFabs() {
