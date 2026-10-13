@@ -1251,7 +1251,7 @@ client.on("interactionCreate", async interaction => {
                 }
                 if (action === "approve") {
                     const ar = await approveViolation(v, interaction.user.id, interaction.user.username);
-                    if (ar && ar.blocked) return interaction.reply({ content: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون رتبة أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حالياً.", ephemeral: true });
+                    if (ar && ar.blocked) return interaction.reply({ content: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون يونت أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حالياً.", ephemeral: true });
                     return interaction.deferUpdate();
                 }
                 if (action === "reject") {
@@ -1525,7 +1525,7 @@ app.use("/api", courtLockGate);
 app.use("/api", attendanceGate);
 const unassignedCache = new Map();
 async function resolveUnassigned(uid) {
-    // انعطى رتبة/قطاع/يونت => تنحذف مخالفاته المقبولة (عنده وعند الكبار) والنقاط ترجع نقاط الرتبة فقط
+    // انعطى يونت + قطاع => تنحذف مخالفاته المقبولة (عنده وعند الكبار) والنقاط ترجع نقاط الرتبة فقط
     try {
         const del = await Violation.deleteMany({ reporterDiscord: uid, status: "approved" });
         const p = await Personnel.findOne({ discord: uid });
@@ -1540,7 +1540,7 @@ async function resolveUnassigned(uid) {
 }
 async function isUnassignedUid(uid) {
     const hit = unassignedCache.get(uid);
-    if (hit && Date.now() - hit.t < 15000) return hit.v;
+    if (hit && Date.now() - hit.t < (hit.v ? 2000 : 15000)) return hit.v;
     let v = false;
     try {
         if (uid && !isSeniorAdmin(uid) && !isOwnerUid(uid)) {
@@ -1555,7 +1555,7 @@ async function isUnassignedUid(uid) {
                 if (!special) {
                     const cy = await cyberRoleOf(uid);
                     if (!cy.isLeader && !cy.isMember) {
-                        // ينقصه واحد من الثلاثة (يونت / رتبة / قطاع) => موقوف
+                        // ينقصه واحد من اثنين (يونت / قطاع) => موقوف، والرتبة ما تنحسب
                         v = !p.unit || !(p.sector || (acc && acc.sector));
                     }
                 }
@@ -1572,7 +1572,7 @@ app.use("/api", async (req, res, next) => {
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
     if (req.path.indexOf("/support/") === 0) return next();
     if (!(await isUnassignedUid(req.user.id))) return next();
-    return res.status(403).json({ error: "🔒 حسابك متوقف: ما عندك رتبة أو قطاع. افتح تكت بخدمة العملاء.", unassigned: true });
+    return res.status(403).json({ error: "🔒 حسابك متوقف: ما عندك يونت أو قطاع. افتح تكت بخدمة العملاء.", unassigned: true });
 });
 async function isSupportAdmin(uid) {
     if (!uid) return false;
@@ -2354,7 +2354,7 @@ app.post("/api/admin/violations/:id/approve", ensureSeniorAdmin, async (req, res
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
-    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون يونت أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3502,7 +3502,7 @@ app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, r
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username);
-    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون يونت أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -3889,7 +3889,7 @@ app.post("/api/violations-officer/violations/:id/approve", ensureViolationsOffic
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     const r = await approveViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)");
-    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون يونت أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 app.post("/api/violations-officer/violations/:id/reject", ensureViolationsOfficer, async (req, res) => {
@@ -4006,7 +4006,7 @@ app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
     const r = await approveViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`);
-    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون يونت أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -8866,15 +8866,15 @@ function uaHardLock() {
         UA.timer = setInterval(async function () {
             try {
                 var f = await api('/api/me');
-                if (f && !f.unassigned) { uaHardClear(); location.reload(); }
+                if (f && !f.unassigned) { uaHardClear(); toast('✅ انعطيت يونت وقطاع، رجع حسابك'); init(); }
             } catch (e) {}
-        }, 6000);
+        }, 3000);
     }
     var h = document.getElementById('ua-hardlock');
     if (!h) { h = document.createElement('div'); h.id = 'ua-hardlock'; document.body.appendChild(h); }
     if (!h.getAttribute('data-ready')) {
         h.setAttribute('data-ready', '1');
-        h.innerHTML = '<div class="ua-box"><div style="font-size:50px">🚫</div><h2>ما يمديك تدخل</h2><div>ما عندك رتبة أو يونت أو قطاع (أو ينقصك واحد منها)، لذلك حسابك متوقف ومخالفاتك ما تنقبل.</div><div style="margin-top:8px;color:#cbd5e1;">لازم تفتح تكت خدمة عملاء من الزر اللي تحت، وإذا انعطيت رتبتك ويونتك وقطاعك ينفتح حسابك.</div><button class="btn" style="width:100%;padding:14px;font-size:16px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);" onclick="spOpen()">🎧 خدمة عملاء</button></div>';
+        h.innerHTML = '<div class="ua-box"><div style="font-size:50px">🚫</div><h2>ما يمديك تدخل</h2><div>ما عندك يونت أو قطاع (أو ينقصك واحد منهم)، لذلك حسابك متوقف ومخالفاتك ما تنقبل.</div><div style="margin-top:8px;color:#cbd5e1;">لازم تفتح تكت خدمة عملاء من الزر اللي تحت، وإذا انعطيت رتبتك ويونتك وقطاعك ينفتح حسابك.</div><button class="btn" style="width:100%;padding:14px;font-size:16px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);" onclick="spOpen()">🎧 خدمة عملاء</button></div>';
     }
 }
 function dvHardLock() {
