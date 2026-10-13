@@ -1434,10 +1434,19 @@ self.addEventListener("push", function (e) {
 });
 self.addEventListener("notificationclick", function (e) {
   var n = e.notification;
-  if (e.action === "mic") {
-    e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
-      list.forEach(function (c) { c.postMessage({ t: "mic-toggle" }); });
-    }));
+  if (e.action === "mic" || e.action === "leave") {
+    var leave = e.action === "leave";
+    var work = self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
+      list.forEach(function (c) { c.postMessage({ t: leave ? "mic-leave" : "mic-toggle" }); });
+    });
+    if (leave) { n.close(); e.waitUntil(work); return; }
+    var nx = !(n.data && n.data.on);
+    e.waitUntil(Promise.all([work, self.registration.showNotification(n.title, {
+      body: nx ? "🎙️ المايك مفتوح" : "🔇 المايك مكتوم", tag: "fl-mic", renotify: false, silent: true, requireInteraction: true,
+      icon: "/icon-192.png", badge: "/icon-192.png", lang: "ar", dir: "rtl",
+      actions: [{ action: "mic", title: nx ? "🔇 كتم المايك" : "🎙️ فتح المايك" }, { action: "leave", title: "📞 خروج" }],
+      data: { url: "/", on: nx }
+    })]));
     return;
   }
   n.close();
@@ -1531,7 +1540,7 @@ async function isUnassignedUid(uid) {
                     const cy = await cyberRoleOf(uid);
                     if (!cy.isLeader && !cy.isMember) {
                         // ينقصه واحد من الثلاثة (يونت / رتبة / قطاع) => موقوف
-                        v = !p.unit || !p.rank || !(p.sector || (acc && acc.sector));
+                        v = !p.unit || !(p.sector || (acc && acc.sector));
                     }
                 }
                 if (v && !p.wasUnassigned) await Personnel.updateOne({ discord: uid }, { $set: { wasUnassigned: true } });
@@ -7074,17 +7083,28 @@ const devGrace = new Set();
 const devIsOnline = id => (devConns.get(id) || 0) > 0 || devGrace.has(id);
 const activeDev = new Map(); // uid -> آخر جهاز دخل بالحساب
 function devOnConnect(c, q) {
-    const id = c.did;
+    const id = c.did, uid = c.uid;
+    const standalone = String(q.sa) === "1";
+    c.sa = standalone;
+    c.mob = /^(آيفون|آيباد|أندرويد)/.test(cleanDevName(q.dn));
     devConns.set(id, (devConns.get(id) || 0) + 1);
     devGrace.delete(id);
-    // جهاز واحد بالحساب: نختار آخر واحد دخل ونطرد الباقي
-    if (c.uid && activeDev.get(c.uid) !== id) {
-        activeDev.set(c.uid, id);
-        sseBroadcast("sessionkick", { t: Date.now() }, cl => cl.uid === c.uid && cl.did && cl.did !== id);
-    }
-    const standalone = String(q.sa) === "1";
-    PushDevice.updateOne({ id }, { $set: { uid: c.uid, name: cleanDevName(q.dn), standalone, lastSeen: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true }).catch(() => {});
-    if (standalone) markPwa(c.uid);
+    (async () => {
+        if (standalone) {
+            // دخل من تطبيق الويب => المتصفح (جوال) ينقفل ويتحذف ويبقى التطبيق
+            sseBroadcast("pwakick", { t: Date.now() }, cl => cl.uid === uid && cl.mob && cl.sa === false);
+            PushDevice.deleteMany({ uid, standalone: false, name: /^(آيفون|آيباد|أندرويد)/, id: { $ne: id } }).catch(() => {});
+            markPwa(uid);
+        } else if (c.mob && await PwaInstall.exists({ uid })) {
+            return; // متصفح جوال وعنده التطبيق: ما ياخذ مكان التطبيق ولا ينسجل
+        }
+        // جهاز واحد بالحساب: آخر جهاز يدخل يفوز
+        if (activeDev.get(uid) !== id) {
+            activeDev.set(uid, id);
+            sseBroadcast("sessionkick", { t: Date.now() }, cl => cl.uid === uid && cl.did && cl.did !== id && !(standalone && cl.mob && cl.sa === false));
+        }
+        await PushDevice.updateOne({ id }, { $set: { uid, name: cleanDevName(q.dn), standalone, lastSeen: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+    })().catch(() => {});
 }
 function devOnClose(c) {
     const id = c && c.did;
@@ -7258,7 +7278,7 @@ const AttLogSchema = new mongoose.Schema({
 AttLogSchema.index({ at: -1 });
 const AttLog = mongoose.model("AttLog", AttLogSchema);
 // كبار المسؤولين ما يلزمهم بصمة (بس تقدر يبصمون إذا حبوا)
-const attRequired = uid => !isSeniorAdmin(uid);
+const attRequired = uid => true;
 async function getAttState(uid) {
     const st = await AttStatus.findOne({ uid }, { status: 1, lastCheckInAt: 1 }).lean();
     return { status: st && st.status === "in" ? "in" : "out", at: st ? st.lastCheckInAt : null };
@@ -9602,6 +9622,7 @@ function spConnect() {
         es.addEventListener('court', function () { try { if (ME && ME.courtLocked) courtCheck(); if (document.getElementById('court-body')) courtPanelLoad(true); } catch (x) {} });
         es.addEventListener('courtlock', function () { try { courtCheck(); } catch (x) {} });
         es.addEventListener('pushtext', function (e) { try { flOnPushText(JSON.parse(e.data)); } catch (x) {} });
+        es.addEventListener('pwakick', function () { try { if (!flStandalone() && ME) { ME.pwaInstalled = true; PWA.mode = 'open'; pwaGate(); } } catch (x) {} });
         es.addEventListener('sessionkick', function () { try { flSessionKicked(); } catch (x) {} });
         es.addEventListener('offann', function () { try { offAnnCheck(); } catch (x) {} });
         es.addEventListener('flashupdate', function () { try { flashUpdCheck(); } catch (x) {} });
@@ -15932,7 +15953,7 @@ var PWA_STEPS = {
     ]
 };
 function pwaNeeded() {
-    return !!(ME && !ME.blocked && !ME.isSeniorAdmin && !ME.isOwner && flIsMobile() && !flStandalone());
+    return !!(ME && !ME.blocked && flIsMobile() && !flStandalone());
 }
 function pwaGate() {
     if (!pwaNeeded()) { pwaClear(); return false; }
@@ -16060,7 +16081,7 @@ async function doFingerprintScan() {
         if (!data.success) {
             if (statusEl) { statusEl.textContent = '❌ فشلت البصمة، حاول مرة ثانية'; statusEl.className = 'fp-status fail'; }
         } else {
-            ME.att = { status: data.status, at: data.at };
+            ME.att = { status: data.status, at: data.at }; try { await refreshMe(); } catch (e) {}
             if (statusEl) { statusEl.textContent = data.status === 'in' ? '✅ تم تسجيل الحضور' : '✅ تم تسجيل الانصراف'; statusEl.className = 'fp-status ok'; }
             setTimeout(function () { if (document.getElementById('fp-circle')) renderDashboard(); }, 900);
         }
@@ -16133,6 +16154,7 @@ function flMicStart() {
             ms.metadata = new MediaMetadata({ title: (VC && VC.court) ? 'المحكمة العسكرية' : 'تردد القطاعات المشتركة', artist: 'فلاش', album: 'الراديو', artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }] });
             ms.playbackState = 'playing';
             try { ms.setActionHandler('togglemicrophone', function () { if (VC && (VC.freq || VC.court)) offToggleMic(); }); } catch (e) {}
+            try { ms.setActionHandler('hangup', function () { if (VC && (VC.freq || VC.court)) offLeaveVoice(false); }); } catch (e) {}
             try { ms.setActionHandler('pause', function () { flMicSet(false); }); } catch (e) {}
             try { ms.setActionHandler('play', function () { flMicSet(true); }); } catch (e) {}
         }
@@ -16156,7 +16178,7 @@ function flMicNotify() {
         return reg.showNotification('📻 ' + (VC && VC.court ? 'المحكمة العسكرية' : 'تردد القطاعات المشتركة'), {
             body: on ? '🎙️ المايك مفتوح' : '🔇 المايك مكتوم', tag: 'fl-mic', renotify: false, silent: true, requireInteraction: true,
             icon: '/icon-192.png', badge: '/icon-192.png', lang: 'ar', dir: 'rtl',
-            actions: [{ action: 'mic', title: on ? '🔇 كتم المايك' : '🎙️ فتح المايك' }], data: { url: '/' }
+            actions: [{ action: 'mic', title: on ? '🔇 كتم المايك' : '🎙️ فتح المايك' }, { action: 'leave', title: '📞 خروج' }], data: { url: '/', on: on }
         });
     }).catch(function () {});
 }
@@ -16171,9 +16193,12 @@ function flMicStop() {
 document.addEventListener('visibilitychange', function () { if (!document.hidden && FLMIC.active) flWake(); });
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('message', function (e) {
-        if (e.data && e.data.t === 'mic-toggle' && typeof VC !== 'undefined' && VC && (VC.freq || VC.court)) offToggleMic();
+        if (!e.data || typeof VC === 'undefined' || !VC || !(VC.freq || VC.court)) return;
+        if (e.data.t === 'mic-toggle') { offToggleMic(); flMicNotify(); }
+        else if (e.data.t === 'mic-leave') offLeaveVoice(false);
     });
 }
+
 
 /* ---------------- المحكمة العسكرية ---------------- */
 var COURT = { frozen: false, timer: null, lock: null, busy: false, panelTimer: null };
