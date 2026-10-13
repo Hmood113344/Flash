@@ -5172,11 +5172,14 @@ function offRemoveEverywhere(uid) {
 }
 function offOnSseClose(uid) {
     if (!uid) return;
+    // التردد/المحكمة: لو طلع من التطبيق للعبة ينتظر 3 دقايق قبل ما نطلعه من الروم
+    let long = false;
+    for (const [n, m] of offLive) { if ((offIsFreq(n) || offIsCourt(n)) && m && m.has(uid)) { long = true; break; } }
     setTimeout(() => {
         let still = false;
         for (const c of sseClients) { if (c.uid === uid) { still = true; break; } }
         if (!still) offRemoveEverywhere(uid);
-    }, 12000);
+    }, long ? 180000 : 12000);
 }
 
 function offParseN(v) {
@@ -14497,7 +14500,7 @@ function offPaintModes() {
 function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
-    if (VC.state.freq) { var fme = offFindP(VC.state, VC.me); box.textContent = (fme && fme.muted) ? '🔇 تم إسكاتك — تسمع الباقي فقط.' : (VC.micOn ? '📻 المايك مفتوح — الكل يتكلم ويسمع. اضغط «🪟 نافذة عائمة» عشان تكتم وتفتح المايك وانت داخل اللعبة.' : '🔇 المايك مكتوم — اضغط زر المايك تحت لما تبي تتكلم.'); return; }
+    if (VC.state.freq) { var fme = offFindP(VC.state, VC.me); box.textContent = (fme && fme.muted) ? '🔇 تم إسكاتك — تسمع الباقي فقط.' : (VC.micOn ? '📻 المايك مفتوح — الكل يتكلم ويسمع. وانت داخل اللعبة تتحكم بالمايك: على آيفون من مركز التحكم أو شاشة القفل (⏸ كتم / ▶️ فتح)، وعلى أندرويد من «🪟 نافذة عائمة».' : '🔇 المايك مكتوم — اضغط زر المايك تحت لما تبي تتكلم.'); return; }
     if (VC.state.court) { var kme = offFindP(VC.state, VC.me); box.textContent = (kme && kme.muted) ? '🔇 تم إسكاتك في المحكمة — تسمع الباقي فقط.' : '⚖️ المحكمة العسكرية — الجميع يتكلم ويسمع.'; return; }
     if (VC.state.cyber) {
         var cme = offFindP(VC.state, VC.me);
@@ -14609,7 +14612,7 @@ function offPaintBar() {
     if (VC.isSenior && !VC.state.training && !VC.state.cyber && !VC.state.freq && !VC.state.court) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
     if (VC.state.court && (offMyRole() === 'senior' || offMyRole() === 'mpl')) qb = '<button class="ov-btn" onclick="courtEndFromRoom()">⏹️ إنهاء المحكمة</button>';
     if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 نشاطه</button><button class="ov-btn" onclick="offCyEnd()">⏹️ إنهاء</button>';
-    if (VC.state.freq || VC.state.court) qb += '<button class="ov-btn" onclick="flPipOpen()">🪟 نافذة عائمة</button>';
+    if (VC.state.freq || VC.state.court) qb += flIsIOS() ? '<button class="ov-btn" onclick="flMicHelp()">🎧 كتم/فتح من الشاشة</button>' : '<button class="ov-btn" onclick="flPipOpen()">🪟 نافذة عائمة</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
 }
@@ -14999,7 +15002,7 @@ function offLeaveVoice(silent) {
     if (document.getElementById('offa-content')) offaReload(false);
 }
 window.addEventListener('pagehide', function () {
-    if (VC) { try { navigator.sendBeacon('/api/officers/rooms/' + VC.n + '/leave'); } catch (e) {} }
+    if (VC && !(VC.freq || VC.court)) { try { navigator.sendBeacon('/api/officers/rooms/' + VC.n + '/leave'); } catch (e) {} }
 });
 
 /* ---------------------------- صفحة الكبار ---------------------------- */
@@ -16149,23 +16152,29 @@ function flMicStart() {
             ms.metadata = new MediaMetadata({ title: (VC && VC.court) ? 'المحكمة العسكرية' : 'تردد القطاعات المشتركة', artist: 'فلاش', album: 'الراديو', artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }] });
             ms.playbackState = 'playing';
             try { ms.setActionHandler('togglemicrophone', function () { if (VC && (VC.freq || VC.court)) offToggleMic(); }); } catch (e) {}
-            try { ms.setActionHandler('pause', function () { if (FLPIP.vid) flPipToggle(); else flMicSet(false); }); } catch (e) {}
-            try { ms.setActionHandler('play', function () { if (FLPIP.vid) flPipToggle(); else flMicSet(true); }); } catch (e) {}
+            try { ms.setActionHandler('pause', function () { flMicSet(false); }); } catch (e) {}
+            try { ms.setActionHandler('play', function () { flMicSet(true); }); } catch (e) {}
+            try { ms.setActionHandler('stop', function () { flMicSet(false); }); } catch (e) {}
             try { ms.setActionHandler('enterpictureinpicture', function () { flPipGo(); }); } catch (e) {}
         }
     } catch (e) {}
     try {
-        if (!FLMIC.audio) { FLMIC.audio = new Audio(flSilentWavUrl()); FLMIC.audio.loop = true; FLMIC.audio.volume = 0.01; }
+        if (!FLMIC.audio) { FLMIC.audio = new Audio(flSilentWavUrl()); FLMIC.audio.loop = true; FLMIC.audio.volume = 1; }
         var p = FLMIC.audio.play(); if (p && p.catch) p.catch(function () {});
     } catch (e) {}
     flWake();
     flPipPrep();
+    var unlock = function () { try { if (FLMIC.audio && FLMIC.audio.paused) FLMIC.audio.play().catch(function () {}); } catch (e) {} };
+    document.addEventListener('touchend', unlock, { once: true });
+    document.addEventListener('click', unlock, { once: true });
     try { if (window.Notification && Notification.permission === 'denied') toast('فعّل إشعارات التطبيق من إعدادات الجوال عشان تتحكم بالمايك وانت داخل اللعبة'); } catch (e) {}
     try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission().then(flMicNotify); } catch (e) {}
     flMicNotify();
 }
 function flMicSync() {
     flPipDraw();
+    try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = (VC && VC.micOn) ? 'playing' : 'paused'; } catch (e) {}
+    try { if (FLMIC.audio && FLMIC.audio.paused) FLMIC.audio.play().catch(function () {}); } catch (e) {}
     try { if (navigator.mediaSession && navigator.mediaSession.setMicrophoneActive) navigator.mediaSession.setMicrophoneActive(!!(VC && VC.micOn)); } catch (e) {}
     flMicNotify();
 }
@@ -16209,6 +16218,18 @@ function flPipDraw() {
     x.font = 'bold 26px sans-serif'; x.fillText(on ? 'المايك مفتوح' : 'المايك مكتوم', cv.width / 2, 112);
     x.font = '17px sans-serif'; x.fillText('اضغط ⏯ لـ ' + (on ? 'كتم' : 'فتح') + ' المايك', cv.width / 2, 148);
 }
+function flMicHelp() {
+    try { if (FLMIC.audio) FLMIC.audio.play().catch(function () {}); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = (VC && VC.micOn) ? 'playing' : 'paused'; } catch (e) {}
+    cyOverlay('<div style="text-align:center;line-height:1.9;"><div style="font-size:40px;">🎧</div><h3 style="margin:6px 0 10px;">كتم وفتح المايك وانت داخل اللعبة</h3>' +
+        '<div style="text-align:right;font-size:14px;">' +
+        'آيفون ما يسمح بنافذة عائمة للتطبيقات، فاستخدم أزرار التشغيل:<br>' +
+        '1️⃣ ادخل اللعبة والتردد شغّال.<br>' +
+        '2️⃣ اسحب <b>مركز التحكم</b> (أو افتح <b>شاشة القفل</b>) وبتلقى «فلاش — تردد القطاعات المشتركة».<br>' +
+        '3️⃣ <b>⏸ إيقاف مؤقت = كتم المايك</b> 🔇<br>' +
+        '4️⃣ <b>▶️ تشغيل = فتح المايك</b> 🎙️<br>' +
+        '5️⃣ نفس الشي بالضغط على <b>سماعة AirPods</b> أو زر السماعة.' +
+        '</div><button class="btn" style="width:100%;margin-top:12px;" onclick="cyOverlayClose()">فهمت</button></div>');
+}
 function flPipToggle() {
     if (VC && (VC.freq || VC.court)) offToggleMic();
     FLPIP.self = true;
@@ -16235,6 +16256,7 @@ function flPipSupported() {
 }
 function flPipPrep() {
     if (FLPIP.cv && FLPIP.vid) return;
+    if (flIsIOS()) return;
     try {
         var cv = document.createElement('canvas'); cv.width = 320; cv.height = 180;
         if (!cv.captureStream) return;
