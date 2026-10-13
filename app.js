@@ -16159,6 +16159,7 @@ function flMicStart() {
         var p = FLMIC.audio.play(); if (p && p.catch) p.catch(function () {});
     } catch (e) {}
     flWake();
+    flPipPrep();
     try { if (window.Notification && Notification.permission === 'denied') toast('فعّل إشعارات التطبيق من إعدادات الجوال عشان تتحكم بالمايك وانت داخل اللعبة'); } catch (e) {}
     try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission().then(flMicNotify); } catch (e) {}
     flMicNotify();
@@ -16232,45 +16233,45 @@ function flPipSupported() {
     var v = document.createElement('video');
     return !!document.pictureInPictureEnabled || !!(v.webkitSupportsPresentationMode && v.webkitSupportsPresentationMode('picture-in-picture'));
 }
-async function flPipGo() {
+function flPipPrep() {
+    if (FLPIP.cv && FLPIP.vid) return;
+    try {
+        var cv = document.createElement('canvas'); cv.width = 320; cv.height = 180;
+        if (!cv.captureStream) return;
+        var v = document.createElement('video');
+        v.muted = true; v.autoplay = true; v.playsInline = true; v.disablePictureInPicture = false;
+        v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
+        v.style.cssText = 'position:fixed;right:0;bottom:0;width:80px;height:45px;opacity:0.02;pointer-events:none;z-index:-1;';
+        FLPIP.cv = cv; FLPIP.vid = v;
+        document.body.appendChild(v);
+        flPipDraw();
+        v.srcObject = cv.captureStream(15);
+        v.addEventListener('pause', function () { if (!FLPIP.self && (document.pictureInPictureElement === v || v.webkitPresentationMode === 'picture-in-picture')) flPipToggle(); });
+        var p = v.play(); if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+}
+function flPipGo() {
     try { localStorage.setItem('fl_pip_help', '1'); } catch (e) {}
     try { cyOverlayClose(); } catch (e) {}
+    // مهم: نستدعي النافذة مباشرة من الضغطة بدون أي await (شرط آيفون)
     try {
-        if (!FLPIP.cv || !FLPIP.vid) {
-            FLPIP.cv = document.createElement('canvas'); FLPIP.cv.width = 320; FLPIP.cv.height = 180;
-            if (!FLPIP.cv.captureStream) throw new Error('captureStream');
-            var v = document.createElement('video');
-            v.muted = true; v.autoplay = true; v.playsInline = true; v.disablePictureInPicture = false;
-            v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
-            v.width = 320; v.height = 180;
-            v.style.cssText = 'position:fixed;left:-400px;top:0;width:320px;height:180px;pointer-events:none;';
-            document.body.appendChild(v);
-            FLPIP.vid = v;
-            flPipDraw();
-            v.srcObject = FLPIP.cv.captureStream(15);
-            v.addEventListener('pause', function () { if (!FLPIP.self && (document.pictureInPictureElement === v || v.webkitPresentationMode === 'picture-in-picture')) flPipToggle(); });
-        }
+        flPipPrep();
         var vid = FLPIP.vid;
+        if (!vid) throw new Error('unsupported');
         flPipDraw();
-        FLPIP.self = true;
-        await vid.play();
-        if (vid.readyState < 2) await new Promise(function (r) { var t = setTimeout(r, 2500); vid.addEventListener('loadeddata', function () { clearTimeout(t); r(); }, { once: true }); });
-        setTimeout(function () { FLPIP.self = false; }, 600);
-        if (vid.requestPictureInPicture) {
-            if (document.pictureInPictureElement !== vid) await vid.requestPictureInPicture();
-        } else if (vid.webkitSetPresentationMode) {
+        if (vid.paused) { FLPIP.self = true; var pp = vid.play(); if (pp && pp.catch) pp.catch(function () {}); setTimeout(function () { FLPIP.self = false; }, 700); }
+        if (vid.webkitSetPresentationMode && (flIsIOS() || !vid.requestPictureInPicture)) {
             vid.webkitSetPresentationMode('picture-in-picture');
+        } else if (vid.requestPictureInPicture) {
+            vid.requestPictureInPicture().catch(function (e) { toast('تعذر فتح النافذة العائمة (' + (e && e.name ? e.name : '') + ')'); });
         } else throw new Error('unsupported');
     } catch (e) {
-        FLPIP.self = false;
-        var nm = (e && e.name) ? e.name : (e && e.message) ? e.message : '';
-        toast('تعذر فتح النافذة العائمة (' + nm + ')');
-        flPipClose();
+        toast('تعذر فتح النافذة العائمة (' + ((e && (e.name || e.message)) || '') + ')');
     }
 }
 function flPipClose() {
     try { if (document.pictureInPictureElement) document.exitPictureInPicture(); } catch (e) {}
-    try { if (FLPIP.vid) { FLPIP.vid.pause(); FLPIP.vid.remove(); } } catch (e) {}
+    try { if (FLPIP.vid) { FLPIP.vid.webkitPresentationMode === 'picture-in-picture' && FLPIP.vid.webkitSetPresentationMode('inline'); FLPIP.vid.pause(); FLPIP.vid.remove(); } } catch (e) {}
     FLPIP.cv = null; FLPIP.vid = null;
 }
 setInterval(function () { if (FLPIP.cv) flPipDraw(); }, 250);
