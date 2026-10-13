@@ -14497,7 +14497,7 @@ function offPaintModes() {
 function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
-    if (VC.state.freq) { var fme = offFindP(VC.state, VC.me); box.textContent = (fme && fme.muted) ? '🔇 تم إسكاتك — تسمع الباقي فقط.' : (VC.micOn ? '📻 المايك مفتوح — الكل يتكلم ويسمع. تقدر تكتم وتفتح المايك من إشعار الجوال وانت داخل اللعبة.' : '🔇 المايك مكتوم — اضغط زر المايك تحت لما تبي تتكلم.'); return; }
+    if (VC.state.freq) { var fme = offFindP(VC.state, VC.me); box.textContent = (fme && fme.muted) ? '🔇 تم إسكاتك — تسمع الباقي فقط.' : (VC.micOn ? '📻 المايك مفتوح — الكل يتكلم ويسمع. اضغط «🪟 نافذة عائمة» عشان تكتم وتفتح المايك وانت داخل اللعبة.' : '🔇 المايك مكتوم — اضغط زر المايك تحت لما تبي تتكلم.'); return; }
     if (VC.state.court) { var kme = offFindP(VC.state, VC.me); box.textContent = (kme && kme.muted) ? '🔇 تم إسكاتك في المحكمة — تسمع الباقي فقط.' : '⚖️ المحكمة العسكرية — الجميع يتكلم ويسمع.'; return; }
     if (VC.state.cyber) {
         var cme = offFindP(VC.state, VC.me);
@@ -14609,6 +14609,7 @@ function offPaintBar() {
     if (VC.isSenior && !VC.state.training && !VC.state.cyber && !VC.state.freq && !VC.state.court) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
     if (VC.state.court && (offMyRole() === 'senior' || offMyRole() === 'mpl')) qb = '<button class="ov-btn" onclick="courtEndFromRoom()">⏹️ إنهاء المحكمة</button>';
     if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 نشاطه</button><button class="ov-btn" onclick="offCyEnd()">⏹️ إنهاء</button>';
+    if (VC.state.freq || VC.state.court) qb += '<button class="ov-btn" onclick="flPipOpen()">🪟 نافذة عائمة</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
 }
@@ -16148,8 +16149,9 @@ function flMicStart() {
             ms.metadata = new MediaMetadata({ title: (VC && VC.court) ? 'المحكمة العسكرية' : 'تردد القطاعات المشتركة', artist: 'فلاش', album: 'الراديو', artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }] });
             ms.playbackState = 'playing';
             try { ms.setActionHandler('togglemicrophone', function () { if (VC && (VC.freq || VC.court)) offToggleMic(); }); } catch (e) {}
-            try { ms.setActionHandler('pause', function () { flMicSet(false); }); } catch (e) {}
-            try { ms.setActionHandler('play', function () { flMicSet(true); }); } catch (e) {}
+            try { ms.setActionHandler('pause', function () { if (FLPIP.vid) flPipToggle(); else flMicSet(false); }); } catch (e) {}
+            try { ms.setActionHandler('play', function () { if (FLPIP.vid) flPipToggle(); else flMicSet(true); }); } catch (e) {}
+            try { ms.setActionHandler('enterpictureinpicture', function () { flPipGo(); }); } catch (e) {}
         }
     } catch (e) {}
     try {
@@ -16162,6 +16164,7 @@ function flMicStart() {
     flMicNotify();
 }
 function flMicSync() {
+    flPipDraw();
     try { if (navigator.mediaSession && navigator.mediaSession.setMicrophoneActive) navigator.mediaSession.setMicrophoneActive(!!(VC && VC.micOn)); } catch (e) {}
     flMicNotify();
 }
@@ -16177,6 +16180,7 @@ function flMicNotify() {
     }).catch(function () {});
 }
 function flMicStop() {
+    flPipClose();
     if (!FLMIC.active) return;
     FLMIC.active = false;
     try { if (FLMIC.wake) { FLMIC.wake.release(); FLMIC.wake = null; } } catch (e) {}
@@ -16191,6 +16195,64 @@ if ('serviceWorker' in navigator) {
     });
 }
 
+
+
+/* ---------------- نافذة عائمة للتحكم بالمايك وأنت داخل اللعبة ---------------- */
+var FLPIP = { cv: null, vid: null, self: false };
+function flPipDraw() {
+    var cv = FLPIP.cv; if (!cv) return;
+    var x = cv.getContext('2d'), on = !!(VC && VC.micOn);
+    x.fillStyle = on ? '#14532d' : '#7f1d1d'; x.fillRect(0, 0, cv.width, cv.height);
+    x.fillStyle = '#fff'; x.textAlign = 'center';
+    x.font = 'bold 50px sans-serif'; x.fillText(on ? '🎙️' : '🔇', cv.width / 2, 70);
+    x.font = 'bold 26px sans-serif'; x.fillText(on ? 'المايك مفتوح' : 'المايك مكتوم', cv.width / 2, 112);
+    x.font = '17px sans-serif'; x.fillText('اضغط ⏯ لـ ' + (on ? 'كتم' : 'فتح') + ' المايك', cv.width / 2, 148);
+}
+function flPipToggle() {
+    if (VC && (VC.freq || VC.court)) offToggleMic();
+    FLPIP.self = true;
+    try { if (FLPIP.vid) FLPIP.vid.play().catch(function () {}); } catch (e) {}
+    setTimeout(function () { FLPIP.self = false; }, 400);
+}
+function flPipOpen() {
+    if (!document.pictureInPictureEnabled) { toast('جهازك ما يدعم النافذة العائمة'); return; }
+    var seen = false; try { seen = localStorage.getItem('fl_pip_help') === '1'; } catch (e) {}
+    if (seen) { flPipGo(); return; }
+    cyOverlay('<div style="text-align:center;line-height:1.9;"><div style="font-size:40px;">🪟</div><h3 style="margin:6px 0 10px;">طريقة التحكم بالمايك</h3>' +
+        '<div style="text-align:right;font-size:14px;">' +
+        '1️⃣ اضغط «فتح النافذة» تحت، بتطلع نافذة صغيرة عائمة.<br>' +
+        '2️⃣ اطلع من التطبيق وادخل اللعبة، النافذة تبقى فوقها.<br>' +
+        '3️⃣ <b>لكتم المايك</b>: اضغط زر ⏯ (إيقاف مؤقت) في النافذة — تتحول للون الأحمر 🔇.<br>' +
+        '4️⃣ <b>لفتح المايك</b>: اضغط نفس الزر مرة ثانية — تتحول للأخضر 🎙️.<br>' +
+        '5️⃣ في أندرويد كروم ممكن يطلع لك زر 🎙️ مباشر في النافذة.' +
+        '</div><button class="btn" style="width:100%;margin-top:12px;" onclick="flPipGo()">فتح النافذة</button>' +
+        '<button class="btn gray" style="width:100%;margin-top:8px;" onclick="cyOverlayClose()">إغلاق</button></div>');
+}
+async function flPipGo() {
+    try { localStorage.setItem('fl_pip_help', '1'); } catch (e) {}
+    try { cyOverlayClose(); } catch (e) {}
+    try {
+        if (!FLPIP.cv) {
+            FLPIP.cv = document.createElement('canvas'); FLPIP.cv.width = 320; FLPIP.cv.height = 180;
+            FLPIP.vid = document.createElement('video'); FLPIP.vid.muted = true; FLPIP.vid.playsInline = true;
+            FLPIP.vid.setAttribute('playsinline', ''); FLPIP.vid.style.cssText = 'position:fixed;width:2px;height:2px;opacity:0;pointer-events:none;';
+            document.body.appendChild(FLPIP.vid);
+            FLPIP.vid.srcObject = FLPIP.cv.captureStream(5);
+            FLPIP.vid.addEventListener('pause', function () { if (!FLPIP.self && document.pictureInPictureElement === FLPIP.vid) flPipToggle(); });
+        }
+        flPipDraw();
+        FLPIP.self = true;
+        await FLPIP.vid.play();
+        setTimeout(function () { FLPIP.self = false; }, 400);
+        if (document.pictureInPictureElement !== FLPIP.vid) await FLPIP.vid.requestPictureInPicture();
+    } catch (e) { toast('تعذر فتح النافذة العائمة'); }
+}
+function flPipClose() {
+    try { if (document.pictureInPictureElement) document.exitPictureInPicture(); } catch (e) {}
+    try { if (FLPIP.vid) { FLPIP.vid.pause(); FLPIP.vid.remove(); } } catch (e) {}
+    FLPIP.cv = null; FLPIP.vid = null;
+}
+setInterval(function () { if (FLPIP.cv) flPipDraw(); }, 1000);
 
 /* ---------------- المحكمة العسكرية ---------------- */
 var COURT = { frozen: false, timer: null, lock: null, busy: false, panelTimer: null };
