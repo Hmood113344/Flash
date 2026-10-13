@@ -12838,7 +12838,7 @@ async function mpPoReportDecide(id, action) {
         .then(() => { toast('✅ تم قبول التقرير'); loadMPPOReports(); }).catch(e => toast(e.message));
 }
 
-let mpMemberTab = 'members';
+var mpMemberTabCur = 'members';
 let mpMemberListCache = [];
 function renderMPMemberPanel() {
     if (!ME.isMilitaryPolice) return renderDashboard();
