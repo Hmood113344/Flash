@@ -8323,6 +8323,7 @@ let ME = null;
 var REAL_OWNER = false, OWNER_DISGUISE = false;
 try { OWNER_DISGUISE = sessionStorage.getItem('flOd') === '1'; } catch (e) {}
 function odFix() {
+    if (ME && !ME.blocked) { if (!ME.registeredName) ME.registeredName = ME.discordTag || 'بدون اسم'; if (!ME.unit) ME.unit = 'غير محدد'; }
     if (ME && ME.isOwner) REAL_OWNER = true;
     if (ME && REAL_OWNER && OWNER_DISGUISE) ME.isOwner = false;
 }
@@ -10493,7 +10494,8 @@ async function init() {
     lastKnownRank = ME.rank;
     buildNav();
     if (checkSummonGate()) return;
-    if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
+    if (!ME.registeredName) ME.registeredName = ME.discordTag || 'بدون اسم';
+    if (!ME.unit) ME.unit = 'غير محدد';
     if (!navRestore()) renderDashboard();
     checkPendingWarning();
     checkPromotionAlert();
@@ -10711,7 +10713,7 @@ window.addEventListener('pageshow', function (e) { resumeRefresh(true); });
 window.addEventListener('online', function () { resumeRefresh(true); });
 window.addEventListener('focus', function () { resumeRefresh(false); });
 async function pollTick() {
-    if (!ME || ME.blocked || (window.CY && CY.frozen) || (window.UA && UA.frozen)) return;
+    if (!ME || ME.blocked || (window.CY && CY.frozen) || (window.UA && UA.frozen) || (window.NG && NG.on)) return;
     if (__pollRunning && Date.now() - __pollStartedAt > 30000) __pollRunning = false;
     if (__pollRunning || document.hidden) return;
     __pollRunning = true; __pollStartedAt = Date.now();
@@ -16029,39 +16031,69 @@ function flPushBanner() {
 }
 
 /* ---------------- نافذة تفعيل الإشعارات (أول شي بعد الدخول) ---------------- */
-var NG = { skipped: false, busy: false };
+var NG = { busy: false, on: false, obs: null };
 async function ntGate() {
-    if (NG.skipped || !ME || ME.blocked || !flPushSupported()) { ntClear(); return false; }
+    if (!ME || ME.blocked || !flPushSupported()) { ntClear(); return false; }
     if (!FLX.push.ready) {
-        await Promise.race([flPushInit(), new Promise(function (r) { setTimeout(r, 5000); })]);
+        await Promise.race([flPushInit(), new Promise(function (r) { setTimeout(r, 8000); })]);
     }
-    if (!FLX.push.ready || FLX.push.sub) { ntClear(); return false; }
+    if (FLX.push.sub) { ntClear(); return false; }
+    if (!FLX.push.ready) {
+        // لو السيرفر نفسه ما جهّز الإشعارات (مفاتيح VAPID) ما نقدر نجبر أحد
+        var serverOk = true;
+        try { var r = await fetch('/api/push/vapid', { cache: 'no-store' }); if (r.status === 503) serverOk = false; } catch (e) {}
+        if (!serverOk) { ntClear(); return false; }
+    }
     try { uaHardClear(); } catch (e) {}
     var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+    NG.on = true;
+    if (!NG.obs) {
+        try {
+            NG.obs = new MutationObserver(function () { if (NG.on && !document.getElementById('nt-gate')) ntRender(); });
+            NG.obs.observe(document.body, { childList: true });
+        } catch (e) {}
+    }
     ntRender();
     return true;
 }
-function ntClear() { var g = document.getElementById('nt-gate'); if (g) g.remove(); }
+function ntClear() {
+    NG.on = false;
+    if (NG.obs) { try { NG.obs.disconnect(); } catch (e) {} NG.obs = null; }
+    var g = document.getElementById('nt-gate'); if (g) g.remove();
+}
 function ntRender() {
     var g = document.getElementById('nt-gate');
     if (!g) { g = document.createElement('div'); g.id = 'nt-gate'; g.className = 'pwa-overlay'; document.body.appendChild(g); }
     var denied = window.Notification && Notification.permission === 'denied';
     g.innerHTML = denied
-        ? '<div class="pwa-box"><div style="font-size:54px">🔕</div><h2>الإشعارات محظورة</h2>' +
-          '<p class="pwa-p">فعّل إشعارات فلاش من إعدادات الجهاز (الإشعارات ← فلاش)، وبعدها اضغط تحقق.</p>' +
-          '<div class="pwa-btns"><button class="btn" onclick="location.reload()">تحقق</button><button class="btn gray" onclick="ntSkip()">لاحقاً</button></div></div>'
-        : '<div class="pwa-box"><div style="font-size:54px">🔔</div><h2>فعّل الإشعارات أول</h2>' +
-          '<p class="pwa-p">عشان توصلك تنبيهات التكتات والاستلام والاستدعاءات حتى لو الموقع مقفل. اضغط تفعيل ووافق على الإذن.</p>' +
-          '<div class="pwa-btns"><button class="btn" id="nt-go" onclick="ntEnable()">تفعيل الإشعارات</button><button class="btn gray" onclick="ntSkip()">لاحقاً</button></div></div>';
+        ? '<div class="pwa-box"><div style="font-size:54px">🔕</div><h2>لازم تفعّل الإشعارات</h2>' +
+          '<p class="pwa-p">الإشعارات محظورة على جهازك. فعّلها من إعدادات الجهاز (الإشعارات ← فلاش)، وبعدها اضغط تحقق. ما تقدر تدخل الموقع إلا بعد التفعيل.</p>' +
+          '<div class="pwa-btns"><button class="btn" onclick="location.reload()">تحقق</button></div></div>'
+        : !FLX.push.ready
+        ? '<div class="pwa-box"><div style="font-size:54px">🔔</div><h2>جارِ تجهيز الإشعارات...</h2>' +
+          '<p class="pwa-p">لازم تفعّل الإشعارات عشان تدخل الموقع. اضغط إعادة المحاولة.</p>' +
+          '<div class="pwa-btns"><button class="btn" onclick="ntRetry()">إعادة المحاولة</button></div></div>'
+        : '<div class="pwa-box"><div style="font-size:54px">🔔</div><h2>لازم تفعّل الإشعارات</h2>' +
+          '<p class="pwa-p">عشان توصلك تنبيهات التكتات والاستلام والاستدعاءات حتى لو الموقع مقفل. اضغط تفعيل ووافق على الإذن. ما تقدر تدخل الموقع إلا بعد التفعيل.</p>' +
+          '<div class="pwa-btns"><button class="btn" id="nt-go" onclick="ntEnable()">تفعيل الإشعارات</button></div></div>';
+}
+async function ntRetry() {
+    if (NG.busy) return;
+    NG.busy = true;
+    try { await Promise.race([flPushInit(), new Promise(function (r) { setTimeout(r, 8000); })]); } catch (e) {}
+    NG.busy = false;
+    if (FLX.push.sub) { ntClear(); init(); } else ntRender();
 }
 async function ntEnable() {
     if (NG.busy) return;
     NG.busy = true;
-    try { await flPushEnable(); } catch (e) {}
+    try {
+        if (!FLX.push.ready) await Promise.race([flPushInit(), new Promise(function (r) { setTimeout(r, 8000); })]);
+        await flPushEnable();
+    } catch (e) {}
     NG.busy = false;
-    if (FLX.push.sub) { ntClear(); init(); } else ntRender();
+    if (FLX.push.sub) { ntClear(); init(); } else ntRender(); // لو رفض أو لغى ترجع النافذة تطلع
 }
-function ntSkip() { NG.skipped = true; ntClear(); init(); }
 
 /* ---------------- تثبيت الموقع كتطبيق ويب (نافذة إجبارية بالمتصفح) ---------------- */
 var PWA = { i: 0, frozen: false, mode: 'steps', timer: null, obs: null };
