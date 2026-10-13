@@ -92,6 +92,16 @@ const CONFIG = {
     MP_SUMMON_VOICE_URL: "https://discord.com/channels/1497233353030766662/1545415195243843644",
     MP_REPORT_POINTS_APPROVE: 1,
 
+    // ── إضافات: الإشعارات / البصمة / الترددات / الاستلام ──
+    PUSH_DEFAULT_TITLE: "فلاش",
+    PUSH_DEFAULT_BODY: "أفضل فلاش في العالم",
+    FP_HOLD_SECONDS: 3,      // مدة الضغط على البصمة
+    FP_FAIL_RATE: 0.2,       // احتمال فشل البصمة عشوائياً (0 = ما تفشل أبداً)
+    FREQ_MAX_EXTRA: 5,       // عدد الترددات الإضافية اللي يسويها الكبار
+    RECEPTION_CHANNEL_ID: process.env.RECEPTION_CHANNEL_ID || "1556661220998774905",
+    RECEPTION_START_HOUR: 14, // الاستلام من 2 العصر
+    RECEPTION_END_HOUR: 21,   // إلى 9 الليل (بتوقيت الرياض)
+
     WARNING_PENALTIES: [
         { id: "deduct5",          label: "خصم 5 نقاط",                        type: "points",  value: 5 },
         { id: "deduct10",         label: "خصم 10 نقاط",                       type: "points",  value: 10 },
@@ -109,7 +119,7 @@ const CONFIG = {
 };
 
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); })
+    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 const PersonnelSchema = new mongoose.Schema({
@@ -159,6 +169,7 @@ const PersonnelSchema = new mongoose.Schema({
     leaveBalance: { type: Number, default: 10 },
     cardNumber: { type: String, default: null, index: true },
     sector: { type: String, default: null },
+    wasUnassigned: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now }
 });
 const Personnel = mongoose.model("Personnel", PersonnelSchema);
@@ -561,6 +572,10 @@ const SettingsSchema = new mongoose.Schema({
     lockSavedLogin: { type: Boolean, default: false },
     officersLocked: { type: Boolean, default: false },
     officerTrainers: { type: [String], default: [] },
+    notifTitle: { type: String, default: null },
+    notifBody: { type: String, default: null },
+    receptionOfficers: { type: [{ id: String, name: String }], default: [] },
+    vapid: { type: mongoose.Schema.Types.Mixed, default: null },
 }, { minimize: false });
 const Settings = mongoose.model("Settings", SettingsSchema);
 
@@ -1406,7 +1421,33 @@ const FLASH_MANIFEST = JSON.stringify({
         { src: "/icon-512.png", sizes: "512x512", type: "image/png" },
     ],
 });
-const FLASH_SW = 'self.addEventListener("install", function () { self.skipWaiting(); });\nself.addEventListener("activate", function (e) { e.waitUntil(self.clients.claim()); });\nself.addEventListener("fetch", function () {});\n';
+const FLASH_SW = String.raw`
+self.addEventListener("install", function () { self.skipWaiting(); });
+self.addEventListener("activate", function (e) { e.waitUntil(self.clients.claim()); });
+self.addEventListener("fetch", function () {});
+self.addEventListener("push", function (e) {
+  var d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (err) { d = { body: e.data ? e.data.text() : "" }; }
+  var opt = { body: d.body || "", icon: "/icon-192.png", badge: "/icon-192.png", lang: "ar", dir: "rtl", data: { url: d.url || "/" } };
+  if (d.tag) { opt.tag = d.tag; opt.renotify = true; }
+  e.waitUntil(self.registration.showNotification(d.title || "فلاش", opt));
+});
+self.addEventListener("notificationclick", function (e) {
+  var n = e.notification;
+  if (e.action === "mic") {
+    e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
+      list.forEach(function (c) { c.postMessage({ t: "mic-toggle" }); });
+    }));
+    return;
+  }
+  n.close();
+  var url = (n.data && n.data.url) || "/";
+  e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
+    for (var i = 0; i < list.length; i++) { if ("focus" in list[i]) return list[i].focus(); }
+    return self.clients.openWindow(url);
+  }));
+});
+`;
 app.get("/manifest.json", (req, res) => { res.set("Cache-Control", "no-cache"); res.type("application/manifest+json").send(FLASH_MANIFEST); });
 app.get("/sw.js", (req, res) => { res.set({ "Content-Type": "application/javascript", "Cache-Control": "no-cache", "Service-Worker-Allowed": "/" }); res.send(FLASH_SW); });
 [180, 192, 512].forEach(n => app.get("/icon-" + n + ".png", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(FLASH_ICONS[n]); }));
@@ -1455,25 +1496,46 @@ app.use("/api", async (req, res, next) => {
     if (vr && offIsCyber(parseInt(vr[1], 10))) return next();
     return res.status(403).json({ error: acctLocked ? "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً" : "🔒 هذا الجهاز تحت التحقيق السيبراني، ما تقدر تسوي أي شي منه", investigation: true });
 });
+app.use("/api", courtLockGate);
+app.use("/api", attendanceGate);
 const unassignedCache = new Map();
+async function resolveUnassigned(uid) {
+    // انعطى رتبة/قطاع/يونت => تنحذف مخالفاته المقبولة (عنده وعند الكبار) والنقاط ترجع نقاط الرتبة فقط
+    try {
+        const del = await Violation.deleteMany({ reporterDiscord: uid, status: "approved" });
+        const p = await Personnel.findOne({ discord: uid });
+        if (p) {
+            const settings = await getSettings();
+            p.points = await pointsForReachingRank(p.rank, settings);
+            p.wasUnassigned = false;
+            await p.save();
+        }
+        await logEvent({ action: "تصفير مخالفات بعد تعيين الرتبة", discordId: uid, actorId: "system", actorTag: "النظام", details: "حُذفت " + (del.deletedCount || 0) + " مخالفة مقبولة والنقاط = نقاط الرتبة" });
+    } catch (e) { console.error("❌ resolveUnassigned:", e.message); }
+}
 async function isUnassignedUid(uid) {
     const hit = unassignedCache.get(uid);
     if (hit && Date.now() - hit.t < 15000) return hit.v;
     let v = false;
     try {
         if (uid && !isSeniorAdmin(uid) && !isOwnerUid(uid)) {
-            const p = await Personnel.findOne({ discord: uid }, { unit: 1, rank: 1, sector: 1, registeredName: 1 }).lean();
-            if (p && p.registeredName && !p.unit && !p.sector && (p.rank || CONFIG.MILITARY_RANKS[0]) === CONFIG.MILITARY_RANKS[0]) {
+            const p = await Personnel.findOne({ discord: uid }, { unit: 1, rank: 1, sector: 1, registeredName: 1, wasUnassigned: 1 }).lean();
+            if (p && p.registeredName) {
                 const acc = await Account.findOne({ uid }, { sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1, isMP: 1 }).lean();
                 const settings = await getSettings();
-                const special = !!(acc && (acc.sector || acc.isSenior || acc.isOwner || acc.tempSenior || acc.isMP))
+                const special = !!(acc && (acc.isSenior || acc.isOwner || acc.tempSenior || acc.isMP))
                     || settings.adminList.includes(uid) || isHighCommand(uid, settings) || !!getSectorRole(uid, settings)
                     || !!getPersonnelOfficerSector(uid, settings) || !!getMPRole(uid, settings) || isMPPersonnelOfficer(uid, settings)
                     || isViolationsOfficer(uid, settings);
                 if (!special) {
                     const cy = await cyberRoleOf(uid);
-                    if (!cy.isLeader && !cy.isMember) v = true;
+                    if (!cy.isLeader && !cy.isMember) {
+                        // ينقصه واحد من الثلاثة (يونت / رتبة / قطاع) => موقوف
+                        v = !p.unit || !p.rank || !(p.sector || (acc && acc.sector));
+                    }
                 }
+                if (v && !p.wasUnassigned) await Personnel.updateOne({ discord: uid }, { $set: { wasUnassigned: true } });
+                else if (!v && p.wasUnassigned) await resolveUnassigned(uid);
             }
         }
     } catch (e) { v = false; }
@@ -1498,9 +1560,10 @@ app.get("/api/events", async (req, res) => {
     if (res.flushHeaders) res.flushHeaders();
     res.write("retry: 3000\n\n");
     let closed = false;
-    const c = { res, uid: req.user ? req.user.id : null, gt: /^[a-f0-9]{32}$/.test(String(req.query.gt || "")) ? String(req.query.gt) : null, isAdmin: false };
+    const c = { res, uid: req.user ? req.user.id : null, gt: /^[a-f0-9]{32}$/.test(String(req.query.gt || "")) ? String(req.query.gt) : null, isAdmin: false, did: null };
+    if (c.uid && validDevId(String(req.query.did || ""))) { c.did = String(req.query.did); devOnConnect(c, req.query); }
     const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch (e) {} }, 25000);
-    req.on("close", () => { closed = true; clearInterval(hb); sseClients.delete(c); offOnSseClose(c.uid); });
+    req.on("close", () => { closed = true; clearInterval(hb); sseClients.delete(c); devOnClose(c); offOnSseClose(c.uid); });
     c.isAdmin = c.uid ? await isSupportAdmin(c.uid) : false;
     if (!closed) sseClients.add(c);
 });
@@ -1949,8 +2012,14 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         unlockAt: p.summon.unlockAt, enteredAt: p.summon.enteredAt,
     } : null;
 
+    const meAtt = await getAttState(req.user.id);
+    const mePwa = !!(await PwaInstall.exists({ uid: req.user.id }));
+    const meCourt = await courtRole(req.user.id);
     res.json({
         blocked: false,
+        att: meAtt, attRequired: attRequired(req.user.id), pwaInstalled: mePwa,
+        isReceptionOfficer: isReceptionOfficer(req.user.id, settings),
+        courtStaff: meCourt.staff, courtLeader: meCourt.leader, courtLocked: !!courtCaseOf(req.user.id), courtCase: courtCaseOf(req.user.id),
         discordId: req.user.id,
         discordTag: req.user.username,
         avatar: req.user.avatar ? `https://cdn.discordapp.com/avatars/${req.user.id}/${req.user.avatar}.png` : null,
@@ -3332,6 +3401,7 @@ app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, re
     const { role, discordId } = req.body;
     if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
     if (!SECTOR_ROLE_LABELS[role]) return res.status(400).json({ error: "دور غير معروف" });
+    if (sector === "cyber" && role === "personnelOfficer") return res.status(400).json({ error: "الأمن السيبراني ما يكون له مسؤول أفراد" });
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
 
     const person = await Personnel.findOne({ discord: discordId.trim() });
@@ -3532,6 +3602,7 @@ app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, 
 });
 
 app.post("/api/sector/personnel-officer/assign", ensureSectorLeader, async (req, res) => {
+    if (req.sectorInfo.sector === "cyber") return res.status(400).json({ error: "الأمن السيبراني ما يكون له مسؤول أفراد" });
     const { discordId } = req.body;
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
     const person = await Personnel.findOne({ discord: discordId.trim() });
@@ -5030,7 +5101,7 @@ function offIvDrop(n, uid) {
 const offCfg = new Map();    // n -> { mode, speakerUid }
 function offGetCfg(n) {
     let c = offCfg.get(n);
-    if (!c) { c = { mode: offIsCyber(n) ? "open" : "listen", speakerUid: null }; offCfg.set(n, c); }
+    if (!c) { c = { mode: (offIsCyber(n) || offIsFreq(n) || offIsCourt(n)) ? "open" : "listen", speakerUid: null }; offCfg.set(n, c); }
     return c;
 }
 function offState(n, viewerUid) {
@@ -5054,7 +5125,7 @@ function offState(n, viewerUid) {
     const ch = offChat.get(n);
     return {
         n, mode: cfg.mode, speakerUid: cfg.speakerUid, rec: offRecIsActive(n),
-        chatSeq: ch ? ch.seq : 0, iv, myQ, myReport, training: offIsTrain(n), cyber: offIsCyber(n), cyShow: offIsCyber(n) ? (cyShownMap.get(n) || null) : null,
+        chatSeq: ch ? ch.seq : 0, iv, myQ, myReport, training: offIsTrain(n), cyber: offIsCyber(n), freq: offIsFreq(n), court: offIsCourt(n), cyShow: offIsCyber(n) ? (cyShownMap.get(n) || null) : null,
         participants: all.filter(p => !isGhost(p)).map(p => ({ uid: p.uid, name: p.name, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
         ghosts: all.filter(isGhost).map(p => ({ uid: p.uid, isSenior: p.isSenior, role: p.role || (p.isSenior ? "senior" : "applicant"), muted: !!p.muted, joinedAt: p.joinedAt })),
     };
@@ -5092,7 +5163,7 @@ function offRemove(uid, n) {
     if (cfg.speakerUid === uid) cfg.speakerUid = null;
     const rr = offRecActive.get(n);
     if (rr && rr.uid === uid) offRecEnd(n, true);
-    if (!offIsCyber(n)) OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, role: p.role, action: "leave" }).catch(() => {});
+    if (!offIsCyber(n) && !offIsFreq(n) && !offIsCourt(n)) OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, role: p.role, action: "leave" }).catch(() => {});
     offPushState(n);
 }
 function offRemoveEverywhere(uid) {
@@ -5799,6 +5870,46 @@ app.get("/api/officers/rooms/:n/chat", ensureAuth, async (req, res, next) => {
     const cc = await CyberCase.findOne({ voiceN: n }, { chat: 1 }).lean();
     const list = ((cc && cc.chat) || []).filter(x => !x.system && x.mid && x.mid > after);
     res.json({ msgs: list.map(x => ({ id: x.mid, uid: x.uid, name: x.name, isSenior: x.role === "leader", text: x.text, at: new Date(x.at).getTime() })), seq: list.length ? list[list.length - 1].mid : after });
+});
+
+// ---------- دخول رومات الترددات المشتركة (910..919) والمحكمة (950..979) ----------
+app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res, next) => {
+    const n = offParseN(req.params.n);
+    if (!n || !offIsFreq(n)) return next();
+    const uid = req.user.id;
+    if (!(await freqExists(n))) return res.status(404).json({ error: "هذا التردد غير موجود" });
+    if (underCourt.has(uid)) return res.status(403).json({ error: "⚖️ أنت مطلوب للمحكمة العسكرية" });
+    const name = await cyName(uid);
+    for (const otherN of Array.from(offLive.keys())) { if (otherN !== n) offRemove(uid, otherN); }
+    let m = offLive.get(n);
+    if (!m) { m = new Map(); offLive.set(n, m); }
+    const existing = Array.from(m.keys()).filter(u => u !== uid);
+    m.set(uid, { uid, name, isSenior: false, role: isSeniorAdmin(uid) ? "senior" : "member", muted: false, joinedAt: Date.now() });
+    offPushState(n);
+    const ch = offChat.get(n);
+    res.json({ ok: true, state: offState(n, uid), existing, iceServers: offIce(), ivQuestions: null, chat: ch ? ch.msgs : [] });
+});
+app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res, next) => {
+    const n = offParseN(req.params.n);
+    if (!n || !offIsCourt(n)) return next();
+    const uid = req.user.id;
+    const cc = await CourtCase.findOne({ voiceN: n, status: "active" });
+    if (!cc) return res.status(404).json({ error: "المحكمة غير موجودة أو انتهت" });
+    const isT = cc.targetUid === uid;
+    const r = await courtRole(uid);
+    if (!isT && !r.staff) return res.status(403).json({ error: "ليست لديك صلاحية دخول المحكمة" });
+    if (!isT && underCourt.has(uid)) return res.status(403).json({ error: "⚖️ أنت مطلوب للمحكمة العسكرية" });
+    if (!isT && (cc.kicked || []).includes(uid)) return res.status(403).json({ error: "🚫 تم طردك من هذه المحكمة" });
+    const role = isT ? "target" : (r.senior ? "senior" : (r.leader ? "mpl" : "mp"));
+    const name = await cyName(uid);
+    for (const otherN of Array.from(offLive.keys())) { if (otherN !== n) offRemove(uid, otherN); }
+    let m = offLive.get(n);
+    if (!m) { m = new Map(); offLive.set(n, m); }
+    const existing = Array.from(m.keys()).filter(u => u !== uid);
+    m.set(uid, { uid, name, isSenior: false, role, muted: (cc.muted || []).includes(uid), joinedAt: Date.now() });
+    offPushState(n);
+    const ch = offChat.get(n);
+    res.json({ ok: true, state: offState(n, uid), existing, iceServers: offIce(), ivQuestions: null, chat: ch ? ch.msgs : [], caseId: String(cc._id) });
 });
 
 // ---------- الروم الصوتي ----------
@@ -6925,6 +7036,508 @@ app.post("/api/cyber/cases/:id/kick", ensureAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: "تعذر الطرد" }); }
 });
 
+// ======================================================================
+//  ⚡ إضافات فلاش: الإشعارات (Web Push) • البصمة • الترددات المشتركة • المحكمة العسكرية • الاستلام
+//  (يحتاج مكتبة web-push:   npm install web-push)
+// ======================================================================
+let webpush = null;
+try { webpush = require("web-push"); }
+catch (e) { console.log("⚠️ مكتبة web-push غير مثبتة — الإشعارات معطّلة. شغّل: npm install web-push"); }
+
+const validDevId = v => typeof v === "string" && /^[a-zA-Z0-9-]{8,64}$/.test(v);
+const cleanDevName = v => String(v || "جهاز").replace(/[\r\n<>]/g, "").slice(0, 40);
+
+// ---------- الأجهزة + حالة التطبيق (PWA) ----------
+const PushDevice = mongoose.model("PushDevice", new mongoose.Schema({
+    id: { type: String, unique: true, required: true },
+    uid: { type: String, default: null, index: true },
+    name: { type: String, default: "جهاز" },
+    standalone: { type: Boolean, default: false },
+    sub: { type: mongoose.Schema.Types.Mixed, default: null },
+    lastSeen: { type: Date, default: Date.now },
+    createdAt: { type: Date, default: Date.now },
+}));
+// حساب دخل مرة من "تطبيق الويب" => المتصفح يتقفل عليه ويقوله ادخل من التطبيق
+const PwaInstall = mongoose.model("PwaInstall", new mongoose.Schema({ uid: { type: String, unique: true }, at: { type: Date, default: Date.now } }));
+const pwaSeen = new Map();
+function markPwa(uid) {
+    if (!uid) return;
+    if (Date.now() - (pwaSeen.get(uid) || 0) < 6 * 3600 * 1000) return;
+    pwaSeen.set(uid, Date.now());
+    PwaInstall.updateOne({ uid }, { $set: { at: new Date() } }, { upsert: true }).catch(() => {});
+    // دخل من التطبيق => نحذف أجهزة المتصفح (الجوال) حقته
+    PushDevice.deleteMany({ uid, standalone: false, name: /^(آيفون|آيباد|أندرويد)/ }).catch(() => {});
+}
+// حضور الأجهزة (متصل/غير متصل) عن طريق نفس اتصال /api/events
+const devConns = new Map();
+const devGrace = new Set();
+const devIsOnline = id => (devConns.get(id) || 0) > 0 || devGrace.has(id);
+const activeDev = new Map(); // uid -> آخر جهاز دخل بالحساب
+function devOnConnect(c, q) {
+    const id = c.did;
+    devConns.set(id, (devConns.get(id) || 0) + 1);
+    devGrace.delete(id);
+    // جهاز واحد بالحساب: نختار آخر واحد دخل ونطرد الباقي
+    if (c.uid && activeDev.get(c.uid) !== id) {
+        activeDev.set(c.uid, id);
+        sseBroadcast("sessionkick", { t: Date.now() }, cl => cl.uid === c.uid && cl.did && cl.did !== id);
+    }
+    const standalone = String(q.sa) === "1";
+    PushDevice.updateOne({ id }, { $set: { uid: c.uid, name: cleanDevName(q.dn), standalone, lastSeen: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true }).catch(() => {});
+    if (standalone) markPwa(c.uid);
+}
+function devOnClose(c) {
+    const id = c && c.did;
+    if (!id) return;
+    const n = (devConns.get(id) || 1) - 1;
+    if (n > 0) { devConns.set(id, n); return; }
+    devConns.delete(id); devGrace.add(id);
+    PushDevice.updateOne({ id }, { $set: { lastSeen: new Date() } }).catch(() => {});
+    setTimeout(() => { if (!devConns.get(id)) devGrace.delete(id); }, 5000);
+}
+
+// ---------- مفاتيح VAPID (من المتغيرات أو تنحفظ بالداتابيس عشان ما تتغير) ----------
+let vapidPromise = null;
+function ensureVapid() {
+    if (!webpush) return Promise.resolve(null);
+    if (vapidPromise) return vapidPromise;
+    vapidPromise = (async () => {
+        let pub = process.env.VAPID_PUBLIC_KEY, priv = process.env.VAPID_PRIVATE_KEY;
+        if (!pub || !priv) {
+            const s = await getSettings();
+            if (s.vapid && s.vapid.publicKey && s.vapid.privateKey) { pub = s.vapid.publicKey; priv = s.vapid.privateKey; }
+            else {
+                const k = webpush.generateVAPIDKeys();
+                pub = k.publicKey; priv = k.privateKey;
+                s.vapid = { publicKey: pub, privateKey: priv };
+                s.markModified("vapid");
+                await s.save();
+                console.log("🔑 تم توليد مفاتيح VAPID وحفظها بالداتابيس");
+            }
+        }
+        webpush.setVapidDetails(process.env.VAPID_SUBJECT || "mailto:admin@flash.sa", pub, priv);
+        return pub;
+    })().catch(e => { vapidPromise = null; console.error("❌ VAPID:", e.message); return null; });
+    return vapidPromise;
+}
+async function sendPushTo(devs, opts) {
+    const key = await ensureVapid();
+    if (!key) return { sent: 0, failed: [], unavailable: true };
+    const payload = JSON.stringify({
+        title: String(opts.title || CONFIG.SITE_NAME).slice(0, 80),
+        body: String(opts.body || "").slice(0, 200),
+        url: opts.url || "/",
+        tag: opts.tag || undefined,
+    });
+    const list = (devs || []).filter(d => d && d.sub && d.sub.endpoint);
+    let sent = 0; const failed = [];
+    for (let i = 0; i < list.length; i += 40) {
+        await Promise.all(list.slice(i, i + 40).map(async d => {
+            try { await webpush.sendNotification(d.sub, payload, { TTL: opts.ttl || 3600, urgency: "high" }); sent++; }
+            catch (e) {
+                failed.push({ id: d.id, name: d.name, code: e.statusCode || 0 });
+                if (e.statusCode === 404 || e.statusCode === 410) PushDevice.updateOne({ id: d.id }, { $set: { sub: null } }).catch(() => {});
+                else console.log("❌ push:", d.name, e.statusCode || "", e.body || e.message);
+            }
+        }));
+    }
+    return { sent, failed };
+}
+// يرسل للمتصل وغير المتصل (كل جهاز مفعّل الإشعارات)
+const pushAll = opts => PushDevice.find({ sub: { $ne: null } }).lean().then(d => sendPushTo(d, opts));
+const pushUid = (uid, opts) => PushDevice.find({ uid, sub: { $ne: null } }).lean().then(d => sendPushTo(d, opts));
+
+app.get("/api/push/vapid", async (req, res) => {
+    const key = await ensureVapid();
+    if (!key) return res.status(503).json({ error: "الإشعارات غير مفعّلة على السيرفر" });
+    res.json({ key });
+});
+app.post("/api/push/subscribe", ensureAuth, async (req, res) => {
+    const b = req.body || {}, sub = b.sub;
+    if (!validDevId(b.id) || !sub || typeof sub.endpoint !== "string" || !/^https:\/\//.test(sub.endpoint) || !sub.keys || !sub.keys.p256dh || !sub.keys.auth)
+        return res.status(400).json({ error: "بيانات غير صالحة" });
+    await PushDevice.updateMany({ "sub.endpoint": sub.endpoint, id: { $ne: b.id } }, { $set: { sub: null } });
+    await PushDevice.updateOne({ id: b.id }, {
+        $set: { uid: req.user.id, name: cleanDevName(b.name), standalone: !!b.standalone, lastSeen: new Date(), sub: { endpoint: sub.endpoint, keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) } } },
+        $setOnInsert: { createdAt: new Date() },
+    }, { upsert: true });
+    res.json({ ok: true });
+});
+app.post("/api/push/unsubscribe", ensureAuth, async (req, res) => {
+    const id = (req.body || {}).id;
+    if (validDevId(id)) await PushDevice.updateOne({ id, uid: req.user.id }, { $set: { sub: null } });
+    res.json({ ok: true });
+});
+app.get("/api/pwa/ping", ensureAuth, (req, res) => {
+    if (String(req.query.sa) === "1") markPwa(req.user.id);
+    res.json({ ok: true });
+});
+
+// ---------- تاب الإشعارات (كبار المسؤولين + المالك) ----------
+app.get("/api/senior/push/devices", ensureSeniorAdmin, async (req, res) => {
+    const hidden = hiddenOwnerIds(req);
+    const devs = (await PushDevice.find({}).sort({ lastSeen: -1 }).limit(600).lean()).filter(d => !hidden.includes(d.uid));
+    const uids = [...new Set(devs.map(d => d.uid).filter(Boolean))];
+    const [pers, accs] = await Promise.all([
+        Personnel.find({ discord: { $in: uids } }, { discord: 1, registeredName: 1 }).lean(),
+        Account.find({ uid: { $in: uids } }, { uid: 1, fullName: 1, email: 1 }).lean(),
+    ]);
+    const nm = new Map();
+    accs.forEach(a => nm.set(a.uid, a.fullName || a.email));
+    pers.forEach(p => { if (p.registeredName) nm.set(p.discord, p.registeredName); });
+    const list = devs.map(d => ({
+        id: d.id, name: d.name, owner: nm.get(d.uid) || null, standalone: !!d.standalone,
+        online: devIsOnline(d.id), push: !!d.sub, lastSeen: d.lastSeen,
+    })).sort((a, b) => (b.online - a.online) || (new Date(b.lastSeen) - new Date(a.lastSeen)));
+    const s = await getSettings();
+    res.json({ list, title: s.notifTitle || CONFIG.PUSH_DEFAULT_TITLE, body: s.notifBody || CONFIG.PUSH_DEFAULT_BODY, supported: !!webpush });
+});
+app.post("/api/senior/push/text", ensureSeniorAdmin, async (req, res) => {
+    const b = req.body || {};
+    const title = String(b.title || "").trim().slice(0, 60) || CONFIG.PUSH_DEFAULT_TITLE;
+    const body = String(b.body || "").trim().slice(0, 160) || CONFIG.PUSH_DEFAULT_BODY;
+    const s = await getSettings();
+    s.notifTitle = title; s.notifBody = body;
+    await s.save();
+    sseBroadcast("pushtext", { title, body, by: req.user.id }, c => !!c.uid && isSeniorAdmin(c.uid));
+    res.json({ ok: true, title, body });
+});
+const pushSendThrottle = new Map();
+app.post("/api/senior/push/send", ensureSeniorAdmin, async (req, res) => {
+    if (Date.now() - (pushSendThrottle.get(req.user.id) || 0) < 1500) return res.status(429).json({ error: "على رواقك شوي" });
+    pushSendThrottle.set(req.user.id, Date.now());
+    const b = req.body || {};
+    const title = String(b.title || "").trim().slice(0, 60) || CONFIG.PUSH_DEFAULT_TITLE;
+    const body = String(b.body || "").trim().slice(0, 160) || CONFIG.PUSH_DEFAULT_BODY;
+    if (!webpush) return res.status(503).json({ error: "مكتبة web-push غير مثبتة على السيرفر" });
+    let devs = [];
+    if (b.all) devs = await PushDevice.find({ sub: { $ne: null } }).lean();
+    else if (validDevId(b.id)) {
+        const d = await PushDevice.findOne({ id: b.id }).lean();
+        if (!d || !d.sub) return res.status(404).json({ error: "هذا الجهاز ما فعّل الإشعارات" });
+        devs = [d];
+    } else return res.status(400).json({ error: "حدد الجهاز" });
+    if (!devs.length) return res.status(404).json({ error: "ما فيه أجهزة مفعّلة للإشعارات" });
+    const s = await getSettings();
+    s.notifTitle = title; s.notifBody = body;
+    await s.save();
+    sseBroadcast("pushtext", { title, body, by: req.user.id }, c => !!c.uid && isSeniorAdmin(c.uid));
+    const r = await sendPushTo(devs, { title, body });
+    await logEvent({ action: "إرسال إشعار", actorId: req.user.id, actorTag: req.user.username, details: (b.all ? "للجميع" : "لجهاز") + " — " + title + ": " + body + " (وصل " + r.sent + ")" });
+    res.json({ sent: r.sent, failed: r.failed.map(f => ({ id: f.id, name: f.name })) });
+});
+
+// إشعار العضو من التكت (للإدارة والكبار): "رد عليك الإداري على تكتك"
+const ticketNotifyThrottle = new Map();
+app.post("/api/support/admin/tickets/:id/notify", async (req, res) => {
+    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+    const t = await SupportTicket.findById(req.params.id, { uid: 1, no: 1 }).lean();
+    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
+    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر بدون حساب، ما نقدر نرسل له إشعار" });
+    const k = String(t._id);
+    if (Date.now() - (ticketNotifyThrottle.get(k) || 0) < 15000) return res.status(429).json({ error: "تم إرسال إشعار قبل شوي" });
+    const r = await pushUid(t.uid, { title: CONFIG.SITE_NAME, body: "رد عليك الإداري على تكتك ⚡", tag: "ticket-" + t.no });
+    if (!r.sent) return res.status(404).json({ error: "العضو ما فعّل الإشعارات على أي جهاز" });
+    ticketNotifyThrottle.set(k, Date.now());
+    res.json({ ok: true, sent: r.sent });
+});
+
+// ---------- البصمة (حضور / انصراف) ----------
+const AttStatus = mongoose.model("AttStatus", new mongoose.Schema({
+    uid: { type: String, unique: true, required: true },
+    name: String,
+    status: { type: String, enum: ["in", "out"], default: "out" },
+    lastCheckInAt: { type: Date, default: null },
+    lastCheckOutAt: { type: Date, default: null },
+    updatedAt: { type: Date, default: Date.now },
+}));
+const AttLogSchema = new mongoose.Schema({
+    uid: String, name: String, type: String, at: { type: Date, default: Date.now },
+});
+AttLogSchema.index({ at: -1 });
+const AttLog = mongoose.model("AttLog", AttLogSchema);
+// كبار المسؤولين ما يلزمهم بصمة (بس تقدر يبصمون إذا حبوا)
+const attRequired = uid => !isSeniorAdmin(uid);
+async function getAttState(uid) {
+    const st = await AttStatus.findOne({ uid }, { status: 1, lastCheckInAt: 1 }).lean();
+    return { status: st && st.status === "in" ? "in" : "out", at: st ? st.lastCheckInAt : null };
+}
+app.get("/api/attendance/status", ensureAuth, async (req, res) => {
+    res.json(await getAttState(req.user.id));
+});
+app.post("/api/attendance/scan", ensureAuth, async (req, res) => {
+    if (Math.random() < CONFIG.FP_FAIL_RATE) return res.json({ success: false });
+    const name = await cyName(req.user.id);
+    let st = await AttStatus.findOne({ uid: req.user.id });
+    if (!st) st = new AttStatus({ uid: req.user.id });
+    const now = new Date();
+    const next = st.status === "in" ? "out" : "in";
+    st.status = next; st.name = name; st.updatedAt = now;
+    if (next === "in") st.lastCheckInAt = now; else st.lastCheckOutAt = now;
+    await st.save();
+    await AttLog.create({ uid: req.user.id, name, type: next, at: now });
+    if (next === "out") {
+        // طلع => يطلع من أي تردد هو فيه
+        for (const n of Array.from(offLive.keys())) {
+            if (offIsFreq(n) && offLive.get(n) && offLive.get(n).has(req.user.id)) { offSendTo(req.user.id, { t: "kicked", n }); offRemove(req.user.id, n); }
+        }
+    }
+    res.json({ success: true, status: next, at: now });
+});
+// بوابة: ما يسجل مخالفة/تقرير ولا يدخل تردد إلا بعد تسجيل الحضور
+const ATT_GATED = [/^\/violations\/submit$/, /^\/reports\/submit$/, /^\/mp\/reports\/submit$/, /^\/officers\/rooms\/91\d\/join$/];
+async function attendanceGate(req, res, next) {
+    try {
+        if (req.method !== "POST" || !req.user) return next();
+        if (!ATT_GATED.some(r => r.test(req.path))) return next();
+        if (!attRequired(req.user.id)) return next();
+        const st = await getAttState(req.user.id);
+        if (st.status === "in") return next();
+        return res.status(403).json({ error: "🖐️ لازم تسجّل دخولك بالبصمة أول", needAttendance: true });
+    } catch (e) { return next(); }
+}
+
+// ---------- مسؤولو الاستلامات + زر فتح استلام ----------
+function isReceptionOfficer(uid, settings) { return !!(settings && (settings.receptionOfficers || []).some(m => m.id === uid)); }
+app.get("/api/senior/reception", ensureSeniorAdmin, async (req, res) => {
+    const s = await getSettings();
+    res.json({ list: s.receptionOfficers || [] });
+});
+app.post("/api/senior/reception/add", ensureSeniorAdmin, async (req, res) => {
+    const discordId = String((req.body || {}).discordId || "").trim();
+    if (!discordId) return res.status(400).json({ error: "حدد الشخص" });
+    const person = await Personnel.findOne({ discord: discordId });
+    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع" });
+    const s = await getSettings();
+    if (!s.receptionOfficers) s.receptionOfficers = [];
+    if (s.receptionOfficers.some(m => m.id === person.discord)) return res.status(400).json({ error: "موجود من قبل" });
+    s.receptionOfficers.push({ id: person.discord, name: person.registeredName || person.discordTag });
+    s.markModified("receptionOfficers");
+    await s.save();
+    await logEvent({ action: "إضافة مسؤول استلامات", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: person.registeredName });
+    res.json({ ok: true, list: s.receptionOfficers });
+});
+app.post("/api/senior/reception/remove", ensureSeniorAdmin, async (req, res) => {
+    const discordId = String((req.body || {}).discordId || "");
+    const s = await getSettings();
+    const removed = (s.receptionOfficers || []).find(m => m.id === discordId);
+    s.receptionOfficers = (s.receptionOfficers || []).filter(m => m.id !== discordId);
+    s.markModified("receptionOfficers");
+    await s.save();
+    await logEvent({ action: "إزالة مسؤول استلامات", actorId: req.user.id, actorTag: req.user.username, details: (removed && removed.name) || discordId });
+    res.json({ ok: true, list: s.receptionOfficers });
+});
+function riyadhHour() {
+    const h = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Riyadh", hour: "2-digit", hour12: false }).format(new Date()), 10);
+    return h % 24;
+}
+let lastReceptionAt = 0;
+app.post("/api/reception/open", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    if (!isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
+    const att = await getAttState(req.user.id);
+    if (att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
+    const h = riyadhHour();
+    if (h < CONFIG.RECEPTION_START_HOUR || h >= CONFIG.RECEPTION_END_HOUR) return res.status(400).json({ error: "⏰ مو وقت الاستلام — الاستلام من الساعة 2 العصر إلى 9 الليل" });
+    if (Date.now() - lastReceptionAt < 30000) return res.status(429).json({ error: "تم فتح الاستلام قبل شوي" });
+    lastReceptionAt = Date.now();
+    const r = await pushAll({ title: CONFIG.SITE_NAME, body: "استلام الان", ttl: 900, tag: "reception" });
+    let discord = false;
+    if (botReady) {
+        try {
+            const ch = await client.channels.fetch(CONFIG.RECEPTION_CHANNEL_ID);
+            await ch.send({ content: "استلام @everyone", allowedMentions: { parse: ["everyone"] } });
+            discord = true;
+        } catch (e) { console.error("❌ فشل إرسال رسالة الاستلام للديسكورد:", e.message); }
+    }
+    await logEvent({ action: "فتح استلام", actorId: req.user.id, actorTag: req.user.username, details: "إشعار وصل لـ " + r.sent + " جهاز" + (discord ? " + ديسكورد" : "") });
+    res.json({ ok: true, sent: r.sent, discord });
+});
+
+// ---------- تردد القطاعات المشتركة (روم صوتي 910..919) ----------
+const FreqRoom = mongoose.model("FreqRoom", new mongoose.Schema({
+    n: { type: Number, unique: true }, name: String, createdBy: String, createdAt: { type: Date, default: Date.now },
+}));
+function offIsFreq(n) { return Number.isInteger(n) && n >= 910 && n <= 919; }
+function offIsCourt(n) { return Number.isInteger(n) && n >= 950 && n <= 979; }
+const FREQ_MAIN = 910;
+async function freqExists(n) { return n === FREQ_MAIN || !!(await FreqRoom.exists({ n })); }
+app.get("/api/freq/list", ensureAuth, async (req, res) => {
+    const extra = await FreqRoom.find({}).sort({ n: 1 }).lean();
+    const row = (n, name, main) => ({ n, name, main, count: (offLive.get(n) || new Map()).size });
+    res.json({
+        list: [row(FREQ_MAIN, "تردد القطاعات المشتركة", true)].concat(extra.map(r => row(r.n, r.name || ("تردد " + (r.n - FREQ_MAIN)), false))),
+        max: CONFIG.FREQ_MAX_EXTRA, canManage: isSeniorAdmin(req.user.id),
+    });
+});
+app.post("/api/senior/freq", ensureSeniorAdmin, async (req, res) => {
+    const existing = await FreqRoom.find({}).select("n").lean();
+    if (existing.length >= CONFIG.FREQ_MAX_EXTRA) return res.status(400).json({ error: "وصلت الحد الأقصى (" + CONFIG.FREQ_MAX_EXTRA + " ترددات إضافية)" });
+    const used = new Set(existing.map(r => r.n));
+    let n = FREQ_MAIN + 1;
+    while (used.has(n) && n < 919) n++;
+    const name = String((req.body || {}).name || "").trim().slice(0, 40) || ("تردد " + (n - FREQ_MAIN));
+    try { await FreqRoom.create({ n, name, createdBy: req.user.id }); }
+    catch (e) { return res.status(409).json({ error: "صار تعارض، جرب مرة ثانية" }); }
+    await logEvent({ action: "إنشاء تردد", actorId: req.user.id, actorTag: req.user.username, details: name });
+    res.json({ ok: true, n });
+});
+app.delete("/api/senior/freq/:n", ensureSeniorAdmin, async (req, res) => {
+    const n = offParseN(req.params.n);
+    if (!n || n === FREQ_MAIN || !offIsFreq(n)) return res.status(400).json({ error: "ما يمديك تحذف هذا التردد" });
+    const m = offLive.get(n);
+    if (m) for (const uid of Array.from(m.keys())) { offSendTo(uid, { t: "roomdeleted", n }); offRemove(uid, n); }
+    offCfg.delete(n); offLive.delete(n); offChat.delete(n);
+    await FreqRoom.deleteOne({ n });
+    await logEvent({ action: "حذف تردد", actorId: req.user.id, actorTag: req.user.username, details: "تردد " + n });
+    res.json({ ok: true });
+});
+
+// ---------- المحكمة العسكرية (روم صوتي 950..979) ----------
+const CourtCase = mongoose.model("CourtCase", new mongoose.Schema({
+    status: { type: String, default: "active" },          // active | ended
+    targetUid: String, targetName: String, reason: { type: String, default: "" },
+    startedBy: String, startedByName: String, startedByRole: String,  // mp | senior
+    voiceN: { type: Number, default: null },
+    muted: { type: [String], default: [] }, kicked: { type: [String], default: [] },
+    startedAt: { type: Date, default: Date.now },
+    endedAt: { type: Date, default: null }, endedBy: String, endedByName: String,
+}));
+const underCourt = new Map();   // targetUid -> { id, n, reason, byName, at }
+const courtLite = c => ({ id: String(c._id), n: c.voiceN, reason: c.reason || "", byName: c.startedByName || "", at: c.startedAt });
+async function loadCourt() {
+    try {
+        underCourt.clear();
+        (await CourtCase.find({ status: "active" }).lean()).forEach(c => underCourt.set(c.targetUid, courtLite(c)));
+    } catch (e) { console.error("❌ فشل تحميل المحكمة:", e.message); }
+}
+function courtCaseOf(uid) { return underCourt.get(uid) || null; }
+async function courtRole(uid) {
+    if (isSeniorAdmin(uid)) return { staff: true, leader: true, senior: true };
+    const settings = await getSettings();
+    const mpRole = getMPRole(uid, settings);
+    const po = isMPPersonnelOfficer(uid, settings);
+    const mem = !!(mpRole || po) || await isMilitaryPoliceMember(uid);
+    return { staff: !!mem, leader: !!mpRole, senior: false };
+}
+function courtPub(c) {
+    return { id: String(c._id), status: c.status, targetUid: c.targetUid, targetName: c.targetName, reason: c.reason || "", byName: c.startedByName || "", byRole: c.startedByRole || "", n: c.voiceN, startedAt: c.startedAt, endedAt: c.endedAt || null, endedByName: c.endedByName || null };
+}
+async function courtAudience() {
+    const ids = new Set();
+    (await Account.find({ status: "approved", isMP: true }, { uid: 1 }).lean()).forEach(a => ids.add(a.uid));
+    const s = await getSettings();
+    const m = s.mpLeadership || {};
+    [m.commanderId, m.deputyId, m.personnelOfficerId].filter(Boolean).forEach(x => ids.add(x));
+    return ids;
+}
+async function courtPush(targetUid) {
+    try {
+        const set = await courtAudience();
+        sseBroadcast("court", { t: Date.now() }, c => !!c.uid && (set.has(c.uid) || c.uid === targetUid || isSeniorAdmin(c.uid)));
+    } catch (e) {}
+}
+function courtVoiceClose(c) {
+    const n = c && c.voiceN;
+    if (!n) return;
+    const m = offLive.get(n);
+    if (m) for (const u of Array.from(m.keys())) { offSendTo(u, { t: "roomdeleted", n }); offRemove(u, n); }
+    offCfg.delete(n); offLive.delete(n); offChat.delete(n);
+}
+// أثناء المحكمة: العضو ما يقدر يسوي أي شي إلا يدخل المحكمة
+function courtLockGate(req, res, next) {
+    if (!req.user) return next();
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+    if (!underCourt.has(req.user.id)) return next();
+    if (req.path.indexOf("/court/") === 0) return next();
+    const vr = /^\/officers\/rooms\/(\d+)\//.exec(req.path);
+    if (vr && offIsCourt(parseInt(vr[1], 10))) return next();
+    return res.status(403).json({ error: "⚖️ أنت مطلوب للمحكمة العسكرية، ما تقدر تسوي أي إجراء قبل ما تدخلها", court: true });
+}
+app.get("/api/court/state", ensureAuth, async (req, res) => {
+    const r = await courtRole(req.user.id);
+    const out = { lock: courtCaseOf(req.user.id), staff: r.staff, leader: r.leader, senior: r.senior, active: [], recent: [] };
+    if (r.staff) {
+        out.active = (await CourtCase.find({ status: "active" }).sort({ startedAt: -1 }).limit(60).lean()).map(courtPub);
+        out.recent = (await CourtCase.find({ status: "ended" }).sort({ endedAt: -1 }).limit(15).lean()).map(courtPub);
+    }
+    res.json(out);
+});
+app.post("/api/court/start", ensureAuth, async (req, res) => {
+    const r = await courtRole(req.user.id);
+    if (!r.staff) return res.status(403).json({ error: "المحكمة العسكرية للشرطة العسكرية وكبار المسؤولين فقط" });
+    const b = req.body || {};
+    const targetUid = String(b.targetUid || "");
+    const reason = String(b.reason || "").trim().slice(0, 300);
+    if (!targetUid || targetUid === req.user.id) return res.status(400).json({ error: "ما تقدر تفتح تحقيق على نفسك" });
+    const ta = await Account.findOne({ uid: targetUid, status: "approved" }, { isSenior: 1, isOwner: 1, tempSenior: 1 }).lean();
+    if (!ta) return res.status(404).json({ error: "هذا العضو غير موجود" });
+    if (isSeniorAdmin(targetUid) || isOwnerUid(targetUid) || ta.isSenior || ta.isOwner || ta.tempSenior) return res.status(403).json({ error: "ما يمديك تفتح تحقيق على هذا الشخص" });
+    if (underCourt.has(targetUid)) return res.status(409).json({ error: "هذا العضو مطلوب للمحكمة حالياً" });
+    const used = new Set((await CourtCase.find({ status: "active", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
+    let n = 950; while (used.has(n) && n < 979) n++;
+    if (used.has(n)) return res.status(400).json({ error: "المحكمة ممتلئة حالياً" });
+    const byName = await cyName(req.user.id), targetName = await cyName(targetUid);
+    const c = await CourtCase.create({ targetUid, targetName, reason, startedBy: req.user.id, startedByName: byName, startedByRole: r.senior ? "senior" : "mp", voiceN: n });
+    underCourt.set(targetUid, courtLite(c));
+    await logEvent({ action: "فتح تحقيق بالمحكمة العسكرية", discordId: targetUid, actorId: req.user.id, actorTag: byName + (r.senior ? " (كبار المسؤولين)" : " (الشرطة العسكرية)"), details: targetName + (reason ? " — " + reason : "") });
+    courtPush(targetUid);
+    sseBroadcast("courtlock", { t: Date.now() }, cl => cl.uid === targetUid);
+    pushUid(targetUid, { title: CONFIG.SITE_NAME, body: "⚖️ أنت مطلوب للمحكمة العسكرية، ادخل الموقع الحين", tag: "court", ttl: 1800 }).catch(() => {});
+    res.json({ ok: true, id: String(c._id), n });
+});
+async function courtAccess(req, res, needLead) {
+    if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "رقم غير صحيح" }); return null; }
+    const c = await CourtCase.findById(req.params.id);
+    if (!c) { res.status(404).json({ error: "غير موجود" }); return null; }
+    const r = await courtRole(req.user.id);
+    const isT = c.targetUid === req.user.id;
+    if (!isT && !r.staff) { res.status(403).json({ error: "ليست لديك صلاحية" }); return null; }
+    if (needLead && (isT || !(r.leader || c.startedBy === req.user.id))) { res.status(403).json({ error: "هذا الإجراء لقيادة الشرطة العسكرية أو اللي فتح التحقيق أو الكبار" }); return null; }
+    return { c, r, isT };
+}
+app.post("/api/court/:id/end", ensureAuth, async (req, res) => {
+    const x = await courtAccess(req, res, true); if (!x) return;
+    const name = await cyName(req.user.id);
+    const c = await CourtCase.findOneAndUpdate({ _id: x.c._id, status: "active" }, { $set: { status: "ended", endedAt: new Date(), endedBy: req.user.id, endedByName: name } }, { new: true });
+    if (!c) return res.status(409).json({ error: "المحكمة منتهية مسبقاً" });
+    underCourt.delete(c.targetUid);
+    courtVoiceClose(c);
+    await logEvent({ action: "إنهاء تحقيق المحكمة العسكرية", discordId: c.targetUid, actorId: req.user.id, actorTag: name, details: c.targetName });
+    courtPush(c.targetUid);
+    sseBroadcast("courtlock", { t: Date.now() }, cl => cl.uid === c.targetUid);
+    res.json({ ok: true });
+});
+app.post("/api/court/:id/voice", ensureAuth, async (req, res) => {
+    const x = await courtAccess(req, res, false); if (!x) return;
+    if (x.c.status !== "active" || !x.c.voiceN) return res.status(400).json({ error: "المحكمة غير نشطة" });
+    res.json({ ok: true, n: x.c.voiceN });
+});
+app.post("/api/court/:id/mute", ensureAuth, async (req, res) => {
+    const x = await courtAccess(req, res, false); if (!x) return;
+    if (x.c.status !== "active") return res.status(400).json({ error: "المحكمة منتهية" });
+    if (x.isT) return res.status(403).json({ error: "ليست لديك صلاحية" });
+    const target = String((req.body || {}).uid || ""), on = !!(req.body || {}).on;
+    if (!target || target === req.user.id) return res.status(400).json({ error: "حدد الشخص" });
+    if (!x.r.leader && target !== x.c.targetUid) return res.status(403).json({ error: "تقدر تسكّت المتحقق معه فقط" });
+    await CourtCase.updateOne({ _id: x.c._id }, on ? { $addToSet: { muted: target } } : { $pull: { muted: target } });
+    const vm = x.c.voiceN ? offLive.get(x.c.voiceN) : null;
+    if (vm && vm.has(target)) { vm.get(target).muted = on; offPushState(x.c.voiceN); }
+    res.json({ ok: true });
+});
+app.post("/api/court/:id/kick", ensureAuth, async (req, res) => {
+    const x = await courtAccess(req, res, true); if (!x) return;
+    if (x.c.status !== "active") return res.status(400).json({ error: "المحكمة منتهية" });
+    const target = String((req.body || {}).uid || "");
+    if (!target || target === req.user.id) return res.status(400).json({ error: "حدد الشخص" });
+    if (isOwnerUid(target) && !isOwnerUid(req.user.id)) return res.status(403).json({ error: "ما يمديك تطرد المالك" });
+    if (isSeniorAdmin(target) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "ما يمديك تطرد أحد من الكبار" });
+    if (target !== x.c.targetUid) await CourtCase.updateOne({ _id: x.c._id }, { $addToSet: { kicked: target } });
+    if (x.c.voiceN) { offSendTo(target, { t: "kicked", n: x.c.voiceN }); offRemove(target, x.c.voiceN); }
+    res.json({ ok: true });
+});
+
 app.get("/", (req, res) => {
     res.set("Cache-Control", "no-store, must-revalidate");
     res.send(`<!DOCTYPE html>
@@ -7418,6 +8031,47 @@ app.get("/", (req, res) => {
     .ov-msg a { color: #93c5fd; text-decoration: underline; }
     .ov-chat-in { display: flex; gap: 6px; }
     .ov-chat-in input { flex: 1; min-width: 0; }
+    /* ===== إضافات: البصمة / تثبيت التطبيق / المحكمة / الإشعارات ===== */
+    .fp-wrap { max-width: 420px; margin: 40px auto; text-align: center; padding: 0 16px; }
+    .fp-circle { width: 160px; height: 160px; border-radius: 50%; border: 4px solid var(--border); background: var(--panel); display: flex; align-items: center; justify-content: center; margin: 20px auto; cursor: pointer; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: none; position: relative; overflow: hidden; transition: 0.15s; }
+    .fp-circle .fp-fill { position: absolute; bottom: 0; left: 0; width: 100%; height: 0%; background: linear-gradient(180deg, var(--gold), var(--green)); transition: height linear; opacity: 0.55; }
+    .fp-circle .fp-icon { font-size: 56px; position: relative; z-index: 2; color: var(--gold-soft); }
+    .fp-circle .fp-icon svg { width: 68px; height: 68px; display: block; }
+    .fp-circle.scanning { border-color: var(--gold); box-shadow: 0 0 25px rgba(59,130,246,0.5); }
+    .fp-status { margin-top: 14px; font-size: 14px; min-height: 20px; }
+    .fp-status.ok { color: #4ade80; }
+    .fp-status.fail { color: #f87171; }
+    .att-card { border-color: rgba(234,179,8,0.5); background: rgba(234,179,8,0.06); }
+    .att-card.in { border-color: rgba(34,197,94,0.4); background: rgba(34,197,94,0.06); color: #4ade80; padding: 12px 16px; }
+    .btn.btn-checkout { background: linear-gradient(135deg, #fde68a, #f59e0b); color: #c2410c; border: 2px solid #ea580c; font-weight: 800; }
+    #pwa-gate, .pwa-overlay { position: fixed; inset: 0; z-index: 2147483200; background: radial-gradient(circle at 50% 30%, #12305e 0%, #060d1a 72%); display: flex; align-items: center; justify-content: center; padding: 16px; overflow-y: auto; color: #e2e8f0; text-align: center; }
+    .pwa-box { max-width: 420px; width: 100%; line-height: 1.8; }
+    .pwa-top { font-size: 13px; color: #fbbf24; background: rgba(234,179,8,0.1); border: 1px solid rgba(234,179,8,0.4); border-radius: 10px; padding: 8px 10px; margin-bottom: 10px; }
+    .pwa-no { font-size: 12px; color: var(--muted); }
+    .pwa-box h2 { margin: 4px 0 10px; color: #e2e8f0; }
+    .pwa-img { margin: 6px 0 10px; }
+    .pwa-p { font-size: 14px; color: #cbd5e1; }
+    .pwa-btns { display: flex; gap: 10px; justify-content: center; margin-top: 14px; }
+    .pwa-btns .btn { flex: 1; max-width: 190px; }
+    .pwa-dots { display: flex; gap: 6px; justify-content: center; margin-top: 14px; }
+    .pwa-dots i { width: 8px; height: 8px; border-radius: 50%; background: #334155; display: inline-block; }
+    .pwa-dots i.on { background: #3b82f6; }
+    .pwa-ring { animation: pwaPulse 1.2s ease-in-out infinite; }
+    @keyframes pwaPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+    html.pwa-lock, html.pwa-lock body { overflow: hidden !important; }
+    body.pwa-frozen #app, body.pwa-frozen nav, body.pwa-frozen #warn-banner, body.pwa-frozen #owner-toolbar, body.pwa-frozen #sp-fab, body.pwa-frozen #sp-modal, body.pwa-frozen #mobile-menu, body.pwa-frozen #menu-backdrop { display: none !important; }
+    #court-hardlock { position: fixed; inset: 0; z-index: 5000; background: radial-gradient(circle at 50% 35%, #12305e 0%, #060d1a 72%); display: flex; align-items: center; justify-content: center; padding: 20px; text-align: center; color: #e2e8f0; }
+    #court-hardlock .cy-hl-box { max-width: 420px; width: 100%; line-height: 1.9; }
+    #court-hardlock h2 { margin: 6px 0 10px; }
+    #court-hardlock .btn { margin-top: 14px; }
+    body.court-frozen #app, body.court-frozen nav, body.court-frozen #warn-banner, body.court-frozen #owner-toolbar, body.court-frozen #sp-fab, body.court-frozen #sp-modal, body.court-frozen #mobile-menu, body.court-frozen #menu-backdrop { display: none !important; }
+    .pt-dev { display: flex; align-items: center; gap: 12px; padding: 12px 6px; border-bottom: 1px solid var(--border); }
+    .pt-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+    .pt-dot.on { background: #22c55e; }
+    .pt-chip { font-size: 11px; padding: 2px 9px; border-radius: 99px; background: rgba(59,130,246,0.15); color: var(--gold-soft); }
+    .pt-chip.on { background: rgba(34,197,94,0.15); color: #4ade80; }
+    .pt-chip.off { background: rgba(100,116,139,0.18); color: var(--muted); }
+
 </style>
 <div id="wf-overlay">
     <div class="wf-box" id="wf-box"></div>
@@ -8184,7 +8838,7 @@ function uaHardLock() {
     if (!h) { h = document.createElement('div'); h.id = 'ua-hardlock'; document.body.appendChild(h); }
     if (!h.getAttribute('data-ready')) {
         h.setAttribute('data-ready', '1');
-        h.innerHTML = '<div class="ua-box"><div style="font-size:50px">🚫</div><h2>ما يمديك تدخل</h2><div>حسابك متوقف لأنه ما عندك رتبة أو قطاع، ومخالفاتك ما تنقبل.</div><div style="margin-top:8px;color:#cbd5e1;">افتح تكت بخدمة العملاء، وشف التعليمات الي منزّلينها في تعميم الأمن العام.</div><button class="btn" onclick="spOpen()">🎧 خدمة العملاء — افتح تكت</button></div>';
+        h.innerHTML = '<div class="ua-box"><div style="font-size:50px">🚫</div><h2>ما يمديك تدخل</h2><div>ما عندك رتبة أو يونت أو قطاع (أو ينقصك واحد منها)، لذلك حسابك متوقف ومخالفاتك ما تنقبل.</div><div style="margin-top:8px;color:#cbd5e1;">لازم تفتح تكت خدمة عملاء من الزر اللي تحت، وإذا انعطيت رتبتك ويونتك وقطاعك ينفتح حسابك.</div><button class="btn" style="width:100%;padding:14px;font-size:16px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);" onclick="spOpen()">🎧 خدمة عملاء</button></div>';
     }
 }
 function dvHardLock() {
@@ -8916,9 +9570,9 @@ async function spApi(url, opts) {
 }
 
 function spConnect() {
-    if (SP.es || typeof EventSource === 'undefined') return;
+    if (SP.es || typeof EventSource === 'undefined' || (typeof FLX !== 'undefined' && FLX.kicked)) return;
     try {
-        var es = new EventSource('/api/events?gt=' + spGuestToken());
+        var es = new EventSource('/api/events?gt=' + spGuestToken() + flEvtQuery());
         SP.es = es;
         es.onopen = function () { SP.esOk = true; };
         es.onerror = function () { SP.esOk = false; };
@@ -8945,6 +9599,10 @@ function spConnect() {
             } catch (x) {}
         });
         es.addEventListener('vsig', function (e) { try { offOnVsig(JSON.parse(e.data)); } catch (x) {} });
+        es.addEventListener('court', function () { try { if (ME && ME.courtLocked) courtCheck(); if (document.getElementById('court-body')) courtPanelLoad(true); } catch (x) {} });
+        es.addEventListener('courtlock', function () { try { courtCheck(); } catch (x) {} });
+        es.addEventListener('pushtext', function (e) { try { flOnPushText(JSON.parse(e.data)); } catch (x) {} });
+        es.addEventListener('sessionkick', function () { try { flSessionKicked(); } catch (x) {} });
         es.addEventListener('offann', function () { try { offAnnCheck(); } catch (x) {} });
         es.addEventListener('flashupdate', function () { try { flashUpdCheck(); } catch (x) {} });
         es.addEventListener('lockchange', function (e) {
@@ -9139,7 +9797,7 @@ async function spOpenTicket(id, mode, box) {
     var el = document.getElementById(box);
     el.innerHTML =
         '<div class="sp-chat">' +
-        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button><button class="sp-link" id="sp-ban" onclick="spBanUser()" style="color:#fca5a5;display:none;">🚫 حظر</button></div>' +
+        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-notify" onclick="spNotifyUser()" style="color:#93c5fd;display:none;">🔔 إشعار</button><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button><button class="sp-link" id="sp-ban" onclick="spBanUser()" style="color:#fca5a5;display:none;">🚫 حظر</button></div>' +
         '<div class="sp-state" id="sp-state"></div>' +
         '<div class="sp-msgs" id="sp-msgs"></div>' +
         '<div id="sp-prev" class="sp-prev"></div>' +
@@ -9232,6 +9890,8 @@ function spPaintState() {
     if (banBtn) banBtn.style.display = (adm && isSen) ? 'inline' : 'none';
     var delBtn = document.getElementById('sp-del');
     if (delBtn) delBtn.style.display = (closed && adm && ME && ME.isSeniorAdmin) ? 'inline' : 'none';
+    var nb = document.getElementById('sp-notify');
+    if (nb) nb.style.display = (adm && !t.guest && !closed) ? 'inline' : 'none';
     var hb = document.getElementById('sp-human');
     if (hb && c.suggest) hb.classList.add('pulse');
 }
@@ -9426,6 +10086,7 @@ function ccRenderHtml(d) {
         '<div class="card" style="flex:1;font-size:12px;">👻 وضع التخفي: <b style="color:' + (d.stealth ? '#a78bfa' : '#4ade80') + ';">' + (d.stealth ? 'مفعّل' : 'مطفي') + '</b></div>' +
         '</div>';
     h += '</div>';
+    h += flCcPushHtml();
     h += '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">🧊 تجميد فوري لحساب</b>' +
         '<div style="margin-top:6px;"><input id="cc-freeze-q" type="text" placeholder="اكتب الإيميل أو الاسم..." oninput="ccFreezeSearch(this.value)" onkeydown="if(event.keyCode===13){this.blur();}" style="width:100%;"></div>' +
         '<div id="cc-freeze-results" style="margin-top:6px;"></div>' +
@@ -9448,6 +10109,7 @@ async function offaOpenCommandCenter() {
     try {
         var d = await api('/api/owner/command-center', { noLock: true });
         ownerModalOpen('🖥️ غرفة التحكم', ccRenderHtml(d));
+        flPushPrefill();
         CC_TIMER = setInterval(async function () {
             if (!OWNER_MODAL_OPEN) { ccStopLive(); return; }
             try {
@@ -9713,8 +10375,11 @@ async function init() {
         renderLogin(); return;
     }
     spReconnect(); spBadges();
+    if (pwaGate()) return;
     if (ME.cyberLocked) { uaHardClear(); cyHardLock(); cyberCheck(); return; }
     cyHardClear();
+    if (ME.courtLocked) { courtHardLock(); courtCheck(); return; }
+    if (COURT.frozen) courtHardClear();
     if (ME.deviceLocked) { dvHardLock(); return; }
     if (ME.unassigned) { uaHardLock(); return; }
     uaHardClear();
@@ -9735,6 +10400,8 @@ async function init() {
     cyberCheck();
     startPolling();
     spDeepLink();
+    flPushInit();
+    try { fetch('/api/pwa/ping?sa=' + (flStandalone() ? 1 : 0)); } catch (e) {}
 }
 function buildNav() {
     const links = document.getElementById('nav-links');
@@ -9762,6 +10429,7 @@ function buildNav() {
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
+    if (ME.courtStaff) items.push({ label: '⚖️ المحكمة العسكرية', fn: 'renderCourtPanel()' });
     if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
@@ -10214,6 +10882,7 @@ function renderDashboard() {
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
             </div>
         </div>
+        \${flAttCardHtml()}<div id="push-banner"></div>
         \${ME.maintenance ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ الموقع في وضع الصيانة حالياً</div>' : ''}
         \${ME.seniorTemp ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">🔑 هذا حساب كبير مسؤولين جديد خاص فيك. بريدك: <b dir="ltr">' + ME.accountEmail + '</b> — غيّر البريد وكلمة المرور من لوحة كبار المسؤولين ← الحسابات المقبولة ← تعديل، وبعدها يصير حسابك أنت. لو ما غيّرتها ودخلت مرة ثانية بالبيانات الافتراضية بينفتح لك حساب جديد غير هذا.</div>' : ''}
         \${cardBlock(ME, { id: 'home-card', hasProgress: true, nextRank: ME.nextRank, remaining: ME.pointsRemaining, remainId: 'home-remaining' })}
@@ -10227,9 +10896,11 @@ function renderDashboard() {
                 <h3>مخالفاتي المسجلة</h3>
                 <div class="row" style="gap:8px;">
                     <button class="btn sm" onclick="renderCard()">بطاقتي</button>
+                    \${flFreqBtnHtml()}
                     \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
                         ? '<button class="btn sm" onclick="renderNewReport()">+ تسجيل تقرير جديد</button>'
                         : '<button class="btn sm" onclick="renderNewViolation()">+ تسجيل مخالفة جديدة</button>') : ''}
+                    \${flAfterBtnsHtml()}
                 </div>
             </div>
             <div id="notes-box" style="margin:10px 0;"></div>
@@ -10239,6 +10910,7 @@ function renderDashboard() {
     \`;
     loadMine();
     renderNotes();
+    flPushBanner();
 }
 function renderNotes() {
     const box = document.getElementById('notes-box');
@@ -10267,6 +10939,7 @@ async function loadMine(silent) {
 }
 let vtypeSelected = [];
 async function renderNewViolation() {
+    if (!attOk()) return;
     const meta = await api('/api/violations/meta');
     META = meta; selectedVehicle = null; photoBase64 = null; vtypeSelected = [];
     document.getElementById('app').innerHTML = \`
@@ -10355,6 +11028,7 @@ async function submitViolation() {
     }
 }
 function renderNewReport() {
+    if (!attOk()) return;
     document.getElementById('app').innerHTML = \`
         <div class="card">
             <h2>تسجيل تقرير جديد</h2>
@@ -10543,6 +11217,8 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
+            <div class="tab" onclick="adminTab('push', this)">📣 الإشعارات</div>
+            <div class="tab" onclick="adminTab('freq', this)">📻 الترددات</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
@@ -10572,6 +11248,8 @@ function adminTab(name, el) {
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
     if (name === 'officers') renderOfficerAdmin();
+    if (name === 'push') flPushTab();
+    if (name === 'freq') flFreqAdmin();
 }
 async function loadReviewedViolations() {
     const box = document.getElementById('admin-content');
@@ -10828,6 +11506,8 @@ function renderSectorsBox() {
             <div id="hc-members-list" style="margin-top:10px;">جارِ التحميل...</div>
         </div>\`;
     loadHighCommandList();
+    flReceptionMount();
+    flHideCyberPO();
 }
 async function loadHighCommandList() {
     const box = document.getElementById('hc-members-list');
@@ -11591,6 +12271,7 @@ function renderMPLeaderMembersList(list) {
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📝 ملاحظة</button>
                     <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/mp/personnel/')">⚠️ تحذير</button>
+                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ تحقيق</button>
                     \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📣 استدعاء</button>\` : ''}
                     \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">✅ إنهاء الاستدعاء</button>\` : ''}
                 </div>
@@ -11854,6 +12535,7 @@ async function loadMPPOMembers() {
             <div class="row">
                 <div><b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span></div>
                 <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/po/personnel/','loadMPPOMembers()')">📝 ملاحظة</button>
+                <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ تحقيق</button>
             </div>
         </div>\`).join('');
 }
@@ -11933,6 +12615,7 @@ function renderMPMemberList(list) {
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📝 ملاحظة</button>
+                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ تحقيق</button>
                     \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📣 طلب استدعاء</button>\` : ''}
                 </div>
             </div>
@@ -11941,6 +12624,7 @@ function renderMPMemberList(list) {
 let mpReportNotes = [];
 let mpReportReturnFn = 'renderMPMemberPanel()';
 function openMPReportForm(returnFn) {
+    if (!attOk()) return;
     mpReportNotes = [];
     mpReportReturnFn = returnFn || 'renderMPMemberPanel()';
     document.getElementById('app').innerHTML = \`
@@ -13396,6 +14080,7 @@ function offAllowed(st, from, to) {
     var f = offFindP(st, from), t = offFindP(st, to);
     if (!f || !t) return false;
     if (st.training) return !f.muted;
+    if (st.freq || st.court) return !f.muted;
     if (st.cyber) {
         if (f.muted) return false;
         if (st.mode === 'mute') return (f.role === 'leader' || f.role === 'member') && (t.role === 'leader' || t.role === 'member');
@@ -13415,6 +14100,7 @@ function offAllowed(st, from, to) {
 }
 function offCanSpeak() {
     if (!VC) return false;
+    if (VC.state.freq || VC.state.court) { var me0 = offFindP(VC.state, VC.me); return !(me0 && me0.muted); }
     return VC.state.participants.concat(VC.state.ghosts || []).some(function (p) { return p.uid !== VC.me && offAllowed(VC.state, VC.me, p.uid); });
 }
 function offCanShare() {
@@ -13461,12 +14147,12 @@ async function offJoinVoice(n) {
         state: j.state, ice: j.iceServers, peers: {}, q: {}, earlyIce: {}, shareFlags: {}, speaking: {},
         sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0,
         ivQ: j.ivQuestions || [], chat: [], chatSeq: 0, chatBusy: false, ivTarget: null, profiles: {}, profBusy: {}, profOpen: false, ansOpen: false, ivHtml: '',
-        training: !!(j.state && j.state.training), cyber: !!(j.state && j.state.cyber), caseId: j.caseId || null, qSeen: '', repSeen: 0, repShown: {}, ivHidden: true, chatUnread: 0, popup: null
+        training: !!(j.state && j.state.training), cyber: !!(j.state && j.state.cyber), freq: !!(j.state && j.state.freq), court: !!(j.state && j.state.court), caseId: j.caseId || null, qSeen: '', repSeen: 0, repShown: {}, ivHidden: true, chatUnread: 0, popup: null
     };
     var ov = document.createElement('div');
     ov.id = 'off-voice';
-    if (VC.cyber) ov.className = 'cy';
-    ov.innerHTML = '<div class="ov-head"><b>' + (VC.cyber ? '🔍 تحقيق سيبراني — روم صوتي' : (VC.training ? '🏋️ روم التدريب' : '🎙️ مقابلة رقم ' + n)) + '</b><span style="font-size:12px;color:var(--muted);">' + offRoleLabel(myRole) + '</span></div>' +
+    if (VC.cyber || VC.court) ov.className = 'cy';
+    ov.innerHTML = '<div class="ov-head"><b>' + (VC.court ? '⚖️ المحكمة العسكرية' : VC.freq ? '📻 تردد القطاعات المشتركة' : VC.cyber ? '🔍 تحقيق سيبراني — روم صوتي' : (VC.training ? '🏋️ روم التدريب' : '🎙️ مقابلة رقم ' + n)) + '</b><span style="font-size:12px;color:var(--muted);">' + offRoleLabel(myRole) + '</span></div>' +
         '<div id="ov-modes" class="ov-modes"></div><div id="ov-note" class="ov-note"></div>' +
         '<div id="ov-iv"></div>' +
         '<div id="ov-stage" class="ov-stage"></div><div id="ov-grid" class="ov-grid"></div>' +
@@ -13487,6 +14173,7 @@ async function offJoinVoice(n) {
     offPaintChat();
     offRecCheck();
     VC.poll = setInterval(offVoicePoll, 5000);
+    if (VC.freq || VC.court) flMicStart();
 }
 
 function offMakePeer(uid, initiator) {
@@ -13780,6 +14467,7 @@ function offPaintAll() { offPaintModes(); offPaintNote(); offPaintIv(); offPaint
 function offPaintModes() {
     var box = document.getElementById('ov-modes');
     if (!box || !VC) return;
+    if (VC.state.freq || VC.state.court) { box.innerHTML = ''; return; }
     if (VC.state.cyber) {
         var cmp = offFindP(VC.state, VC.me);
         if (!(VC.isSenior || (cmp && cmp.role === 'leader'))) { box.innerHTML = ''; return; }
@@ -13796,6 +14484,8 @@ function offPaintModes() {
 function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
+    if (VC.state.freq) { var fme = offFindP(VC.state, VC.me); box.textContent = (fme && fme.muted) ? '🔇 تم إسكاتك — تسمع الباقي فقط.' : (VC.micOn ? '📻 المايك مفتوح — الكل يتكلم ويسمع. تقدر تكتم وتفتح المايك من إشعار الجوال وانت داخل اللعبة.' : '🔇 المايك مكتوم — اضغط زر المايك تحت لما تبي تتكلم.'); return; }
+    if (VC.state.court) { var kme = offFindP(VC.state, VC.me); box.textContent = (kme && kme.muted) ? '🔇 تم إسكاتك في المحكمة — تسمع الباقي فقط.' : '⚖️ المحكمة العسكرية — الجميع يتكلم ويسمع.'; return; }
     if (VC.state.cyber) {
         var cme = offFindP(VC.state, VC.me);
         var cstaff = cme && (cme.role === 'leader' || cme.role === 'member');
@@ -13840,6 +14530,11 @@ function offPaintGrid() {
                     h += '<button class="btn sm danger" data-u="' + p.uid + '" data-m="1" onclick="offTrainMute(this.dataset.u, this.dataset.m)">🔇 إسكات</button>';
                 }
             }
+        } else if (st.freq) {
+        } else if (st.court) {
+            var cr2 = offMyRole(), mgr = (cr2 === 'senior' || cr2 === 'mpl');
+            if (!isMe && mgr && p.role !== 'senior') h += '<button class="btn sm danger" data-u="' + p.uid + '" onclick="courtKick(this.dataset.u)">🚫 طرد</button>';
+            if (!isMe && cr2 !== 'target' && (mgr || p.role === 'target')) h += '<button class="btn sm' + (p.muted ? '' : ' danger') + '" data-u="' + p.uid + '" data-m="' + (p.muted ? '0' : '1') + '" onclick="courtMute(this.dataset.u, this.dataset.m)">' + (p.muted ? '🎙️ فك الإسكات' : '🔇 إسكات') + '</button>';
         } else if (st.cyber) {
             var cr = offMyRole();
             if (!isMe && cr === 'leader') h += '<button class="btn sm danger" data-u="' + p.uid + '" onclick="offCyKick(this.dataset.u)">🚫 طرد</button>';
@@ -13898,7 +14593,8 @@ function offPaintBar() {
     var micCls = 'ov-btn' + (!canSpeak ? ' dis' : (VC.micOn ? '' : ' off'));
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
     var qb = '';
-    if (VC.isSenior && !VC.state.training && !VC.state.cyber) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
+    if (VC.isSenior && !VC.state.training && !VC.state.cyber && !VC.state.freq && !VC.state.court) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
+    if (VC.state.court && (offMyRole() === 'senior' || offMyRole() === 'mpl')) qb = '<button class="ov-btn" onclick="courtEndFromRoom()">⏹️ إنهاء المحكمة</button>';
     if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 نشاطه</button><button class="ov-btn" onclick="offCyEnd()">⏹️ إنهاء</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
@@ -14098,7 +14794,7 @@ function offQRefresh() {
 }
 /* ---- روم التدريب ---- */
 function offMyRole() { var p = VC ? offFindP(VC.state, VC.me) : null; return p ? p.role : ''; }
-function offRoleLabel(r) { return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : (r === 'leader' ? '🛡️ قيادة السيبراني' : (r === 'member' ? '🛡️ عضو سيبراني' : (r === 'target' ? '⚠️ متحقق معه' : 'متقدم'))))); }
+function offRoleLabel(r) { if (r === 'mpl') return '🚔 قيادة الشرطة العسكرية'; if (r === 'mp') return '🚔 شرطة عسكرية'; if (r === 'member' && VC && VC.state && VC.state.freq) return '🎙️ عضو'; return r === 'senior' ? '🎖️ من الكبار' : (r === 'trainer' ? '🏋️ مدرب' : (r === 'trainee' ? 'متدرب' : (r === 'leader' ? '🛡️ قيادة السيبراني' : (r === 'member' ? '🛡️ عضو سيبراني' : (r === 'target' ? '⚠️ متحقق معه' : 'متقدم'))))); }
 function offCyKick(uid) {
     if (!VC || !VC.caseId) return;
     var cid = VC.caseId;
@@ -14225,6 +14921,7 @@ function offToggleMic() {
     if (!offCanSpeak()) { toast('أنت مستمع فقط، الكبار هم الي يتكلمون'); return; }
     VC.micOn = !VC.micOn;
     offApplyPerms(); offPaintBar();
+    flMicSync();
 }
 function offFullscreen(el) {
     try {
@@ -14263,6 +14960,7 @@ function offLeaveVoice(silent) {
     var v = VC;
     if (!v) return;
     VC = null;
+    flMicStop();
     if (v.poll) clearInterval(v.poll);
     v.timers.forEach(function (t) { clearInterval(t); });
     Object.keys(v.peers).forEach(function (uid) {
@@ -15062,6 +15760,793 @@ function offOnPoll() {
         if (document.getElementById('offa-content') && !VC) offaReload(true);
     } catch (e) {}
 }
+
+/* ============================================================================
+   ⚡ إضافات فلاش (واجهة): تثبيت التطبيق • الإشعارات • البصمة • التردد المشترك • المحكمة • الاستلام
+   ============================================================================ */
+var FLX = { push: { reg: null, key: null, sub: null, ready: false } };
+
+/* ---------------- أدوات الجهاز ---------------- */
+function flStandalone() { return (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true; }
+function flIsIOS() { var ua = navigator.userAgent; return /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); }
+function flIsAndroid() { return /Android/i.test(navigator.userAgent); }
+function flIsMobile() { return flIsIOS() || flIsAndroid(); }
+function flDevId() {
+    var id = null;
+    try { id = localStorage.getItem('fl_push_id'); } catch (e) {}
+    if (!id || !/^[a-zA-Z0-9-]{8,64}$/.test(id)) {
+        var a = new Uint8Array(16); crypto.getRandomValues(a);
+        id = Array.prototype.map.call(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+        try { localStorage.setItem('fl_push_id', id); } catch (e) {}
+    }
+    return id;
+}
+function flDevName() {
+    var ua = navigator.userAgent, t = 'جهاز';
+    if (/iPhone/.test(ua)) t = 'آيفون';
+    else if (/iPad/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) t = 'آيباد';
+    else if (/Android/.test(ua)) t = 'أندرويد';
+    else if (/Windows/.test(ua)) t = 'ويندوز';
+    else if (/Mac/.test(ua)) t = 'ماك';
+    else if (/Linux/.test(ua)) t = 'لينكس';
+    return t + ' #' + flDevId().slice(0, 4);
+}
+function flEvtQuery() { return '&did=' + flDevId() + '&dn=' + encodeURIComponent(flDevName()) + '&sa=' + (flStandalone() ? 1 : 0); }
+function flTime(d) { try { return new Date(d).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
+
+/* ---------------- الإشعارات (Web Push) ---------------- */
+function flPushSupported() { return ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window); }
+function flB64(s) {
+    var p = '='.repeat((4 - s.length % 4) % 4);
+    var b = atob((s + p).replace(/-/g, '+').replace(/_/g, '/'));
+    var a = new Uint8Array(b.length);
+    for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i);
+    return a;
+}
+function flPushSend(sub) {
+    return fetch('/api/push/subscribe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: flDevId(), name: flDevName(), standalone: flStandalone(), sub: sub.toJSON() })
+    }).catch(function () {});
+}
+async function flPushInit() {
+    if (!flPushSupported() || !ME || ME.blocked) return;
+    try {
+        var reg = await navigator.serviceWorker.ready;
+        var r = await fetch('/api/push/vapid', { cache: 'no-store' });
+        if (!r.ok) return;
+        var j = await r.json();
+        if (!j.key) return;
+        FLX.push.reg = reg; FLX.push.key = j.key;
+        var sub = await reg.pushManager.getSubscription();
+        var saved = null; try { saved = localStorage.getItem('fl_vapid'); } catch (e) {}
+        if (sub && saved && saved !== j.key) { await sub.unsubscribe(); sub = null; }
+        FLX.push.sub = sub; FLX.push.ready = true;
+        if (sub) await flPushSend(sub);
+        flPushBanner();
+    } catch (e) {}
+}
+async function flPushEnable() {
+    if (!FLX.push.ready) { toast('الإشعارات مو جاهزة، حدّث الصفحة وجرب'); return; }
+    try {
+        var perm = await Notification.requestPermission();
+        if (perm !== 'granted') { toast('ما انعطى إذن الإشعارات'); flPushBanner(); return; }
+        var sub = await FLX.push.reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: flB64(FLX.push.key) });
+        FLX.push.sub = sub;
+        try { localStorage.setItem('fl_vapid', FLX.push.key); } catch (e) {}
+        await flPushSend(sub);
+        toast('تم تفعيل الإشعارات ✓');
+        flPushBanner();
+    } catch (e) { toast('فشل التفعيل: ' + (e && e.message ? e.message : e)); }
+}
+function flPushBanner() {
+    var box = document.getElementById('push-banner');
+    if (!box) return;
+    if (!flPushSupported() || !FLX.push.ready || FLX.push.sub) { box.innerHTML = ''; return; }
+    if (Notification.permission === 'denied') {
+        box.innerHTML = '<div class="card" style="border-color:rgba(234,179,8,.45);color:#fbbf24;font-size:13px;">🔕 الإشعارات محظورة — فعّلها من إعدادات الجهاز للتطبيق ثم ارجع.</div>';
+        return;
+    }
+    box.innerHTML = '<div class="card" style="border-color:rgba(59,130,246,.5);"><div class="row"><div><b>🔔 فعّل الإشعارات</b><div style="color:var(--muted);font-size:12px;margin-top:3px;">عشان توصلك تنبيهات التكتات والاستلام حتى لو الموقع مقفل</div></div><button class="btn sm" onclick="flPushEnable()">تفعيل</button></div></div>';
+}
+
+/* ---------------- تثبيت الموقع كتطبيق ويب (نافذة إجبارية بالمتصفح) ---------------- */
+var PWA = { i: 0, frozen: false, mode: 'steps', timer: null, obs: null };
+var PWA_GOLD = '#eab308';
+function pwaSvg(inner) {
+    return '<svg viewBox="0 0 260 190" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:300px;height:auto;display:block;margin:0 auto;" font-family="Tajawal,Tahoma,sans-serif">' +
+        '<defs><linearGradient id="pwg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs>' +
+        '<rect x="50" y="4" width="160" height="182" rx="18" fill="#0a1628" stroke="#3b82f6" stroke-width="2"/>' + inner + '</svg>';
+}
+function pwaTxt(x, y, s, size, fill, anchor) {
+    return '<text x="' + x + '" y="' + y + '" font-size="' + (size || 9) + '" fill="' + (fill || '#e2e8f0') + '" text-anchor="' + (anchor || 'middle') + '" direction="rtl">' + s + '</text>';
+}
+function pwaRing(cx, cy, r) { return '<circle class="pwa-ring" cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="' + PWA_GOLD + '" stroke-width="3"/>'; }
+function pwaRRing(x, y, w, h, r) { return '<rect class="pwa-ring" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="' + (r || 6) + '" fill="none" stroke="' + PWA_GOLD + '" stroke-width="3"/>'; }
+function pwaBolt(x, y, s) { return '<g transform="translate(' + x + ',' + y + ') scale(' + s + ')"><path d="M58 8 L26 55 L46 55 L40 92 L74 42 L54 42 L64 8 Z" fill="url(#pwg)"/></g>'; }
+function pwaPageBody() {
+    return pwaBolt(122, 22, 0.16) + pwaTxt(130, 52, 'فلاش', 11, '#e2e8f0') +
+        '<rect x="68" y="64" width="124" height="8" rx="4" fill="#12305e"/><rect x="68" y="80" width="100" height="8" rx="4" fill="#12305e"/><rect x="68" y="96" width="116" height="8" rx="4" fill="#12305e"/><rect x="68" y="112" width="84" height="8" rx="4" fill="#12305e"/>';
+}
+function pwaHome(highlight) {
+    var g = '', xs = [68, 104, 140, 176], ys = [30, 62, 94, 126];
+    ys.forEach(function (y, r) { xs.forEach(function (x, c) { if (r === 2 && c === 1) return; g += '<rect x="' + x + '" y="' + y + '" width="26" height="26" rx="7" fill="#12305e"/>'; }); });
+    g += '<rect x="104" y="94" width="26" height="26" rx="7" fill="#0d1f3c" stroke="#3b82f6"/>' + pwaBolt(106, 94, 0.26) + pwaTxt(117, 132, 'فلاش', 8, '#e2e8f0');
+    return g + (highlight ? pwaRing(117, 107, 21) : '');
+}
+var PWA_STEPS = {
+    ios: [
+        { t: 'اضغط زر المشاركة', d: 'افتح الموقع من سفاري، واضغط زر المشاركة اللي تحت بالنص (المربع اللي فيه سهم لفوق).',
+          img: function () {
+              return pwaSvg(pwaPageBody() + '<rect x="50" y="148" width="160" height="38" fill="#0d1f3c"/>' +
+                  '<path d="M76 168 l-6 -6 l6 -6 M98 156 l6 6 l-6 6" stroke="#94a3b8" stroke-width="2" fill="none" stroke-linecap="round"/>' +
+                  '<path d="M123 164 v11 h14 v-11 M130 170 v-17 M125 158 l5 -5 l5 5" stroke="#e2e8f0" stroke-width="2" fill="none" stroke-linecap="round"/>' +
+                  '<rect x="158" y="156" width="12" height="14" rx="2" stroke="#94a3b8" stroke-width="2" fill="none"/><rect x="184" y="157" width="12" height="12" rx="2" stroke="#94a3b8" stroke-width="2" fill="none"/>' +
+                  pwaRing(130, 164, 15) + pwaTxt(130, 142, 'اضغط هنا ↓', 9, PWA_GOLD));
+          } },
+        { t: 'اختر «إضافة إلى الشاشة الرئيسية»', d: 'مرّر القائمة لتحت لين تلقى «إضافة إلى الشاشة الرئيسية» واضغط عليها.',
+          img: function () {
+              var rows = [['نسخ', 70], ['إضافة إلى المفضلة', 94], ['إضافة إلى الشاشة الرئيسية', 118], ['بحث في الصفحة', 142]], h = '';
+              h += '<rect x="56" y="48" width="148" height="132" rx="14" fill="#12305e"/><rect x="118" y="53" width="24" height="3" rx="2" fill="#475569"/>';
+              rows.forEach(function (r, i) { h += '<rect x="64" y="' + (r[1] - 4) + '" width="132" height="20" rx="6" fill="' + (i === 2 ? '#1d4ed8' : '#0d1f3c') + '"/>' + pwaTxt(178, r[1] + 10, r[0], 8, '#e2e8f0', 'end'); });
+              h += '<rect x="70" y="118" width="12" height="12" rx="3" stroke="#e2e8f0" stroke-width="1.6" fill="none"/><path d="M76 121 v6 M73 124 h6" stroke="#e2e8f0" stroke-width="1.6"/>';
+              return pwaSvg(pwaPageBody() + h + pwaRRing(62, 112, 136, 24, 8));
+          } },
+        { t: 'خلّ «فتح كتطبيق ويب» شغّال ثم «إضافة»', d: 'تأكد إن خيار «فتح كتطبيق ويب» مفعّل (أخضر)، بعدها اضغط «إضافة» فوق.',
+          img: function () {
+              var h = '<rect x="56" y="12" width="148" height="168" rx="14" fill="#12305e"/>' +
+                  pwaTxt(72, 30, 'إلغاء', 9, '#94a3b8', 'start') + pwaTxt(190, 30, 'إضافة', 10, '#60a5fa', 'end') +
+                  '<rect x="68" y="46" width="30" height="30" rx="8" fill="#0d1f3c" stroke="#3b82f6"/>' + pwaBolt(70, 46, 0.3) +
+                  '<rect x="106" y="50" width="86" height="22" rx="6" fill="#0d1f3c"/>' + pwaTxt(186, 65, 'فلاش', 9, '#e2e8f0', 'end') +
+                  '<rect x="64" y="92" width="132" height="26" rx="8" fill="#0d1f3c"/>' + pwaTxt(186, 109, 'فتح كتطبيق ويب', 8, '#e2e8f0', 'end') +
+                  '<rect x="72" y="98" width="30" height="14" rx="7" fill="#22c55e"/><circle cx="95" cy="105" r="5.5" fill="#fff"/>';
+              return pwaSvg(h + pwaRRing(66, 90, 128, 30, 9) + pwaRRing(150, 16, 50, 20, 8));
+          } },
+        { t: 'افتح فلاش من الأيقونة', d: 'روح للشاشة الرئيسية وافتح «فلاش» من الأيقونة الجديدة (مو من سفاري)، وسجّل دخولك من التطبيق.',
+          img: function () { return pwaSvg(pwaHome(true)); } }
+    ],
+    android: [
+        { t: 'اضغط النقاط الثلاث ⋮', d: 'افتح الموقع من كروم، واضغط النقاط الثلاث (⋮) اللي فوق على اليمين.',
+          img: function () {
+              return pwaSvg(pwaPageBody() + '<rect x="50" y="4" width="160" height="30" rx="18" fill="#0d1f3c"/><rect x="60" y="12" width="110" height="14" rx="7" fill="#12305e"/>' +
+                  pwaTxt(115, 22, 'flash', 8, '#94a3b8') + '<circle cx="192" cy="14" r="1.8" fill="#e2e8f0"/><circle cx="192" cy="19" r="1.8" fill="#e2e8f0"/><circle cx="192" cy="24" r="1.8" fill="#e2e8f0"/>' +
+                  pwaRing(192, 19, 12) + pwaTxt(150, 52, 'اضغط هنا ↗', 9, PWA_GOLD));
+          } },
+        { t: 'اختر «تثبيت التطبيق»', d: 'من القائمة اختر «تثبيت التطبيق» أو «إضافة إلى الشاشة الرئيسية».',
+          img: function () {
+              var rows = [['علامة تبويب جديدة', 44], ['السجل', 68], ['تثبيت التطبيق', 92], ['الإعدادات', 116]], h = '';
+              h += '<rect x="86" y="30" width="116" height="110" rx="10" fill="#12305e"/>';
+              rows.forEach(function (r, i) { if (i === 2) h += '<rect x="90" y="' + (r[1] - 6) + '" width="108" height="22" rx="6" fill="#1d4ed8"/>'; h += pwaTxt(190, r[1] + 8, r[0], 8.5, '#e2e8f0', 'end'); });
+              return pwaSvg(pwaPageBody() + h + pwaRRing(88, 84, 112, 26, 8));
+          } },
+        { t: 'اضغط «تثبيت»', d: 'بيطلع لك مربع تأكيد، اضغط «تثبيت».',
+          img: function () {
+              var h = '<rect x="64" y="56" width="132" height="84" rx="12" fill="#12305e"/>' +
+                  '<rect x="72" y="64" width="24" height="24" rx="7" fill="#0d1f3c" stroke="#3b82f6"/>' + pwaBolt(73, 64, 0.24) +
+                  pwaTxt(188, 80, 'تثبيت التطبيق؟', 9, '#e2e8f0', 'end') + pwaTxt(188, 94, 'فلاش', 8, '#94a3b8', 'end') +
+                  pwaTxt(92, 128, 'إلغاء', 9, '#94a3b8', 'middle') + '<rect x="130" y="112" width="58" height="22" rx="11" fill="#1d4ed8"/>' + pwaTxt(159, 127, 'تثبيت', 9.5, '#fff', 'middle');
+              return pwaSvg(pwaPageBody() + h + pwaRRing(128, 110, 62, 26, 13));
+          } },
+        { t: 'افتح فلاش من الأيقونة', d: 'روح للشاشة الرئيسية وافتح «فلاش» من الأيقونة الجديدة (مو من كروم)، وسجّل دخولك من التطبيق.',
+          img: function () { return pwaSvg(pwaHome(true)); } }
+    ]
+};
+function pwaNeeded() {
+    return !!(ME && !ME.blocked && !ME.isSeniorAdmin && !ME.isOwner && flIsMobile() && !flStandalone());
+}
+function pwaGate() {
+    if (!pwaNeeded()) { pwaClear(); return false; }
+    pwaFreeze();
+    if (ME.pwaInstalled) PWA.mode = 'open';
+    pwaRender();
+    if (!PWA.timer) {
+        PWA.timer = setInterval(async function () {
+            try {
+                var m = await api('/api/me', { noLock: true });
+                if (m && m.pwaInstalled && PWA.mode !== 'open') { ME.pwaInstalled = true; PWA.mode = 'open'; pwaRender(); }
+            } catch (e) {}
+        }, 5000);
+    }
+    return true;
+}
+function pwaFreeze() {
+    if (PWA.frozen) return;
+    PWA.frozen = true;
+    try { if (typeof pollTimer !== 'undefined' && pollTimer) clearInterval(pollTimer); } catch (e) {}
+    try { if (typeof blockedPollTimer !== 'undefined' && blockedPollTimer) clearInterval(blockedPollTimer); } catch (e) {}
+    var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+    document.body.classList.add('pwa-frozen');
+    document.documentElement.classList.add('pwa-lock');
+    try {
+        PWA.obs = new MutationObserver(function () { if (PWA.frozen && !document.getElementById('pwa-gate')) pwaRender(); });
+        PWA.obs.observe(document.body, { childList: true });
+    } catch (e) {}
+}
+function pwaClear() {
+    if (!PWA.frozen) return;
+    PWA.frozen = false;
+    if (PWA.obs) { try { PWA.obs.disconnect(); } catch (e) {} PWA.obs = null; }
+    if (PWA.timer) { clearInterval(PWA.timer); PWA.timer = null; }
+    var g = document.getElementById('pwa-gate'); if (g) g.remove();
+    document.body.classList.remove('pwa-frozen');
+    document.documentElement.classList.remove('pwa-lock');
+}
+function pwaRender() {
+    var g = document.getElementById('pwa-gate');
+    if (!g) { g = document.createElement('div'); g.id = 'pwa-gate'; document.body.appendChild(g); }
+    var kind = flIsIOS() ? 'ios' : 'android', steps = PWA_STEPS[kind], h;
+    if (PWA.mode === 'open') {
+        h = '<div class="pwa-box"><div style="font-size:54px">✅</div><h2>ادخل من التطبيق</h2>' +
+            '<p class="pwa-p">فلاش مثبّت عندك كتطبيق، والمتصفح مقفل عليك.<br>افتح <b>فلاش</b> من الأيقونة اللي على شاشتك الرئيسية وسجّل دخولك منه.</p>' +
+            '<div class="pwa-img">' + pwaSvg(pwaHome(true)) + '</div></div>';
+    } else if (PWA.mode === 'done') {
+        h = '<div class="pwa-box"><div style="font-size:54px">🎉</div><h2>تمام! الحين افتح التطبيق</h2>' +
+            '<p class="pwa-p">روح للشاشة الرئيسية وافتح <b>فلاش</b> من الأيقونة الجديدة، وسجّل دخولك منه.<br>وقفل المتصفح لأنك ما تحتاجه بعد الحين.</p>' +
+            '<div class="pwa-img">' + pwaSvg(pwaHome(true)) + '</div>' +
+            '<div class="pwa-btns"><button class="btn gray" onclick="pwaBack()">رجوع</button></div></div>';
+    } else {
+        var i = Math.max(0, Math.min(PWA.i, steps.length - 1)), s = steps[i];
+        h = '<div class="pwa-box"><div class="pwa-top">⚡ لازم تثبّت فلاش كتطبيق ويب عشان تستخدم الموقع</div>' +
+            '<div class="pwa-no">الخطوة ' + (i + 1) + ' من ' + steps.length + '</div>' +
+            '<h2>' + s.t + '</h2><div class="pwa-img">' + s.img() + '</div><p class="pwa-p">' + s.d + '</p>' +
+            '<div class="pwa-btns">' + (i > 0 ? '<button class="btn gray" onclick="pwaBack()">رجوع</button>' : '') +
+            '<button class="btn" onclick="pwaNext()">سويتها ✓</button></div>' +
+            '<div class="pwa-dots">' + steps.map(function (x, k) { return '<i class="' + (k === i ? 'on' : '') + '"></i>'; }).join('') + '</div></div>';
+    }
+    g.innerHTML = h;
+    g.scrollTop = 0;
+}
+function pwaNext() {
+    var steps = PWA_STEPS[flIsIOS() ? 'ios' : 'android'];
+    if (PWA.i < steps.length - 1) { PWA.i++; pwaRender(); }
+    else { PWA.mode = 'done'; pwaRender(); }
+}
+function pwaBack() {
+    if (PWA.mode === 'done') { PWA.mode = 'steps'; PWA.i = PWA_STEPS[flIsIOS() ? 'ios' : 'android'].length - 1; pwaRender(); return; }
+    if (PWA.i > 0) { PWA.i--; pwaRender(); }
+}
+
+/* ---------------- البصمة (حضور / انصراف) ---------------- */
+var FP_HOLD_SECONDS = ${CONFIG.FP_HOLD_SECONDS};
+var fpHoldTimer = null, fpScanning = false;
+function attOk() {
+    if (!ME) return false;
+    if (!ME.attRequired) return true;
+    if (ME.att && ME.att.status === 'in') return true;
+    toast('🖐️ لازم تسجّل دخولك بالبصمة أول');
+    return false;
+}
+function renderFingerprint(mode) {
+    document.getElementById('app').innerHTML =
+        '<div class="fp-wrap">' +
+        '<h2>' + (mode === 'checkin' ? '🖐️ سجّل حضورك' : '🖐️ سجّل انصرافك') + '</h2>' +
+        '<p style="color:var(--muted);font-size:13px;margin-top:6px;">اضغط مع الاستمرار على البصمة ' + FP_HOLD_SECONDS + ' ثوانٍ لتسجيل ' + (mode === 'checkin' ? 'الحضور' : 'الانصراف') + '</p>' +
+        '<div class="fp-circle" id="fp-circle" oncontextmenu="return false" onmousedown="fpHoldStart_()" onmouseup="fpHoldEnd_()" onmouseleave="fpHoldEnd_()" ontouchstart="fpHoldStart_(event)" ontouchend="fpHoldEnd_()" ontouchcancel="fpHoldEnd_()">' +
+        '<div class="fp-fill" id="fp-fill"></div>' +
+        '<div class="fp-icon"><svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round">' +
+        '<path d="M50 30 C35 30 25 42 25 55 C25 65 28 72 33 80" /><path d="M50 22 C68 22 82 38 82 56 C82 63 81 70 78 76" />' +
+        '<path d="M50 38 C41 38 34 46 34 55 C34 68 40 76 46 83" /><path d="M50 46 C45 46 42 50 42 55 C42 63 45 69 50 74" />' +
+        '<path d="M58 46 C63 49 66 53 67 60 C68 68 66 75 61 82" /><path d="M50 22 C32 22 18 37 18 55 C18 60 18.5 65 20 70" /></svg></div>' +
+        '</div>' +
+        '<div class="fp-status" id="fp-status"></div>' +
+        '<button class="btn gray sm" onclick="renderDashboard()" style="margin-top:10px;">رجوع</button>' +
+        '</div>';
+    window.__fpMode = mode;
+}
+function fpHoldStart_(ev) {
+    if (fpScanning) return;
+    if (ev) ev.preventDefault();
+    var circle = document.getElementById('fp-circle'), fill = document.getElementById('fp-fill');
+    if (!circle || !fill) return;
+    circle.classList.add('scanning');
+    fill.style.transitionDuration = (FP_HOLD_SECONDS * 1000) + 'ms';
+    requestAnimationFrame(function () { fill.style.height = '100%'; });
+    fpHoldTimer = setTimeout(function () { doFingerprintScan(); }, FP_HOLD_SECONDS * 1000);
+}
+function fpHoldEnd_() {
+    if (fpScanning) return;
+    clearTimeout(fpHoldTimer);
+    var circle = document.getElementById('fp-circle'), fill = document.getElementById('fp-fill');
+    if (circle) circle.classList.remove('scanning');
+    if (fill) { fill.style.transitionDuration = '150ms'; fill.style.height = '0%'; }
+}
+async function doFingerprintScan() {
+    fpScanning = true;
+    var statusEl = document.getElementById('fp-status');
+    if (statusEl) { statusEl.textContent = 'جارِ التحقق...'; statusEl.className = 'fp-status'; }
+    try {
+        if (window.__fpMode === 'checkout' && typeof VC !== 'undefined' && VC && VC.freq) offLeaveVoice(false);
+        var data = await api('/api/attendance/scan', { method: 'POST', body: '{}' });
+        if (!data.success) {
+            if (statusEl) { statusEl.textContent = '❌ فشلت البصمة، حاول مرة ثانية'; statusEl.className = 'fp-status fail'; }
+        } else {
+            ME.att = { status: data.status, at: data.at };
+            if (statusEl) { statusEl.textContent = data.status === 'in' ? '✅ تم تسجيل الحضور' : '✅ تم تسجيل الانصراف'; statusEl.className = 'fp-status ok'; }
+            setTimeout(function () { if (document.getElementById('fp-circle')) renderDashboard(); }, 900);
+        }
+    } catch (e) {
+        if (statusEl) { statusEl.textContent = 'تعذر الاتصال — ' + e.message; statusEl.className = 'fp-status fail'; }
+    }
+    var circle = document.getElementById('fp-circle'), fill = document.getElementById('fp-fill');
+    if (circle) circle.classList.remove('scanning');
+    if (fill) { fill.style.transitionDuration = '150ms'; fill.style.height = '0%'; }
+    fpScanning = false;
+}
+function flAttCardHtml() {
+    if (!ME) return '';
+    if (ME.att && ME.att.status === 'in') {
+        return '<div class="card att-card in"><b>✅ مسجّل حضورك</b>' + (ME.att.at ? ' <span style="font-size:12px;color:var(--muted);">منذ ' + flTime(ME.att.at) + '</span>' : '') + '</div>';
+    }
+    return '<div class="card att-card"><div class="row"><div><b>🖐️ ما سجّلت دخولك بعد</b>' +
+        '<div style="color:var(--muted);font-size:12px;margin-top:3px;">سجّل بصمة الحضور عشان تقدر تسجّل مخالفة وتدخل التردد</div></div>' +
+        '<button class="btn" onclick="renderFingerprint(\\'checkin\\')">🖐️ تسجيل دخول</button></div></div>';
+}
+function flFreqBtnHtml() { return '<button class="btn sm" onclick="flFreqOpen()">📻 تردد القطاعات المشتركة</button>'; }
+function flAfterBtnsHtml() {
+    var h = '';
+    if (ME && ME.att && ME.att.status === 'in') {
+        h += '<button class="btn sm btn-checkout" onclick="renderFingerprint(\\'checkout\\')">🚪 تسجيل انصراف</button>';
+        if (ME.isReceptionOfficer) h += '<button class="btn sm" onclick="flReceptionOpen()">🎤 فتح استلام</button>';
+    }
+    return h;
+}
+async function flReceptionOpen() {
+    if (!(await confirmModal('تبي تفتح الاستلام وترسل إشعار للجميع؟'))) return;
+    try {
+        var r = await api('/api/reception/open', { method: 'POST', body: '{}' });
+        toast('📣 انفتح الاستلام — وصل لـ ' + r.sent + ' جهاز' + (r.discord ? ' + ديسكورد' : ''));
+    } catch (e) { toast(e.message); }
+}
+
+/* ---------------- تردد القطاعات المشتركة ---------------- */
+async function flFreqOpen() {
+    if (!attOk()) return;
+    if (typeof VC !== 'undefined' && VC) { toast('أنت داخل روم حالياً'); return; }
+    var d;
+    try { d = await api('/api/freq/list'); } catch (e) { toast(e.message); return; }
+    if (d.list.length === 1) { offJoinVoice(d.list[0].n); return; }
+    cyOverlay('<div style="text-align:center;"><div style="font-size:38px;">📻</div><h3 style="margin:6px 0 12px;">اختر التردد</h3>' +
+        d.list.map(function (f) {
+            return '<button class="btn" style="display:block;width:100%;margin-bottom:8px;" onclick="flFreqJoin(' + f.n + ')">' + spEsc(f.name) + ' <span style="opacity:.75;font-size:12px;">(' + f.count + ' متصل)</span></button>';
+        }).join('') + '<button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div>');
+}
+function flFreqJoin(n) { cyOverlayClose(); offJoinVoice(n); }
+
+/* التحكم بالمايك وأنت داخل اللعبة: Media Session + إشعار ثابت بزر + إبقاء الشاشة شغالة */
+var FLMIC = { active: false, wake: null, audio: null };
+function flSilentWavUrl() {
+    var n = 8000, buf = new ArrayBuffer(44 + n), v = new DataView(buf), i;
+    function w(o, s) { for (var k = 0; k < s.length; k++) v.setUint8(o + k, s.charCodeAt(k)); }
+    w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true); w(36, 'data'); v.setUint32(40, n, true);
+    for (i = 0; i < n; i++) v.setUint8(44 + i, 128);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+async function flWake() { try { if ('wakeLock' in navigator && FLMIC.active) FLMIC.wake = await navigator.wakeLock.request('screen'); } catch (e) {} }
+function flMicSet(on) { if (VC && (VC.freq || VC.court) && VC.micOn !== on) offToggleMic(); }
+function flMicStart() {
+    if (FLMIC.active) return;
+    FLMIC.active = true;
+    try {
+        if ('mediaSession' in navigator) {
+            var ms = navigator.mediaSession;
+            ms.metadata = new MediaMetadata({ title: (VC && VC.court) ? 'المحكمة العسكرية' : 'تردد القطاعات المشتركة', artist: 'فلاش', album: 'الراديو', artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }] });
+            ms.playbackState = 'playing';
+            try { ms.setActionHandler('togglemicrophone', function () { if (VC && (VC.freq || VC.court)) offToggleMic(); }); } catch (e) {}
+            try { ms.setActionHandler('pause', function () { flMicSet(false); }); } catch (e) {}
+            try { ms.setActionHandler('play', function () { flMicSet(true); }); } catch (e) {}
+        }
+    } catch (e) {}
+    try {
+        if (!FLMIC.audio) { FLMIC.audio = new Audio(flSilentWavUrl()); FLMIC.audio.loop = true; FLMIC.audio.volume = 0.01; }
+        var p = FLMIC.audio.play(); if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+    flWake();
+    try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission().then(flMicNotify); } catch (e) {}
+    flMicNotify();
+}
+function flMicSync() {
+    try { if (navigator.mediaSession && navigator.mediaSession.setMicrophoneActive) navigator.mediaSession.setMicrophoneActive(!!(VC && VC.micOn)); } catch (e) {}
+    flMicNotify();
+}
+function flMicNotify() {
+    if (!FLMIC.active || !VC || !('serviceWorker' in navigator) || !window.Notification || Notification.permission !== 'granted') return;
+    var on = !!VC.micOn;
+    navigator.serviceWorker.ready.then(function (reg) {
+        return reg.showNotification('📻 ' + (VC && VC.court ? 'المحكمة العسكرية' : 'تردد القطاعات المشتركة'), {
+            body: on ? '🎙️ المايك مفتوح' : '🔇 المايك مكتوم', tag: 'fl-mic', renotify: false, silent: true, requireInteraction: true,
+            icon: '/icon-192.png', badge: '/icon-192.png', lang: 'ar', dir: 'rtl',
+            actions: [{ action: 'mic', title: on ? '🔇 كتم المايك' : '🎙️ فتح المايك' }], data: { url: '/' }
+        });
+    }).catch(function () {});
+}
+function flMicStop() {
+    if (!FLMIC.active) return;
+    FLMIC.active = false;
+    try { if (FLMIC.wake) { FLMIC.wake.release(); FLMIC.wake = null; } } catch (e) {}
+    try { if (FLMIC.audio) FLMIC.audio.pause(); } catch (e) {}
+    try { if ('mediaSession' in navigator) { navigator.mediaSession.playbackState = 'none'; navigator.mediaSession.metadata = null; } } catch (e) {}
+    try { navigator.serviceWorker.ready.then(function (reg) { return reg.getNotifications({ tag: 'fl-mic' }); }).then(function (l) { (l || []).forEach(function (n) { n.close(); }); }).catch(function () {}); } catch (e) {}
+}
+document.addEventListener('visibilitychange', function () { if (!document.hidden && FLMIC.active) flWake(); });
+if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', function (e) {
+        if (e.data && e.data.t === 'mic-toggle' && typeof VC !== 'undefined' && VC && (VC.freq || VC.court)) offToggleMic();
+    });
+}
+
+/* ---------------- المحكمة العسكرية ---------------- */
+var COURT = { frozen: false, timer: null, lock: null, busy: false, panelTimer: null };
+function courtHardLock() {
+    if (!COURT.frozen) {
+        COURT.frozen = true;
+        try { if (typeof pollTimer !== 'undefined' && pollTimer) clearInterval(pollTimer); } catch (e) {}
+        try { if (typeof blockedPollTimer !== 'undefined' && blockedPollTimer) clearInterval(blockedPollTimer); } catch (e) {}
+        var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+        document.body.classList.add('court-frozen');
+        if (COURT.timer) clearInterval(COURT.timer);
+        COURT.timer = setInterval(courtCheck, 4000);
+    }
+    var h = document.getElementById('court-hardlock');
+    if (!h) { h = document.createElement('div'); h.id = 'court-hardlock'; document.body.appendChild(h); }
+    if (!h.getAttribute('data-ready')) {
+        h.setAttribute('data-ready', '1');
+        var c = COURT.lock || (ME && ME.courtCase) || {};
+        h.innerHTML = '<div class="cy-hl-box"><div style="font-size:52px">⚖️</div><h2>المحكمة العسكرية</h2>' +
+            '<div>أنت مطلوب للمحكمة العسكرية، وتم إيقاف حسابك مؤقتاً.' + (c.reason ? '<br>السبب: ' + cyEsc(c.reason) : '') + '<br>هذي النافذة تبقى لين تنتهي المحكمة.</div>' +
+            '<button class="btn" onclick="courtEnter()">🚪 دخول المحكمة</button><div id="court-hl-hint"></div></div>';
+    }
+}
+function courtHardClear() {
+    COURT.frozen = false; COURT.lock = null;
+    if (COURT.timer) { clearInterval(COURT.timer); COURT.timer = null; }
+    var h = document.getElementById('court-hardlock'); if (h) h.remove();
+    document.body.classList.remove('court-frozen');
+}
+async function courtCheck() {
+    if (COURT.busy || !ME || ME.blocked) return;
+    COURT.busy = true;
+    try {
+        var st = await api('/api/court/state', { noLock: true });
+        COURT.lock = st.lock;
+        if (st.lock) { ME.courtLocked = true; ME.courtCase = st.lock; courtHardLock(); }
+        else if (COURT.frozen) { ME.courtLocked = false; ME.courtCase = null; courtHardClear(); COURT.busy = false; init(); return; }
+    } catch (e) {}
+    COURT.busy = false;
+}
+async function courtEnter() {
+    var c = COURT.lock || (ME && ME.courtCase);
+    if (!c || !c.n) return;
+    if (typeof VC !== 'undefined' && VC) return;
+    await offJoinVoice(c.n);
+    if (typeof OFF_MICFAIL !== 'undefined' && OFF_MICFAIL) {
+        var hint = document.getElementById('court-hl-hint');
+        if (hint) hint.innerHTML = '<div style="margin-top:10px;color:#fbbf24;font-size:13px;font-weight:bold;">المايك محظور، فعّله بهالخطوات ثم اضغط دخول المحكمة:</div>' + cyMicSteps();
+    }
+}
+function courtNameOf(uid) {
+    var lists = [];
+    try { if (typeof mpLeaderListCache !== 'undefined') lists.push(mpLeaderListCache); } catch (e) {}
+    try { if (typeof mpMemberListCache !== 'undefined') lists.push(mpMemberListCache); } catch (e) {}
+    for (var k = 0; k < lists.length; k++) {
+        var f = (lists[k] || []).filter(function (p) { return p.discord === uid; })[0];
+        if (f) return f.registeredName || f.discordTag || 'العضو';
+    }
+    return 'العضو';
+}
+function courtStartBtn(uid) { return courtStart(uid, courtNameOf(uid)); }
+async function courtStart(uid, name) {
+    var r = await promptModal('⚖️ فتح تحقيق بالمحكمة العسكرية مع ' + name + '\\nاكتب السبب (اختياري):', '');
+    if (r === null) return;
+    try {
+        await api('/api/court/start', { method: 'POST', body: JSON.stringify({ targetUid: uid, reason: r }) });
+        toast('⚖️ انفتح التحقيق — العضو انقفل عليه وبيدخل المحكمة');
+        if (document.getElementById('court-body')) courtPanelLoad(true);
+    } catch (e) { toast(e.message); }
+}
+function courtJoin(n) {
+    if (typeof VC !== 'undefined' && VC) { toast('أنت داخل روم حالياً'); return; }
+    offJoinVoice(n);
+}
+async function courtEnd(id) {
+    if (!(await confirmModal('تنهي هذي المحكمة وتفك التقييد عن العضو؟'))) return;
+    try { await api('/api/court/' + id + '/end', { method: 'POST', body: '{}' }); toast('تم إنهاء المحكمة'); courtPanelLoad(true); }
+    catch (e) { toast(e.message); }
+}
+function courtEndFromRoom() {
+    if (!VC || !VC.caseId) return;
+    var id = VC.caseId;
+    confirmModal('تنهي المحكمة وتفك التقييد عن العضو؟').then(function (ok) {
+        if (!ok) return;
+        api('/api/court/' + id + '/end', { method: 'POST', body: '{}' }).catch(function (e) { toast(e.message); });
+    });
+}
+function courtKick(uid) {
+    if (!VC || !VC.caseId) return;
+    var id = VC.caseId;
+    confirmModal('تطرده من المحكمة؟').then(function (ok) {
+        if (!ok) return;
+        api('/api/court/' + id + '/kick', { method: 'POST', body: JSON.stringify({ uid: uid }) }).catch(function (e) { toast(e.message); });
+    });
+}
+function courtMute(uid, m) {
+    if (!VC || !VC.caseId) return;
+    api('/api/court/' + VC.caseId + '/mute', { method: 'POST', body: JSON.stringify({ uid: uid, on: String(m) === '1' }) }).catch(function (e) { toast(e.message); });
+}
+function courtPanelClose() {
+    if (COURT.panelTimer) { clearInterval(COURT.panelTimer); COURT.panelTimer = null; }
+    renderDashboard();
+}
+function renderCourtPanel() {
+    if (!ME || !ME.courtStaff) return renderDashboard();
+    document.getElementById('app').innerHTML =
+        '<div class="card row"><h2>⚖️ المحكمة العسكرية</h2><button class="btn gray sm" onclick="courtPanelClose()">رجوع للوحتي</button></div>' +
+        '<div id="court-body"><div class="card">جارِ التحميل...</div></div>';
+    courtPanelLoad(false);
+    if (COURT.panelTimer) clearInterval(COURT.panelTimer);
+    COURT.panelTimer = setInterval(function () {
+        if (document.getElementById('court-body')) courtPanelLoad(true);
+        else { clearInterval(COURT.panelTimer); COURT.panelTimer = null; }
+    }, 8000);
+}
+function courtCaseHtml(c, st, active) {
+    var canEnd = active && (st.leader || c.by === ME.discordId);
+    return '<div class="card"><div class="row"><div><b>' + spEsc(c.targetName || '') + '</b>' +
+        '<div style="color:var(--muted);font-size:12px;margin-top:3px;">' + (c.reason ? 'السبب: ' + spEsc(c.reason) + ' • ' : '') + 'فتحه: ' + spEsc(c.byName || '-') + ' • ' + flTime(c.startedAt) +
+        (!active && c.endedByName ? ' • أنهاه: ' + spEsc(c.endedByName) : '') + '</div></div>' +
+        (active ? '<div class="row" style="gap:6px;"><button class="btn sm" onclick="courtJoin(' + c.n + ')">🎙️ دخول المحكمة</button>' +
+            (canEnd ? '<button class="btn sm danger" onclick="courtEnd(\\'' + c.id + '\\')">⏹️ إنهاء</button>' : '') + '</div>' : '<span class="badge approved">منتهية</span>') +
+        '</div></div>';
+}
+async function courtPanelLoad(silent) {
+    var box = document.getElementById('court-body');
+    if (!box) return;
+    var st;
+    try { st = await api('/api/court/state', { noLock: true }); }
+    catch (e) { if (!silent) box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + e.message + ')</div>'; return; }
+    if (!document.getElementById('court-body')) return;
+    var typing = document.activeElement && document.activeElement.id === 'court-q';
+    var h = '';
+    if (ME.isSeniorAdmin) {
+        h += '<div class="card"><h3>➕ إدخال عضو للمحكمة</h3><div style="color:var(--muted);font-size:12px;margin-bottom:8px;">كبار المسؤولين يدخلون أي عضو للمحكمة حتى لو ما عليه تحقيق.</div>' +
+            '<input id="court-q" placeholder="🔍 ابحث عن اسم العضو..." oninput="courtSearch(this.value)"><div id="court-cand"></div></div>';
+    } else {
+        h += '<div class="card" style="color:var(--muted);font-size:13px;">لفتح تحقيق مع عضو: روح لتاب الأعضاء بلوحة الشرطة العسكرية واضغط زر «⚖️ تحقيق» جنبه.</div>';
+    }
+    h += '<h3 style="margin:14px 0 8px;">🔴 المحاكمات الجارية (' + st.active.length + ')</h3>' +
+        (st.active.length ? st.active.map(function (c) { return courtCaseHtml(c, st, true); }).join('') : '<div class="card" style="color:var(--muted);">لا يوجد محاكمات جارية</div>');
+    if (st.recent.length) h += '<h3 style="margin:14px 0 8px;">📜 آخر المنتهية</h3>' + st.recent.map(function (c) { return courtCaseHtml(c, st, false); }).join('');
+    if (typing) {
+        var keep = document.getElementById('court-q').value;
+        box.innerHTML = h;
+        var qi = document.getElementById('court-q'); if (qi) { qi.value = keep; qi.focus(); }
+    } else box.innerHTML = h;
+}
+var courtSearchTimer = null;
+function courtSearch(q) {
+    clearTimeout(courtSearchTimer);
+    courtSearchTimer = setTimeout(async function () {
+        var box = document.getElementById('court-cand'); if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            var r = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
+            var list = (r.list || []).filter(function (p) { return p.registeredName; });
+            if (!list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = list.slice(0, 15).map(function (p) {
+                return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + spEsc(p.registeredName) + ' <span style="color:var(--muted);font-size:12px;">(' + spEsc(p.unit || '-') + ' • ' + spEsc(p.rank || '') + ')</span></span>' +
+                    '<button class="btn sm" data-u="' + p.discord + '" data-n="' + spEsc(p.registeredName) + '" onclick="courtStart(this.dataset.u, this.dataset.n)">⚖️ إدخال للمحكمة</button></div></div>';
+            }).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+
+/* ---------------- تاب الإشعارات (كبار المسؤولين) ---------------- */
+var PT = { list: [], timer: null, saveT: null };
+async function flPushTab() {
+    var box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var d;
+    try { d = await api('/api/senior/push/devices'); }
+    catch (e) { if (currentAdminTab !== 'push') return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + e.message + ')</div>'; return; }
+    if (currentAdminTab !== 'push') return;
+    PT.list = d.list;
+    box.innerHTML =
+        (d.supported ? '' : '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ مكتبة web-push غير مثبتة على السيرفر — شغّل: npm install web-push</div>') +
+        '<div class="card"><h3>📣 نص الإشعار</h3>' +
+        '<label>العنوان</label><input id="pt-title" maxlength="60" value="' + spEsc(d.title) + '" oninput="ptTextChanged()">' +
+        '<label>الوصف</label><input id="pt-body" maxlength="160" value="' + spEsc(d.body) + '" oninput="ptTextChanged()">' +
+        '<div style="color:var(--muted);font-size:12px;">أي تعديل تسويه على النص يتغير عند كل كبار المسؤولين.</div></div>' +
+        '<div class="card"><div class="row"><h3>📱 الأجهزة</h3><span id="pt-count" style="color:var(--muted);font-size:13px;"></span></div>' +
+        '<div id="pt-list" class="dev-list"></div>' +
+        '<button class="btn" id="pt-all" style="width:100%;margin-top:12px;" onclick="ptSend(\\'all\\')">📤 إرسال للجميع (المتصل وغير المتصل)</button></div>';
+    ptRenderList();
+    if (PT.timer) clearInterval(PT.timer);
+    PT.timer = setInterval(ptRefresh, 5000);
+}
+async function ptRefresh() {
+    if (currentAdminTab !== 'push' || !document.getElementById('pt-list')) { clearInterval(PT.timer); PT.timer = null; return; }
+    try { var d = await api('/api/senior/push/devices', { noLock: true }); PT.list = d.list; ptRenderList(); } catch (e) {}
+}
+function ptRenderList() {
+    var list = document.getElementById('pt-list'); if (!list) return;
+    var online = PT.list.filter(function (d) { return d.online; }).length;
+    var cnt = document.getElementById('pt-count'); if (cnt) cnt.textContent = online + ' متصل الآن من ' + PT.list.length;
+    var all = document.getElementById('pt-all'); if (all) all.disabled = !PT.list.some(function (d) { return d.push; });
+    if (!PT.list.length) { list.innerHTML = '<div style="padding:18px;text-align:center;color:var(--muted);font-size:14px;">ما فيه أجهزة بعد</div>'; return; }
+    list.innerHTML = PT.list.map(function (d) {
+        return '<div class="pt-dev"><span class="pt-dot' + (d.online ? ' on' : '') + '"></span><div style="flex:1;min-width:0;"><div style="font-weight:700;font-size:14px;">' + spEsc(d.name) + (d.owner ? ' <span style="color:var(--muted);font-weight:400;font-size:12px;">— ' + spEsc(d.owner) + '</span>' : '') + '</div>' +
+            '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;">' +
+            '<span class="pt-chip ' + (d.online ? 'on' : 'off') + '">' + (d.online ? 'متصل' : 'غير متصل') + '</span>' +
+            '<span class="pt-chip">' + (d.standalone ? 'تطبيق ويب' : 'متصفح') + '</span>' +
+            '<span class="pt-chip ' + (d.push ? 'on' : 'off') + '">' + (d.push ? 'إشعارات مفعّلة' : 'بدون إشعارات') + '</span></div></div>' +
+            '<button class="btn sm" ' + (d.push ? '' : 'disabled') + ' data-d="' + d.id + '" onclick="ptSend(this.dataset.d)">إرسال</button></div>';
+    }).join('');
+}
+function ptTextChanged() {
+    clearTimeout(PT.saveT);
+    PT.saveT = setTimeout(function () {
+        var t = document.getElementById('pt-title'), b = document.getElementById('pt-body');
+        if (!t || !b) return;
+        api('/api/senior/push/text', { method: 'POST', noLock: true, body: JSON.stringify({ title: t.value, body: b.value }) }).catch(function () {});
+    }, 800);
+}
+async function ptSend(target) {
+    var t = document.getElementById('pt-title'), b = document.getElementById('pt-body');
+    if (!t || !b) return;
+    var data = { title: t.value, body: b.value };
+    if (target === 'all') data.all = true; else data.id = target;
+    try {
+        var r = await api('/api/senior/push/send', { method: 'POST', body: JSON.stringify(data) });
+        toast(r.sent ? ('انرسل إلى ' + r.sent + ' جهاز ✓') : 'ما انرسل لأي جهاز');
+        if (r.failed && r.failed.length) setTimeout(function () { toast('فشل الإرسال لـ ' + r.failed.map(function (f) { return f.name; }).join('، ')); }, 2900);
+    } catch (e) { toast(e.message); }
+}
+function flOnPushText(d) {
+    try {
+        if (currentAdminTab !== 'push') return;
+        var t = document.getElementById('pt-title'), b = document.getElementById('pt-body');
+        if (t && document.activeElement !== t) t.value = d.title;
+        if (b && document.activeElement !== b) b.value = d.body;
+    } catch (e) {}
+}
+
+/* ---------------- مركز التحكم (المالك): إرسال إشعار للجميع ---------------- */
+function flCcPushHtml() {
+    return '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">📣 إرسال إشعار للأجهزة</b>' +
+        '<div style="margin-top:6px;"><input id="cc-n-title" maxlength="60" placeholder="العنوان" style="width:100%;margin-bottom:6px;"><input id="cc-n-body" maxlength="160" placeholder="الوصف" style="width:100%;"></div>' +
+        '<button class="btn sm" style="margin-top:8px;width:100%;" onclick="ccSendPush()">📤 إرسال (المتصل وغير المتصل)</button></div>';
+}
+async function flPushPrefill() {
+    try {
+        var d = await api('/api/senior/push/devices', { noLock: true });
+        var t = document.getElementById('cc-n-title'), b = document.getElementById('cc-n-body');
+        if (t && !t.value) t.value = d.title;
+        if (b && !b.value) b.value = d.body;
+    } catch (e) {}
+}
+async function ccSendPush() {
+    var t = document.getElementById('cc-n-title'), b = document.getElementById('cc-n-body');
+    if (!t || !b) return;
+    if (!(await confirmModal('تبي ترسل الإشعار لكل الأجهزة (المتصلة وغير المتصلة)؟'))) return;
+    try {
+        var r = await api('/api/senior/push/send', { method: 'POST', body: JSON.stringify({ all: true, title: t.value, body: b.value }) });
+        toast(r.sent ? ('انرسل إلى ' + r.sent + ' جهاز ✓') : 'ما انرسل لأي جهاز');
+    } catch (e) { toast(e.message); }
+}
+
+/* ---------------- التكت: إشعار العضو ---------------- */
+async function spNotifyUser() {
+    var c = SP.cur; if (!c) return;
+    try { await spApi('/api/support/admin/tickets/' + c.id + '/notify', { method: 'POST', body: '{}' }); toast('🔔 انرسل إشعار للعضو'); }
+    catch (e) { toast(e.message); }
+}
+
+/* ---------------- تاب الترددات (كبار المسؤولين) ---------------- */
+async function flFreqAdmin() {
+    var box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var d;
+    try { d = await api('/api/freq/list'); }
+    catch (e) { if (currentAdminTab !== 'freq') return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + e.message + ')</div>'; return; }
+    if (currentAdminTab !== 'freq') return;
+    var extra = d.list.filter(function (f) { return !f.main; });
+    box.innerHTML = '<div class="card"><h3>📻 الترددات</h3>' +
+        '<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">تردد القطاعات المشتركة موجود للجميع، وتقدر تسوي ' + d.max + ' ترددات إضافية.</div>' +
+        d.list.map(function (f) {
+            return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + (f.main ? '⭐ ' : '') + spEsc(f.name) + ' <span style="color:var(--muted);font-size:12px;">(' + f.count + ' متصل)</span></span>' +
+                (f.main ? '<span style="color:var(--muted);font-size:12px;">الأساسي</span>' : '<button class="btn danger sm" onclick="flFreqDel(' + f.n + ')">حذف</button>') + '</div></div>';
+        }).join('') +
+        '<div style="margin-top:12px;"><input id="freq-name" maxlength="40" placeholder="اسم التردد الجديد (اختياري)">' +
+        '<button class="btn" ' + (extra.length >= d.max ? 'disabled' : '') + ' onclick="flFreqAdd()">➕ إضافة تردد (' + extra.length + '/' + d.max + ')</button></div></div>';
+}
+async function flFreqAdd() {
+    var i = document.getElementById('freq-name');
+    try { await api('/api/senior/freq', { method: 'POST', body: JSON.stringify({ name: i ? i.value : '' }) }); toast('تمت الإضافة'); flFreqAdmin(); }
+    catch (e) { toast(e.message); }
+}
+async function flFreqDel(n) {
+    if (!(await confirmModal('تحذف هذا التردد؟ بيطلع منه كل اللي فيه.'))) return;
+    try { await api('/api/senior/freq/' + n, { method: 'DELETE' }); toast('تم الحذف'); flFreqAdmin(); }
+    catch (e) { toast(e.message); }
+}
+
+/* ---------------- مسؤولو الاستلامات (داخل تاب قادة القطاعات) ---------------- */
+function flReceptionMount() {
+    var box = document.getElementById('admin-content');
+    if (!box || document.getElementById('rc-card')) return;
+    box.insertAdjacentHTML('beforeend', '<div class="card" id="rc-card"><h3>🎤 مسؤولو الاستلامات</h3>' +
+        '<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">بعد ما يسجل المسؤول حضوره بالبصمة يظهر له زر «فتح استلام» (من 2 العصر إلى 9 الليل) — يوصل إشعار للجميع ورسالة بالديسكورد. تقدر تضيف أكثر من شخص.</div>' +
+        '<input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="rcSearch(this.value)"><div id="rc-cand"></div><div id="rc-list" style="margin-top:10px;">جارِ التحميل...</div></div>');
+    rcLoad();
+}
+async function rcLoad() {
+    var box = document.getElementById('rc-list'); if (!box) return;
+    try {
+        var r = await api('/api/senior/reception');
+        if (!r.list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا يوجد مسؤولي استلامات بعد</p>'; return; }
+        box.innerHTML = r.list.map(function (m) {
+            return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + spEsc(m.name) + '</span><button class="btn danger sm" data-u="' + m.id + '" onclick="rcRemove(this.dataset.u)">إزالة</button></div></div>';
+        }).join('');
+    } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+}
+var rcTimer = null;
+function rcSearch(q) {
+    clearTimeout(rcTimer);
+    rcTimer = setTimeout(async function () {
+        var box = document.getElementById('rc-cand'); if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            var r = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
+            var list = (r.list || []).filter(function (p) { return p.registeredName; });
+            if (!list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = list.slice(0, 15).map(function (p) {
+                return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + spEsc(p.registeredName) + ' <span style="color:var(--muted);font-size:12px;">(' + spEsc(p.unit || '-') + ' • ' + spEsc(p.rank || '') + ')</span></span>' +
+                    '<button class="btn sm" data-u="' + p.discord + '" onclick="rcAdd(this.dataset.u)">إضافة</button></div></div>';
+            }).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+async function rcAdd(id) {
+    try { await api('/api/senior/reception/add', { method: 'POST', body: JSON.stringify({ discordId: id }) }); toast('تمت الإضافة'); var c = document.getElementById('rc-cand'); if (c) c.innerHTML = ''; rcLoad(); }
+    catch (e) { toast(e.message); }
+}
+async function rcRemove(id) {
+    if (!(await confirmModal('تزيله من مسؤولي الاستلامات؟'))) return;
+    try { await api('/api/senior/reception/remove', { method: 'POST', body: JSON.stringify({ discordId: id }) }); toast('تم'); rcLoad(); }
+    catch (e) { toast(e.message); }
+}
+
+/* ---------------- جهاز واحد بالحساب (آخر جهاز يفوز) ---------------- */
+function flSessionKicked() {
+    FLX.kicked = true;
+    try { if (SP.es) { SP.es.close(); SP.es = null; } } catch (e) {}
+    try { if (typeof pollTimer !== 'undefined' && pollTimer) clearInterval(pollTimer); } catch (e) {}
+    document.body.classList.add('pwa-frozen');
+    document.documentElement.classList.add('pwa-lock');
+    var g = document.getElementById('sess-gate');
+    if (!g) { g = document.createElement('div'); g.id = 'sess-gate'; g.className = 'pwa-overlay'; document.body.appendChild(g); }
+    g.innerHTML = '<div class="pwa-box"><div style="font-size:54px">📵</div><h2>تم تسجيل دخولك من جهاز ثاني</h2>' +
+        '<p class="pwa-p">الحساب مفتوح الحين على جهاز أو تطبيق ثاني، والموقع يعتمد آخر جهاز دخلت منه.<br>إذا تبي ترجع لهذا الجهاز اضغط الزر.</p>' +
+        '<div class="pwa-btns"><button class="btn" onclick="location.reload()">استخدام هذا الجهاز</button></div></div>';
+}
+/* الأمن السيبراني ما يكون له مسؤول أفراد */
+function flHideCyberPO() {
+    try {
+        var b = document.querySelector('button[onclick*="openSectorPicker(\\'cyber\\',\\'personnelOfficer\\')"]');
+        if (!b) return;
+        var row = b.parentElement && b.parentElement.parentElement;
+        if (!row) return;
+        var note = row.nextElementSibling;
+        if (note && /مسؤول الأفراد/.test(note.textContent || '')) note.remove();
+        row.remove();
+        var pk = document.getElementById('picker-cyber-personnelOfficer'); if (pk) pk.remove();
+    } catch (e) {}
+}
+
 
 init();
 </script>
