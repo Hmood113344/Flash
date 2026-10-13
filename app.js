@@ -1347,6 +1347,8 @@ if (CONFIG.BOT_TOKEN) {
     console.log("⚠️ BOT_TOKEN غير موجود — البوت لن يعمل، تحقق من متغيرات البيئة");
 }
 
+// رقم نسخة الموقع: يتغير تلقائياً لما تعدّل الملف وترفعه، والأعضاء يتحدثون عليه لحالهم
+const APP_VER = (() => { try { return crypto.createHash("md5").update(require("fs").readFileSync(__filename)).digest("hex").slice(0, 12); } catch (e) { return String(Date.now()); } })();
 const app = express();
 
 ["get", "post", "put", "delete", "patch"].forEach(method => {
@@ -1539,6 +1541,11 @@ app.use("/api", async (req, res, next) => {
     return res.status(403).json({ error: acctLocked ? "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً" : "🔒 هذا الجهاز تحت التحقيق السيبراني، ما تقدر تسوي أي شي منه", investigation: true });
 });
 app.use("/api", courtLockGate);
+app.get("/api/me", (req, res, next) => {
+    const j = res.json.bind(res);
+    res.json = (o) => j(o && typeof o === "object" && !Array.isArray(o) ? Object.assign({ ver: APP_VER }, o) : o);
+    next();
+});
 app.use("/api", attendanceGate);
 const unassignedCache = new Map();
 async function resolveUnassigned(uid) {
@@ -1602,6 +1609,7 @@ app.get("/api/events", async (req, res) => {
     res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
     if (res.flushHeaders) res.flushHeaders();
     res.write("retry: 3000\n\n");
+    res.write("event: ver\ndata: " + JSON.stringify({ v: APP_VER }) + "\n\n");
     let closed = false;
     const c = { res, uid: req.user ? req.user.id : null, gt: /^[a-f0-9]{32}$/.test(String(req.query.gt || "")) ? String(req.query.gt) : null, isAdmin: false, did: null };
     if (c.uid && validDevId(String(req.query.did || ""))) { c.did = String(req.query.did); devOnConnect(c, req.query); }
@@ -3378,11 +3386,14 @@ app.delete("/api/owner/updates/:id", ensureAuth, async (req, res) => {
 
 app.get("/api/updates/latest", ensureAuth, async (req, res) => {
     const uid = req.user.id;
-    const u = await FlashUpdate.findOne({ published: true, publishedAt: { $gte: new Date(Date.now() - 14 * 24 * 3600 * 1000) } }).sort({ publishedAt: -1 }).lean();
+    // كل التحديثات المنشورة (آخر 14 يوم) اللي العضو ما وافق عليها، تطلع له وحدة وحدة من الأقدم
+    const list = await FlashUpdate.find({ published: true, publishedAt: { $gte: new Date(Date.now() - 14 * 24 * 3600 * 1000) } }).sort({ publishedAt: 1 }).lean();
+    if (!list.length) return res.json({ update: null });
+    const acks = await FlashUpdateAck.find({ uid, uaId: { $in: list.map(x => String(x._id)) } }, { uaId: 1 }).lean();
+    const done = new Set(acks.map(a => a.uaId));
+    const u = list.find(x => !done.has(String(x._id)));
     if (!u) return res.json({ update: null });
-    const acked = await FlashUpdateAck.findOne({ uid, uaId: String(u._id) }).lean();
-    if (acked) return res.json({ update: null });
-    res.json({ update: { id: String(u._id) } });
+    res.json({ update: { id: String(u._id), title: u.title, body: u.body } });
 });
 app.post("/api/updates/:id/ack", ensureAuth, async (req, res) => {
     await FlashUpdateAck.updateOne({ uid: req.user.id, uaId: req.params.id }, { $set: { at: new Date() } }, { upsert: true });
@@ -7639,6 +7650,7 @@ app.get("/", (req, res) => {
 <meta name="apple-mobile-web-app-title" content="فلاش">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="theme-color" content="#0a1628">
+<script>window.APP_VER = "${APP_VER}";</script>
 <script>if ('serviceWorker' in navigator) { window.addEventListener('load', function () { navigator.serviceWorker.register('/sw.js').catch(function () {}); }); }</script>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
@@ -9665,7 +9677,8 @@ function spConnect() {
         es.addEventListener('typing', function (e) {
             try { var d = JSON.parse(e.data); if (SP.cur && SP.cur.id === d.id) { SP.cur.typing = !!d.on; spShowTyping(); } } catch (x) {}
         });
-        es.addEventListener('changed', function () { spLiveRefresh(); });
+        es.addEventListener('changed', function () { spLiveRefresh(); liveSyncSoon(); });
+        es.addEventListener('ver', function (e) { try { verCheck(JSON.parse(e.data).v); } catch (x) {} });
         es.addEventListener('cyber', function () { try { cyberCheck(); if (CY.roomId) cyLoadRoom(); if (document.getElementById('cy-panel')) cyPanelLoad(); } catch (x) {} });
         es.addEventListener('cyreload', function () {
             try {
@@ -10626,6 +10639,50 @@ async function submitLeaveRequest() {
         renderLeavePage();
     } catch (e) { toast(e.message); }
 }
+/* ---------------- تحديث الموقع تلقائياً (نسخة جديدة + تغييرات فورية) ---------------- */
+var VER = { t: null };
+var LIVE = { t: null, last: 0, sig: null };
+function verBusy() {
+    try {
+        if (typeof VC !== 'undefined' && VC) return true;
+        if (typeof FLMIC !== 'undefined' && FLMIC.active) return true;
+        if (typeof CY !== 'undefined' && CY.roomId) return true;
+        if (typeof photoBase64 !== 'undefined' && photoBase64) return true;
+        var a = document.activeElement;
+        if (a && (a.tagName === 'TEXTAREA' || a.tagName === 'INPUT' || a.isContentEditable)) return true;
+        var f = document.querySelectorAll('textarea, input[type=text], input[type=number], input[type=email], input[type=password], input:not([type])');
+        for (var i = 0; i < f.length; i++) { if ((f[i].value || '').trim() && f[i].offsetParent !== null) return true; }
+    } catch (e) {}
+    return false;
+}
+function verCheck(v) {
+    if (!v || !window.APP_VER || v === window.APP_VER || VER.t) return;
+    VER.t = setInterval(verApply, 4000);
+    verApply();
+}
+function verApply() {
+    if (verBusy()) return;
+    var last = 0; try { last = parseInt(sessionStorage.getItem('verReloadAt') || '0', 10); } catch (e) {}
+    if (Date.now() - last < 60000) return;
+    clearInterval(VER.t); VER.t = null;
+    try { toast('🔄 فيه تحديث جديد، جارِ تحديث الموقع...'); } catch (e) {}
+    // تأخير عشوائي بسيط عشان ما يدخلون كلهم بنفس اللحظة على السيرفر بعد إعادة التشغيل
+    setTimeout(function () {
+        if (verBusy()) { if (!VER.t) VER.t = setInterval(verApply, 4000); return; }
+        try { sessionStorage.setItem('verReloadAt', String(Date.now())); } catch (e) {}
+        location.reload();
+    }, 800 + Math.floor(Math.random() * 6000));
+}
+// أي تغيير يسويه أي أحد بالموقع => يتحدث عند الكل بدون ريفرش (على الأكثر مرة كل ثانيتين)
+function liveSyncSoon() {
+    if (LIVE.t) return;
+    var wait = Math.max(300, 2000 - (Date.now() - LIVE.last));
+    LIVE.t = setTimeout(function () {
+        LIVE.t = null; LIVE.last = Date.now();
+        if (__pollRunning) { liveSyncSoon(); return; }
+        try { pollTick(); } catch (x) {}
+    }, wait);
+}
 function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
@@ -10660,6 +10717,7 @@ async function pollTick() {
     __pollRunning = true; __pollStartedAt = Date.now();
     try {
         const fresh = await api('/api/me');
+        verCheck(fresh.ver);
         if (fresh.blocked) {
             clearInterval(pollTimer);
             ME = fresh;
@@ -10675,6 +10733,14 @@ async function pollTick() {
         if (fresh.deviceLocked && !fresh.cyberLocked) { dvHardLock(); return; }
         if (fresh.unassigned && !fresh.cyberLocked) { uaHardLock(); return; }
         buildNav();
+        try {
+            var sig = NAV_FNS.join('|') + '#' + renderFabs();
+            if (LIVE.sig === null) LIVE.sig = sig;
+            else if (LIVE.sig !== sig) {
+                if (!document.getElementById('home-points')) LIVE.sig = sig;
+                else if (!verBusy()) { LIVE.sig = sig; renderDashboard(); }
+            }
+        } catch (x) {}
         const rp = document.getElementById('home-points');
         if (rp) {
             document.getElementById('home-points').textContent = ME.points;
@@ -10704,6 +10770,7 @@ function startBlockedRecheck() {
     blockedPollTimer = setInterval(async () => {
         try {
             const fresh = await api('/api/me');
+            verCheck(fresh.ver);
             if (!fresh.blocked) { clearInterval(blockedPollTimer); location.reload(); }
         } catch (e) {}
     }, 6000);
@@ -15817,12 +15884,16 @@ document.addEventListener('touchmove', function (e) {
 }, { passive: false });
 
 var FLASHUPD = { shown: false, id: null, busy: false };
+function flashUpdAcked(id) { try { return localStorage.getItem('upd_ack_' + id) === '1'; } catch (e) { return false; } }
 async function flashUpdCheck() {
     if (!ME || ME.blocked || FLASHUPD.shown || FLASHUPD.busy || VC || OFFANN.shown) return;
     FLASHUPD.busy = true;
     try {
         var d = await offFetch('/api/updates/latest');
-        if (d.update) flashUpdShow(d.update);
+        if (d.update) {
+            if (flashUpdAcked(d.update.id)) offPost('/api/updates/' + d.update.id + '/ack', {}).catch(function () {});
+            else flashUpdShow(d.update);
+        }
     } catch (e) {}
     FLASHUPD.busy = false;
 }
@@ -15831,21 +15902,25 @@ function flashUpdShow(u) {
     FLASHUPD.shown = true; FLASHUPD.id = u.id;
     var ov = document.createElement('div');
     ov.className = 'ann-ov'; ov.id = 'flash-upd';
-    ov.innerHTML = '<div class="ann-card"><button class="ann-x" onclick="flashUpdClose()" aria-label="إغلاق">✕</button>' +
+    ov.innerHTML = '<div class="ann-card">' +
         '<div class="ann-badge">🆕 تحديث جديد</div><div style="font-size:42px;line-height:1.2;">🚀</div>' +
-        '<h3>تم إصدار تحديث جديد على فلاش!</h3>' +
-        '<p>سوّينا شغل وراكم هالفترة 👀 جرّبوا الموقع الحين وشوفوا الجديد بنفسكم.</p>' +
-        '<div class="ann-btns"><button class="btn" onclick="flashUpdClose()">✅ يلا بشوف</button></div></div>';
+        '<h3>' + spEsc(u.title || 'تحديث جديد') + '</h3>' +
+        '<div style="text-align:right;white-space:pre-wrap;line-height:1.8;font-size:14px;margin:8px 0 12px;">' + spEsc(u.body || '') + '</div>' +
+        '<div class="ann-btns"><button class="btn" id="flash-upd-ok" onclick="flashUpdClose()">✅ موافق</button></div></div>';
     document.body.appendChild(ov);
     document.documentElement.classList.add('ann-open');
 }
-function flashUpdClose() {
+async function flashUpdClose() {
     var id = FLASHUPD.id;
+    if (!id) return;
+    var btn = document.getElementById('flash-upd-ok'); if (btn) btn.disabled = true;
+    try { localStorage.setItem('upd_ack_' + id, '1'); } catch (e) {}
+    try { await offPost('/api/updates/' + id + '/ack', {}); } catch (e) {}
     var el = document.getElementById('flash-upd');
     if (el) el.remove();
     document.documentElement.classList.remove('ann-open');
-    FLASHUPD.shown = false;
-    if (id) offPost('/api/updates/' + id + '/ack', {}).catch(function () {});
+    FLASHUPD.shown = false; FLASHUPD.id = null;
+    setTimeout(flashUpdCheck, 400); // لو فيه تحديث ثاني ما وافق عليه يطلع بعده
 }
 document.addEventListener('touchmove', function (e) {
     if (!FLASHUPD.shown) return;
