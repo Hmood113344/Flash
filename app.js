@@ -16241,7 +16241,7 @@ function flPipPrep() {
         var v = document.createElement('video');
         v.muted = true; v.autoplay = true; v.playsInline = true; v.disablePictureInPicture = false;
         v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
-        v.style.cssText = 'position:fixed;right:0;bottom:0;width:80px;height:45px;opacity:0.02;pointer-events:none;z-index:-1;';
+        v.style.cssText = 'position:fixed;left:8px;bottom:90px;width:96px;height:54px;border-radius:8px;border:1px solid #3b82f6;z-index:7000;pointer-events:none;background:#000;';
         FLPIP.cv = cv; FLPIP.vid = v;
         document.body.appendChild(v);
         flPipDraw();
@@ -16253,18 +16253,30 @@ function flPipPrep() {
 function flPipGo() {
     try { localStorage.setItem('fl_pip_help', '1'); } catch (e) {}
     try { cyOverlayClose(); } catch (e) {}
-    // مهم: نستدعي النافذة مباشرة من الضغطة بدون أي await (شرط آيفون)
     try {
         flPipPrep();
         var vid = FLPIP.vid;
-        if (!vid) throw new Error('unsupported');
+        if (!vid) { toast('جهازك ما يدعم النافذة العائمة (لا يوجد captureStream)'); return; }
         flPipDraw();
-        if (vid.paused) { FLPIP.self = true; var pp = vid.play(); if (pp && pp.catch) pp.catch(function () {}); setTimeout(function () { FLPIP.self = false; }, 700); }
-        if (vid.webkitSetPresentationMode && (flIsIOS() || !vid.requestPictureInPicture)) {
-            vid.webkitSetPresentationMode('picture-in-picture');
-        } else if (vid.requestPictureInPicture) {
-            vid.requestPictureInPicture().catch(function (e) { toast('تعذر فتح النافذة العائمة (' + (e && e.name ? e.name : '') + ')'); });
-        } else throw new Error('unsupported');
+        var open = function () {
+            try {
+                if (vid.webkitSetPresentationMode && (flIsIOS() || !vid.requestPictureInPicture)) vid.webkitSetPresentationMode('picture-in-picture');
+                else if (vid.requestPictureInPicture) vid.requestPictureInPicture().catch(function (e) { toast('تعذر فتح النافذة العائمة (' + (e && e.name ? e.name : '') + ')'); });
+            } catch (e) { toast('تعذر فتح النافذة العائمة (' + ((e && (e.name || e.message)) || '') + ')'); }
+            setTimeout(function () {
+                var inPip = document.pictureInPictureElement === vid || vid.webkitPresentationMode === 'picture-in-picture';
+                if (!inPip) {
+                    var sup = false; try { sup = !!(vid.webkitSupportsPresentationMode && vid.webkitSupportsPresentationMode('picture-in-picture')); } catch (e) {}
+                    toast('ما انفتحت النافذة — جاهزية الفيديو ' + vid.readyState + ' | شغّال ' + (!vid.paused) + ' | دعم ' + sup + ' | مسارات ' + (vid.srcObject && vid.srcObject.getVideoTracks ? vid.srcObject.getVideoTracks().length : 0));
+                }
+            }, 900);
+        };
+        if (vid.paused) {
+            FLPIP.self = true;
+            var pp = vid.play();
+            setTimeout(function () { FLPIP.self = false; }, 900);
+            if (pp && pp.then) pp.then(open, function () { open(); }); else open();
+        } else open();
     } catch (e) {
         toast('تعذر فتح النافذة العائمة (' + ((e && (e.name || e.message)) || '') + ')');
     }
