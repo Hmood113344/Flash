@@ -1547,6 +1547,7 @@ app.use("/api", async (req, res, next) => {
     if (!req.user) return next();
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
     if (req.path.indexOf("/support/") === 0) return next();
+    if (req.path.indexOf("/push/") === 0) return next(); // تفعيل الإشعارات مسموح حتى للحساب الموقوف
     if (!(await isUnassignedUid(req.user.id))) return next();
     return res.status(403).json({ error: "🔒 حسابك متوقف: ما عندك رتبة أو قطاع. افتح تكت بخدمة العملاء.", unassigned: true });
 });
@@ -7059,8 +7060,25 @@ const PushDevice = mongoose.model("PushDevice", new mongoose.Schema({
     standalone: { type: Boolean, default: false },
     sub: { type: mongoose.Schema.Types.Mixed, default: null },
     lastSeen: { type: Date, default: Date.now },
+    enteredAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now },
 }));
+// الأجهزة المكررة: لكل حساب نعتمد آخر جهاز دخل فيه (المتصل أولاً)، والباقي "مكرر" ما ينرسل لهم شي
+async function pushDupSet() {
+    const all = await PushDevice.find({ uid: { $ne: null } }, { id: 1, uid: 1, enteredAt: 1, lastSeen: 1 }).lean();
+    const best = new Map();
+    for (const d of all) {
+        const sc = (devIsOnline(d.id) ? 1e15 : 0) + (+new Date(d.enteredAt || d.lastSeen || 0));
+        const b = best.get(d.uid);
+        if (!b || sc > b.sc) best.set(d.uid, { id: d.id, sc });
+    }
+    return new Set(all.filter(d => best.get(d.uid).id !== d.id).map(d => d.id));
+}
+async function pushableDevs(filter) {
+    const dup = await pushDupSet();
+    const list = await PushDevice.find(Object.assign({ sub: { $ne: null } }, filter || {})).lean();
+    return list.filter(d => !dup.has(d.id));
+}
 // حساب دخل مرة من "تطبيق الويب" => المتصفح يتقفل عليه ويقوله ادخل من التطبيق
 const PwaInstall = mongoose.model("PwaInstall", new mongoose.Schema({ uid: { type: String, unique: true }, at: { type: Date, default: Date.now } }));
 const pwaSeen = new Map();
@@ -7098,7 +7116,7 @@ function devOnConnect(c, q) {
             activeDev.set(uid, id);
             sseBroadcast("sessionkick", { t: Date.now() }, cl => cl.uid === uid && cl.did && cl.did !== id && !(standalone && cl.mob && cl.sa === false));
         }
-        await PushDevice.updateOne({ id }, { $set: { uid, name: cleanDevName(q.dn), standalone, lastSeen: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+        await PushDevice.updateOne({ id }, { $set: { uid, name: cleanDevName(q.dn), standalone, lastSeen: new Date(), enteredAt: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
     })().catch(() => {});
 }
 function devOnClose(c) {
@@ -7159,8 +7177,8 @@ async function sendPushTo(devs, opts) {
     return { sent, failed };
 }
 // يرسل للمتصل وغير المتصل (كل جهاز مفعّل الإشعارات)
-const pushAll = opts => PushDevice.find({ sub: { $ne: null } }).lean().then(d => sendPushTo(d, opts));
-const pushUid = (uid, opts) => PushDevice.find({ uid, sub: { $ne: null } }).lean().then(d => sendPushTo(d, opts));
+const pushAll = opts => pushableDevs().then(d => sendPushTo(d, opts));
+const pushUid = (uid, opts) => pushableDevs({ uid }).then(d => sendPushTo(d, opts));
 
 app.get("/api/push/vapid", async (req, res) => {
     const key = await ensureVapid();
@@ -7197,15 +7215,25 @@ app.get("/api/senior/push/devices", ensureSeniorAdmin, async (req, res) => {
         Personnel.find({ discord: { $in: uids } }, { discord: 1, registeredName: 1 }).lean(),
         Account.find({ uid: { $in: uids } }, { uid: 1, fullName: 1, email: 1 }).lean(),
     ]);
-    const nm = new Map();
-    accs.forEach(a => nm.set(a.uid, a.fullName || a.email));
+    const nm = new Map(), em = new Map();
+    accs.forEach(a => { nm.set(a.uid, a.fullName || a.email); em.set(a.uid, a.email || ""); });
     pers.forEach(p => { if (p.registeredName) nm.set(p.discord, p.registeredName); });
+    const dupSet = await pushDupSet();
     const list = devs.map(d => ({
-        id: d.id, name: d.name, owner: nm.get(d.uid) || null, standalone: !!d.standalone,
-        online: devIsOnline(d.id), push: !!d.sub, lastSeen: d.lastSeen,
+        id: d.id, name: d.name, owner: nm.get(d.uid) || null, uid: d.uid || "", email: em.get(d.uid) || "", standalone: !!d.standalone,
+        online: devIsOnline(d.id), push: !!d.sub, dup: dupSet.has(d.id), lastSeen: d.lastSeen,
     })).sort((a, b) => (b.online - a.online) || (new Date(b.lastSeen) - new Date(a.lastSeen)));
     const s = await getSettings();
     res.json({ list, title: s.notifTitle || CONFIG.PUSH_DEFAULT_TITLE, body: s.notifBody || CONFIG.PUSH_DEFAULT_BODY, supported: !!webpush });
+});
+app.post("/api/senior/push/dups/delete", ensureSeniorAdmin, async (req, res) => {
+    const dup = await pushDupSet();
+    const hidden = hiddenOwnerIds(req);
+    const ids = [...dup];
+    if (!ids.length) return res.json({ deleted: 0 });
+    const r = await PushDevice.deleteMany({ id: { $in: ids }, uid: { $nin: hidden } });
+    await logEvent({ action: "حذف أجهزة مكررة", actorId: req.user.id, actorTag: req.user.username, details: "حُذف " + (r.deletedCount || 0) + " جهاز مكرر" });
+    res.json({ deleted: r.deletedCount || 0 });
 });
 app.post("/api/senior/push/text", ensureSeniorAdmin, async (req, res) => {
     const b = req.body || {};
@@ -7226,10 +7254,11 @@ app.post("/api/senior/push/send", ensureSeniorAdmin, async (req, res) => {
     const body = String(b.body || "").trim().slice(0, 160) || CONFIG.PUSH_DEFAULT_BODY;
     if (!webpush) return res.status(503).json({ error: "مكتبة web-push غير مثبتة على السيرفر" });
     let devs = [];
-    if (b.all) devs = await PushDevice.find({ sub: { $ne: null } }).lean();
+    if (b.all) devs = await pushableDevs();
     else if (validDevId(b.id)) {
         const d = await PushDevice.findOne({ id: b.id }).lean();
         if (!d || !d.sub) return res.status(404).json({ error: "هذا الجهاز ما فعّل الإشعارات" });
+        if ((await pushDupSet()).has(d.id)) return res.status(400).json({ error: "هذا الجهاز مكرر، ما يمديك ترسل له" });
         devs = [d];
     } else return res.status(400).json({ error: "حدد الجهاز" });
     if (!devs.length) return res.status(404).json({ error: "ما فيه أجهزة مفعّلة للإشعارات" });
@@ -10397,6 +10426,7 @@ async function init() {
     if (ME.courtLocked) { courtHardLock(); courtCheck(); return; }
     if (COURT.frozen) courtHardClear();
     if (ME.deviceLocked) { dvHardLock(); return; }
+    if (await ntGate()) return;
     if (ME.unassigned) { uaHardLock(); return; }
     uaHardClear();
     markOwnerSaved();
@@ -15867,6 +15897,41 @@ function flPushBanner() {
     box.innerHTML = '<div class="card" style="border-color:rgba(59,130,246,.5);"><div class="row"><div><b>🔔 فعّل الإشعارات</b><div style="color:var(--muted);font-size:12px;margin-top:3px;">عشان توصلك تنبيهات التكتات والاستلام حتى لو الموقع مقفل</div></div><button class="btn sm" onclick="flPushEnable()">تفعيل</button></div></div>';
 }
 
+/* ---------------- نافذة تفعيل الإشعارات (أول شي بعد الدخول) ---------------- */
+var NG = { skipped: false, busy: false };
+async function ntGate() {
+    if (NG.skipped || !ME || ME.blocked || !flPushSupported()) { ntClear(); return false; }
+    if (!FLX.push.ready) {
+        await Promise.race([flPushInit(), new Promise(function (r) { setTimeout(r, 5000); })]);
+    }
+    if (!FLX.push.ready || FLX.push.sub) { ntClear(); return false; }
+    try { uaHardClear(); } catch (e) {}
+    var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+    ntRender();
+    return true;
+}
+function ntClear() { var g = document.getElementById('nt-gate'); if (g) g.remove(); }
+function ntRender() {
+    var g = document.getElementById('nt-gate');
+    if (!g) { g = document.createElement('div'); g.id = 'nt-gate'; g.className = 'pwa-overlay'; document.body.appendChild(g); }
+    var denied = window.Notification && Notification.permission === 'denied';
+    g.innerHTML = denied
+        ? '<div class="pwa-box"><div style="font-size:54px">🔕</div><h2>الإشعارات محظورة</h2>' +
+          '<p class="pwa-p">فعّل إشعارات فلاش من إعدادات الجهاز (الإشعارات ← فلاش)، وبعدها اضغط تحقق.</p>' +
+          '<div class="pwa-btns"><button class="btn" onclick="location.reload()">تحقق</button><button class="btn gray" onclick="ntSkip()">لاحقاً</button></div></div>'
+        : '<div class="pwa-box"><div style="font-size:54px">🔔</div><h2>فعّل الإشعارات أول</h2>' +
+          '<p class="pwa-p">عشان توصلك تنبيهات التكتات والاستلام والاستدعاءات حتى لو الموقع مقفل. اضغط تفعيل ووافق على الإذن.</p>' +
+          '<div class="pwa-btns"><button class="btn" id="nt-go" onclick="ntEnable()">تفعيل الإشعارات</button><button class="btn gray" onclick="ntSkip()">لاحقاً</button></div></div>';
+}
+async function ntEnable() {
+    if (NG.busy) return;
+    NG.busy = true;
+    try { await flPushEnable(); } catch (e) {}
+    NG.busy = false;
+    if (FLX.push.sub) { ntClear(); init(); } else ntRender();
+}
+function ntSkip() { NG.skipped = true; ntClear(); init(); }
+
 /* ---------------- تثبيت الموقع كتطبيق ويب (نافذة إجبارية بالمتصفح) ---------------- */
 var PWA = { i: 0, frozen: false, mode: 'steps', timer: null, obs: null };
 var PWA_GOLD = '#eab308';
@@ -16491,7 +16556,7 @@ function courtSearch(q) {
 }
 
 /* ---------------- تاب الإشعارات (كبار المسؤولين) ---------------- */
-var PT = { list: [], timer: null, saveT: null };
+var PT = { list: [], timer: null, saveT: null, q: '' };
 async function flPushTab() {
     var box = document.getElementById('admin-content');
     if (!box) return;
@@ -16508,6 +16573,7 @@ async function flPushTab() {
         '<label>الوصف</label><input id="pt-body" maxlength="160" value="' + spEsc(d.body) + '" oninput="ptTextChanged()">' +
         '<div style="color:var(--muted);font-size:12px;">أي تعديل تسويه على النص يتغير عند كل كبار المسؤولين.</div></div>' +
         '<div class="card"><div class="row"><h3>📱 الأجهزة</h3><span id="pt-count" style="color:var(--muted);font-size:13px;"></span></div>' +
+        '<input id="pt-q" placeholder="🔍 ابحث باسم الجهاز أو اسم الحساب..." value="' + spEsc(PT.q || '') + '" oninput="ptSearch(this.value)" style="width:100%;margin-top:10px;">' +
         '<div id="pt-list" class="dev-list"></div>' +
         '<button class="btn" id="pt-all" style="width:100%;margin-top:12px;" onclick="ptSend(\\'all\\')">📤 إرسال للجميع (المتصل وغير المتصل)</button></div>';
     ptRenderList();
@@ -16518,20 +16584,48 @@ async function ptRefresh() {
     if (currentAdminTab !== 'push' || !document.getElementById('pt-list')) { clearInterval(PT.timer); PT.timer = null; return; }
     try { var d = await api('/api/senior/push/devices', { noLock: true }); PT.list = d.list; ptRenderList(); } catch (e) {}
 }
+function ptMatch(d, q) {
+    if (!q) return true;
+    var s = [d.name, d.owner, d.id, d.uid, d.email].join(' ').toLowerCase();
+    return q.toLowerCase().split(' ').every(function (w) { return !w || s.indexOf(w) > -1; });
+}
+function ptSearch(v) { PT.q = String(v || '').trim(); ptRenderList(); }
+function ptRow(d) {
+    var canSend = d.push && !d.dup;
+    return '<div class="pt-dev"><span class="pt-dot' + (d.online ? ' on' : '') + '"></span><div style="flex:1;min-width:0;"><div style="font-weight:700;font-size:14px;">' + spEsc(d.name) + (d.owner ? ' <span style="color:var(--muted);font-weight:400;font-size:12px;">— ' + spEsc(d.owner) + '</span>' : '') + '</div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;">' +
+        '<span class="pt-chip ' + (d.online ? 'on' : 'off') + '">' + (d.online ? 'متصل' : 'غير متصل') + '</span>' +
+        '<span class="pt-chip">' + (d.standalone ? 'تطبيق ويب' : 'متصفح') + '</span>' +
+        (d.dup ? '<span class="pt-chip off">مكرر</span>' : '<span class="pt-chip ' + (d.push ? 'on' : 'off') + '">' + (d.push ? 'إشعارات مفعّلة' : 'بدون إشعارات') + '</span>') + '</div></div>' +
+        '<button class="btn sm" ' + (canSend ? '' : 'disabled') + ' data-d="' + d.id + '" onclick="ptSend(this.dataset.d)">إرسال</button></div>';
+}
+function ptSection(title, arr, extra) {
+    return '<div style="margin-top:14px;"><div class="row" style="margin-bottom:4px;"><b style="font-size:14px;">' + title + ' <span style="color:var(--muted);font-weight:400;font-size:12px;">(' + arr.length + ')</span></b>' + (extra || '') + '</div>' +
+        (arr.length ? arr.map(ptRow).join('') : '<div style="padding:10px;text-align:center;color:var(--muted);font-size:13px;">ما فيه</div>') + '</div>';
+}
+async function ptDelDups() {
+    if (!(await confirmModal('تبي تحذف كل الأجهزة المكررة؟ (يبقى آخر جهاز دخل لكل حساب)'))) return;
+    try {
+        var r = await api('/api/senior/push/dups/delete', { method: 'POST', body: '{}' });
+        toast('انحذف ' + r.deleted + ' جهاز مكرر ✓');
+        ptRefresh();
+    } catch (e) { toast(e.message); }
+}
 function ptRenderList() {
     var list = document.getElementById('pt-list'); if (!list) return;
     var online = PT.list.filter(function (d) { return d.online; }).length;
     var cnt = document.getElementById('pt-count'); if (cnt) cnt.textContent = online + ' متصل الآن من ' + PT.list.length;
-    var all = document.getElementById('pt-all'); if (all) all.disabled = !PT.list.some(function (d) { return d.push; });
+    var all = document.getElementById('pt-all'); if (all) all.disabled = !PT.list.some(function (d) { return d.push && !d.dup; });
     if (!PT.list.length) { list.innerHTML = '<div style="padding:18px;text-align:center;color:var(--muted);font-size:14px;">ما فيه أجهزة بعد</div>'; return; }
-    list.innerHTML = PT.list.map(function (d) {
-        return '<div class="pt-dev"><span class="pt-dot' + (d.online ? ' on' : '') + '"></span><div style="flex:1;min-width:0;"><div style="font-weight:700;font-size:14px;">' + spEsc(d.name) + (d.owner ? ' <span style="color:var(--muted);font-weight:400;font-size:12px;">— ' + spEsc(d.owner) + '</span>' : '') + '</div>' +
-            '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;">' +
-            '<span class="pt-chip ' + (d.online ? 'on' : 'off') + '">' + (d.online ? 'متصل' : 'غير متصل') + '</span>' +
-            '<span class="pt-chip">' + (d.standalone ? 'تطبيق ويب' : 'متصفح') + '</span>' +
-            '<span class="pt-chip ' + (d.push ? 'on' : 'off') + '">' + (d.push ? 'إشعارات مفعّلة' : 'بدون إشعارات') + '</span></div></div>' +
-            '<button class="btn sm" ' + (d.push ? '' : 'disabled') + ' data-d="' + d.id + '" onclick="ptSend(this.dataset.d)">إرسال</button></div>';
-    }).join('');
+    var shown = PT.list.filter(function (d) { return ptMatch(d, PT.q); });
+    if (!shown.length) { list.innerHTML = '<div style="padding:18px;text-align:center;color:var(--muted);font-size:14px;">لا نتائج للبحث</div>'; return; }
+    var on = shown.filter(function (d) { return d.push && !d.dup; });
+    var off = shown.filter(function (d) { return !d.push && !d.dup; });
+    var dup = shown.filter(function (d) { return d.dup; });
+    var anyDup = PT.list.some(function (d) { return d.dup; });
+    list.innerHTML = ptSection('✅ المفعّلين للإشعارات', on) +
+        ptSection('🔕 غير المفعّلين', off) +
+        (anyDup ? ptSection('♻️ مكرر', dup, '<button class="btn sm gray" onclick="ptDelDups()">🗑️ حذف المكرر</button>') : '');
 }
 function ptTextChanged() {
     clearTimeout(PT.saveT);
