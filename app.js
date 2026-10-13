@@ -16239,13 +16239,22 @@ function flPipPrep() {
         var cv = document.createElement('canvas'); cv.width = 320; cv.height = 180;
         if (!cv.captureStream) return;
         var v = document.createElement('video');
-        v.muted = true; v.autoplay = true; v.playsInline = true; v.disablePictureInPicture = false;
-        v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
+        v.muted = false; v.autoplay = true; v.playsInline = true; v.disablePictureInPicture = false;
+        v.setAttribute('playsinline', '');
         v.style.cssText = 'position:fixed;left:8px;bottom:90px;width:96px;height:54px;border-radius:8px;border:1px solid #3b82f6;z-index:7000;pointer-events:none;background:#000;';
         FLPIP.cv = cv; FLPIP.vid = v;
         document.body.appendChild(v);
         flPipDraw();
-        v.srcObject = cv.captureStream(15);
+        var st = cv.captureStream(15);
+        try {
+            var AC = window.AudioContext || window.webkitAudioContext;
+            if (AC) {
+                var ac = new AC(), dst = ac.createMediaStreamDestination(), osc = ac.createOscillator(), g = ac.createGain();
+                g.gain.value = 0.0001; osc.connect(g); g.connect(dst); osc.start();
+                st.addTrack(dst.stream.getAudioTracks()[0]); FLPIP.ac = ac;
+            }
+        } catch (e) {}
+        v.srcObject = st;
         v.addEventListener('pause', function () { if (!FLPIP.self && (document.pictureInPictureElement === v || v.webkitPresentationMode === 'picture-in-picture')) flPipToggle(); });
         var p = v.play(); if (p && p.catch) p.catch(function () {});
     } catch (e) {}
@@ -16258,6 +16267,7 @@ function flPipGo() {
         var vid = FLPIP.vid;
         if (!vid) { toast('جهازك ما يدعم النافذة العائمة (لا يوجد captureStream)'); return; }
         flPipDraw();
+        try { if (FLPIP.ac && FLPIP.ac.state === 'suspended') FLPIP.ac.resume(); } catch (e) {}
         var open = function () {
             try {
                 if (vid.webkitSetPresentationMode && (flIsIOS() || !vid.requestPictureInPicture)) vid.webkitSetPresentationMode('picture-in-picture');
@@ -16267,7 +16277,7 @@ function flPipGo() {
                 var inPip = document.pictureInPictureElement === vid || vid.webkitPresentationMode === 'picture-in-picture';
                 if (!inPip) {
                     var sup = false; try { sup = !!(vid.webkitSupportsPresentationMode && vid.webkitSupportsPresentationMode('picture-in-picture')); } catch (e) {}
-                    toast('ما انفتحت النافذة — جاهزية الفيديو ' + vid.readyState + ' | شغّال ' + (!vid.paused) + ' | دعم ' + sup + ' | مسارات ' + (vid.srcObject && vid.srcObject.getVideoTracks ? vid.srcObject.getVideoTracks().length : 0));
+                    toast('ما انفتحت النافذة — جاهزية الفيديو ' + vid.readyState + ' | شغّال ' + (!vid.paused) + ' | دعم ' + sup + ' | فيديو ' + (vid.srcObject && vid.srcObject.getVideoTracks ? vid.srcObject.getVideoTracks().length : 0) + ' | صوت ' + (vid.srcObject && vid.srcObject.getAudioTracks ? vid.srcObject.getAudioTracks().length : 0));
                 }
             }, 900);
         };
@@ -16284,7 +16294,8 @@ function flPipGo() {
 function flPipClose() {
     try { if (document.pictureInPictureElement) document.exitPictureInPicture(); } catch (e) {}
     try { if (FLPIP.vid) { FLPIP.vid.webkitPresentationMode === 'picture-in-picture' && FLPIP.vid.webkitSetPresentationMode('inline'); FLPIP.vid.pause(); FLPIP.vid.remove(); } } catch (e) {}
-    FLPIP.cv = null; FLPIP.vid = null;
+    try { if (FLPIP.ac) FLPIP.ac.close(); } catch (e) {}
+    FLPIP.ac = null; FLPIP.cv = null; FLPIP.vid = null;
 }
 setInterval(function () { if (FLPIP.cv) flPipDraw(); }, 250);
 
