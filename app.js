@@ -10413,6 +10413,7 @@ async function init() {
     }
     spReconnect(); spBadges();
     if (pwaGate()) return;
+    if (ntfGate()) return;
     if (ME.cyberLocked) { uaHardClear(); cyHardLock(); cyberCheck(); return; }
     cyHardClear();
     if (ME.courtLocked) { courtHardLock(); courtCheck(); return; }
@@ -16071,6 +16072,103 @@ function pwaBack() {
     if (PWA.mode === 'done') { PWA.mode = 'steps'; PWA.i = PWA_STEPS[flIsIOS() ? 'ios' : 'android'].length - 1; pwaRender(); return; }
     if (PWA.i > 0) { PWA.i--; pwaRender(); }
 }
+
+/* ---------------- نافذة إجبارية: تفعيل الإشعارات (الحساب والموقع يوقفون لين تفعّلها) ---------------- */
+var NTF = { frozen: false, obs: null, timer: null, busy: false, tried: false, finishing: false };
+function ntfPerm() { try { return window.Notification ? Notification.permission : 'granted'; } catch (e) { return 'granted'; } }
+function ntfNeeded() {
+    return !!(ME && !ME.blocked && !FLX.kicked && flPushSupported() && ntfPerm() !== 'granted');
+}
+function ntfGate() {
+    if (!ntfNeeded()) { ntfClear(); return false; }
+    ntfFreeze();
+    ntfRender();
+    if (!NTF.timer) {
+        NTF.timer = setInterval(function () {
+            if (ntfPerm() === 'granted') ntfDone();
+            else if (NTF.frozen && !document.getElementById('ntf-gate')) ntfRender();
+        }, 1500);
+    }
+    return true;
+}
+function ntfFreeze() {
+    if (NTF.frozen) return;
+    NTF.frozen = true;
+    try { if (typeof VC !== 'undefined' && VC && (VC.freq || VC.court)) offLeaveVoice(false); } catch (e) {}
+    try { if (SP.es) { SP.es.close(); SP.es = null; } } catch (e) {}
+    try { if (typeof pollTimer !== 'undefined' && pollTimer) clearInterval(pollTimer); } catch (e) {}
+    try { if (typeof blockedPollTimer !== 'undefined' && blockedPollTimer) clearInterval(blockedPollTimer); } catch (e) {}
+    var sp = document.getElementById('fl-splash'); if (sp) { sp.remove(); document.documentElement.classList.remove('fl-splash-on'); }
+    document.body.classList.add('pwa-frozen');
+    document.documentElement.classList.add('pwa-lock');
+    try {
+        NTF.obs = new MutationObserver(function () { if (NTF.frozen && !document.getElementById('ntf-gate')) ntfRender(); });
+        NTF.obs.observe(document.body, { childList: true });
+    } catch (e) {}
+}
+function ntfClear() {
+    if (!NTF.frozen) return;
+    NTF.frozen = false;
+    if (NTF.obs) { try { NTF.obs.disconnect(); } catch (e) {} NTF.obs = null; }
+    if (NTF.timer) { clearInterval(NTF.timer); NTF.timer = null; }
+    var g = document.getElementById('ntf-gate'); if (g) g.remove();
+    if (!PWA.frozen && !FLX.kicked) {
+        document.body.classList.remove('pwa-frozen');
+        document.documentElement.classList.remove('pwa-lock');
+    }
+}
+function ntfRender() {
+    var g = document.getElementById('ntf-gate');
+    if (!g) { g = document.createElement('div'); g.id = 'ntf-gate'; g.className = 'pwa-overlay'; g.style.zIndex = '2147483300'; document.body.appendChild(g); }
+    var denied = ntfPerm() === 'denied';
+    var where = flIsIOS() ? 'الإعدادات ← الإشعارات ← فلاش ← فعّل «السماح بالإشعارات»'
+        : (flIsAndroid() ? 'إعدادات الجهاز ← التطبيقات (أو إعدادات الموقع) ← فلاش ← الإشعارات ← سماح'
+            : 'اضغط على القفل 🔒 اللي بجنب رابط الموقع ← الإشعارات ← سماح');
+    var h = '<div class="pwa-box">' +
+        '<div class="pwa-top" style="color:#fca5a5;background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);">⛔ حسابك موقوف مؤقتاً لين تفعّل الإشعارات</div>' +
+        '<div style="font-size:56px;margin-top:6px;">' + (denied ? '🔕' : '🔔') + '</div>' +
+        '<h2>' + (denied ? 'الإشعارات محظورة عندك' : 'لازم تفعّل الإشعارات') + '</h2>' +
+        '<p class="pwa-p">وقّفنا حسابك والموقع كامل (الصفحات والتحديثات وكل شي بالخلفية) لين تسمح للموقع بإرسال الإشعارات.</p>' +
+        '<p class="pwa-p">الإشعارات هي اللي توصّل لك تنبيهات الاستلام والمخالفات والتحذيرات والترقيات حتى لو الموقع مو قدامك، وتخليك تتحكم بالمايك من برا التطبيق وانت داخل اللعبة. بدونها ما يشتغل حسابك.</p>';
+    if (denied) {
+        h += '<p class="pwa-p" style="color:#fbbf24;">انت ضغطت «إلغاء/عدم السماح» قبل، فلازم تفعّلها يدوياً:<br><b>' + where + '</b><br>وارجع هنا، وبيتفعل تلقائياً.</p>' +
+            '<div class="pwa-btns"><button class="btn" style="max-width:none;font-size:16px;padding:12px 18px;" onclick="ntfRecheck()">سويتها، تحقق ✓</button></div>';
+    } else {
+        if (NTF.tried) h += '<p class="pwa-p" style="color:#fca5a5;">ما فعّلت الإذن! اضغط الزر وبعدين اختر «سماح». إذا ضغطت «إلغاء» يبقى حسابك موقوف.</p>';
+        h += '<div class="pwa-btns"><button class="btn" style="max-width:none;font-size:16px;padding:12px 18px;" onclick="ntfEnable()">🔔 تفعيل الإشعارات</button></div>';
+    }
+    h += '</div>';
+    g.innerHTML = h;
+    g.scrollTop = 0;
+}
+async function ntfEnable() {
+    if (NTF.busy) return;
+    NTF.busy = true;
+    try {
+        var perm = await Notification.requestPermission();
+        NTF.tried = true;
+        if (perm === 'granted') { NTF.busy = false; await ntfDone(); return; }
+    } catch (e) { NTF.tried = true; }
+    NTF.busy = false;
+    ntfRender();
+}
+function ntfRecheck() {
+    if (ntfPerm() === 'granted') { ntfDone(); return; }
+    toast('الإشعارات للحين محظورة، إذا فعّلتها من الإعدادات اقفل التطبيق وافتحه من جديد');
+    ntfRender();
+}
+async function ntfDone() {
+    if (NTF.finishing) return;
+    NTF.finishing = true;
+    try { if (!FLX.push.ready) await flPushInit(); } catch (e) {}
+    try { if (FLX.push.ready && !FLX.push.sub) await flPushEnable(); } catch (e) {}
+    toast('تم تفعيل الإشعارات ✓ رجع حسابك');
+    ntfClear();
+    setTimeout(function () { location.reload(); }, 500);
+}
+document.addEventListener('visibilitychange', function () {
+    try { if (document.visibilityState === 'visible' && ME && !NTF.frozen && !PWA.frozen && ntfNeeded()) ntfGate(); } catch (e) {}
+});
 
 /* ---------------- البصمة (حضور / انصراف) ---------------- */
 var FP_HOLD_SECONDS = ${CONFIG.FP_HOLD_SECONDS};
