@@ -10912,7 +10912,7 @@ function renderDashboard() {
                 <h3>مخالفاتي المسجلة</h3>
                 <div class="row" style="gap:8px;">
                     <button class="btn sm" onclick="renderCard()">بطاقتي</button>
-                    \${flFreqBtnHtml()}
+                    \${/* ملاحظة: هنا التردد — تم حذف الزر فقط والكود باقي. لإرجاع الزر استبدل '' بـ flFreqBtnHtml() */ ''}
                     \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
                         ? '<button class="btn sm" onclick="renderNewReport()">+ تسجيل تقرير جديد</button>'
                         : '<button class="btn sm" onclick="renderNewViolation()">+ تسجيل مخالفة جديدة</button>') : ''}
@@ -11234,7 +11234,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
             <div class="tab" onclick="adminTab('push', this)">📣 الإشعارات</div>
-            <div class="tab" onclick="adminTab('freq', this)">📻 الترددات</div>
+            \${/* ملاحظة: هنا التردد — تم حذف التاب فقط والكود باقي. لإرجاعه حط مكان '' هذا: '<div class="tab" onclick="adminTab(\'freq\', this)">📻 الترددات</div>' */ ''}
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
@@ -16098,6 +16098,7 @@ function flAttCardHtml() {
         '<div style="color:var(--muted);font-size:12px;margin-top:3px;">سجّل بصمة الحضور عشان تقدر تسجّل مخالفة وتدخل التردد</div></div>' +
         '<button class="btn" onclick="renderFingerprint(\\'checkin\\')">🖐️ تسجيل دخول</button></div></div>';
 }
+// ملاحظة: هنا التردد — زر التردد محذوف من الصفحة الرئيسية، والكود باقي ما انحذف
 function flFreqBtnHtml() { return '<button class="btn sm" onclick="flFreqOpen()">📻 تردد القطاعات المشتركة</button>'; }
 function flAfterBtnsHtml() {
     var h = '';
