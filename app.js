@@ -575,6 +575,7 @@ const SettingsSchema = new mongoose.Schema({
     notifTitle: { type: String, default: null },
     notifBody: { type: String, default: null },
     receptionOfficers: { type: [{ id: String, name: String }], default: [] },
+    attConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     vapid: { type: mongoose.Schema.Types.Mixed, default: null },
 }, { minimize: false });
 const Settings = mongoose.model("Settings", SettingsSchema);
@@ -4482,7 +4483,7 @@ function supportCleanImage(v) {
     return /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+\/=]+$/.test(v) ? v : null;
 }
 async function supportLoad(req, res) {
-    if (!mongoose.isValidObjectId(req.params.id)) { res.status(404).json({ error: "التكت غير موجود" }); return null; }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) { res.status(404).json({ error: "التكت غير موجود" }); return null; }
     const t = await SupportTicket.findById(req.params.id);
     if (!t) { res.status(404).json({ error: "التكت غير موجود" }); return null; }
     const uid = req.user ? req.user.id : null;
@@ -4914,7 +4915,7 @@ app.get("/api/support/admin/tickets", async (req, res) => {
 
 app.post("/api/support/admin/tickets/:id/ban", async (req, res) => {
     if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "الحظر لكبار المسؤولين فقط" });
-    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
     const t = await SupportTicket.findById(req.params.id);
     if (!t) return res.status(404).json({ error: "التكت غير موجود" });
     if (t.uid && await isSupportAdmin(t.uid)) return res.status(400).json({ error: "ما تقدر تحظر إداري" });
@@ -4955,7 +4956,7 @@ app.get("/api/support/admin/bans", async (req, res) => {
 });
 app.delete("/api/support/admin/bans/:id", async (req, res) => {
     if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "غير موجود" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
     const b = await SupportBan.findByIdAndDelete(req.params.id);
     if (!b) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "فك حظر من الدعم الفني", discordId: b.uid || null, actorId: req.user.id, actorTag: req.user.username, details: b.name || "-" });
@@ -4964,7 +4965,7 @@ app.delete("/api/support/admin/bans/:id", async (req, res) => {
 
 app.delete("/api/support/admin/tickets/:id", async (req, res) => {
     if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا الإجراء لكبار المسؤولين فقط" });
-    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
     const t = await SupportTicket.findById(req.params.id).select("no name status uid guestToken deviceToken");
     if (!t) return res.status(404).json({ error: "التكت غير موجود" });
     if (t.status !== "closed") return res.status(400).json({ error: "تقدر تحذف التكتات المغلقة فقط" });
@@ -6317,7 +6318,7 @@ function cyPublic(c) {
     };
 }
 async function cyAccess(req, res, needLeader) {
-    if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "رقم غير صحيح" }); return null; }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) { res.status(400).json({ error: "رقم غير صحيح" }); return null; }
     const c = await CyberCase.findById(req.params.id);
     if (!c) { res.status(404).json({ error: "غير موجود" }); return null; }
     const role = await cyberRoleOf(req.user.id);
@@ -7021,7 +7022,7 @@ app.post("/api/cyber/flags/:id/resolve", ensureAuth, async (req, res) => {
     try {
         const role = await cyGuard(req, res); if (!role) return;
         if (!role.isLeader) return res.status(403).json({ error: "هذا الإجراء لقائد ونائب الأمن السيبراني فقط" });
-        if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
         const name = await cyName(req.user.id);
         const f = await CyberFlag.findOneAndUpdate({ _id: req.params.id, status: { $in: ["open", "investigated"] } }, { $set: { status: "resolved", handledBy: req.user.id, handledByName: name, handledAt: new Date() } }, { new: true });
         if (!f) return res.status(409).json({ error: "تم التعامل معها مسبقاً" });
@@ -7034,7 +7035,7 @@ app.post("/api/cyber/flags/:id/resolve", ensureAuth, async (req, res) => {
 app.get("/api/cyber/flags/:id/photo", ensureAuth, async (req, res) => {
     try {
         const role = await cyGuard(req, res); if (!role) return;
-        if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
         const f = await CyberFlag.findById(req.params.id, { violationIds: 1 }).lean();
         const vid = f && (f.violationIds || [])[0];
         if (!vid || !mongoose.isValidObjectId(vid)) return res.status(404).json({ error: "لا توجد صورة" });
@@ -7331,7 +7332,7 @@ app.post("/api/senior/push/send", ensureSeniorAdmin, async (req, res) => {
 const ticketNotifyThrottle = new Map();
 app.post("/api/support/admin/tickets/:id/notify", async (req, res) => {
     if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
     const t = await SupportTicket.findById(req.params.id, { uid: 1, no: 1 }).lean();
     if (!t) return res.status(404).json({ error: "التكت غير موجود" });
     if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر بدون حساب، ما نقدر نرسل له إشعار" });
@@ -7479,7 +7480,7 @@ app.get("/api/senior/att/members", ensureSeniorAdmin, async (req, res) => {
         };
     });
     list.sort((a, b) => (a.status === b.status ? 0 : a.status === "in" ? -1 : 1));
-    res.json({ list, present: list.filter(x => x.status === "in").length });
+    res.json({ list, present: list.filter(x => x.status === "in").length, maxHours: (await getAttCfg()).maxHours });
 });
 app.post("/api/senior/att/members/:uid/force/:type", ensureSeniorAdmin, async (req, res) => {
     const uid = String(req.params.uid || ""), type = req.params.type;
@@ -7513,7 +7514,7 @@ app.get("/api/senior/att/member/:uid", ensureSeniorAdmin, async (req, res) => {
         days.push({ start: new Date(s), ms: attCalcMs(logs, s, Math.min(s + ATT_DAY_MS, now.getTime())) });
     }
     const weekMs = days.reduce((t, d) => t + d.ms, 0);
-    const recent = logs.filter(l => l.at >= from).slice(-40).reverse().map(l => ({ type: l.type, at: l.at, forced: !!l.by }));
+    const recent = logs.filter(l => l.at >= from).slice(-40).reverse().map(l => ({ type: l.type, at: l.at, forced: !!l.by && l.by !== "auto", auto: l.by === "auto" }));
     res.json({ weekMs, days, recent });
 });
 app.get("/api/senior/att/hours", ensureSeniorAdmin, async (req, res) => {
@@ -7606,6 +7607,194 @@ app.get("/api/senior/att/sectors", ensureSeniorAdmin, async (req, res) => {
         daily.push({ start: new Date(s), count: u.size });
     }
     res.json({ total, presentNow, todayTotal, daily, sectors: Array.from(rows.values()).filter(r => r.total > 0) });
+});
+
+// ---------- حماية الحضور: تجاوز مدة الحضور (ملاحظة تلقائية + تصعيد للقيادة عند التكرار) ----------
+const ATT_CFG_DEFAULT = { enabled: true, maxHours: 8, autoCheckout: true, repeatThreshold: 2, notifyMember: true, discordAlert: true };
+async function getAttCfg() {
+    const s = await getSettings();
+    return Object.assign({}, ATT_CFG_DEFAULT, (s && s.attConfig) || {});
+}
+const AttViolationSchema = new mongoose.Schema({
+    uid: String, name: String,
+    checkInAt: Date, hoursAway: Number, occurrence: Number, maxHours: Number,
+    status: { type: String, enum: ["note", "pending", "deciding", "warned", "penalized", "dismissed"], default: "note" },
+    autoCheckedOut: { type: Boolean, default: false },
+    decisionBy: String, decisionByName: String, decisionAt: Date, decisionLabel: String, decisionReason: String,
+    createdAt: { type: Date, default: Date.now },
+});
+AttViolationSchema.index({ uid: 1, checkInAt: 1 }, { unique: true });
+AttViolationSchema.index({ status: 1, createdAt: -1 });
+const AttViolation = mongoose.model("AttViolation", AttViolationSchema);
+
+// انصراف (تلقائي أو بواسطة الإدارة) مع إخراجه من أي تردد
+async function attForceOut(uid, by) {
+    const now = new Date();
+    const st = await AttStatus.findOneAndUpdate({ uid, status: "in" }, { $set: { status: "out", lastCheckOutAt: now, updatedAt: now } }, { new: true });
+    if (!st) return false;
+    await AttLog.create({ uid, name: st.name || uid, type: "out", at: now, by });
+    for (const n of Array.from(offLive.keys())) {
+        if (offIsFreq(n) && offLive.get(n) && offLive.get(n).has(uid)) { offSendTo(uid, { t: "kicked", n }); offRemove(uid, n); }
+    }
+    return true;
+}
+
+// تنبيه القيادة (القيادة العليا + كبار المسؤولين) لما أحد يكرر التجاوز
+async function attNotifyLeadership(v) {
+    const cfg = await getAttCfg();
+    const settings = await getSettings();
+    const ids = new Set((settings.highCommand || []).map(m => m.id).concat(Array.from(seniorUids)));
+    ids.delete(v.uid);
+    if (!ids.size) return;
+    const text = "🚨 تكرار تجاوز الحضور\nالعضو: " + v.name + "\nبقي حاضر " + v.hoursAway + " ساعة بدون انصراف (المرة رقم " + v.occurrence + ")\nحدد تحذير أو عقوبة من تاب «تجاوزات الحضور».";
+    sseBroadcast("hcalert", { t: Date.now(), att: true }, c => !!c.uid && ids.has(c.uid));
+    for (const id of ids) {
+        pushNoticeTo(id, text, "auto", "🤖 نظام الحضور").catch(() => {});
+        pushUid(id, { title: CONFIG.SITE_NAME, body: "🚨 تكرار تجاوز حضور — " + v.name, tag: "att-over-" + v._id, ttl: 86400 }).catch(() => {});
+    }
+    if (cfg.discordAlert && botReady) {
+        const embed = new EmbedBuilder().setTitle("🚨 تكرار تجاوز الحضور").setColor(0xef4444).addFields(
+            { name: "العضو", value: v.name || "-", inline: true },
+            { name: "مدة الحضور", value: v.hoursAway + " ساعة", inline: true },
+            { name: "المرة", value: String(v.occurrence), inline: true },
+            { name: "المطلوب", value: "حدد تحذير أو عقوبة من الموقع (تاب تجاوزات الحضور)", inline: false },
+        ).setTimestamp(new Date());
+        for (const id of ids) { try { const u = await client.users.fetch(id); await u.send({ embeds: [embed] }); } catch (e) {} }
+    }
+}
+
+async function attHandleOver(st, cfg) {
+    if (!st.lastCheckInAt || isSeniorAdmin(st.uid)) return;
+    if (await AttViolation.exists({ uid: st.uid, checkInAt: st.lastCheckInAt })) return;
+    const occurrence = (await AttViolation.countDocuments({ uid: st.uid })) + 1;
+    const repeated = occurrence >= cfg.repeatThreshold;
+    const name = st.name || await cyName(st.uid);
+    const hours = Math.round((Date.now() - st.lastCheckInAt.getTime()) / 360000) / 10;
+    let v;
+    try {
+        v = await AttViolation.create({
+            uid: st.uid, name, checkInAt: st.lastCheckInAt, hoursAway: hours, occurrence, maxHours: cfg.maxHours,
+            status: repeated ? "pending" : "note", autoCheckedOut: !!cfg.autoCheckout,
+        });
+    } catch (e) { return; }
+    if (cfg.autoCheckout) await attForceOut(st.uid, "auto");
+    const noteText = "⏱️ ملاحظة تلقائية: بقي حاضر " + hours + " ساعة بدون انصراف (الحد " + cfg.maxHours + " ساعات)" + (cfg.autoCheckout ? " — انسجّل انصرافه تلقائياً" : "") + " — المرة رقم " + occurrence + ".";
+    await Personnel.updateOne({ discord: st.uid }, { $push: { notes: { text: noteText, addedBy: "auto", addedByTag: "🤖 نظام الحضور" } } }).catch(() => {});
+    if (cfg.notifyMember) {
+        const msg = "⏱️ انسجّلت عليك ملاحظة: بقيت حاضر " + hours + " ساعة بدون انصراف (الحد " + cfg.maxHours + " ساعات)." + (repeated ? " الأمر تكرر وانرفع للقيادة." : " لا تنسى تسجّل انصرافك.");
+        pushNoticeTo(st.uid, msg, "auto", "🤖 نظام الحضور").catch(() => {});
+        pushUid(st.uid, { title: CONFIG.SITE_NAME, body: "⏱️ ملاحظة: نسيت تسجّل انصرافك", tag: "att-note", ttl: 86400 }).catch(() => {});
+    }
+    await logEvent({ action: repeated ? "تجاوز حضور متكرر (للقيادة)" : "ملاحظة تجاوز حضور تلقائية", discordId: st.uid, actorId: "auto", actorTag: "🤖 نظام الحضور", details: name + " — " + hours + " ساعة (المرة " + occurrence + ")" });
+    if (repeated) await attNotifyLeadership(v);
+}
+
+let attWatchBusy = false;
+async function attOverCheck() {
+    if (attWatchBusy) return;
+    attWatchBusy = true;
+    try {
+        const cfg = await getAttCfg();
+        if (!cfg.enabled) return;
+        const limit = new Date(Date.now() - cfg.maxHours * 3600000);
+        const over = await AttStatus.find({ status: "in", lastCheckInAt: { $lte: limit } }).limit(300).lean();
+        for (const st of over) {
+            try { await attHandleOver(st, cfg); } catch (e) { console.error("❌ فشل معالجة تجاوز الحضور:", e.message); }
+        }
+    } catch (e) { console.error("❌ فشل فحص تجاوز الحضور:", e.message); }
+    finally { attWatchBusy = false; }
+}
+setInterval(() => { attOverCheck().catch(() => {}); }, 5 * 60 * 1000);
+setTimeout(() => { attOverCheck().catch(() => {}); }, 30000);
+
+app.get("/api/senior/att/config", ensureSeniorAdmin, async (req, res) => {
+    res.json({ config: await getAttCfg() });
+});
+app.post("/api/senior/att/config", ensureSeniorAdmin, async (req, res) => {
+    const b = req.body || {};
+    const cur = await getAttCfg();
+    const num = (v, lo, hi, d) => { const n = parseInt(v, 10); return isNaN(n) ? d : Math.max(lo, Math.min(hi, n)); };
+    const bool = (v, d) => (v === undefined ? d : !!v);
+    const cfg = {
+        enabled: bool(b.enabled, cur.enabled),
+        maxHours: num(b.maxHours, 2, 24, cur.maxHours),
+        autoCheckout: bool(b.autoCheckout, cur.autoCheckout),
+        repeatThreshold: num(b.repeatThreshold, 1, 10, cur.repeatThreshold),
+        notifyMember: bool(b.notifyMember, cur.notifyMember),
+        discordAlert: bool(b.discordAlert, cur.discordAlert),
+    };
+    const s = await getSettings();
+    s.attConfig = cfg;
+    s.markModified("attConfig");
+    await s.save();
+    await logEvent({ action: "تعديل إعدادات الحضور", actorId: req.user.id, actorTag: req.user.username, details: "الحد " + cfg.maxHours + " ساعات — " + (cfg.enabled ? "مفعّل" : "متوقف") + " — تصعيد من المرة " + cfg.repeatThreshold });
+    res.json({ ok: true, config: cfg });
+});
+
+// زر: ينصرف الكل يدوياً (الحاضرين كلهم، أو اللي نسوا الانصراف بس)
+app.post("/api/senior/att/checkout-all", ensureSeniorAdmin, async (req, res) => {
+    const scope = (req.body && req.body.scope) === "stale" ? "stale" : "in";
+    const cfg = await getAttCfg();
+    if (scope === "stale") await attOverCheck();
+    const q = { status: "in" };
+    if (scope === "stale") q.lastCheckInAt = { $lte: new Date(Date.now() - cfg.maxHours * 3600000) };
+    const list = await AttStatus.find(q, { uid: 1 }).limit(5000).lean();
+    let count = 0;
+    for (const x of list) { if (await attForceOut(x.uid, req.user.id)) count++; }
+    await logEvent({ action: "انصراف جماعي يدوي", actorId: req.user.id, actorTag: req.user.username, details: (scope === "stale" ? "اللي نسوا الانصراف" : "كل الحاضرين") + " — " + count });
+    res.json({ ok: true, count });
+});
+
+// تجاوزات الحضور: القيادة العليا + كبار المسؤولين
+app.get("/api/hc/att-violations", ensureHighCommand, async (req, res) => {
+    const f = String(req.query.filter || "pending");
+    const q = f === "pending" ? { status: { $in: ["pending", "deciding"] } }
+        : f === "notes" ? { status: "note" }
+        : f === "done" ? { status: { $in: ["warned", "penalized", "dismissed"] } } : {};
+    const [list, pendingCount] = await Promise.all([
+        AttViolation.find(q).sort({ createdAt: -1 }).limit(200).lean(),
+        AttViolation.countDocuments({ status: "pending" }),
+    ]);
+    const penalties = (req.settings.warningPenalties || []).map(p => ({ id: p.id, label: p.label }));
+    res.json({ list, pendingCount, penalties });
+});
+app.post("/api/hc/att-violations/:id/decide", ensureHighCommand, async (req, res) => {
+    const b = req.body || {};
+    const action = b.action;
+    if (!["warning", "penalty", "dismiss"].includes(action)) return res.status(400).json({ error: "قرار غير معروف" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
+    let pen = null;
+    if (action === "penalty") {
+        pen = (req.settings.warningPenalties || []).find(x => x.id === b.penaltyId);
+        if (!pen) return res.status(400).json({ error: "اختر العقوبة" });
+    }
+    const v = await AttViolation.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "deciding" } }, { new: true });
+    if (!v) return res.status(409).json({ error: "تم اتخاذ قرار على هذي الحالة من قبل" });
+    const byName = await cyName(req.user.id);
+    const extra = String(b.reason || "").trim().slice(0, 300);
+    const baseReason = "تكرار البقاء حاضر أكثر من " + (v.maxHours || 8) + " ساعات بدون انصراف (المرة رقم " + v.occurrence + ")" + (extra ? " — " + extra : "");
+    try {
+        let label, status;
+        if (action === "warning") {
+            const r = await issueWarning({ targetDiscord: v.uid, kind: "warning", reason: baseReason, actorId: req.user.id, actorTag: req.user.username });
+            status = "warned"; label = r.dismissed ? "تحذير (انفصل تلقائياً)" : "تحذير";
+        } else if (action === "penalty") {
+            const p = await Personnel.findOne({ discord: v.uid });
+            if (!p) throw new Error("العضو غير موجود");
+            applyPenaltyEffect(p, pen);
+            p.warnings.push({ kind: "notice", reason: "⚖️ عقوبة من القيادة: " + pen.label + " — السبب: " + baseReason, issuedBy: req.user.id, issuedByTag: req.user.username, penaltyType: pen.type, penaltyLabel: pen.label });
+            await p.save();
+            status = "penalized"; label = pen.label;
+            await logEvent({ action: "عقوبة تجاوز حضور", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: p.registeredName + " — " + pen.label });
+        } else {
+            status = "dismissed"; label = "حفظ بدون إجراء";
+        }
+        await AttViolation.updateOne({ _id: v._id }, { $set: { status, decisionBy: req.user.id, decisionByName: byName, decisionAt: new Date(), decisionLabel: label, decisionReason: extra || null } });
+        res.json({ ok: true });
+    } catch (e) {
+        await AttViolation.updateOne({ _id: v._id, status: "deciding" }, { $set: { status: "pending" } });
+        res.status(400).json({ error: e.message });
+    }
 });
 
 // ---------- مسؤولو الاستلامات + زر فتح استلام ----------
@@ -7838,7 +8027,7 @@ app.post("/api/court/start", ensureAuth, async (req, res) => {
     res.json({ ok: true, id: String(c._id), status: c.status });
 });
 async function courtAccess(req, res, needLead) {
-    if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "رقم غير صحيح" }); return null; }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) { res.status(400).json({ error: "رقم غير صحيح" }); return null; }
     const c = await CourtCase.findById(req.params.id);
     if (!c) { res.status(404).json({ error: "غير موجود" }); return null; }
     const r = await courtRole(req.user.id);
@@ -10022,6 +10211,8 @@ function spConnect() {
         });
         es.addEventListener('hcalert', function () {
             try {
+                if (ME && document.getElementById('att-body') && typeof ATTP !== 'undefined' && ATTP.tab === 'viol') attLoad(true);
+                if (ME && document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'att') loadHCAtt(true);
                 if (!ME || !ME.isHighCommand) return;
                 checkPromotionAlert();
                 if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
@@ -11755,7 +11946,7 @@ function adminTab(name, el) {
     if (name === 'push') flPushTab();
     if (name === 'freq') flFreqAdmin();
 }
-var ATTP = { tab: 'members', filter: 'all', q: '', sig: '', timer: null, period: 'week', days: 3, openUid: null, data: {}, mdata: {} };
+var ATTP = { maxHours: 8, tab: 'members', filter: 'all', q: '', sig: '', timer: null, period: 'week', days: 3, openUid: null, data: {}, mdata: {} };
 function attFmtMs(ms) {
     var m = Math.floor((ms || 0) / 60000), h = Math.floor(m / 60);
     m = m % 60;
@@ -11789,7 +11980,7 @@ function attBar(pct, color) {
 function attOpen() {
     var box = document.getElementById('admin-content');
     if (!box) return;
-    var T = [['members', '👥 الأعضاء'], ['hours', '⏱️ ساعات الدوام'], ['absent', '🚫 المتغيبون'], ['sectors', '📈 القطاعات']];
+    var T = [['members', '👥 الأعضاء'], ['hours', '⏱️ ساعات الدوام'], ['absent', '🚫 المتغيبون'], ['sectors', '📈 القطاعات'], ['viol', '🚨 تجاوزات الحضور'], ['cfg', '⚙️ الإعدادات']];
     box.innerHTML = '<div class="tabs" id="att-tabs">' + T.map(function (t) {
         return '<div class="tab' + (t[0] === ATTP.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="attSetTab(this.dataset.t)">' + t[1] + '</div>';
     }).join('') + '</div><div id="att-body"></div>';
@@ -11807,7 +11998,7 @@ function attStartTimer() {
     ATTP.timer = setInterval(function () {
         if (currentAdminTab !== 'att' || !document.getElementById('att-body')) { clearInterval(ATTP.timer); ATTP.timer = null; return; }
         if (document.hidden) return;
-        if (ATTP.tab === 'members') attLoad(true);
+        if (ATTP.tab === 'members' || ATTP.tab === 'viol') attLoad(true);
     }, 7000);
 }
 async function attLoad(silent) {
@@ -11817,6 +12008,8 @@ async function attLoad(silent) {
     if (tab === 'members') url = '/api/senior/att/members';
     else if (tab === 'hours') url = '/api/senior/att/hours?period=' + ATTP.period;
     else if (tab === 'absent') url = '/api/senior/att/absent?days=' + ATTP.days;
+    else if (tab === 'viol') url = '/api/hc/att-violations?filter=' + ATTV.filter;
+    else if (tab === 'cfg') url = '/api/senior/att/config';
     else url = '/api/senior/att/sectors';
     if (!silent) { ATTP.sig = ''; box.innerHTML = '<div class="card">جارِ التحميل...</div>'; }
     var d;
@@ -11829,16 +12022,19 @@ async function attLoad(silent) {
     }
     if (ATTP.tab !== tab || !document.getElementById('att-body')) return;
     ATTP.data[tab] = d;
+    if (tab === 'members' && d && d.maxHours) ATTP.maxHours = d.maxHours;
     var sig = JSON.stringify(tab === 'members' ? d.list : d);
     if (silent && sig === ATTP.sig) return;
     ATTP.sig = sig;
     if (tab === 'members') attPaintMembers(d);
     else if (tab === 'hours') attPaintHours(d);
     else if (tab === 'absent') attPaintAbsent(d);
+    else if (tab === 'viol') attPaintViol(d);
+    else if (tab === 'cfg') attPaintCfg(d);
     else attPaintSectors(d);
 }
 function attIsStale(x) {
-    return x.status === 'in' && x.lastCheckInAt && (Date.now() - new Date(x.lastCheckInAt).getTime()) > 8 * 3600000;
+    return x.status === 'in' && x.lastCheckInAt && (Date.now() - new Date(x.lastCheckInAt).getTime()) > (ATTP.maxHours || 8) * 3600000;
 }
 function attSetFilter(v) { ATTP.filter = v; attPaintMembers(ATTP.data.members); }
 function attPaintMembers(d) {
@@ -11854,7 +12050,7 @@ function attPaintMembers(d) {
     document.getElementById('att-stats').innerHTML =
         '<div class="stat"><div class="num" style="color:#4ade80;">' + present + '</div><div class="lbl">حاضرون الآن</div></div>' +
         '<div class="stat"><div class="num">' + (L.length - present) + '</div><div class="lbl">منصرفون</div></div>' +
-        '<div class="stat"><div class="num" style="color:#fbbf24;">' + stale + '</div><div class="lbl">⚠️ أكثر من ٨ ساعات</div></div>';
+        '<div class="stat"><div class="num" style="color:#fbbf24;">' + stale + '</div><div class="lbl">⚠️ أكثر من ' + (ATTP.maxHours || 8) + ' ساعات</div></div>';
     var f = ATTP.filter;
     document.getElementById('att-filters').innerHTML =
         attChip('الكل (' + L.length + ')', f === 'all', 'attSetFilter', 'all') +
@@ -11874,8 +12070,10 @@ function attPaintList() {
         if (!q) return true;
         return [x.name, x.unit, x.rank, x.sector].join(' ').toLowerCase().indexOf(q) > -1;
     });
-    if (!L.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء</div>'; return; }
-    box.innerHTML = L.map(function (x) {
+    var scopeCnt = (d.list || []).filter(function (x) { return f === 'stale' ? attIsStale(x) : x.status === 'in'; }).length;
+    var bulk = ((f === 'stale' || f === 'in') && scopeCnt) ? '<div class="card row" style="padding:12px;"><div style="font-size:13px;">' + (f === 'stale' ? '⚠️ ' + scopeCnt + ' نسوا الانصراف' : '🟢 ' + scopeCnt + ' حاضر الحين') + '</div><button class="btn sm danger" data-s="' + f + '" onclick="attForceAll(this.dataset.s)">🚪 ينصرف الكل</button></div>' : '';
+    if (!L.length) { box.innerHTML = bulk + '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء</div>'; return; }
+    box.innerHTML = bulk + L.map(function (x) {
         var u = cyEsc(x.uid), isIn = x.status === 'in', st = attIsStale(x);
         return '<div class="card" style="padding:14px;">' +
             '<div class="row" style="cursor:pointer;" data-u="' + u + '" onclick="attToggleMember(this.dataset.u)">' +
@@ -11899,7 +12097,7 @@ function attMemberDetail(uid) {
             '<div style="font-size:10px;color:var(--muted);margin-top:3px;">' + attWd(x.start, false) + '</div><div style="font-size:10px;color:var(--gold-soft);">' + attFmtMs(x.ms) + '</div></div>';
     }).join('');
     var rec = m.recent.length ? m.recent.map(function (l) {
-        return '<div class="row" style="padding:5px 0;border-bottom:1px solid var(--border);font-size:12px;"><span style="color:' + (l.type === 'in' ? '#4ade80' : '#f87171') + ';font-weight:700;">' + (l.type === 'in' ? 'حضور' : 'انصراف') + (l.forced ? ' <span style="color:var(--muted);font-weight:400;">(بواسطة الإدارة)</span>' : '') + '</span><span style="color:var(--muted);">' + attFmtT(l.at) + '</span></div>';
+        return '<div class="row" style="padding:5px 0;border-bottom:1px solid var(--border);font-size:12px;"><span style="color:' + (l.type === 'in' ? '#4ade80' : '#f87171') + ';font-weight:700;">' + (l.type === 'in' ? 'حضور' : 'انصراف') + (l.forced ? ' <span style="color:var(--muted);font-weight:400;">(بواسطة الإدارة)</span>' : (l.auto ? ' <span style="color:var(--muted);font-weight:400;">(تلقائي ⏱️)</span>' : '')) + '</span><span style="color:var(--muted);">' + attFmtT(l.at) + '</span></div>';
     }).join('') : '<div style="color:var(--muted);font-size:12px;">لا توجد حركات آخر ٧ أيام</div>';
     return '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">' +
         '<div style="font-size:13px;margin-bottom:8px;">إجمالي آخر ٧ أيام: <b style="color:var(--gold-soft);">' + attFmtMs(m.weekMs) + '</b></div>' +
@@ -11989,6 +12187,121 @@ function attPaintSectors(d) {
         '<div class="stat"><div class="num">' + d.todayTotal + '</div><div class="lbl">حضروا اليوم</div></div>' +
         '<div class="stat"><div class="num">' + d.total + '</div><div class="lbl">إجمالي الأعضاء</div></div></div>' +
         '<div class="card"><div style="font-size:13px;margin-bottom:10px;">📊 عدد الأعضاء اللي حضروا كل يوم (آخر ٧ أيام)</div><div style="display:flex;gap:4px;">' + bars + '</div></div>' + secs;
+}
+var ATTV = { filter: 'pending', penalties: [], id: null, kind: null };
+async function attForceAll(scope) {
+    var d = ATTP.data.members, L = (d && d.list) || [];
+    var cnt = L.filter(function (x) { return scope === 'stale' ? attIsStale(x) : x.status === 'in'; }).length;
+    if (!cnt) { toast('ما فيه أحد'); return; }
+    if (!(await confirmModal('تسجيل انصراف ' + (scope === 'stale' ? 'كل اللي نسوا الانصراف' : 'كل الحاضرين') + ' (' + cnt + ') يدوياً؟'))) return;
+    try {
+        var r = await api('/api/senior/att/checkout-all', { method: 'POST', body: JSON.stringify({ scope: scope }) });
+        toast('✅ تم انصراف ' + r.count);
+        attLoad(false);
+    } catch (e) { toast(e.message); }
+}
+function attVBadge(v) {
+    var m = { note: ['pending', '📝 ملاحظة تلقائية'], pending: ['pending', '⏳ بانتظار قرار القيادة'], deciding: ['pending', '⏳ جاري التنفيذ'], warned: ['approved', '⚠️ انعطى تحذير'], penalized: ['approved', '⚖️ انعاقب'], dismissed: ['approved', '✔️ انحفظ بدون إجراء'] };
+    var x = m[v.status] || ['pending', v.status];
+    return '<span class="badge ' + x[0] + '">' + x[1] + '</span>';
+}
+function attVCard(v) {
+    var id = cyEsc(v._id), acts = '';
+    if (v.status === 'pending') {
+        acts = '<div class="row" style="gap:6px;margin-top:10px;justify-content:flex-start;flex-wrap:wrap;">' +
+            '<button class="btn sm" data-i="' + id + '" data-k="warning" onclick="attVAsk(this.dataset.i, this.dataset.k)">⚠️ تحذير</button>' +
+            '<button class="btn sm gold" data-i="' + id + '" data-k="penalty" onclick="attVAsk(this.dataset.i, this.dataset.k)">⚖️ عقوبة</button>' +
+            '<button class="btn sm gray" data-i="' + id + '" data-k="dismiss" onclick="attVAsk(this.dataset.i, this.dataset.k)">✔️ بدون إجراء</button></div>';
+    }
+    var dec = v.decisionLabel ? '<div style="font-size:12px;margin-top:8px;">القرار: <b>' + cyEsc(v.decisionLabel) + '</b> — ' + cyEsc(v.decisionByName || '') + (v.decisionReason ? ' — ' + cyEsc(v.decisionReason) : '') + '</div>' : '';
+    return '<div class="card" style="padding:14px;"><div><b>' + cyEsc(v.name) + '</b> ' + attVBadge(v) + '</div>' +
+        '<div style="font-size:12px;color:var(--muted);margin-top:4px;">حضر ' + attFmtT(v.checkInAt) + ' • بقي ' + v.hoursAway + ' ساعة بدون انصراف' + (v.autoCheckedOut ? ' • انسجّل انصرافه تلقائياً' : '') + '</div>' +
+        '<div style="font-size:12px;color:var(--gold-soft);margin-top:3px;">🔁 المرة رقم ' + v.occurrence + '</div>' + dec + acts + '</div>';
+}
+function attVHtml(d) {
+    ATTV.penalties = d.penalties || [];
+    var F = [['pending', '⏳ بانتظار القرار'], ['notes', '📝 الملاحظات'], ['done', '✅ تم البت'], ['all', 'الكل']];
+    var chips = F.map(function (f) { return attChip(f[1] + (f[0] === 'pending' && d.pendingCount ? ' (' + d.pendingCount + ')' : ''), ATTV.filter === f[0], 'attVSetFilter', f[0]); }).join('');
+    var rows = d.list.length ? d.list.map(function (v) { return attVCard(v); }).join('') : '<div class="card center" style="color:var(--muted);">لا توجد حالات</div>';
+    return '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
+        '<div style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.7;">أول مرة: تنسجّل ملاحظة تلقائية على العضو. إذا كررها: ينرسل لكم وتحددون تحذير أو عقوبة.</div></div>' + rows;
+}
+function attPaintViol(d) {
+    var body = document.getElementById('att-body');
+    if (body) body.innerHTML = attVHtml(d);
+}
+function attVSetFilter(v) { ATTV.filter = v; attVReload(); }
+function attVReload() {
+    if (document.getElementById('att-body') && ATTP.tab === 'viol') attLoad(false);
+    else if (document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'att') loadHCAtt(false);
+}
+async function loadHCAtt(silent) {
+    var box = document.getElementById('hc-content');
+    if (!box) return;
+    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var d;
+    try { d = await api('/api/hc/att-violations?filter=' + ATTV.filter, { noLock: true }); }
+    catch (e) { if (silent || hcTab !== 'att') return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + cyEsc(e.message) + ')</div>'; return; }
+    if (hcTab !== 'att') return;
+    box.innerHTML = attVHtml(d);
+}
+function attVAsk(id, kind) {
+    var box = document.getElementById('wf-box');
+    if (!box) return;
+    ATTV.id = id; ATTV.kind = kind;
+    var h;
+    if (kind === 'warning') {
+        h = '<h3>⚠️ إرسال تحذير</h3><p style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.7;">يُحسب ضمن تحذيرات العضو: الأول خصم ١٠ نقاط، الثاني تنزيل رتبة + خصم ٢٥ نقطة، الثالث فصل نهائي.</p>';
+    } else if (kind === 'penalty') {
+        var opts = (ATTV.penalties || []).map(function (p) { return '<option value="' + cyEsc(p.id) + '">' + cyEsc(p.label) + '</option>'; }).join('');
+        h = '<h3>⚖️ اختر العقوبة</h3><select id="attv-pen" style="margin-top:8px;">' + opts + '</select>';
+    } else {
+        h = '<h3>✔️ حفظ بدون إجراء</h3>';
+    }
+    h += '<textarea id="attv-reason" placeholder="ملاحظة القيادة (اختياري)" style="margin-top:8px;"></textarea>' +
+        '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button><button class="btn sm" onclick="attVSubmit()">تأكيد</button></div>';
+    box.innerHTML = h;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function attVSubmit() {
+    var r0 = document.getElementById('attv-reason');
+    var body = { action: ATTV.kind, reason: r0 ? r0.value : '' };
+    if (ATTV.kind === 'penalty') {
+        var sel = document.getElementById('attv-pen');
+        if (!sel || !sel.value) { toast('اختر العقوبة'); return; }
+        body.penaltyId = sel.value;
+    }
+    try {
+        await api('/api/hc/att-violations/' + encodeURIComponent(ATTV.id) + '/decide', { method: 'POST', body: JSON.stringify(body) });
+        closeWarnForm();
+        toast('✅ تم تنفيذ القرار');
+        attVReload();
+    } catch (e) { toast(e.message); }
+}
+function attPaintCfg(d) {
+    var body = document.getElementById('att-body');
+    if (!body) return;
+    var c = d.config;
+    function row(label, id, on) { return '<div class="row" style="margin-top:12px;"><span>' + label + '</span><input type="checkbox" id="' + id + '"' + (on ? ' checked' : '') + '></div>'; }
+    body.innerHTML = '<div class="card"><h3 style="margin-bottom:4px;">⚙️ إعدادات حماية الحضور</h3>' +
+        row('تفعيل الحماية (ملاحظة تلقائية على اللي يتجاوز المدة)', 'attc-en', c.enabled) +
+        '<label style="margin-top:14px;">الحد الأقصى للحضور (بالساعات)</label><input id="attc-h" type="number" min="2" max="24" value="' + c.maxHours + '">' +
+        row('تسجيل انصراف تلقائي لما يتجاوز الحد', 'attc-auto', c.autoCheckout) +
+        '<label style="margin-top:14px;">ينرسل للقيادة من المرة رقم</label><input id="attc-rep" type="number" min="1" max="10" value="' + c.repeatThreshold + '">' +
+        row('إشعار العضو لما تنسجّل عليه الملاحظة', 'attc-mem', c.notifyMember) +
+        row('تنبيه القيادة على الديسكورد (خاص)', 'attc-dc', c.discordAlert) +
+        '<button class="btn" style="margin-top:16px;" onclick="attSaveCfg()">حفظ الإعدادات</button></div>' +
+        '<div class="card" style="font-size:12px;color:var(--muted);line-height:1.9;">• أول تجاوز: ملاحظة تلقائية على ملف العضو.<br>• إذا كرر (حسب الرقم فوق): ينرسل للقيادة العليا وكبار المسؤولين، وهم يختارون تحذير أو عقوبة من تاب «تجاوزات الحضور».<br>• كبار المسؤولين ما تنسجّل عليهم تجاوزات.</div>';
+}
+async function attSaveCfg() {
+    function g(id) { return document.getElementById(id); }
+    var body = { enabled: g('attc-en').checked, maxHours: g('attc-h').value, autoCheckout: g('attc-auto').checked, repeatThreshold: g('attc-rep').value, notifyMember: g('attc-mem').checked, discordAlert: g('attc-dc').checked };
+    try {
+        var r = await api('/api/senior/att/config', { method: 'POST', body: JSON.stringify(body) });
+        ATTP.maxHours = r.config.maxHours;
+        toast('✅ تم حفظ الإعدادات');
+        attPaintCfg(r);
+    } catch (e) { toast(e.message); }
 }
 async function loadReviewedViolations() {
     const box = document.getElementById('admin-content');
@@ -12400,6 +12713,7 @@ function renderHighCommandPanel() {
         <div class="tabs">
             <div class="tab active" onclick="hcTabSwitch('pending', this)">⏳ الطلبات المعلّقة</div>
             <div class="tab" onclick="hcTabSwitch('history', this)">📜 السجل</div>
+            <div class="tab" onclick="hcTabSwitch('att', this)">🚨 تجاوزات الحضور</div>
         </div>
         <div id="hc-content"></div>\`;
     hcTabSwitch('pending');
@@ -12410,6 +12724,7 @@ function hcTabSwitch(name, el) {
     hcTab = name;
     if (name === 'pending') loadHCPending();
     if (name === 'history') loadHCHistory();
+    if (name === 'att') loadHCAtt();
 }
 function hcCard(r, withActions) {
     const kind = r.kind || 'rank';
