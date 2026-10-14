@@ -2030,10 +2030,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
 
     const isAdmin = senior || settings.adminList.includes(req.user.id);
     let seniorTemp = false, accountEmail = null;
-    if (senior) {
-        const acc = await Account.findOne({ uid: req.user.id }, { email: 1, tempSenior: 1 }).lean();
-        if (acc) { accountEmail = acc.email; seniorTemp = !!acc.tempSenior; }
-    }
     const progress = await rankProgress(p, settings);
     const sectorInfo = getSectorRole(req.user.id, settings);
     if (sectorInfo) {
@@ -2063,9 +2059,17 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         unlockAt: p.summon.unlockAt, enteredAt: p.summon.enteredAt,
     } : null;
 
-    const meAtt = await getAttState(req.user.id);
-    const mePwa = !!(await PwaInstall.exists({ uid: req.user.id }));
-    const meCourt = await courtRole(req.user.id);
+    const [meAtt, mePwaDoc, meCourt, meCyber, meDevLocked, meUnassigned, meAcc] = await Promise.all([
+        getAttState(req.user.id),
+        PwaInstall.exists({ uid: req.user.id }),
+        courtRole(req.user.id),
+        cyberRoleOf(req.user.id),
+        cyDevLocked(req),
+        isUnassignedUid(req.user.id),
+        Account.findOne({ uid: req.user.id }, { sector: 1, email: 1, tempSenior: 1 }).lean(),
+    ]);
+    const mePwa = !!mePwaDoc;
+    if (senior && meAcc) { accountEmail = meAcc.email; seniorTemp = !!meAcc.tempSenior; }
     res.json({
         blocked: false,
         att: meAtt, attRequired: attRequired(req.user.id), pwaInstalled: mePwa,
@@ -2076,7 +2080,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         avatar: req.user.avatar ? `https://cdn.discordapp.com/avatars/${req.user.id}/${req.user.avatar}.png` : null,
         registeredName: p.registeredName,
         cardNumber: p.cardNumber,
-        sector: (await Account.findOne({ uid: req.user.id }, { sector: 1 }).lean())?.sector || p.sector || null,
+        sector: (meAcc && meAcc.sector) || p.sector || null,
         unit: p.unit,
         rank: p.rank,
         points: p.points,
@@ -2093,10 +2097,10 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         mpPersonnelOfficer,
         isMilitaryPolice,
         isHighCommand: isHighCommand(req.user.id, settings),
-        cyber: await cyberRoleOf(req.user.id),
+        cyber: meCyber,
         cyberLocked: underInvestigation.has(req.user.id),
-        deviceLocked: await cyDevLocked(req),
-        unassigned: await isUnassignedUid(req.user.id),
+        deviceLocked: meDevLocked,
+        unassigned: meUnassigned,
         isViolationsOfficer: isViolationsOfficer(req.user.id, settings),
         isOwner: isOwnerUid(req.user.id),
         seniorTemp,
@@ -7733,9 +7737,26 @@ async function courtTick() {
 }
 setInterval(courtTick, 15000);
 
+// الصفحة ثابتة (ما تتغير بين الطلبات) => نضغطها مرة وحدة ونرسلها gzip: ٦٢٠KB تصير ~١٣٠KB
+let __flHtmlCache = null;
+function flSendHtml(req, res, html) {
+    try {
+        if (!__flHtmlCache) {
+            const raw = Buffer.from(html, "utf8");
+            __flHtmlCache = { raw, gz: require("zlib").gzipSync(raw, { level: 9 }) };
+        }
+        res.set("Vary", "Accept-Encoding");
+        res.type("html");
+        if (/\bgzip\b/.test(String(req.headers["accept-encoding"] || ""))) {
+            res.set("Content-Encoding", "gzip");
+            return res.end(__flHtmlCache.gz);
+        }
+        return res.end(__flHtmlCache.raw);
+    } catch (e) { return res.send(html); }
+}
 app.get("/", (req, res) => {
     res.set("Cache-Control", "no-store, must-revalidate");
-    res.send(`<!DOCTYPE html>
+    flSendHtml(req, res, `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
