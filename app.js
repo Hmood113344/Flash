@@ -7353,7 +7353,7 @@ const AttStatus = mongoose.model("AttStatus", new mongoose.Schema({
     updatedAt: { type: Date, default: Date.now },
 }));
 const AttLogSchema = new mongoose.Schema({
-    uid: String, name: String, type: String, at: { type: Date, default: Date.now },
+    uid: String, name: String, type: String, at: { type: Date, default: Date.now }, by: { type: String, default: null },
 });
 AttLogSchema.index({ at: -1 });
 const AttLog = mongoose.model("AttLog", AttLogSchema);
@@ -7397,6 +7397,216 @@ async function attendanceGate(req, res, next) {
         return res.status(403).json({ error: "🖐️ لازم تسجّل دخولك بالبصمة أول", needAttendance: true });
     } catch (e) { return next(); }
 }
+
+const ATT_TZ_MS = 3 * 60 * 60 * 1000;
+const ATT_DAY_MS = 24 * 60 * 60 * 1000;
+const ATT_SESSION_CAP = 12 * 60 * 60 * 1000;
+function attDayStart(d) {
+    const t = (d || new Date()).getTime();
+    return new Date(Math.floor((t + ATT_TZ_MS) / ATT_DAY_MS) * ATT_DAY_MS - ATT_TZ_MS);
+}
+function attClip(a, b, from, to) {
+    const s = Math.max(a, from), e = Math.min(b, to);
+    return e > s ? e - s : 0;
+}
+function attCalcMs(logs, from, to) {
+    let ms = 0, open = null;
+    for (const l of logs) {
+        const t = l.at.getTime();
+        if (l.type === "in") open = t;
+        else if (l.type === "out" && open !== null) {
+            ms += attClip(open, Math.min(t, open + ATT_SESSION_CAP), from, to);
+            open = null;
+        }
+    }
+    if (open !== null) ms += attClip(open, Math.min(to, open + ATT_SESSION_CAP), from, to);
+    return Math.floor(ms / 60000) * 60000;
+}
+function attGroup(logs) {
+    logs.sort((a, b) => a.at - b.at);
+    const m = new Map();
+    for (const l of logs) {
+        let a = m.get(l.uid);
+        if (!a) { a = []; m.set(l.uid, a); }
+        a.push(l);
+    }
+    return m;
+}
+async function attPeople(uids) {
+    const out = new Map();
+    if (!uids.length) return out;
+    const [ps, accs] = await Promise.all([
+        Personnel.find({ discord: { $in: uids } }, { discord: 1, registeredName: 1, unit: 1, rank: 1, sector: 1, discordTag: 1 }).maxTimeMS(10000).lean(),
+        Account.find({ uid: { $in: uids } }, { uid: 1, fullName: 1, sector: 1 }).maxTimeMS(10000).lean(),
+    ]);
+    const pm = new Map(ps.map(p => [p.discord, p]));
+    const am = new Map(accs.map(a => [a.uid, a]));
+    for (const uid of uids) {
+        const p = pm.get(uid) || {}, a = am.get(uid) || {};
+        const key = a.sector || p.sector || null;
+        out.set(uid, {
+            name: p.registeredName || a.fullName || p.discordTag || null,
+            unit: p.unit || null,
+            rank: p.rank || null,
+            sectorLabel: key ? (CONFIG.SECTORS[key] || null) : null,
+        });
+    }
+    return out;
+}
+app.get("/api/senior/att/members", ensureSeniorAdmin, async (req, res) => {
+    const now = new Date(), ds = attDayStart(now);
+    const sts = await AttStatus.find({}).sort({ updatedAt: -1 }).limit(500).maxTimeMS(10000).lean();
+    const uids = sts.map(s => s.uid);
+    const [people, logs] = await Promise.all([
+        attPeople(uids),
+        AttLog.find({ at: { $gte: new Date(ds.getTime() - ATT_SESSION_CAP) } }, { uid: 1, type: 1, at: 1 }).limit(60000).maxTimeMS(10000).lean(),
+    ]);
+    const byUid = attGroup(logs);
+    const list = sts.map(s => {
+        const p = people.get(s.uid) || {};
+        const lg = byUid.get(s.uid) || [];
+        return {
+            uid: s.uid,
+            name: p.name || s.name || s.uid,
+            unit: p.unit || null,
+            rank: p.rank || null,
+            sector: p.sectorLabel || null,
+            status: s.status === "in" ? "in" : "out",
+            lastCheckInAt: s.lastCheckInAt,
+            lastCheckOutAt: s.lastCheckOutAt,
+            todayIn: lg.filter(l => l.type === "in" && l.at >= ds).length,
+            todayMs: attCalcMs(lg, ds.getTime(), now.getTime()),
+        };
+    });
+    list.sort((a, b) => (a.status === b.status ? 0 : a.status === "in" ? -1 : 1));
+    res.json({ list, present: list.filter(x => x.status === "in").length });
+});
+app.post("/api/senior/att/members/:uid/force/:type", ensureSeniorAdmin, async (req, res) => {
+    const uid = String(req.params.uid || ""), type = req.params.type;
+    if (!uid || !["in", "out"].includes(type)) return res.status(400).json({ error: "نوع غير صحيح" });
+    let st = await AttStatus.findOne({ uid });
+    if (!st) st = new AttStatus({ uid });
+    if (!st.isNew && st.status === type) return res.json({ ok: true, same: true });
+    const name = await cyName(uid);
+    const now = new Date();
+    st.status = type; st.name = name; st.updatedAt = now;
+    if (type === "in") st.lastCheckInAt = now; else st.lastCheckOutAt = now;
+    await st.save();
+    await AttLog.create({ uid, name, type, at: now, by: req.user.id });
+    if (type === "out") {
+        for (const n of Array.from(offLive.keys())) {
+            if (offIsFreq(n) && offLive.get(n) && offLive.get(n).has(uid)) { offSendTo(uid, { t: "kicked", n }); offRemove(uid, n); }
+        }
+    }
+    await logEvent({ action: type === "in" ? "تحضير يدوي بالبصمة" : "انصراف يدوي بالبصمة", discordId: uid, actorId: req.user.id, actorTag: req.user.username, details: name });
+    res.json({ ok: true });
+});
+app.get("/api/senior/att/member/:uid", ensureSeniorAdmin, async (req, res) => {
+    const uid = String(req.params.uid || "");
+    const now = new Date(), ds = attDayStart(now);
+    const from = new Date(ds.getTime() - 6 * ATT_DAY_MS);
+    const logs = await AttLog.find({ uid, at: { $gte: new Date(from.getTime() - ATT_SESSION_CAP) } }, { type: 1, at: 1, by: 1, uid: 1 }).maxTimeMS(10000).lean();
+    logs.sort((a, b) => a.at - b.at);
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+        const s = ds.getTime() - i * ATT_DAY_MS;
+        days.push({ start: new Date(s), ms: attCalcMs(logs, s, Math.min(s + ATT_DAY_MS, now.getTime())) });
+    }
+    const weekMs = days.reduce((t, d) => t + d.ms, 0);
+    const recent = logs.filter(l => l.at >= from).slice(-40).reverse().map(l => ({ type: l.type, at: l.at, forced: !!l.by }));
+    res.json({ weekMs, days, recent });
+});
+app.get("/api/senior/att/hours", ensureSeniorAdmin, async (req, res) => {
+    const period = ["day", "week", "month"].includes(req.query.period) ? req.query.period : "week";
+    const now = new Date(), ds = attDayStart(now);
+    const from = period === "day" ? ds : new Date(now.getTime() - (period === "week" ? 7 : 30) * ATT_DAY_MS);
+    const logs = await AttLog.find({ at: { $gte: new Date(from.getTime() - ATT_SESSION_CAP) } }, { uid: 1, type: 1, at: 1 }).limit(60000).maxTimeMS(10000).lean();
+    const rows = [];
+    let totalMs = 0;
+    for (const [uid, lg] of attGroup(logs)) {
+        const ms = attCalcMs(lg, from.getTime(), now.getTime());
+        if (ms <= 0) continue;
+        totalMs += ms;
+        const dayKeys = new Set(lg.filter(l => l.type === "in" && l.at >= from).map(l => Math.floor((l.at.getTime() + ATT_TZ_MS) / ATT_DAY_MS)));
+        rows.push({ uid, ms, days: dayKeys.size });
+    }
+    rows.sort((a, b) => b.ms - a.ms);
+    const top = rows.slice(0, 100);
+    const people = await attPeople(top.map(r => r.uid));
+    const list = top.map(r => {
+        const p = people.get(r.uid) || {};
+        return { uid: r.uid, name: p.name || r.uid, unit: p.unit || null, rank: p.rank || null, sector: p.sectorLabel || null, ms: r.ms, days: r.days };
+    });
+    res.json({ period, list, totalMs, count: rows.length });
+});
+app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
+    const d = parseInt(req.query.days, 10);
+    const days = [1, 3, 7, 14].includes(d) ? d : 3;
+    const now = new Date();
+    const since = new Date(attDayStart(now).getTime() - (days - 1) * ATT_DAY_MS);
+    const [accs, ps, sts, leaves] = await Promise.all([
+        Account.find({ status: "approved" }, { uid: 1, fullName: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        Personnel.find({}, { discord: 1, registeredName: 1, unit: 1, rank: 1, sector: 1, isDismissed: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        AttStatus.find({}, { uid: 1, status: 1, lastCheckInAt: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        LeaveRequest.find({ status: "approved" }, { discord: 1, endDate: 1 }).limit(5000).maxTimeMS(10000).lean(),
+    ]);
+    const pm = new Map(ps.map(p => [p.discord, p]));
+    const sm = new Map(sts.map(s => [s.uid, s]));
+    const lv = new Set(leaves.filter(l => !l.endDate || l.endDate > now).map(l => l.discord));
+    const universe = accs.filter(a => !a.isSenior && !a.isOwner && !a.tempSenior && !isSeniorAdmin(a.uid) && !(pm.get(a.uid) || {}).isDismissed);
+    const list = [];
+    for (const a of universe) {
+        const st = sm.get(a.uid);
+        if (st && (st.status === "in" || (st.lastCheckInAt && st.lastCheckInAt >= since))) continue;
+        const p = pm.get(a.uid) || {};
+        const key = a.sector || p.sector || null;
+        list.push({
+            uid: a.uid,
+            name: p.registeredName || a.fullName || a.uid,
+            unit: p.unit || null,
+            rank: p.rank || null,
+            sector: key ? (CONFIG.SECTORS[key] || null) : null,
+            lastCheckInAt: st ? st.lastCheckInAt : null,
+            onLeave: lv.has(a.uid),
+        });
+    }
+    list.sort((x, y) => (x.lastCheckInAt ? x.lastCheckInAt.getTime() : 0) - (y.lastCheckInAt ? y.lastCheckInAt.getTime() : 0));
+    res.json({ days, total: universe.length, absentCount: list.length, list: list.slice(0, 400) });
+});
+app.get("/api/senior/att/sectors", ensureSeniorAdmin, async (req, res) => {
+    const now = new Date(), ds = attDayStart(now);
+    const weekFrom = new Date(ds.getTime() - 6 * ATT_DAY_MS);
+    const [accs, sts, logs, leaves] = await Promise.all([
+        Account.find({ status: "approved" }, { uid: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        AttStatus.find({}, { uid: 1, status: 1, lastCheckInAt: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        AttLog.find({ type: "in", at: { $gte: weekFrom } }, { uid: 1, at: 1 }).limit(60000).maxTimeMS(10000).lean(),
+        LeaveRequest.find({ status: "approved" }, { discord: 1, endDate: 1 }).limit(5000).maxTimeMS(10000).lean(),
+    ]);
+    const sm = new Map(sts.map(s => [s.uid, s]));
+    const lv = new Set(leaves.filter(l => !l.endDate || l.endDate > now).map(l => l.discord));
+    const keys = Object.keys(CONFIG.SECTORS).concat(["none"]);
+    const rows = new Map(keys.map(k => [k, { key: k, label: k === "none" ? "بدون قطاع" : CONFIG.SECTORS[k], total: 0, present: 0, today: 0, leave: 0 }]));
+    let total = 0, presentNow = 0, todayTotal = 0;
+    for (const a of accs) {
+        if (a.isSenior || a.isOwner || a.tempSenior || isSeniorAdmin(a.uid)) continue;
+        const r = rows.get(a.sector && rows.has(a.sector) ? a.sector : "none");
+        const st = sm.get(a.uid);
+        const isIn = !!(st && st.status === "in");
+        const cameToday = !!(st && (isIn || (st.lastCheckInAt && st.lastCheckInAt >= ds)));
+        r.total++; total++;
+        if (isIn) { r.present++; presentNow++; }
+        if (cameToday) { r.today++; todayTotal++; }
+        if (lv.has(a.uid)) r.leave++;
+    }
+    const daily = [];
+    for (let i = 6; i >= 0; i--) {
+        const s = ds.getTime() - i * ATT_DAY_MS, e = s + ATT_DAY_MS;
+        const u = new Set();
+        for (const l of logs) { const t = l.at.getTime(); if (t >= s && t < e) u.add(l.uid); }
+        daily.push({ start: new Date(s), count: u.size });
+    }
+    res.json({ total, presentNow, todayTotal, daily, sectors: Array.from(rows.values()).filter(r => r.total > 0) });
+});
 
 // ---------- مسؤولو الاستلامات + زر فتح استلام ----------
 function isReceptionOfficer(uid, settings) { return !!(settings && (settings.receptionOfficers || []).some(m => m.id === uid)); }
@@ -11505,6 +11715,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
+            <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
             <div class="tab" id="tab-officers" onclick="adminTab('officers', this)">🎖️ إدارة سلك الضباط</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
@@ -11536,12 +11747,248 @@ function adminTab(name, el) {
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
+    if (name === 'att') attOpen();
     if (name === 'log') loadLog();
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
     if (name === 'officers') renderOfficerAdmin();
     if (name === 'push') flPushTab();
     if (name === 'freq') flFreqAdmin();
+}
+var ATTP = { tab: 'members', filter: 'all', q: '', sig: '', timer: null, period: 'week', days: 3, openUid: null, data: {}, mdata: {} };
+function attFmtMs(ms) {
+    var m = Math.floor((ms || 0) / 60000), h = Math.floor(m / 60);
+    m = m % 60;
+    if (h === 0) return m + ' د';
+    return h + ' س' + (m ? ' ' + m + ' د' : '');
+}
+function attFmtT(t) {
+    if (!t) return '—';
+    try { return new Date(t).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; }
+}
+function attAgo(t) {
+    if (!t) return '';
+    var s = Math.floor((Date.now() - new Date(t).getTime()) / 1000);
+    if (s < 60) return 'الحين';
+    var m = Math.floor(s / 60);
+    if (m < 60) return 'قبل ' + m + ' د';
+    var h = Math.floor(m / 60);
+    if (h < 24) return 'قبل ' + h + ' س';
+    return 'قبل ' + Math.floor(h / 24) + ' يوم';
+}
+function attMeta(x) { return [x.unit, x.rank, x.sector].filter(Boolean).map(cyEsc).join(' • ') || '-'; }
+function attWd(t, long) {
+    try { return new Date(t).toLocaleDateString('ar-SA-u-ca-gregory', { weekday: long ? 'long' : 'short', timeZone: 'Asia/Riyadh' }); } catch (e) { return ''; }
+}
+function attChip(label, on, fn, v) {
+    return '<button class="btn sm ' + (on ? '' : 'gray') + '" data-v="' + v + '" onclick="' + fn + '(this.dataset.v)">' + label + '</button>';
+}
+function attBar(pct, color) {
+    return '<div style="height:6px;background:rgba(255,255,255,0.06);border-radius:4px;margin-top:8px;overflow:hidden;"><div style="height:100%;width:' + Math.max(0, Math.min(100, pct)) + '%;background:' + (color || 'linear-gradient(90deg,#3b82f6,#60a5fa)') + ';border-radius:4px;"></div></div>';
+}
+function attOpen() {
+    var box = document.getElementById('admin-content');
+    if (!box) return;
+    var T = [['members', '👥 الأعضاء'], ['hours', '⏱️ ساعات الدوام'], ['absent', '🚫 المتغيبون'], ['sectors', '📈 القطاعات']];
+    box.innerHTML = '<div class="tabs" id="att-tabs">' + T.map(function (t) {
+        return '<div class="tab' + (t[0] === ATTP.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="attSetTab(this.dataset.t)">' + t[1] + '</div>';
+    }).join('') + '</div><div id="att-body"></div>';
+    attStartTimer();
+    attLoad(false);
+}
+function attSetTab(t) {
+    ATTP.tab = t; ATTP.sig = ''; ATTP.openUid = null;
+    var els = document.querySelectorAll('#att-tabs .tab');
+    for (var i = 0; i < els.length; i++) els[i].classList.toggle('active', els[i].dataset.t === t);
+    attLoad(false);
+}
+function attStartTimer() {
+    if (ATTP.timer) return;
+    ATTP.timer = setInterval(function () {
+        if (currentAdminTab !== 'att' || !document.getElementById('att-body')) { clearInterval(ATTP.timer); ATTP.timer = null; return; }
+        if (document.hidden) return;
+        if (ATTP.tab === 'members') attLoad(true);
+    }, 7000);
+}
+async function attLoad(silent) {
+    var box = document.getElementById('att-body');
+    if (!box) return;
+    var tab = ATTP.tab, url;
+    if (tab === 'members') url = '/api/senior/att/members';
+    else if (tab === 'hours') url = '/api/senior/att/hours?period=' + ATTP.period;
+    else if (tab === 'absent') url = '/api/senior/att/absent?days=' + ATTP.days;
+    else url = '/api/senior/att/sectors';
+    if (!silent) { ATTP.sig = ''; box.innerHTML = '<div class="card">جارِ التحميل...</div>'; }
+    var d;
+    try { d = await api(url, { noLock: true }); }
+    catch (e) {
+        if (silent || ATTP.tab !== tab) return;
+        var b0 = document.getElementById('att-body');
+        if (b0) b0.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + cyEsc(e.message) + ')<div style="margin-top:8px;"><button class="btn sm" onclick="attLoad(false)">إعادة المحاولة</button></div></div>';
+        return;
+    }
+    if (ATTP.tab !== tab || !document.getElementById('att-body')) return;
+    ATTP.data[tab] = d;
+    var sig = JSON.stringify(tab === 'members' ? d.list : d);
+    if (silent && sig === ATTP.sig) return;
+    ATTP.sig = sig;
+    if (tab === 'members') attPaintMembers(d);
+    else if (tab === 'hours') attPaintHours(d);
+    else if (tab === 'absent') attPaintAbsent(d);
+    else attPaintSectors(d);
+}
+function attIsStale(x) {
+    return x.status === 'in' && x.lastCheckInAt && (Date.now() - new Date(x.lastCheckInAt).getTime()) > 8 * 3600000;
+}
+function attSetFilter(v) { ATTP.filter = v; attPaintMembers(ATTP.data.members); }
+function attPaintMembers(d) {
+    var body = document.getElementById('att-body');
+    if (!body || !d) return;
+    if (!document.getElementById('att-list')) {
+        body.innerHTML = '<div class="grid3" id="att-stats"></div>' +
+            '<div class="card"><input id="att-q" type="text" placeholder="🔍 ابحث بالاسم أو اليونت أو الرتبة أو القطاع" value="' + cyEsc(ATTP.q) + '" oninput="ATTP.q = this.value; attPaintList()"><div class="row" id="att-filters" style="justify-content:flex-start;"></div></div>' +
+            '<div id="att-list"></div>';
+    }
+    var L = d.list || [], present = 0, stale = 0;
+    L.forEach(function (x) { if (x.status === 'in') present++; if (attIsStale(x)) stale++; });
+    document.getElementById('att-stats').innerHTML =
+        '<div class="stat"><div class="num" style="color:#4ade80;">' + present + '</div><div class="lbl">حاضرون الآن</div></div>' +
+        '<div class="stat"><div class="num">' + (L.length - present) + '</div><div class="lbl">منصرفون</div></div>' +
+        '<div class="stat"><div class="num" style="color:#fbbf24;">' + stale + '</div><div class="lbl">⚠️ أكثر من ٨ ساعات</div></div>';
+    var f = ATTP.filter;
+    document.getElementById('att-filters').innerHTML =
+        attChip('الكل (' + L.length + ')', f === 'all', 'attSetFilter', 'all') +
+        attChip('حاضر', f === 'in', 'attSetFilter', 'in') +
+        attChip('منصرف', f === 'out', 'attSetFilter', 'out') +
+        attChip('⚠️ نسي الانصراف', f === 'stale', 'attSetFilter', 'stale');
+    attPaintList();
+}
+function attPaintList() {
+    var d = ATTP.data.members, box = document.getElementById('att-list');
+    if (!d || !box) return;
+    var q = (ATTP.q || '').trim().toLowerCase(), f = ATTP.filter;
+    var L = (d.list || []).filter(function (x) {
+        if (f === 'in' && x.status !== 'in') return false;
+        if (f === 'out' && x.status === 'in') return false;
+        if (f === 'stale' && !attIsStale(x)) return false;
+        if (!q) return true;
+        return [x.name, x.unit, x.rank, x.sector].join(' ').toLowerCase().indexOf(q) > -1;
+    });
+    if (!L.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء</div>'; return; }
+    box.innerHTML = L.map(function (x) {
+        var u = cyEsc(x.uid), isIn = x.status === 'in', st = attIsStale(x);
+        return '<div class="card" style="padding:14px;">' +
+            '<div class="row" style="cursor:pointer;" data-u="' + u + '" onclick="attToggleMember(this.dataset.u)">' +
+            '<div><b>' + cyEsc(x.name) + '</b> <span class="badge ' + (isIn ? 'approved' : 'pending') + '">' + (isIn ? 'حاضر' : 'منصرف') + '</span>' + (st ? ' <span class="badge pending">⚠️ نسي الانصراف؟</span>' : '') +
+            '<div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div>' +
+            '<div style="font-size:11px;color:var(--muted);margin-top:3px;">' + (isIn ? 'حضر ' + attAgo(x.lastCheckInAt) : 'آخر انصراف: ' + (x.lastCheckOutAt ? attAgo(x.lastCheckOutAt) : '—')) + ' • اليوم: ' + x.todayIn + ' حضور • ' + attFmtMs(x.todayMs) + '</div></div>' +
+            '<div class="row" style="gap:6px;">' +
+            '<button class="btn sm gray" data-u="' + u + '" data-t="in" onclick="event.stopPropagation(); attForce(this.dataset.u, this.dataset.t)">🖐️ تحضير</button>' +
+            '<button class="btn sm danger" data-u="' + u + '" data-t="out" onclick="event.stopPropagation(); attForce(this.dataset.u, this.dataset.t)">🚪 انصراف</button>' +
+            '</div></div>' + (ATTP.openUid === x.uid ? attMemberDetail(x.uid) : '') + '</div>';
+    }).join('');
+}
+function attMemberDetail(uid) {
+    var m = ATTP.mdata[uid];
+    if (!m) return '<div style="margin-top:10px;color:var(--muted);font-size:12px;">جارِ التحميل...</div>';
+    if (m.err) return '<div style="margin-top:10px;color:#f87171;font-size:12px;">' + cyEsc(m.err) + '</div>';
+    var max = 1;
+    m.days.forEach(function (x) { if (x.ms > max) max = x.ms; });
+    var bars = m.days.map(function (x) {
+        return '<div style="flex:1;text-align:center;"><div style="height:60px;display:flex;align-items:flex-end;justify-content:center;"><div style="width:70%;min-height:2px;height:' + Math.round(x.ms / max * 100) + '%;background:linear-gradient(180deg,#60a5fa,#2563eb);border-radius:4px;"></div></div>' +
+            '<div style="font-size:10px;color:var(--muted);margin-top:3px;">' + attWd(x.start, false) + '</div><div style="font-size:10px;color:var(--gold-soft);">' + attFmtMs(x.ms) + '</div></div>';
+    }).join('');
+    var rec = m.recent.length ? m.recent.map(function (l) {
+        return '<div class="row" style="padding:5px 0;border-bottom:1px solid var(--border);font-size:12px;"><span style="color:' + (l.type === 'in' ? '#4ade80' : '#f87171') + ';font-weight:700;">' + (l.type === 'in' ? 'حضور' : 'انصراف') + (l.forced ? ' <span style="color:var(--muted);font-weight:400;">(بواسطة الإدارة)</span>' : '') + '</span><span style="color:var(--muted);">' + attFmtT(l.at) + '</span></div>';
+    }).join('') : '<div style="color:var(--muted);font-size:12px;">لا توجد حركات آخر ٧ أيام</div>';
+    return '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">' +
+        '<div style="font-size:13px;margin-bottom:8px;">إجمالي آخر ٧ أيام: <b style="color:var(--gold-soft);">' + attFmtMs(m.weekMs) + '</b></div>' +
+        '<div style="display:flex;gap:4px;">' + bars + '</div>' +
+        '<div style="margin-top:10px;max-height:220px;overflow-y:auto;">' + rec + '</div></div>';
+}
+async function attToggleMember(uid) {
+    if (ATTP.openUid === uid) { ATTP.openUid = null; attPaintList(); return; }
+    ATTP.openUid = uid;
+    delete ATTP.mdata[uid];
+    attPaintList();
+    try { ATTP.mdata[uid] = await api('/api/senior/att/member/' + encodeURIComponent(uid), { noLock: true }); }
+    catch (e) { ATTP.mdata[uid] = { err: e.message }; }
+    attPaintList();
+}
+async function attForce(uid, type) {
+    var m = ((ATTP.data.members && ATTP.data.members.list) || []).filter(function (x) { return x.uid === uid; })[0];
+    if (!(await confirmModal((type === 'in' ? 'تسجيل حضور ' : 'تسجيل انصراف ') + (m ? m.name : '') + ' يدوياً؟'))) return;
+    try {
+        await api('/api/senior/att/members/' + encodeURIComponent(uid) + '/force/' + type, { method: 'POST', body: '{}' });
+        toast('تم التحديث');
+        await attLoad(true);
+        if (ATTP.openUid === uid) { ATTP.openUid = null; attToggleMember(uid); }
+    } catch (e) { toast(e.message); }
+}
+function attSetPeriod(v) { ATTP.period = v; attLoad(false); }
+function attSetDays(v) { ATTP.days = parseInt(v, 10) || 3; attLoad(false); }
+function attPaintHours(d) {
+    var body = document.getElementById('att-body');
+    if (!body) return;
+    var P = [['day', 'اليوم'], ['week', 'آخر ٧ أيام'], ['month', 'آخر ٣٠ يوم']];
+    var max = d.list.length ? d.list[0].ms : 1;
+    var medals = ['🥇', '🥈', '🥉'];
+    var chips = P.map(function (p) { return attChip(p[1], ATTP.period === p[0], 'attSetPeriod', p[0]); }).join('');
+    var rows = d.list.length ? d.list.map(function (x, i) {
+        return '<div class="card" style="padding:12px;"><div class="row"><div style="display:flex;gap:10px;align-items:center;">' +
+            '<div style="font-size:20px;min-width:30px;text-align:center;">' + (i < 3 ? medals[i] : (i + 1)) + '</div>' +
+            '<div><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + attMeta(x) + '</div></div></div>' +
+            '<div style="text-align:left;"><div style="color:var(--gold-soft);font-weight:800;">' + attFmtMs(x.ms) + '</div><div style="font-size:11px;color:var(--muted);">' + x.days + ' يوم دوام</div></div></div>' +
+            attBar(Math.round(x.ms / max * 100)) + '</div>';
+    }).join('') : '<div class="card center" style="color:var(--muted);">لا توجد ساعات دوام في هذي الفترة</div>';
+    body.innerHTML = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
+        '<div style="font-size:12px;color:var(--muted);margin-top:10px;">إجمالي ساعات الدوام: <b style="color:var(--gold-soft);">' + attFmtMs(d.totalMs) + '</b> • عدد اللي داوموا: ' + d.count + '</div></div>' +
+        rows + '<div style="font-size:11px;color:var(--muted);text-align:center;margin-bottom:14px;">كل جلسة تُحسب بحد أقصى ١٢ ساعة، عشان اللي ينسى الانصراف ما يتضخم رقمه.</div>';
+}
+function attPaintAbsent(d) {
+    var body = document.getElementById('att-body');
+    if (!body) return;
+    var P = [[1, 'اليوم'], [3, 'آخر ٣ أيام'], [7, 'آخر ٧ أيام'], [14, 'آخر ١٤ يوم']];
+    var chips = P.map(function (p) { return attChip(p[1], ATTP.days === p[0], 'attSetDays', p[0]); }).join('');
+    var pct = d.total ? Math.round(d.absentCount / d.total * 100) : 0;
+    var rows = d.list.length ? d.list.map(function (x) {
+        return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b>' + (x.onLeave ? ' <span class="badge approved">🌴 في إجازة</span>' : '') +
+            '<div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
+            '<div style="text-align:left;font-size:12px;color:' + (x.lastCheckInAt ? 'var(--muted)' : '#f87171') + ';">' + (x.lastCheckInAt ? 'آخر حضور<br>' + attFmtT(x.lastCheckInAt) + '<br>' + attAgo(x.lastCheckInAt) : 'ما حضر أبداً') + '</div></div></div>';
+    }).join('') : '<div class="card center" style="color:#4ade80;">🎉 الكل حاضر في هذي الفترة</div>';
+    body.innerHTML = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
+        '<div class="row" style="margin-top:12px;"><div><b style="font-size:18px;color:#f87171;">' + d.absentCount + '</b> <span style="color:var(--muted);font-size:13px;">من ' + d.total + ' ما حضروا (' + pct + '%)</span></div>' +
+        '<button class="btn sm gray" onclick="attCopyAbsent()">📋 نسخ الأسماء</button></div>' + attBar(pct, 'linear-gradient(90deg,#ef4444,#f87171)') +
+        '<div style="font-size:11px;color:var(--muted);margin-top:8px;">النسخ يستثني اللي في إجازة، وكبار المسؤولين ما يدخلون بالحساب.</div></div>' + rows;
+}
+function attCopyAbsent() {
+    var d = ATTP.data.absent;
+    if (!d) return;
+    var nl = String.fromCharCode(10);
+    var t = d.list.filter(function (x) { return !x.onLeave; }).map(function (x) { return x.name; }).join(nl);
+    if (!t) { toast('ما فيه أسماء للنسخ'); return; }
+    try { navigator.clipboard.writeText(t).then(function () { toast('تم نسخ الأسماء'); }, function () { toast('تعذر النسخ'); }); }
+    catch (e) { toast('تعذر النسخ'); }
+}
+function attPaintSectors(d) {
+    var body = document.getElementById('att-body');
+    if (!body) return;
+    var max = 1;
+    d.daily.forEach(function (x) { if (x.count > max) max = x.count; });
+    var bars = d.daily.map(function (x) {
+        return '<div style="flex:1;text-align:center;"><div style="font-size:11px;color:var(--gold-soft);">' + x.count + '</div><div style="height:90px;display:flex;align-items:flex-end;justify-content:center;"><div style="width:70%;min-height:2px;height:' + Math.round(x.count / max * 100) + '%;background:linear-gradient(180deg,#60a5fa,#2563eb);border-radius:4px;"></div></div><div style="font-size:10px;color:var(--muted);margin-top:3px;">' + attWd(x.start, false) + '</div></div>';
+    }).join('');
+    var secs = d.sectors.length ? d.sectors.map(function (s) {
+        var pNow = s.total ? Math.round(s.present / s.total * 100) : 0, pToday = s.total ? Math.round(s.today / s.total * 100) : 0;
+        return '<div class="card" style="padding:14px;"><div class="row"><b>' + cyEsc(s.label) + '</b><span style="font-size:12px;color:var(--muted);">' + s.total + ' عضو' + (s.leave ? ' • 🌴 ' + s.leave : '') + '</span></div>' +
+            '<div class="row" style="margin-top:8px;font-size:12px;"><span style="color:#4ade80;">حاضر الآن: ' + s.present + ' (' + pNow + '%)</span><span style="color:var(--gold-soft);">حضروا اليوم: ' + s.today + ' (' + pToday + '%)</span></div>' +
+            attBar(pToday) + attBar(pNow, 'linear-gradient(90deg,#16a34a,#4ade80)') + '</div>';
+    }).join('') : '<div class="card center" style="color:var(--muted);">لا توجد بيانات</div>';
+    body.innerHTML = '<div class="grid3">' +
+        '<div class="stat"><div class="num" style="color:#4ade80;">' + d.presentNow + '</div><div class="lbl">حاضرون الآن</div></div>' +
+        '<div class="stat"><div class="num">' + d.todayTotal + '</div><div class="lbl">حضروا اليوم</div></div>' +
+        '<div class="stat"><div class="num">' + d.total + '</div><div class="lbl">إجمالي الأعضاء</div></div></div>' +
+        '<div class="card"><div style="font-size:13px;margin-bottom:10px;">📊 عدد الأعضاء اللي حضروا كل يوم (آخر ٧ أيام)</div><div style="display:flex;gap:4px;">' + bars + '</div></div>' + secs;
 }
 async function loadReviewedViolations() {
     const box = document.getElementById('admin-content');
