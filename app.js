@@ -166,6 +166,10 @@ const PersonnelSchema = new mongoose.Schema({
     isBlocked: { type: Boolean, default: false },
     blockUntil: { type: Date, default: null },
     isDismissed: { type: Boolean, default: false },
+    excusedAbsences: [{
+        excuseId: String, type: String,
+        absenceAt: Date, approvedAt: Date, approvedByName: String,
+    }],
     leaveBalance: { type: Number, default: 10 },
     cardNumber: { type: String, default: null, index: true },
     sector: { type: String, default: null },
@@ -2087,6 +2091,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         points: p.points,
         leaveBalance: p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE,
         notes: p.notes,
+        excusedAbsences: p.excusedAbsences || [],
         isBlocked: p.isBlocked,
         isAdmin,
         isSeniorAdmin: senior,
@@ -7544,6 +7549,22 @@ app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
     const d = parseInt(req.query.days, 10);
     const days = [1, 3, 7, 14].includes(d) ? d : 3;
     const now = new Date();
+    if (days === 1) {
+        const rd = await RecDay.findOne({ dayKey: attDayStart(now).getTime() }).lean();
+        if (rd) {
+            const rows = await RecRow.find({ dayKey: rd.dayKey }).limit(5000).maxTimeMS(10000).lean();
+            const slim = r => ({ uid: r.uid, name: r.name, unit: r.unit, rank: r.rank, sector: r.sector, deducted: r.deducted, refunded: r.refunded, excuseStatus: r.excuseStatus, onLeave: r.kind === "leave", lastCheckInAt: null });
+            const byName = (a, b) => String(a.name || "").localeCompare(String(b.name || ""), "ar");
+            const attended = rows.filter(r => r.kind === "attended").map(slim).sort(byName);
+            const absentRows = rows.filter(r => r.kind === "absent").map(slim).sort(byName);
+            const leaveRows = rows.filter(r => r.kind === "leave").map(slim).sort(byName);
+            return res.json({
+                days, total: rows.length, absentCount: absentRows.length,
+                reception: { openedAt: rd.openedAt, openedByName: rd.openedByName, attendedCount: attended.length, absentCount: absentRows.length, leaveCount: leaveRows.length },
+                attended, list: absentRows.concat(leaveRows),
+            });
+        }
+    }
     const since = new Date(attDayStart(now).getTime() - (days - 1) * ATT_DAY_MS);
     const [accs, ps, sts, leaves] = await Promise.all([
         Account.find({ status: "approved" }, { uid: 1, fullName: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(10000).lean(),
@@ -7797,6 +7818,205 @@ app.post("/api/hc/att-violations/:id/decide", ensureHighCommand, async (req, res
     }
 });
 
+
+const RecDay = mongoose.model("RecDay", new mongoose.Schema({
+    dayKey: { type: Number, unique: true }, openedAt: Date, openedBy: String, openedByName: String,
+}));
+const RecRowSchema = new mongoose.Schema({
+    dayKey: { type: Number, index: true }, uid: String, name: String, unit: String, rank: String,
+    sector: String, sectorKey: String, kind: String,
+    gained: { type: Number, default: 0 }, deducted: { type: Number, default: 0 }, refunded: { type: Number, default: 0 },
+    excuseStatus: { type: String, default: "none" }, excuseId: { type: String, default: null }, openedAt: Date,
+});
+RecRowSchema.index({ dayKey: 1, uid: 1 }, { unique: true });
+const RecRow = mongoose.model("RecRow", RecRowSchema);
+const AbsenceExcuseSchema = new mongoose.Schema({
+    rowId: String, dayKey: Number, uid: String, name: String, unit: String, rank: String, sector: String, sectorKey: String,
+    type: { type: String, enum: ["medical", "nonmedical"], default: "nonmedical" },
+    reason: String, proof: { type: String, default: null }, hasProof: { type: Boolean, default: false },
+    status: { type: String, enum: ["pending", "deciding", "accepted", "rejected"], default: "pending" },
+    rejectReason: { type: String, default: null }, absenceAt: Date,
+    decidedBy: String, decidedByName: String, decidedAt: Date, refunded: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now },
+});
+AbsenceExcuseSchema.index({ uid: 1, createdAt: -1 });
+const AbsenceExcuse = mongoose.model("AbsenceExcuse", AbsenceExcuseSchema);
+
+const EXCUSE_WINDOW_DAYS = 14;
+const EXCUSE_TYPE_LABEL = { medical: "طبي", nonmedical: "بدون طبي" };
+
+async function recordReception(openerId, openerName) {
+    const now = new Date();
+    const dayKey = attDayStart(now).getTime();
+    try { await RecDay.create({ dayKey, openedAt: now, openedBy: openerId, openedByName: openerName }); }
+    catch (e) { return null; }
+    const settings = await getSettings();
+    const [accs, ps, sts, leaves] = await Promise.all([
+        Account.find({ status: "approved" }, { uid: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        Personnel.find({}, { discord: 1, registeredName: 1, unit: 1, rank: 1, sector: 1, points: 1, isDismissed: 1, isBlocked: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        AttStatus.find({}, { uid: 1, status: 1 }).limit(5000).maxTimeMS(10000).lean(),
+        LeaveRequest.find({ status: "approved" }, { discord: 1, endDate: 1 }).limit(5000).maxTimeMS(10000).lean(),
+    ]);
+    const pm = new Map(ps.map(p => [p.discord, p]));
+    const sm = new Map(sts.map(s => [s.uid, s]));
+    const lv = new Set(leaves.filter(l => !l.endDate || l.endDate > now).map(l => l.discord));
+    const rows = [], ops = [];
+    let attended = 0, absent = 0, leave = 0;
+    for (const a of accs) {
+        if (a.isSenior || a.isOwner || a.tempSenior || isSeniorAdmin(a.uid) || isHighCommand(a.uid, settings)) continue;
+        const p = pm.get(a.uid);
+        if (!p || !p.registeredName || p.isDismissed || p.isBlocked) continue;
+        const key = a.sector || p.sector || null;
+        if (!p.unit || !key) continue;
+        const st = sm.get(a.uid);
+        const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: now };
+        if (st && st.status === "in") {
+            rows.push({ ...base, kind: "attended", gained: 1 });
+            ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
+            attended++;
+        } else if (lv.has(a.uid)) {
+            rows.push({ ...base, kind: "leave" });
+            leave++;
+        } else {
+            const ded = Math.min(2, Math.max(0, p.points || 0));
+            rows.push({ ...base, kind: "absent", deducted: ded, excuseStatus: "none" });
+            if (ded) ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: -ded } } } });
+            absent++;
+        }
+    }
+    if (rows.length) await RecRow.insertMany(rows, { ordered: false }).catch(e => console.error("❌ فشل حفظ حضور الاستلام:", e.message));
+    if (ops.length) await Personnel.bulkWrite(ops, { ordered: false }).catch(e => console.error("❌ فشل تحديث نقاط الاستلام:", e.message));
+    (async () => {
+        for (const r of rows) {
+            if (r.kind !== "absent") continue;
+            await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "غبت عن الاستلام" + (r.deducted ? " وانخصم عليك " + r.deducted + " نقطة" : "") + " — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
+        }
+    })();
+    await logEvent({ action: "تسجيل حضور الاستلام", actorId: openerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-2) • إجازة " + leave });
+    return { attended, absent, leave };
+}
+
+app.get("/api/excuse/my", ensureAuth, async (req, res) => {
+    const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
+    const rows = await RecRow.find({ uid: req.user.id, kind: "absent", dayKey: { $gte: since } }).sort({ dayKey: -1 }).limit(60).lean();
+    const ids = rows.map(r => r.excuseId).filter(Boolean);
+    const exs = ids.length ? await AbsenceExcuse.find({ _id: { $in: ids } }, { proof: 0 }).lean() : [];
+    const em = new Map(exs.map(e => [String(e._id), e]));
+    res.json({
+        list: rows.map(r => {
+            const e = r.excuseId ? em.get(String(r.excuseId)) : null;
+            return {
+                rowId: String(r._id), openedAt: r.openedAt, deducted: r.deducted, refunded: r.refunded, excuseStatus: r.excuseStatus,
+                excuse: e ? { type: e.type, reason: e.reason, status: e.status, rejectReason: e.rejectReason, createdAt: e.createdAt, decidedAt: e.decidedAt, hasProof: !!e.hasProof } : null,
+            };
+        }),
+    });
+});
+
+app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
+    const b = req.body || {};
+    const rowId = String(b.rowId || "");
+    const reason = String(b.reason || "").trim().slice(0, 500);
+    const type = b.type === "medical" ? "medical" : b.type === "nonmedical" ? "nonmedical" : null;
+    if (!mongoose.Types.ObjectId.isValid(rowId)) return res.status(404).json({ error: "غير موجود" });
+    if (reason.length < 3) return res.status(400).json({ error: "اكتب العذر" });
+    if (!type) return res.status(400).json({ error: "حدد نوع العذر (طبي أو بدون طبي)" });
+    let proof = null;
+    if (b.proof) {
+        proof = String(b.proof);
+        if (!/^data:image\/(jpeg|png|webp);base64,/.test(proof) || proof.length > 2500000) return res.status(400).json({ error: "الدليل لازم يكون صورة وحجمها صغير" });
+    }
+    const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
+    const row = await RecRow.findOneAndUpdate(
+        { _id: rowId, uid: req.user.id, kind: "absent", excuseStatus: "none", dayKey: { $gte: since } },
+        { $set: { excuseStatus: "pending" } }, { new: true });
+    if (!row) return res.status(409).json({ error: "ما تقدر تقدم عذر على هذا الغياب" });
+    let ex;
+    try {
+        ex = await AbsenceExcuse.create({
+            rowId: String(row._id), dayKey: row.dayKey, uid: row.uid, name: row.name, unit: row.unit, rank: row.rank,
+            sector: row.sector, sectorKey: row.sectorKey, type, reason, proof, hasProof: !!proof, absenceAt: row.openedAt,
+        });
+        await RecRow.updateOne({ _id: row._id }, { $set: { excuseId: String(ex._id) } });
+    } catch (e) {
+        await RecRow.updateOne({ _id: row._id }, { $set: { excuseStatus: "none" } });
+        return res.status(500).json({ error: "تعذر إرسال العذر، حاول مرة ثانية" });
+    }
+    const settings = await getSettings();
+    const sec = (settings.sectorLeadership && row.sectorKey && settings.sectorLeadership[row.sectorKey]) || {};
+    const targets = Array.from(new Set([sec.commanderId, sec.deputyId, sec.personnelOfficerId].filter(x => x && x !== req.user.id)));
+    const text = "🩺 تنبيه: العضو " + row.name + " (" + (row.rank || "-") + " • " + (row.unit || "-") + ") قدّم عذر غياب عن الاستلام — النوع: " + EXCUSE_TYPE_LABEL[type] + " — السبب: " + reason.slice(0, 150) + " — القرار عند القيادة العليا.";
+    for (const t of targets) {
+        await pushNoticeTo(t, text, "auto", "🤖 نظام الاستلام");
+        pushUid(t, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name, ttl: 86400, tag: "excuse-" + String(ex._id) }).catch(() => {});
+    }
+    const hcIds = new Set((settings.highCommand || []).map(m => m.id));
+    for (const id of hcIds) pushUid(id, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name + " ينتظر قرارك", ttl: 86400, tag: "excuse-hc-" + String(ex._id) }).catch(() => {});
+    if (hcIds.size) sseBroadcast("hcalert", { t: Date.now(), exc: true }, c => !!c.uid && hcIds.has(c.uid));
+    await logEvent({ action: "تقديم عذر غياب", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username, details: row.name + " — " + EXCUSE_TYPE_LABEL[type] });
+    res.json({ ok: true });
+});
+
+app.get("/api/hc/excuses", ensureHighCommand, async (req, res) => {
+    const f = String(req.query.filter || "pending");
+    const q = f === "pending" ? { status: { $in: ["pending", "deciding"] } } : { status: { $in: ["accepted", "rejected"] } };
+    const [list, pendingCount] = await Promise.all([
+        AbsenceExcuse.find(q, { proof: 0 }).sort({ createdAt: -1 }).limit(200).lean(),
+        AbsenceExcuse.countDocuments({ status: "pending" }),
+    ]);
+    res.json({ list, pendingCount });
+});
+app.get("/api/hc/excuses/:id/proof", ensureHighCommand, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
+    const ex = await AbsenceExcuse.findById(req.params.id, { proof: 1 }).lean();
+    if (!ex || !ex.proof) return res.status(404).json({ error: "ما فيه دليل" });
+    res.json({ image: ex.proof });
+});
+async function tellExcuseResult(ex, text) {
+    await pushNoticeTo(ex.uid, text, "auto", "🤖 نظام الاستلام");
+    pushUid(ex.uid, { title: CONFIG.SITE_NAME, body: text.slice(0, 120), ttl: 86400, tag: "excuse-res-" + String(ex._id) }).catch(() => {});
+}
+app.post("/api/hc/excuses/:id/accept", ensureHighCommand, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
+    const ex = await AbsenceExcuse.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "deciding" } }, { new: true });
+    if (!ex) return res.status(409).json({ error: "تم اتخاذ قرار على هذا العذر من قبل" });
+    try {
+        const row = await RecRow.findById(ex.rowId);
+        const refund = row ? (row.deducted || 0) : 0;
+        const now = new Date();
+        const byName = await cyName(req.user.id);
+        const upd = { $push: { excusedAbsences: { excuseId: String(ex._id), type: ex.type, absenceAt: row ? row.openedAt : ex.createdAt, approvedAt: now, approvedByName: byName } } };
+        if (refund) upd.$inc = { points: refund };
+        await Personnel.updateOne({ discord: ex.uid }, upd);
+        if (row) await RecRow.updateOne({ _id: row._id }, { $set: { excuseStatus: "accepted", deducted: 0, refunded: refund } });
+        await AbsenceExcuse.updateOne({ _id: ex._id }, { $set: { status: "accepted", decidedBy: req.user.id, decidedByName: byName, decidedAt: now, refunded: refund } });
+        await logEvent({ action: "قبول عذر غياب", discordId: ex.uid, actorId: req.user.id, actorTag: req.user.username, details: ex.name + (refund ? " — رجعت " + refund + " نقطة" : "") });
+        await tellExcuseResult(ex, "✅ تم قبول عذر غيابك عن الاستلام" + (refund ? " ورجعت لك " + refund + " نقطة" : "") + " — تسجّل في ملفك كغياب بعذر.");
+        res.json({ ok: true, refunded: refund });
+    } catch (e) {
+        await AbsenceExcuse.updateOne({ _id: ex._id, status: "deciding" }, { $set: { status: "pending" } });
+        res.status(400).json({ error: e.message });
+    }
+});
+app.post("/api/hc/excuses/:id/reject", ensureHighCommand, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
+    const reason = String((req.body || {}).reason || "").trim().slice(0, 300);
+    if (!reason) return res.status(400).json({ error: "اكتب سبب الرفض" });
+    const ex = await AbsenceExcuse.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "deciding" } }, { new: true });
+    if (!ex) return res.status(409).json({ error: "تم اتخاذ قرار على هذا العذر من قبل" });
+    try {
+        const byName = await cyName(req.user.id);
+        await RecRow.updateOne({ _id: ex.rowId }, { $set: { excuseStatus: "rejected" } });
+        await AbsenceExcuse.updateOne({ _id: ex._id }, { $set: { status: "rejected", rejectReason: reason, decidedBy: req.user.id, decidedByName: byName, decidedAt: new Date() } });
+        await logEvent({ action: "رفض عذر غياب", discordId: ex.uid, actorId: req.user.id, actorTag: req.user.username, details: ex.name + " — " + reason });
+        await tellExcuseResult(ex, "❌ تم رفض عذر غيابك عن الاستلام وتثبّت الخصم — السبب: " + reason);
+        res.json({ ok: true });
+    } catch (e) {
+        await AbsenceExcuse.updateOne({ _id: ex._id, status: "deciding" }, { $set: { status: "pending" } });
+        res.status(400).json({ error: e.message });
+    }
+});
+
 // ---------- مسؤولو الاستلامات + زر فتح استلام ----------
 function isReceptionOfficer(uid, settings) { return !!(settings && (settings.receptionOfficers || []).some(m => m.id === uid)); }
 app.get("/api/senior/reception", ensureSeniorAdmin, async (req, res) => {
@@ -7841,6 +8061,9 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
     if (h < CONFIG.RECEPTION_START_HOUR || h >= CONFIG.RECEPTION_END_HOUR) return res.status(400).json({ error: "⏰ مو وقت الاستلام — الاستلام من الساعة 2 العصر إلى 9 الليل" });
     if (Date.now() - lastReceptionAt < 30000) return res.status(429).json({ error: "تم فتح الاستلام قبل شوي" });
     lastReceptionAt = Date.now();
+    let rec = null;
+    try { rec = await recordReception(req.user.id, await cyName(req.user.id)); }
+    catch (e) { console.error("❌ فشل تسجيل حضور الاستلام:", e.message); }
     const r = await pushAll({ title: CONFIG.SITE_NAME, body: "استلام الان", ttl: 900, tag: "reception" });
     let discord = false;
     if (botReady) {
@@ -7851,7 +8074,7 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
         } catch (e) { console.error("❌ فشل إرسال رسالة الاستلام للديسكورد:", e.message); }
     }
     await logEvent({ action: "فتح استلام", actorId: req.user.id, actorTag: req.user.username, details: "إشعار وصل لـ " + r.sent + " جهاز" + (discord ? " + ديسكورد" : "") });
-    res.json({ ok: true, sent: r.sent, discord });
+    res.json({ ok: true, sent: r.sent, discord, rec });
 });
 
 // ---------- تردد القطاعات المشتركة (روم صوتي 910..919) ----------
@@ -10213,6 +10436,7 @@ function spConnect() {
             try {
                 if (ME && document.getElementById('att-body') && typeof ATTP !== 'undefined' && ATTP.tab === 'viol') attLoad(true);
                 if (ME && document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'att') loadHCAtt(true);
+                if (ME && document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'exc') loadHCExcuses(true);
                 if (!ME || !ME.isHighCommand) return;
                 checkPromotionAlert();
                 if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
@@ -11057,6 +11281,7 @@ function buildNav() {
     items.push(
         { label: '📋 مخالفاتي', fn: 'renderMinePage()' },
         { label: '🌴 الإجازات', fn: 'renderLeavePage()' },
+        { label: '🩺 غياب بعذر', fn: 'renderExcusePage()' },
         { label: '🪪 بطاقتي', fn: 'renderCard()' },
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
@@ -12146,6 +12371,7 @@ function attPaintHours(d) {
 function attPaintAbsent(d) {
     var body = document.getElementById('att-body');
     if (!body) return;
+    if (d.reception) { attPaintReception(d); return; }
     var P = [[1, 'اليوم'], [3, 'آخر ٣ أيام'], [7, 'آخر ٧ أيام'], [14, 'آخر ١٤ يوم']];
     var chips = P.map(function (p) { return attChip(p[1], ATTP.days === p[0], 'attSetDays', p[0]); }).join('');
     var pct = d.total ? Math.round(d.absentCount / d.total * 100) : 0;
@@ -12714,6 +12940,7 @@ function renderHighCommandPanel() {
             <div class="tab active" onclick="hcTabSwitch('pending', this)">⏳ الطلبات المعلّقة</div>
             <div class="tab" onclick="hcTabSwitch('history', this)">📜 السجل</div>
             <div class="tab" onclick="hcTabSwitch('att', this)">🚨 تجاوزات الحضور</div>
+            <div class="tab" onclick="hcTabSwitch('exc', this)">🩺 أعذار الغياب</div>
         </div>
         <div id="hc-content"></div>\`;
     hcTabSwitch('pending');
@@ -12725,6 +12952,7 @@ function hcTabSwitch(name, el) {
     if (name === 'pending') loadHCPending();
     if (name === 'history') loadHCHistory();
     if (name === 'att') loadHCAtt();
+    if (name === 'exc') loadHCExcuses();
 }
 function hcCard(r, withActions) {
     const kind = r.kind || 'rank';
@@ -12751,6 +12979,181 @@ function hcCard(r, withActions) {
                 <button class="btn danger sm" onclick="hcDecide('\${r._id}','reject')">رفض</button>
             </div>\` : ''}
         </div>\`;
+}
+function exFull(t) {
+    if (!t) return '—';
+    try {
+        var d = new Date(t);
+        var a = d.toLocaleDateString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+        var b = d.toLocaleTimeString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', hour: 'numeric', minute: '2-digit', second: '2-digit' });
+        return 'يوم ' + a + ' الساعة ' + b;
+    } catch (e) { return '—'; }
+}
+function exCompress(file) {
+    return new Promise(function (resolve, reject) {
+        var fr = new FileReader();
+        fr.onerror = function () { reject(new Error('تعذر قراءة الصورة')); };
+        fr.onload = function () {
+            var img = new Image();
+            img.onerror = function () { reject(new Error('الملف مو صورة صالحة')); };
+            img.onload = function () {
+                var w = img.width, h = img.height, m = 1280;
+                if (w > m || h > m) { var k = m / Math.max(w, h); w = Math.round(w * k); h = Math.round(h * k); }
+                var c = document.createElement('canvas');
+                c.width = w; c.height = h;
+                c.getContext('2d').drawImage(img, 0, 0, w, h);
+                resolve(c.toDataURL('image/jpeg', 0.7));
+            };
+            img.src = fr.result;
+        };
+        fr.readAsDataURL(file);
+    });
+}
+function exBadge(st) {
+    if (st === 'pending') return '<span class="badge pending">⏳ بانتظار القيادة العليا</span>';
+    if (st === 'accepted') return '<span class="badge approved">✅ مقبول</span>';
+    if (st === 'rejected') return '<span class="badge rejected">❌ مرفوض</span>';
+    return '';
+}
+function exTypeLabel(t) { return t === 'medical' ? '🩺 طبي' : '📄 بدون طبي'; }
+async function renderExcusePage() {
+    document.getElementById('app').innerHTML = '<div class="card row"><h2>🩺 غياب بعذر</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>' +
+        '<div id="ex-body"><div class="card">جارِ التحميل...</div></div>';
+    exLoad();
+}
+async function exLoad() {
+    var box = document.getElementById('ex-body');
+    if (!box) return;
+    var d;
+    try { d = await api('/api/excuse/my'); }
+    catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cyEsc(e.message) + '</div>'; return; }
+    if (!d.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">ما عليك أي غياب عن الاستلام في آخر ١٤ يوم 👌</div>'; return; }
+    box.innerHTML = '<div class="card" style="font-size:12px;color:var(--muted);">اختر الغياب وقدّم عذرك. إذا انقبل العذر ترجع لك النقاط، وإذا انرفض يتثبت الخصم.</div>' + d.list.map(function (x) {
+        var ex = x.excuse;
+        var right = '';
+        if (x.excuseStatus === 'none') right = '<button class="btn sm" data-id="' + x.rowId + '" onclick="exOpen(this.dataset.id)">تقديم عذر</button>';
+        else if (ex) right = exBadge(ex.status);
+        var info = '';
+        if (ex) {
+            info = '<div style="font-size:13px;margin-top:8px;">' + exTypeLabel(ex.type) + ' — ' + cyEsc(ex.reason) + (ex.hasProof ? ' 📎' : '') + '</div>' +
+                '<div style="font-size:11px;color:var(--muted);margin-top:4px;">قدّمته: ' + exFull(ex.createdAt) + '</div>';
+            if (ex.status === 'rejected' && ex.rejectReason) info += '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(ex.rejectReason) + '</div>';
+            if (ex.status === 'accepted') info += '<div style="font-size:12px;color:#4ade80;margin-top:4px;">انسجّل في ملفك وبطاقتك كغياب بعذر' + (x.refunded ? ' ورجعت لك ' + x.refunded + ' نقطة' : '') + '</div>';
+        }
+        var ded = x.excuseStatus === 'accepted' ? '' : (x.deducted ? ' • انخصم عليك ' + x.deducted + ' نقطة' : ' • بدون خصم');
+        return '<div class="card" style="padding:12px;"><div class="row"><div><b>غياب عن الاستلام</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + exFull(x.openedAt) + ded + '</div></div><div>' + right + '</div></div>' + info +
+            '<div id="ex-f-' + x.rowId + '"></div></div>';
+    }).join('');
+}
+function exOpen(id) {
+    var box = document.getElementById('ex-f-' + id);
+    if (!box) return;
+    if (box.innerHTML) { box.innerHTML = ''; return; }
+    box.innerHTML = '<div style="margin-top:10px;display:flex;flex-direction:column;gap:8px;">' +
+        '<textarea id="ex-r-' + id + '" rows="3" maxlength="500" placeholder="اكتب عذرك هنا..." style="width:100%;"></textarea>' +
+        '<select id="ex-t-' + id + '"><option value="medical">🩺 طبي</option><option value="nonmedical">📄 بدون طبي</option></select>' +
+        '<div style="font-size:12px;color:var(--muted);">دليل (اختياري) — صورة:</div>' +
+        '<input type="file" id="ex-p-' + id + '" accept="image/*">' +
+        '<div class="row" style="gap:8px;justify-content:flex-start;"><button class="btn sm" data-id="' + id + '" onclick="exSend(this.dataset.id)">إرسال</button>' +
+        '<button class="btn gray sm" data-id="' + id + '" onclick="exOpen(this.dataset.id)">إلغاء</button></div></div>';
+}
+async function exSend(id) {
+    var r = document.getElementById('ex-r-' + id), t = document.getElementById('ex-t-' + id), p = document.getElementById('ex-p-' + id);
+    if (!r || !t) return;
+    var reason = r.value.trim();
+    if (reason.length < 3) return toast('اكتب العذر');
+    var proof = null;
+    try {
+        if (p && p.files && p.files[0]) proof = await exCompress(p.files[0]);
+        await api('/api/excuse/submit', { method: 'POST', body: JSON.stringify({ rowId: id, reason: reason, type: t.value, proof: proof }) });
+        toast('✅ انرسل عذرك للقيادة');
+        exLoad();
+    } catch (e) { toast(e.message); }
+}
+var HCEX = { f: 'pending' };
+function hcExSetFilter(f) { HCEX.f = f; loadHCExcuses(); }
+async function loadHCExcuses(silent) {
+    var box = document.getElementById('hc-content');
+    if (!box) return;
+    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var d;
+    try { d = await api('/api/hc/excuses?filter=' + HCEX.f); }
+    catch (e) { if (hcTab !== 'exc' || silent) return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + cyEsc(e.message) + ')</div>'; return; }
+    if (hcTab !== 'exc') return;
+    var chips = '<div class="card"><div class="row" style="justify-content:flex-start;">' +
+        attChip('⏳ المعلّقة' + (d.pendingCount ? ' (' + d.pendingCount + ')' : ''), HCEX.f === 'pending', 'hcExSetFilter', 'pending') +
+        attChip('📜 المنتهية', HCEX.f === 'done', 'hcExSetFilter', 'done') + '</div></div>';
+    var rows = d.list.length ? d.list.map(function (x) {
+        var meta = [x.unit, x.rank, x.sector].filter(Boolean).map(cyEsc).join(' • ') || '-';
+        var actions = '';
+        if (x.status === 'pending' || x.status === 'deciding') {
+            actions = '<div class="row" style="gap:8px;margin-top:10px;"><button class="btn sm" data-id="' + x._id + '" onclick="hcExDecide(this.dataset.id, ' + "'accept'" + ')">✅ قبول</button>' +
+                '<button class="btn danger sm" data-id="' + x._id + '" onclick="hcExDecide(this.dataset.id, ' + "'reject'" + ')">❌ رفض</button></div>';
+        } else {
+            actions = '<div style="margin-top:8px;">' + exBadge(x.status) + ' <span style="font-size:12px;color:var(--muted);">بواسطة ' + cyEsc(x.decidedByName || '-') + ' • ' + exFull(x.decidedAt) + '</span>' +
+                (x.status === 'accepted' && x.refunded ? '<div style="font-size:12px;color:#4ade80;margin-top:4px;">انسترجعت ' + x.refunded + ' نقطة</div>' : '') +
+                (x.status === 'rejected' && x.rejectReason ? '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(x.rejectReason) + '</div>' : '') + '</div>';
+        }
+        return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
+            '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + ' — غياب ' + exFull(x.absenceAt) + '</div>' +
+            '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
+            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="hcExProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') +
+            '<div style="font-size:11px;color:var(--muted);margin-top:4px;">قُدّم: ' + exFull(x.createdAt) + '</div>' + actions + '</div>';
+    }).join('') : '<div class="card center" style="color:var(--muted);">' + (HCEX.f === 'pending' ? 'لا توجد أعذار معلّقة' : 'لا توجد أعذار منتهية') + '</div>';
+    paintSilent(box, 'hex' + HCEX.f, chips + rows, silent);
+}
+function hcExProof(id, btn) {
+    api('/api/hc/excuses/' + id + '/proof').then(function (d) {
+        var im = document.createElement('img');
+        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
+        btn.parentNode.appendChild(im); btn.remove();
+    }).catch(function (e) { toast(e.message); });
+}
+async function hcExDecide(id, action) {
+    if (action === 'reject') {
+        var reason = await promptModal('اكتب سبب رفض العذر:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/hc/excuses/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) })
+            .then(function () { toast('تم الرفض وتثبّت الخصم'); loadHCExcuses(); }).catch(function (e) { toast(e.message); });
+        return;
+    }
+    if (!(await confirmModal('تقبل العذر؟ بينحذف الخصم وترجع النقاط للعضو.'))) return;
+    api('/api/hc/excuses/' + id + '/accept', { method: 'POST', body: '{}' })
+        .then(function (r) { toast('✅ انقبل العذر' + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : '')); loadHCExcuses(); }).catch(function (e) { toast(e.message); });
+}
+function attExBadge(x) {
+    if (x.onLeave) return ' <span class="badge approved">🌴 في إجازة</span>';
+    if (x.excuseStatus === 'pending') return ' <span class="badge pending">⏳ عذر معلّق</span>';
+    if (x.excuseStatus === 'accepted') return ' <span class="badge approved">🩺 غياب بعذر</span>';
+    if (x.excuseStatus === 'rejected') return ' <span class="badge rejected">❌ عذر مرفوض</span>';
+    return '';
+}
+function attPaintReception(d) {
+    var body = document.getElementById('att-body');
+    if (!body) return;
+    var P = [[1, 'اليوم'], [3, 'آخر ٣ أيام'], [7, 'آخر ٧ أيام'], [14, 'آخر ١٤ يوم']];
+    var chips = P.map(function (p) { return attChip(p[1], ATTP.days === p[0], 'attSetDays', p[0]); }).join('');
+    var r = d.reception;
+    var head = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
+        '<div style="font-size:12px;color:var(--muted);margin-top:10px;">📣 انفتح الاستلام: ' + attFmtT(r.openedAt) + ' • بواسطة ' + cyEsc(r.openedByName || '-') + '</div>' +
+        '<div class="row" style="margin-top:10px;"><div><b style="color:#4ade80;">' + r.attendedCount + '</b> <span style="color:var(--muted);font-size:13px;">حضروا (+١)</span> • ' +
+        '<b style="color:#f87171;">' + r.absentCount + '</b> <span style="color:var(--muted);font-size:13px;">غابوا (-٢)</span> • ' +
+        '<b>' + r.leaveCount + '</b> <span style="color:var(--muted);font-size:13px;">إجازة</span></div>' +
+        '<button class="btn sm gray" onclick="attCopyAbsent()">📋 نسخ الغايبين</button></div></div>';
+    var okRows = d.attended.length ? d.attended.map(function (x) {
+        return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
+            '<div><span class="badge approved">✅ حضر +١</span></div></div></div>';
+    }).join('') : '<div class="card center" style="color:var(--muted);">ما فيه أحد كان حاضر وقت فتح الاستلام</div>';
+    var abRows = d.list.length ? d.list.map(function (x) {
+        var pts = x.onLeave ? '' : (x.excuseStatus === 'accepted' ? (x.refunded ? 'رجعت ' + x.refunded + ' نقطة' : '') : (x.deducted ? '-' + x.deducted + ' نقطة' : 'بدون خصم'));
+        return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b>' + attExBadge(x) +
+            '<div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
+            '<div style="text-align:left;font-size:12px;color:#f87171;">' + pts + '</div></div></div>';
+    }).join('') : '<div class="card center" style="color:#4ade80;">🎉 الكل حاضر</div>';
+    body.innerHTML = head +
+        '<h3 style="margin:14px 0 8px;color:#4ade80;">✅ حضروا (' + d.attended.length + ')</h3>' + okRows +
+        '<h3 style="margin:14px 0 8px;color:#f87171;">❌ ما حضروا (' + d.list.length + ')</h3>' + abRows;
 }
 function hcShowImage(id, btn) {
     api('/api/high-command/promotion-requests/' + id + '/image').then(function (d) {
@@ -13947,11 +14350,12 @@ function cardFields(p) {
         points: (p.points === undefined || p.points === null) ? '-' : String(p.points),
         note: p.notes === undefined ? '—' : (notes.length ? notes[notes.length - 1] : 'لا توجد ملاحظات'),
         notes: p.notes === undefined ? '—' : (notes.length ? notes.join(' | ') : 'لا توجد ملاحظات'),
+        excused: Array.isArray(p.excusedAbsences) ? (p.excusedAbsences.length ? p.excusedAbsences.slice().reverse().slice(0, 10).map(function (x) { return 'غياب بعذر — ' + exFull(x.absenceAt) + ' (اعتُمد ' + exFull(x.approvedAt) + ')'; }).join(' | ') : 'لا يوجد') : null,
     };
 }
 const MC_DATA = {};
 const MC_OPT = {};
-const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات']];
+const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات'], ['excused', 'الغياب بعذر']];
 function mcFace(f) {
     return '<div class="mc-face">' +
         '<div class="mc-t name" data-k="name">' + cardEsc(f.name) + '</div>' +
@@ -13994,6 +14398,7 @@ function mcInfoHtml(id) {
     const f = cardFields(p);
     let info = '';
     MC_ROWS.forEach(function (r) {
+        if (r[0] === 'excused' && f.excused === null) return;
         info += '<div class="mc-row"><div class="mc-row-top"><span>' + r[1] + '</span><button class="mc-copy" onclick="mcCopy(this)">📋 نسخ</button></div><b data-k="' + r[0] + '">' + cardEsc(f[r[0]]) + '</b></div>';
     });
     const remain = o.hasProgress ? '<div class="mc-remain">' + remainText(o.nextRank, o.remaining) + '</div>' : '';
@@ -17232,7 +17637,7 @@ async function flReceptionOpen() {
     if (!(await confirmModal('تبي تفتح الاستلام وترسل إشعار للجميع؟'))) return;
     try {
         var r = await api('/api/reception/open', { method: 'POST', body: '{}' });
-        toast('📣 انفتح الاستلام — وصل لـ ' + r.sent + ' جهاز' + (r.discord ? ' + ديسكورد' : ''));
+        toast('📣 انفتح الاستلام — وصل لـ ' + r.sent + ' جهاز' + (r.discord ? ' + ديسكورد' : '') + (r.rec ? ' — سُجّل: ' + r.rec.attended + ' حضروا / ' + r.rec.absent + ' غابوا' : ' — (حضور اليوم مسجّل من قبل)'));
     } catch (e) { toast(e.message); }
 }
 
