@@ -3426,16 +3426,22 @@ app.get("/api/owner/lockdown", ensureAuth, async (req, res) => {
 
 app.get("/api/owner/devices", ensureAuth, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
-    const recs = await DeviceSession.find({ revoked: false }).sort({ loginAt: -1 }).limit(400).lean();
-    const alive = [];
-    for (const r of recs) {
-        const exists = await new Promise(resolve => sessionStore.get(r.sid, (e, s) => resolve(!!s)));
-        if (exists) alive.push(r);
+    try {
+        const recs = await DeviceSession.find({ revoked: false }).sort({ loginAt: -1 }).limit(400).maxTimeMS(8000).lean();
+        const sids = recs.map(r => r.sid).filter(Boolean);
+        const live = await SessionDoc.find({ _id: { $in: sids }, expires: { $gt: new Date() } }, { _id: 1 }).maxTimeMS(8000).lean();
+        const liveSet = new Set(live.map(s => String(s._id)));
+        const alive = recs.filter(r => liveSet.has(String(r.sid)));
+        const deadIds = recs.filter(r => !liveSet.has(String(r.sid))).map(r => r._id);
+        if (deadIds.length) DeviceSession.updateMany({ _id: { $in: deadIds } }, { $set: { revoked: true } }).catch(() => {});
+        const uids = [...new Set(alive.map(r => r.uid))];
+        const accs = await Account.find({ uid: { $in: uids } }, { uid: 1, fullName: 1, email: 1 }).maxTimeMS(8000).lean();
+        const nameMap = {}; accs.forEach(a => nameMap[a.uid] = a.fullName + " — " + a.email);
+        res.json({ list: alive.map(r => ({ _id: r._id, uid: r.uid, name: nameMap[r.uid] || r.uid, ip: r.ip, ua: r.ua, loginAt: r.loginAt })) });
+    } catch (e) {
+        console.error("❌ /api/owner/devices:", e.message);
+        res.status(500).json({ error: "تعذر تحميل الأجهزة، حاول مرة ثانية" });
     }
-    const uids = [...new Set(alive.map(r => r.uid))];
-    const accs = await Account.find({ uid: { $in: uids } }, { uid: 1, fullName: 1, email: 1 }).lean();
-    const nameMap = {}; accs.forEach(a => nameMap[a.uid] = a.fullName + " — " + a.email);
-    res.json({ list: alive.map(r => ({ _id: r._id, uid: r.uid, name: nameMap[r.uid] || r.uid, ip: r.ip, ua: r.ua, loginAt: r.loginAt })) });
 });
 app.post("/api/owner/devices/:id/kick", ensureAuth, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
@@ -11175,7 +11181,10 @@ async function offaOpenDevices() {
                 '</div></div>';
         }).join('');
         ownerModalOpen('📱 الأجهزة المتصلة', h);
-    } catch (e) { toast(e.message); }
+    } catch (e) {
+        ownerModalOpen('📱 الأجهزة المتصلة', '<div style="color:#f87171;">' + spEsc(e.message || 'تعذر التحميل') + '</div>');
+        toast(e.message);
+    }
 }
 async function offaKickDevice(id) {
     try { await api('/api/owner/devices/' + id + '/kick', { method: 'POST', noLock: true }); toast('⛔ تم طرد الجهاز'); offaOpenDevices(); } catch (e) { toast(e.message); }
