@@ -2064,6 +2064,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         unlockAt: p.summon.unlockAt, enteredAt: p.summon.enteredAt,
     } : null;
 
+    const recState = isReceptionOfficer(req.user.id, settings) ? await getReceptionState() : { open: null };
     const [meAtt, mePwaDoc, meCourt, meCyber, meDevLocked, meUnassigned, meAcc] = await Promise.all([
         getAttState(req.user.id),
         PwaInstall.exists({ uid: req.user.id }),
@@ -2079,6 +2080,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         blocked: false,
         att: meAtt, attRequired: attRequired(req.user.id), pwaInstalled: mePwa,
         isReceptionOfficer: isReceptionOfficer(req.user.id, settings),
+        receptionOpen: recState.open,
         courtStaff: meCourt.staff, courtLeader: meCourt.leader, courtLocked: !!courtCaseOf(req.user.id), courtCase: courtCaseOf(req.user.id), courtSoon: courtSoonOf(req.user.id),
         discordId: req.user.id,
         discordTag: req.user.username,
@@ -7556,7 +7558,7 @@ app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
     const days = [1, 3, 7, 14].includes(d) ? d : 3;
     const now = new Date();
     if (days === 1) {
-        const rd = await RecDay.findOne({ dayKey: attDayStart(now).getTime() }).lean();
+        const rd = await RecDay.findOne({ openedAt: { $gte: attDayStart(now) }, status: { $ne: "open" } }).sort({ openedAt: -1 }).lean();
         if (rd) {
             const rows = await RecRow.find({ dayKey: rd.dayKey }).limit(5000).maxTimeMS(10000).lean();
             const slim = r => ({ uid: r.uid, name: r.name, unit: r.unit, rank: r.rank, sector: r.sector, deducted: r.deducted, refunded: r.refunded, excuseStatus: r.excuseStatus, onLeave: r.kind === "leave", lastCheckInAt: null });
@@ -7566,7 +7568,7 @@ app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
             const leaveRows = rows.filter(r => r.kind === "leave").map(slim).sort(byName);
             return res.json({
                 days, total: rows.length, absentCount: absentRows.length,
-                reception: { openedAt: rd.openedAt, openedByName: rd.openedByName, attendedCount: attended.length, absentCount: absentRows.length, leaveCount: leaveRows.length },
+                reception: { openedAt: rd.openedAt, openedByName: rd.openedByName, closedAt: rd.closedAt || null, closedByName: rd.closedByName || null, attendedCount: attended.length, absentCount: absentRows.length, leaveCount: leaveRows.length },
                 attended, list: absentRows.concat(leaveRows),
             });
         }
@@ -7827,6 +7829,8 @@ app.post("/api/hc/att-violations/:id/decide", ensureHighCommand, async (req, res
 
 const RecDay = mongoose.model("RecDay", new mongoose.Schema({
     dayKey: { type: Number, unique: true }, openedAt: Date, openedBy: String, openedByName: String,
+    status: { type: String, default: "closed" }, // open = الاستلام مفتوح الحين • closed = انسكّر وانحسبت الغيابات
+    closedAt: Date, closedBy: String, closedByName: String,
 }));
 const RecRowSchema = new mongoose.Schema({
     dayKey: { type: Number, index: true }, uid: String, name: String, unit: String, rank: String,
@@ -7851,11 +7855,33 @@ const AbsenceExcuse = mongoose.model("AbsenceExcuse", AbsenceExcuseSchema);
 const EXCUSE_WINDOW_DAYS = 14;
 const EXCUSE_TYPE_LABEL = { medical: "طبي", nonmedical: "بدون طبي" };
 
-async function recordReception(openerId, openerName) {
+// فتح الاستلام: بس يسجّل إنه مفتوح (ما يحسب غياب الحين)
+async function openReceptionDay(openerId, openerName) {
     const now = new Date();
-    const dayKey = attDayStart(now).getTime();
-    try { await RecDay.create({ dayKey, openedAt: now, openedBy: openerId, openedByName: openerName }); }
+    const dayKey = now.getTime(); // كل استلام له مفتاح خاص (يتكرر باليوم أكثر من مرة)
+    try { await RecDay.create({ dayKey, openedAt: now, openedBy: openerId, openedByName: openerName, status: "open" }); }
     catch (e) { return null; }
+    return { dayKey, openedAt: now };
+}
+
+// حالة الاستلام اليوم (مفتوح الحين؟ / انتهى اليوم؟) — ولو في استلام قديم نسوا يسكرونه ينسكّر بدون حساب
+async function getReceptionState() {
+    const now = new Date();
+    await RecDay.updateMany({ status: "open", openedAt: { $lt: attDayStart(now) } }, { $set: { status: "closed", closedAt: now, closedByName: "تلقائي" } }).catch(() => {});
+    const rd = await RecDay.findOne({ status: "open" }, { openedAt: 1, openedByName: 1 }).sort({ openedAt: -1 }).lean();
+    return { open: rd ? { openedAt: rd.openedAt, openedByName: rd.openedByName } : null };
+}
+
+// إغلاق الاستلام: هنا بس يحسب الحضور والغياب وقتها
+async function closeReceptionDay(closerId, closerName) {
+    const now = new Date();
+    const rd = await RecDay.findOneAndUpdate(
+        { status: "open" },
+        { $set: { status: "closed", closedAt: now, closedBy: closerId, closedByName: closerName } },
+        { new: true, sort: { openedAt: -1 } }
+    );
+    if (!rd) return null;
+    const dayKey = rd.dayKey;
     const settings = await getSettings();
     const [accs, ps, sts, leaves] = await Promise.all([
         Account.find({ status: "approved" }, { uid: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(10000).lean(),
@@ -7875,7 +7901,7 @@ async function recordReception(openerId, openerName) {
         const key = a.sector || p.sector || null;
         if (!p.unit || !key) continue;
         const st = sm.get(a.uid);
-        const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: now };
+        const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: rd.openedAt };
         if (st && st.status === "in") {
             rows.push({ ...base, kind: "attended", gained: 1 });
             ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
@@ -7898,7 +7924,7 @@ async function recordReception(openerId, openerName) {
             await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "غبت عن الاستلام" + (r.deducted ? " وانخصم عليك " + r.deducted + " نقطة" : "") + " — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
         }
     })();
-    await logEvent({ action: "تسجيل حضور الاستلام", actorId: openerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-2) • إجازة " + leave });
+    await logEvent({ action: "إغلاق استلام وحساب الغيابات", actorId: closerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-2) • إجازة " + leave });
     return { attended, absent, leave };
 }
 
@@ -8065,11 +8091,10 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
     if (att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
     const h = riyadhHour();
     if (h < CONFIG.RECEPTION_START_HOUR || h >= CONFIG.RECEPTION_END_HOUR) return res.status(400).json({ error: "⏰ مو وقت الاستلام — الاستلام من الساعة 2 العصر إلى 9 الليل" });
-    if (Date.now() - lastReceptionAt < 30000) return res.status(429).json({ error: "تم فتح الاستلام قبل شوي" });
-    lastReceptionAt = Date.now();
-    let rec = null;
-    try { rec = await recordReception(req.user.id, await cyName(req.user.id)); }
-    catch (e) { console.error("❌ فشل تسجيل حضور الاستلام:", e.message); }
+    const state = await getReceptionState();
+    if (state.open) return res.status(409).json({ error: "الاستلام مفتوح الحين", receptionOpen: state.open });
+    const opened = await openReceptionDay(req.user.id, await cyName(req.user.id));
+    if (!opened) return res.status(409).json({ error: "الاستلام انفتح قبل شوي" });
     const r = await pushAll({ title: CONFIG.SITE_NAME, body: "استلام الان", ttl: 900, tag: "reception" });
     let discord = false;
     if (botReady) {
@@ -8080,7 +8105,20 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
         } catch (e) { console.error("❌ فشل إرسال رسالة الاستلام للديسكورد:", e.message); }
     }
     await logEvent({ action: "فتح استلام", actorId: req.user.id, actorTag: req.user.username, details: "إشعار وصل لـ " + r.sent + " جهاز" + (discord ? " + ديسكورد" : "") });
-    res.json({ ok: true, sent: r.sent, discord, rec });
+    res.json({ ok: true, sent: r.sent, discord, receptionOpen: { openedAt: opened.openedAt, openedByName: await cyName(req.user.id) } });
+});
+app.post("/api/reception/close", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    if (!isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
+    const att = await getAttState(req.user.id);
+    if (att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
+    const state = await getReceptionState();
+    if (!state.open) return res.status(409).json({ error: "الاستلام مو مفتوح الحين", receptionOpen: null });
+    let rec = null;
+    try { rec = await closeReceptionDay(req.user.id, await cyName(req.user.id)); }
+    catch (e) { console.error("❌ فشل إغلاق الاستلام:", e.message); return res.status(500).json({ error: "صار خطأ وقت إغلاق الاستلام" }); }
+    if (!rec) return res.status(409).json({ error: "الاستلام انسكّر قبل شوي", receptionOpen: null });
+    res.json({ ok: true, rec });
 });
 
 // ---------- تردد القطاعات المشتركة (روم صوتي 910..919) ----------
@@ -11487,6 +11525,7 @@ async function pollTick() {
         }
         lastKnownRank = fresh.rank;
         ME = fresh; odFix();
+        try { flRcRefresh(); } catch (x) {}
         if (fresh.deviceLocked && !fresh.cyberLocked) { dvHardLock(); return; }
         if (fresh.unassigned && !fresh.cyberLocked) { uaHardLock(); return; }
         buildNav();
@@ -13146,6 +13185,7 @@ function attPaintReception(d) {
     var r = d.reception;
     var head = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
         '<div style="font-size:12px;color:var(--muted);margin-top:10px;">📣 انفتح الاستلام: ' + attFmtT(r.openedAt) + ' • بواسطة ' + cyEsc(r.openedByName || '-') + '</div>' +
+        (r.closedAt ? '<div style=\"font-size:12px;color:var(--muted);margin-top:4px;\">🔒 انسكّر الاستلام: ' + attFmtT(r.closedAt) + ' • بواسطة ' + cyEsc(r.closedByName || '-') + '</div>' : '') +
         '<div class="row" style="margin-top:10px;"><div><b style="color:#4ade80;">' + r.attendedCount + '</b> <span style="color:var(--muted);font-size:13px;">حضروا (+١)</span> • ' +
         '<b style="color:#f87171;">' + r.absentCount + '</b> <span style="color:var(--muted);font-size:13px;">غابوا (-٢)</span> • ' +
         '<b>' + r.leaveCount + '</b> <span style="color:var(--muted);font-size:13px;">إجازة</span></div>' +
@@ -13153,7 +13193,7 @@ function attPaintReception(d) {
     var okRows = d.attended.length ? d.attended.map(function (x) {
         return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
             '<div><span class="badge approved">✅ حضر +١</span></div></div></div>';
-    }).join('') : '<div class="card center" style="color:var(--muted);">ما فيه أحد كان حاضر وقت فتح الاستلام</div>';
+    }).join('') : '<div class="card center" style="color:var(--muted);">ما فيه أحد كان حاضر وقت إغلاق الاستلام</div>';
     var abRows = d.list.length ? d.list.map(function (x) {
         var pts = x.onLeave ? '' : (x.excuseStatus === 'accepted' ? (x.refunded ? 'رجعت ' + x.refunded + ' نقطة' : '') : (x.deducted ? '-' + x.deducted + ' نقطة' : 'بدون خصم'));
         return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b>' + attExBadge(x) +
@@ -17634,20 +17674,48 @@ function flAttCardHtml() {
 }
 // ملاحظة: هنا التردد — زر التردد محذوف من الصفحة الرئيسية، والكود باقي ما انحذف
 function flFreqBtnHtml() { return '<button class="btn sm" onclick="flFreqOpen()">📻 تردد القطاعات المشتركة</button>'; }
+function flRcBtnHtml() {
+    if (!ME || !ME.isReceptionOfficer || !(ME.att && ME.att.status === 'in')) return '';
+    if (ME.receptionOpen) return '<button class=\"btn sm danger\" onclick=\"flReceptionClose()\">🔒 إغلاق الاستلام</button>';
+    return '<button class=\"btn sm\" onclick=\"flReceptionOpen()\">🎤 فتح استلام</button>';
+}
+function flRcRefresh() {
+    var w = document.getElementById('rc-btn-wrap');
+    if (!w) return;
+    var h = flRcBtnHtml();
+    if (w.innerHTML !== h) w.innerHTML = h;
+}
 function flAfterBtnsHtml() {
     var h = '';
     if (ME && ME.att && ME.att.status === 'in') {
-        h += '<button class="btn sm btn-checkout" onclick="renderFingerprint(\\'checkout\\')">🚪 تسجيل انصراف</button>';
-        if (ME.isReceptionOfficer) h += '<button class="btn sm" onclick="flReceptionOpen()">🎤 فتح استلام</button>';
+        h += '<button class=\"btn sm btn-checkout\" onclick=\"renderFingerprint(\\'checkout\\')\">🚪 تسجيل انصراف</button>';
     }
+    if (ME && ME.isReceptionOfficer) h += '<span id=\"rc-btn-wrap\">' + flRcBtnHtml() + '</span>';
     return h;
 }
 async function flReceptionOpen() {
-    if (!(await confirmModal('تبي تفتح الاستلام وترسل إشعار للجميع؟'))) return;
+    if (!(await confirmModal('تبي تفتح الاستلام وترسل إشعار للجميع؟ (الغيابات تنحسب لما تسكّر الاستلام)'))) return;
     try {
         var r = await api('/api/reception/open', { method: 'POST', body: '{}' });
-        toast('📣 انفتح الاستلام — وصل لـ ' + r.sent + ' جهاز' + (r.discord ? ' + ديسكورد' : '') + (r.rec ? ' — سُجّل: ' + r.rec.attended + ' حضروا / ' + r.rec.absent + ' غابوا' : ' — (حضور اليوم مسجّل من قبل)'));
-    } catch (e) { toast(e.message); }
+        ME.receptionOpen = r.receptionOpen || { openedAt: new Date().toISOString() };
+        flRcRefresh();
+        toast('📣 انفتح الاستلام — وصل لـ ' + r.sent + ' جهاز' + (r.discord ? ' + ديسكورد' : '') + ' — لا تنسى تسكّره');
+    } catch (e) {
+        if (e.message && /مفتوح|انسكّر|انفتح/.test(e.message)) { try { var f = await api('/api/me'); ME = f; } catch (x) {} flRcRefresh(); }
+        toast(e.message);
+    }
+}
+async function flReceptionClose() {
+    if (!(await confirmModal('تسكّر الاستلام؟ بيتم حساب الحضور والغياب الحين وخصم نقاط الغايبين.'))) return;
+    try {
+        var r = await api('/api/reception/close', { method: 'POST', body: '{}' });
+        ME.receptionOpen = null;
+        flRcRefresh();
+        toast('🔒 انسكّر الاستلام — حضروا ' + r.rec.attended + ' / غابوا ' + r.rec.absent + ' / إجازة ' + r.rec.leave);
+    } catch (e) {
+        if (e.message && /مو مفتوح|انسكّر/.test(e.message)) { try { var f = await api('/api/me'); ME = f; } catch (x) {} flRcRefresh(); }
+        toast(e.message);
+    }
 }
 
 /* ---------------- تردد القطاعات المشتركة ---------------- */
@@ -18283,7 +18351,7 @@ function flReceptionMount() {
     var box = document.getElementById('admin-content');
     if (!box || document.getElementById('rc-card')) return;
     box.insertAdjacentHTML('beforeend', '<div class="card" id="rc-card"><h3>🎤 مسؤولو الاستلامات</h3>' +
-        '<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">بعد ما يسجل المسؤول حضوره بالبصمة يظهر له زر «فتح استلام» (من 2 العصر إلى 9 الليل) — يوصل إشعار للجميع ورسالة بالديسكورد. تقدر تضيف أكثر من شخص.</div>' +
+        '<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">بعد ما يسجل المسؤول حضوره بالبصمة يظهر له زر «فتح استلام» (من 2 العصر إلى 9 الليل) — يوصل إشعار للجميع ورسالة بالديسكورد، وعند كل المسؤولين يتحول الزر إلى «إغلاق الاستلام»، ولما ينسكّر تنحسب الغيابات. تقدر تضيف أكثر من شخص.</div>' +
         '<input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="rcSearch(this.value)"><div id="rc-cand"></div><div id="rc-list" style="margin-top:10px;">جارِ التحميل...</div></div>');
     rcLoad();
 }
