@@ -8000,7 +8000,7 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
         await pushNoticeTo(t, text, "auto", "🤖 نظام الاستلام");
         pushUid(t, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name, ttl: 86400, tag: "excuse-" + String(ex._id) }).catch(() => {});
     }
-    const hcIds = new Set((settings.highCommand || []).map(m => m.id));
+    const hcIds = new Set([...(settings.highCommand || []).map(m => m.id), ...Array.from(seniorUids)]);
     for (const id of hcIds) pushUid(id, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name + " ينتظر قرارك", ttl: 86400, tag: "excuse-hc-" + String(ex._id) }).catch(() => {});
     if (hcIds.size) sseBroadcast("hcalert", { t: Date.now(), exc: true }, c => !!c.uid && hcIds.has(c.uid));
     await logEvent({ action: "تقديم عذر غياب", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username, details: row.name + " — " + EXCUSE_TYPE_LABEL[type] });
@@ -10549,6 +10549,7 @@ function spConnect() {
                 if (ME && document.getElementById('att-body') && typeof ATTP !== 'undefined' && ATTP.tab === 'viol') attLoad(true);
                 if (ME && document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'att') loadHCAtt(true);
                 if (ME && document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'exc') loadHCExcuses(true);
+                if (ME && document.getElementById('admin-content') && typeof currentAdminTab !== 'undefined' && currentAdminTab === 'excuses') loadSeniorExcuses(true);
                 if (!ME || !ME.isHighCommand) return;
                 checkPromotionAlert();
                 if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
@@ -12248,6 +12249,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
+            <div class="tab" id="tab-excuses" onclick="adminTab('excuses', this)">🩺 غياب بعذر</div>
             <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
             <div class="tab" id="tab-officers" onclick="adminTab('officers', this)">🎖️ إدارة سلك الضباط</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
@@ -12280,6 +12282,7 @@ function adminTab(name, el) {
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
+    if (name === 'excuses') loadSeniorExcuses();
     if (name === 'att') attOpen();
     if (name === 'sfile') sfOpen();
     if (name === 'log') loadLog();
@@ -13220,6 +13223,62 @@ async function loadHCExcuses(silent) {
             '<div style="font-size:11px;color:var(--muted);margin-top:4px;">قُدّم: ' + exFull(x.createdAt) + '</div>' + actions + '</div>';
     }).join('') : '<div class="card center" style="color:var(--muted);">' + (HCEX.f === 'pending' ? 'لا توجد أعذار معلّقة' : 'لا توجد أعذار منتهية') + '</div>';
     paintSilent(box, 'hex' + HCEX.f, chips + rows, silent);
+}
+var SEX = { f: 'pending' };
+function sexSetFilter(f) { SEX.f = f; loadSeniorExcuses(); }
+async function loadSeniorExcuses(silent) {
+    var box = document.getElementById('admin-content');
+    if (!box || currentAdminTab !== 'excuses') return;
+    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var d;
+    try { d = await api('/api/hc/excuses?filter=' + SEX.f); }
+    catch (e) { if (currentAdminTab !== 'excuses' || silent) return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + cyEsc(e.message) + ')</div>'; return; }
+    if (currentAdminTab !== 'excuses') return;
+    var chips = '<div class="card"><div class="row" style="justify-content:flex-start;">' +
+        attChip('⏳ المعلّقة' + (d.pendingCount ? ' (' + d.pendingCount + ')' : ''), SEX.f === 'pending', 'sexSetFilter', 'pending') +
+        attChip('📜 المنتهية', SEX.f === 'done', 'sexSetFilter', 'done') + '</div></div>';
+    var rows = d.list.length ? d.list.map(function (x) {
+        var meta = [x.unit, x.rank, x.sector].filter(Boolean).map(cyEsc).join(' • ') || '-';
+        var actions = '';
+        if (x.status === 'pending' || x.status === 'deciding') {
+            actions = '<div class="row" style="gap:8px;margin-top:10px;"><button class="btn sm" data-id="' + x._id + '" data-a="accept" onclick="sexDecide(this.dataset.id, this.dataset.a)">✅ قبول</button>' +
+                '<button class="btn danger sm" data-id="' + x._id + '" data-a="reject" onclick="sexDecide(this.dataset.id, this.dataset.a)">❌ رفض</button></div>';
+        } else {
+            actions = '<div style="margin-top:8px;">' + exBadge(x.status) + ' <span style="font-size:12px;color:var(--muted);">بواسطة ' + cyEsc(x.decidedByName || '-') + '</span>' +
+                '<div style="font-size:12px;color:var(--muted);margin-top:4px;">🕒 وقت القرار: ' + exFull(x.decidedAt) + '</div>' +
+                (x.status === 'accepted' && x.refunded ? '<div style="font-size:12px;color:#4ade80;margin-top:4px;">انسترجعت ' + x.refunded + ' نقطة</div>' : '') +
+                (x.status === 'rejected' && x.rejectReason ? '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(x.rejectReason) + '</div>' : '') + '</div>';
+        }
+        return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
+            '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + '</div>' +
+            '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
+            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="sexProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') +
+            '<div style="font-size:12px;margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);line-height:1.9;">' +
+                '<div>📥 <b>وقت الاستلام:</b> ' + exFull(x.absenceAt) + '</div>' +
+                '<div>📝 <b>وقت تنفيذ الطلب:</b> ' + exFull(x.createdAt) + '</div>' +
+            '</div>' + actions + '</div>';
+    }).join('') : '<div class="card center" style="color:var(--muted);">' + (SEX.f === 'pending' ? 'لا توجد طلبات غياب بعذر معلّقة' : 'لا توجد طلبات منتهية') + '</div>';
+    paintSilent(box, 'sex' + SEX.f, chips + rows, silent);
+}
+function sexProof(id, btn) {
+    api('/api/hc/excuses/' + id + '/proof').then(function (d) {
+        var im = document.createElement('img');
+        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
+        btn.parentNode.appendChild(im); btn.remove();
+    }).catch(function (e) { toast(e.message); });
+}
+async function sexDecide(id, action) {
+    if (action === 'reject') {
+        var reason = await promptModal('اكتب سبب رفض العذر:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/hc/excuses/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) })
+            .then(function () { toast('تم الرفض وتثبّت الخصم'); loadSeniorExcuses(); }).catch(function (e) { toast(e.message); });
+        return;
+    }
+    if (!(await confirmModal('تقبل العذر؟ بينحذف الخصم وترجع النقاط للعضو.'))) return;
+    api('/api/hc/excuses/' + id + '/accept', { method: 'POST', body: '{}' })
+        .then(function (r) { toast('✅ انقبل العذر' + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : '')); loadSeniorExcuses(); }).catch(function (e) { toast(e.message); });
 }
 function hcExProof(id, btn) {
     api('/api/hc/excuses/' + id + '/proof').then(function (d) {
