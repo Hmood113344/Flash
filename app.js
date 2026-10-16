@@ -766,10 +766,15 @@ async function ensureGuildMembersFetched(guild) {
     guildMembersFetch.promise = guild.members.fetch().catch(e => { guildMembersFetch.promise = null; throw e; });
     return guildMembersFetch.promise;
 }
+// ── المسجلين في فلاش فقط: حساب معتمد + إيميل + باسورد (نفس شرط قائمة الكبار) ──
+const FLASH_REGISTERED_COND = { status: "approved", email: { $nin: [null, ""] }, passwordHash: { $nin: [null, ""] } };
+async function getFlashRegisteredUids(extra = {}) {
+    const list = await Account.find({ ...FLASH_REGISTERED_COND, ...extra }, { uid: 1 }).lean();
+    return list.map(a => a.uid);
+}
 async function getSectorMemberIds(sectorKey) {
     try {
-        const list = await Account.find({ status: "approved", sector: sectorKey }, { uid: 1 }).lean();
-        return list.map(a => a.uid);
+        return await getFlashRegisteredUids({ sector: sectorKey });
     } catch (e) {
         console.error("❌ فشل جلب أعضاء القطاع:", e.message);
         return null;
@@ -862,8 +867,7 @@ async function isMilitaryPoliceMember(uid) {
 }
 async function getMilitaryPoliceMemberIds() {
     try {
-        const list = await Account.find({ status: "approved", isMP: true }, { uid: 1 }).lean();
-        return list.map(a => a.uid);
+        return await getFlashRegisteredUids({ isMP: true });
     } catch (e) {
         console.error("❌ فشل جلب أعضاء الشرطة العسكرية:", e.message);
         return null;
@@ -2417,11 +2421,7 @@ app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
     const qe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const base = q ? { $or: [{ registeredName: new RegExp(qe, "i") }, { unit: new RegExp(qe, "i") }, { discordTag: new RegExp(qe, "i") }, { cardNumber: new RegExp(qe, "i") }] } : {};
     const owners = Array.from(ownerUids);
-    const regUids = (await Account.find({
-        status: "approved",
-        email: { $nin: [null, ""] },
-        passwordHash: { $nin: [null, ""] },
-    }, { uid: 1 }).lean()).map(a => a.uid);
+    const regUids = await getFlashRegisteredUids();
     const rest = await Personnel.find({ ...base, discord: { $in: regUids, $nin: owners } }, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
     let list = rest;
     if (isOwnerUid(req.user.id) && owners.length) {
@@ -4149,7 +4149,8 @@ app.post("/api/mp/personnel-officer/remove", ensureMPLeader, async (req, res) =>
 
 app.get("/api/mp/members", ensureMPMember, async (req, res) => {
     await ensureCardNumbers();
-    const list = await Personnel.find({ registeredName: { $ne: null }, discord: { $nin: hiddenOwnerIds(req) } }, { notes: 0 });
+    const regUids = await getFlashRegisteredUids();
+    const list = await Personnel.find({ registeredName: { $ne: null }, discord: { $in: regUids, $nin: hiddenOwnerIds(req) } }, { notes: 0 });
     list.sort((a, b) => rankIndex(b.rank) - rankIndex(a.rank));
     res.json({ list });
 });
@@ -4427,7 +4428,8 @@ app.get("/api/bank/ranks", async (req, res) => {
 
 app.get("/api/bank/personnel-ranks", async (req, res) => {
     try {
-        const list = await Personnel.find({ isBlocked: false, discord: { $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
+        const regUidsB = await getFlashRegisteredUids();
+        const list = await Personnel.find({ isBlocked: false, discord: { $in: regUidsB, $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
         const personnel = list.map(p => ({
             discord: p.discord,
             discordTag: p.discordTag,
@@ -5882,7 +5884,8 @@ app.get("/api/officers/admin/trainers/search", ensureSeniorAdmin, async (req, re
     const q = String(req.query.q || "").trim().slice(0, 40);
     if (!q) return res.json({ results: [] });
     const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-    const list = await Personnel.find({ registeredName: { $ne: null }, $or: [{ registeredName: rx }, { discordTag: rx }, { discord: q }] },
+    const regUidsT = await getFlashRegisteredUids();
+    const list = await Personnel.find({ registeredName: { $ne: null }, discord: { $in: regUidsT }, $or: [{ registeredName: rx }, { discordTag: rx }, { discord: q }] },
         { discord: 1, registeredName: 1, discordTag: 1, rank: 1 }).limit(15).lean();
     const st = await getSettings();
     const cur = new Set(Array.isArray(st.officerTrainers) ? st.officerTrainers : []);
