@@ -170,6 +170,10 @@ const PersonnelSchema = new mongoose.Schema({
         excuseId: String, type: String,
         absenceAt: Date, approvedAt: Date, approvedByName: String,
     }],
+    removedAbsences: [{
+        dayKey: Number, absenceAt: Date, removedAt: Date, removedByName: String,
+        refunded: { type: Number, default: 0 },
+    }],
     leaveBalance: { type: Number, default: 10 },
     cardNumber: { type: String, default: null, index: true },
     sector: { type: String, default: null },
@@ -2094,6 +2098,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         leaveBalance: p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE,
         notes: p.notes,
         excusedAbsences: p.excusedAbsences || [],
+        removedAbsences: p.removedAbsences || [],
         isBlocked: p.isBlocked,
         isAdmin,
         isSeniorAdmin: senior,
@@ -2424,6 +2429,15 @@ app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
         list = [...ownerDocs, ...rest];
     }
     res.json({ list });
+});
+
+app.get("/api/senior/personnel/:discord/file", ensureSeniorAdmin, async (req, res) => {
+    if (ownerUids.has(req.params.discord) && !isOwnerUid(req.user.id)) return res.status(404).json({ error: "غير موجود" });
+    await ensureCardNumbers();
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const progress = await rankProgress(p, await getSettings());
+    res.json({ personnel: p, progress });
 });
 
 app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, res) => {
@@ -7568,7 +7582,7 @@ app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
             const leaveRows = rows.filter(r => r.kind === "leave").map(slim).sort(byName);
             return res.json({
                 days, total: rows.length, absentCount: absentRows.length,
-                reception: { openedAt: rd.openedAt, openedByName: rd.openedByName, closedAt: rd.closedAt || null, closedByName: rd.closedByName || null, attendedCount: attended.length, absentCount: absentRows.length, leaveCount: leaveRows.length },
+                reception: { dayKey: rd.dayKey, openedAt: rd.openedAt, openedByName: rd.openedByName, closedAt: rd.closedAt || null, closedByName: rd.closedByName || null, attendedCount: attended.length, absentCount: absentRows.length, leaveCount: leaveRows.length },
                 attended, list: absentRows.concat(leaveRows),
             });
         }
@@ -7837,6 +7851,7 @@ const RecRowSchema = new mongoose.Schema({
     sector: String, sectorKey: String, kind: String,
     gained: { type: Number, default: 0 }, deducted: { type: Number, default: 0 }, refunded: { type: Number, default: 0 },
     excuseStatus: { type: String, default: "none" }, excuseId: { type: String, default: null }, openedAt: Date,
+    removedAt: Date, removedBy: String, removedByName: String,
 });
 RecRowSchema.index({ dayKey: 1, uid: 1 }, { unique: true });
 const RecRow = mongoose.model("RecRow", RecRowSchema);
@@ -8047,6 +8062,56 @@ app.post("/api/hc/excuses/:id/reject", ensureHighCommand, async (req, res) => {
         await AbsenceExcuse.updateOne({ _id: ex._id, status: "deciding" }, { $set: { status: "pending" } });
         res.status(400).json({ error: e.message });
     }
+});
+
+// ---------- إزالة الغياب (للمالك فقط) ----------
+app.post("/api/owner/att/remove-absence", ensureSeniorAdmin, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const b = req.body || {};
+    const dayKey = Number(b.dayKey);
+    if (!Number.isFinite(dayKey)) return res.status(400).json({ error: "حدد الاستلام" });
+    const mode = b.mode === "all" ? "all" : b.mode === "except" ? "except" : null;
+    if (!mode) return res.status(400).json({ error: "حدد الكل أو مستثنى" });
+    const except = new Set(mode === "except" && Array.isArray(b.exceptUids) ? b.exceptUids.map(String) : []);
+    const rd = await RecDay.findOne({ dayKey }).lean();
+    if (!rd || rd.status === "open") return res.status(409).json({ error: "الاستلام ما انسكّر بعد" });
+    const OK = ["none", "pending", "rejected"];
+    const rows = await RecRow.find({ dayKey, kind: "absent", excuseStatus: { $in: OK } }, { uid: 1 }).limit(5000).lean();
+    const targets = rows.filter(r => !except.has(r.uid));
+    if (!targets.length) return res.status(400).json({ error: "ما فيه غايبين تنشال عنهم" });
+    const now = new Date();
+    const byName = await cyName(req.user.id);
+    let removed = 0, refundedTotal = 0;
+    const done = [];
+    for (const t of targets) {
+        try {
+            const old = await RecRow.findOneAndUpdate(
+                { _id: t._id, kind: "absent", excuseStatus: { $in: OK } },
+                { $set: { excuseStatus: "removed", deducted: 0, removedAt: now, removedBy: req.user.id, removedByName: byName } },
+                { new: false }
+            );
+            if (!old) continue;
+            const ded = old.deducted || 0;
+            if (ded) await RecRow.updateOne({ _id: old._id }, { $set: { refunded: ded } });
+            if (old.excuseStatus === "pending" && old.excuseId) {
+                await AbsenceExcuse.updateOne({ _id: old.excuseId, status: "pending" }, { $set: { status: "rejected", rejectReason: "أُزيل الغياب من المالك", decidedBy: req.user.id, decidedByName: byName, decidedAt: now } });
+            }
+            const upd = { $push: { removedAbsences: { dayKey, absenceAt: old.openedAt || rd.openedAt, removedAt: now, removedByName: byName, refunded: ded } } };
+            if (ded) upd.$inc = { points: ded };
+            await Personnel.updateOne({ discord: old.uid }, upd);
+            removed++; refundedTotal += ded;
+            done.push({ uid: old.uid, name: old.name, ded });
+        } catch (e) { console.error("❌ فشل إزالة غياب:", e.message); }
+    }
+    await logEvent({ action: "إزالة غياب", actorId: req.user.id, actorTag: req.user.username, details: "أُزيل الغياب عن " + removed + " (رجعت " + refundedTotal + " نقطة)" + (except.size ? " • مستثنى " + except.size : "") });
+    (async () => {
+        for (const x of done) {
+            const text = "🧹 تم إزالة غيابك عن الاستلام" + (x.ded ? " ورجعت لك " + x.ded + " نقطة" : "") + " — وانسجّل في ملفك.";
+            await pushNoticeTo(x.uid, text, "auto", "🤖 نظام الاستلام");
+            pushUid(x.uid, { title: CONFIG.SITE_NAME, body: text.slice(0, 120), ttl: 86400, tag: "rmabs-" + dayKey }).catch(() => {});
+        }
+    })();
+    res.json({ ok: true, removed, refunded: refundedTotal, skipped: except.size });
 });
 
 // ---------- مسؤولو الاستلامات + زر فتح استلام ----------
@@ -12175,6 +12240,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div>
             <div class="tab" onclick="adminTab('accounts', this)">✅ الحسابات المقبولة</div>
             <div class="tab" onclick="adminTab('personnel', this)">ملفات العسكريين</div>
+            <div class="tab" onclick="adminTab('sfile', this)">📇 عرض ملف عسكري</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
@@ -12212,6 +12278,7 @@ function adminTab(name, el) {
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
     if (name === 'att') attOpen();
+    if (name === 'sfile') sfOpen();
     if (name === 'log') loadLog();
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
@@ -13080,6 +13147,7 @@ async function exLoad() {
         var ex = x.excuse;
         var right = '';
         if (x.excuseStatus === 'none') right = '<button class="btn sm" data-id="' + x.rowId + '" onclick="exOpen(this.dataset.id)">تقديم عذر</button>';
+        else if (x.excuseStatus === 'removed') right = '<span class="badge approved">🧹 أُزيل الغياب</span>';
         else if (ex) right = exBadge(ex.status);
         var info = '';
         if (ex) {
@@ -13088,7 +13156,7 @@ async function exLoad() {
             if (ex.status === 'rejected' && ex.rejectReason) info += '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(ex.rejectReason) + '</div>';
             if (ex.status === 'accepted') info += '<div style="font-size:12px;color:#4ade80;margin-top:4px;">انسجّل في ملفك وبطاقتك كغياب بعذر' + (x.refunded ? ' ورجعت لك ' + x.refunded + ' نقطة' : '') + '</div>';
         }
-        var ded = x.excuseStatus === 'accepted' ? '' : (x.deducted ? ' • انخصم عليك ' + x.deducted + ' نقطة' : ' • بدون خصم');
+        var ded = (x.excuseStatus === 'accepted' || x.excuseStatus === 'removed') ? '' : (x.deducted ? ' • انخصم عليك ' + x.deducted + ' نقطة' : ' • بدون خصم');
         return '<div class="card" style="padding:12px;"><div class="row"><div><b>غياب عن الاستلام</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + exFull(x.openedAt) + ded + '</div></div><div>' + right + '</div></div>' + info +
             '<div id="ex-f-' + x.rowId + '"></div></div>';
     }).join('');
@@ -13171,11 +13239,103 @@ async function hcExDecide(id, action) {
         .then(function (r) { toast('✅ انقبل العذر' + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : '')); loadHCExcuses(); }).catch(function (e) { toast(e.message); });
 }
 function attExBadge(x) {
+    if (x.excuseStatus === 'removed') return ' <span class="badge approved">🧹 أُزيل الغياب</span>';
     if (x.onLeave) return ' <span class="badge approved">🌴 في إجازة</span>';
     if (x.excuseStatus === 'pending') return ' <span class="badge pending">⏳ عذر معلّق</span>';
     if (x.excuseStatus === 'accepted') return ' <span class="badge approved">🩺 غياب بعذر</span>';
     if (x.excuseStatus === 'rejected') return ' <span class="badge rejected">❌ عذر مرفوض</span>';
     return '';
+}
+var ATTRM = { mode: 'all', ex: {}, list: [] };
+function attRmOpen() {
+    var d = ATTP.data.absent;
+    if (!ME || !ME.isOwner || !d || !d.reception) return;
+    var list = d.list.filter(function (x) { return !x.onLeave && x.excuseStatus !== 'accepted' && x.excuseStatus !== 'removed'; });
+    if (!list.length) { toast('ما فيه غايبين تنشال عنهم'); return; }
+    ATTRM = { mode: 'all', ex: {}, list: list };
+    document.getElementById('wf-overlay').classList.add('open');
+    attRmPaint();
+}
+function attRmMode(m) { ATTRM.mode = m; attRmPaint(); }
+function attRmTog(u) { ATTRM.ex[u] = !ATTRM.ex[u]; attRmPaint(); }
+function attRmPaint() {
+    var st = ATTRM, box = document.getElementById('wf-box');
+    if (!box) return;
+    var exN = 0;
+    st.list.forEach(function (x) { if (st.ex[x.uid]) exN++; });
+    var isEx = st.mode === 'except';
+    var n = isEx ? st.list.length - exN : st.list.length;
+    var rows = st.list.map(function (x) {
+        var ex = isEx && st.ex[x.uid];
+        var tog = isEx ? ' data-u="' + cyEsc(x.uid) + '" onclick="attRmTog(this.dataset.u)"' : '';
+        return '<div class="card" style="padding:8px 12px;margin-top:6px;' + (isEx ? 'cursor:pointer;' : '') + (ex ? 'opacity:0.55;' : '') + '"' + tog + '><div class="row"><div><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
+            '<span style="font-size:12px;">' + (ex ? '🔒 مستثنى (يبقى غيابه)' : '🧹 ينشال غيابه') + '</span></div></div>';
+    }).join('');
+    box.innerHTML = '<h3>🧹 إزالة الغياب (' + st.list.length + ' غايب)</h3>' +
+        '<div class="row" style="justify-content:flex-start;gap:6px;margin:8px 0;">' +
+            '<button class="btn sm ' + (isEx ? 'gray' : '') + '" data-m="all" onclick="attRmMode(this.dataset.m)">الكل</button>' +
+            '<button class="btn sm ' + (isEx ? '' : 'gray') + '" data-m="except" onclick="attRmMode(this.dataset.m)">مستثنى</button></div>' +
+        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">' + (isEx ? 'اضغط على اللي تبي تستثنيهم (يبقى غيابهم)، والباقي ينشال عنهم الغياب وترجع نقاطهم.' : 'بينشال الغياب عن كل الغايبين وترجع نقاطهم، وينسجّل في ملفاتهم.') + '</div>' +
+        '<div style="max-height:45vh;overflow-y:auto;">' + rows + '</div>' +
+        '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button><button class="btn sm" onclick="attRmGo()">تأكيد الإزالة (' + n + ')</button></div>';
+}
+async function attRmGo() {
+    var st = ATTRM, d = ATTP.data.absent;
+    if (!d || !d.reception) return;
+    var exc = Object.keys(st.ex).filter(function (k) { return st.ex[k]; });
+    var isEx = st.mode === 'except';
+    var n = isEx ? st.list.length - exc.length : st.list.length;
+    if (n <= 0) { toast('كل الغايبين مستثنين — ما فيه شي ينشال'); return; }
+    if (!(await confirmModal('تبي تشيل الغياب عن ' + n + ' شخص؟ بترجع نقاطهم وينسجّل في ملفاتهم.'))) return;
+    try {
+        var r = await api('/api/owner/att/remove-absence', { method: 'POST', body: JSON.stringify({ dayKey: d.reception.dayKey, mode: st.mode, exceptUids: isEx ? exc : [] }) });
+        toast('🧹 انشال الغياب عن ' + r.removed + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : ''));
+        closeWarnForm();
+        attLoad(false);
+    } catch (e) { toast(e.message); }
+}
+var SF = { t: null, seq: 0 };
+function sfOpen() {
+    var box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card"><input id="sf-q" placeholder="🔍 ابحث بالاسم / اليونت / رقم البطاقة..." oninput="sfSearch()"><div id="sf-results"></div></div><div id="sf-view"></div>';
+}
+function sfSearch() {
+    clearTimeout(SF.t);
+    SF.t = setTimeout(sfRunSearch, 300);
+}
+async function sfRunSearch() {
+    var inp = document.getElementById('sf-q'), box = document.getElementById('sf-results');
+    if (!inp || !box) return;
+    var q = inp.value.trim();
+    if (!q) { box.innerHTML = ''; return; }
+    var my = ++SF.seq, list;
+    try { list = (await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true })).list; }
+    catch (e) { if (my === SF.seq && document.getElementById('sf-results')) document.getElementById('sf-results').innerHTML = '<p style="color:#f87171;font-size:13px;">' + cyEsc(e.message) + '</p>'; return; }
+    box = document.getElementById('sf-results');
+    if (my !== SF.seq || !box) return;
+    box.innerHTML = list.length ? list.map(function (p) {
+        return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + cyEsc(p.registeredName || p.discordTag) + ' <span style="color:var(--muted);font-size:12px;">(' + cyEsc(p.unit || '-') + ')</span></span>' +
+            '<button class="btn sm" data-d="' + cyEsc(p.discord) + '" onclick="sfView(this.dataset.d)">عرض الملف</button></div></div>';
+    }).join('') : '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
+}
+async function sfView(discord) {
+    var box = document.getElementById('sf-view');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try {
+        var d = await api('/api/senior/personnel/' + discord + '/file');
+        var p = d.personnel, progress = d.progress;
+        var notes = (p.notes && p.notes.length) ? '<div style="margin-top:10px;font-size:13px;color:var(--gold-soft);">الملاحظات:</div>' + p.notes.map(function (n) {
+            var hasImg = n.image || (n.imageChannelId && n.imageMessageId);
+            return '<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">' + cardEsc(n.text) +
+                (hasImg ? '<button class="btn sm gray" style="margin-top:6px;" data-d="' + cardEsc(p.discord) + '" data-n="' + cardEsc(n._id) + '" onclick="viewNotePhoto(this.dataset.d, this.dataset.n)">📷 عرض الصورة</button>' : '') + '</div>';
+        }).join('') : '';
+        box.innerHTML = '<div style="margin-top:16px;">' + cardBlock(p, { hasProgress: !!progress, nextRank: progress && progress.nextRank, remaining: progress && progress.remaining }) + '</div>' +
+            '<div class="id-card" style="margin-top:16px;"><div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">' + cardEsc(p.registeredName || p.discordTag) + '</div>' +
+            '<div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري</div>' +
+            '<table><tr><td>اليونت</td><td>' + cardEsc(p.unit || '-') + '</td></tr><tr><td>الرتبة</td><td>' + cardEsc(p.rank) + '</td></tr></table>' + notes + '</div>';
+    } catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cardEsc(e.message) + '</div>'; }
 }
 function attPaintReception(d) {
     var body = document.getElementById('att-body');
@@ -13183,19 +13343,21 @@ function attPaintReception(d) {
     var P = [[1, 'اليوم'], [3, 'آخر ٣ أيام'], [7, 'آخر ٧ أيام'], [14, 'آخر ١٤ يوم']];
     var chips = P.map(function (p) { return attChip(p[1], ATTP.days === p[0], 'attSetDays', p[0]); }).join('');
     var r = d.reception;
+    var rmN = d.list.filter(function (x) { return !x.onLeave && x.excuseStatus !== 'accepted' && x.excuseStatus !== 'removed'; }).length;
+    var canRm = !!(ME && ME.isOwner && r.dayKey && rmN);
     var head = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
         '<div style="font-size:12px;color:var(--muted);margin-top:10px;">📣 انفتح الاستلام: ' + attFmtT(r.openedAt) + ' • بواسطة ' + cyEsc(r.openedByName || '-') + '</div>' +
         (r.closedAt ? '<div style=\"font-size:12px;color:var(--muted);margin-top:4px;\">🔒 انسكّر الاستلام: ' + attFmtT(r.closedAt) + ' • بواسطة ' + cyEsc(r.closedByName || '-') + '</div>' : '') +
         '<div class="row" style="margin-top:10px;"><div><b style="color:#4ade80;">' + r.attendedCount + '</b> <span style="color:var(--muted);font-size:13px;">حضروا (+١)</span> • ' +
         '<b style="color:#f87171;">' + r.absentCount + '</b> <span style="color:var(--muted);font-size:13px;">غابوا (-٢)</span> • ' +
         '<b>' + r.leaveCount + '</b> <span style="color:var(--muted);font-size:13px;">إجازة</span></div>' +
-        '<button class="btn sm gray" onclick="attCopyAbsent()">📋 نسخ الغايبين</button></div></div>';
+        '<div class="row" style="gap:6px;">' + (canRm ? '<button class="btn sm" onclick="attRmOpen()">🧹 إزالة الغياب</button>' : '') + '<button class="btn sm gray" onclick="attCopyAbsent()">📋 نسخ الغايبين</button></div></div></div>';
     var okRows = d.attended.length ? d.attended.map(function (x) {
         return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
             '<div><span class="badge approved">✅ حضر +١</span></div></div></div>';
     }).join('') : '<div class="card center" style="color:var(--muted);">ما فيه أحد كان حاضر وقت إغلاق الاستلام</div>';
     var abRows = d.list.length ? d.list.map(function (x) {
-        var pts = x.onLeave ? '' : (x.excuseStatus === 'accepted' ? (x.refunded ? 'رجعت ' + x.refunded + ' نقطة' : '') : (x.deducted ? '-' + x.deducted + ' نقطة' : 'بدون خصم'));
+        var pts = x.onLeave ? '' : ((x.excuseStatus === 'accepted' || x.excuseStatus === 'removed') ? (x.refunded ? 'رجعت ' + x.refunded + ' نقطة' : '') : (x.deducted ? '-' + x.deducted + ' نقطة' : 'بدون خصم'));
         return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b>' + attExBadge(x) +
             '<div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
             '<div style="text-align:left;font-size:12px;color:#f87171;">' + pts + '</div></div></div>';
@@ -14400,11 +14562,12 @@ function cardFields(p) {
         note: p.notes === undefined ? '—' : (notes.length ? notes[notes.length - 1] : 'لا توجد ملاحظات'),
         notes: p.notes === undefined ? '—' : (notes.length ? notes.join(' | ') : 'لا توجد ملاحظات'),
         excused: Array.isArray(p.excusedAbsences) ? (p.excusedAbsences.length ? p.excusedAbsences.slice().reverse().slice(0, 10).map(function (x) { return 'غياب بعذر — ' + exFull(x.absenceAt) + ' (اعتُمد ' + exFull(x.approvedAt) + ')'; }).join(' | ') : 'لا يوجد') : null,
+        removed: Array.isArray(p.removedAbsences) ? (p.removedAbsences.length ? p.removedAbsences.slice().reverse().slice(0, 10).map(function (x) { return 'غياب مُزال — ' + exFull(x.absenceAt) + ' (أُزيل ' + exFull(x.removedAt) + ')'; }).join(' | ') : 'لا يوجد') : null,
     };
 }
 const MC_DATA = {};
 const MC_OPT = {};
-const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات'], ['excused', 'الغياب بعذر']];
+const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات'], ['excused', 'الغياب بعذر'], ['removed', 'الغياب المُزال']];
 function mcFace(f) {
     return '<div class="mc-face">' +
         '<div class="mc-t name" data-k="name">' + cardEsc(f.name) + '</div>' +
@@ -14447,7 +14610,7 @@ function mcInfoHtml(id) {
     const f = cardFields(p);
     let info = '';
     MC_ROWS.forEach(function (r) {
-        if (r[0] === 'excused' && f.excused === null) return;
+        if ((r[0] === 'excused' || r[0] === 'removed') && f[r[0]] === null) return;
         info += '<div class="mc-row"><div class="mc-row-top"><span>' + r[1] + '</span><button class="mc-copy" onclick="mcCopy(this)">📋 نسخ</button></div><b data-k="' + r[0] + '">' + cardEsc(f[r[0]]) + '</b></div>';
     });
     const remain = o.hasProgress ? '<div class="mc-remain">' + remainText(o.nextRank, o.remaining) + '</div>' : '';
