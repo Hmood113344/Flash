@@ -91,6 +91,8 @@ const CONFIG = {
     MILITARY_POLICE_ROLE_ID: process.env.MILITARY_POLICE_ROLE_ID || "1545415273438249010",
     MP_SUMMON_VOICE_URL: "https://discord.com/channels/1497233353030766662/1545415195243843644",
     MP_REPORT_POINTS_APPROVE: 1,
+    MP_POINTS_CHANNEL_ID: process.env.MP_POINTS_CHANNEL_ID || "1561112154080284693",
+    MP_POINTS_REQUEST_MAX: 500,
 
     // ── إضافات: الإشعارات / البصمة / الترددات / الاستلام ──
     PUSH_DEFAULT_TITLE: "فلاش",
@@ -523,6 +525,23 @@ const MPReportSchema = new mongoose.Schema({
 });
 MPReportSchema.index({ status: 1, createdAt: -1 });
 const MPReport = mongoose.model("MPReport", MPReportSchema);
+
+const MPPointsApprovalSchema = new mongoose.Schema({ by: String, byTag: String, at: Date }, { _id: false });
+const MPPointsRequestSchema = new mongoose.Schema({
+    targetDiscord: String, targetTag: String, targetName: String,
+    direction: { type: String, enum: ["add", "deduct"], required: true },
+    amount: { type: Number, required: true },
+    reason: String,
+    requestedBy: String, requestedByTag: String, requestedByName: String,
+    status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+    commanderApproval: { type: MPPointsApprovalSchema, default: () => ({}) },
+    deputyApproval: { type: MPPointsApprovalSchema, default: () => ({}) },
+    reviewedBy: String, reviewedByTag: String, reviewedAt: Date,
+    channelId: { type: String, default: null }, messageId: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now },
+});
+MPPointsRequestSchema.index({ status: 1, createdAt: -1 });
+const MPPointsRequest = mongoose.model("MPPointsRequest", MPPointsRequestSchema);
 
 const LeaveRequestSchema = new mongoose.Schema({
     discord: String,
@@ -1354,6 +1373,14 @@ client.on("interactionCreate", async interaction => {
                     modal.addComponents(new ActionRowBuilder().addComponents(input));
                     return interaction.showModal(modal);
                 }
+                return;
+            }
+
+            if (id.startsWith("mppr_")) {
+                const parts = id.split("_");
+                await interaction.deferUpdate();
+                const out = await decideMPPointsRequest(parts[2], interaction.user.id, interaction.user.username, parts[1] === "ok" ? "approve" : "reject");
+                if (out.error) return interaction.followUp({ content: "🚫 " + out.error, ephemeral: true });
                 return;
             }
 
@@ -4357,6 +4384,217 @@ app.post("/api/summon/enter", ensureAuth, async (req, res) => {
     p.summon.enteredAt = new Date();
     await p.save();
     res.json({ ok: true, url: CONFIG.MP_SUMMON_VOICE_URL });
+});
+
+function mpPointsApprovalsDone(r, ml) {
+    const needC = !!ml.commanderId, needD = !!ml.deputyId;
+    if (!needC && !needD) return false;
+    const okC = !!(r.commanderApproval && r.commanderApproval.by);
+    const okD = !!(r.deputyApproval && r.deputyApproval.by);
+    return (!needC || okC) && (!needD || okD);
+}
+
+function buildMPPointsEmbed(r, settings) {
+    const ml = (settings && settings.mpLeadership) || {};
+    const add = r.direction === "add";
+    const color = r.status === "approved" ? 0x16a34a : r.status === "rejected" ? 0x6b7280 : (add ? 0x22c55e : 0xef4444);
+    const title = r.status === "approved" ? "✅ تم تنفيذ طلب النقاط" : r.status === "rejected" ? "❌ تم رفض طلب النقاط" : (add ? "⭐ طلب إضافة نقاط — شرطة عسكرية" : "⭐ طلب خصم نقاط — شرطة عسكرية");
+    const approvalLine = (ap, id) => {
+        if (ap && ap.by) return "✅ " + (ap.byTag || ap.by);
+        if (r.status === "rejected") return "—";
+        return id ? "⏳ بانتظار <@" + id + ">" : "غير معيّن";
+    };
+    const embed = new EmbedBuilder()
+        .setTitle(title)
+        .setColor(color)
+        .addFields(
+            { name: "العسكري", value: (r.targetName || r.targetTag || "-") + (r.targetDiscord ? "\n<@" + r.targetDiscord + ">" : ""), inline: true },
+            { name: "النوع", value: add ? "➕ إضافة" : "➖ خصم", inline: true },
+            { name: "عدد النقاط", value: String(r.amount), inline: true },
+            { name: "السبب", value: (r.reason || "-").slice(0, 1000), inline: false },
+            { name: "مقدّم الطلب", value: (r.requestedByName || r.requestedByTag || "-") + (r.requestedBy ? "\n<@" + r.requestedBy + ">" : ""), inline: true },
+            { name: "موافقة القائد", value: approvalLine(r.commanderApproval, ml.commanderId), inline: true },
+            { name: "موافقة النائب", value: approvalLine(r.deputyApproval, ml.deputyId), inline: true },
+        )
+        .setFooter({ text: "ID: " + r._id })
+        .setTimestamp(r.createdAt || new Date());
+    if (r.status === "rejected" && r.reviewedByTag) embed.addFields({ name: "رفض بواسطة", value: r.reviewedByTag, inline: true });
+    return embed;
+}
+
+function buildMPPointsButtons(r) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("mppr_ok_" + r._id).setLabel("✅ موافقة").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("mppr_no_" + r._id).setLabel("❌ رفض").setStyle(ButtonStyle.Danger),
+    );
+}
+
+async function postMPPointsRequest(r) {
+    if (!botReady) return;
+    try {
+        const settings = await getSettings();
+        const ml = settings.mpLeadership || {};
+        const channel = await client.channels.fetch(CONFIG.MP_POINTS_CHANNEL_ID);
+        const mentions = [ml.commanderId, ml.deputyId].filter(Boolean).map(i => "<@" + i + ">").join(" ");
+        const msg = await channel.send({
+            content: mentions || undefined,
+            embeds: [buildMPPointsEmbed(r, settings)],
+            components: [buildMPPointsButtons(r)],
+        });
+        await MPPointsRequest.updateOne({ _id: r._id }, { $set: { channelId: msg.channelId, messageId: msg.id } });
+    } catch (e) {
+        console.error("❌ فشل إرسال طلب النقاط لروم الشرطة العسكرية:", e.message);
+    }
+}
+
+async function refreshMPPointsMessage(r) {
+    if (!botReady || !r || !r.channelId || !r.messageId) return;
+    try {
+        const settings = await getSettings();
+        const channel = await client.channels.fetch(r.channelId);
+        const msg = await channel.messages.fetch(r.messageId);
+        await msg.edit({
+            embeds: [buildMPPointsEmbed(r, settings)],
+            components: r.status === "pending" ? [buildMPPointsButtons(r)] : [],
+        });
+    } catch (e) {
+        console.error("❌ فشل تحديث رسالة طلب النقاط:", e.message);
+    }
+}
+
+async function applyMPPointsRequest(r) {
+    const cur = await Personnel.findOne({ discord: r.targetDiscord }, { points: 1 });
+    if (!cur) return null;
+    const oldPoints = cur.points;
+    const delta = r.direction === "add" ? r.amount : -r.amount;
+    await Personnel.updateOne({ discord: r.targetDiscord }, { $inc: { points: delta } });
+    await Personnel.updateOne({ discord: r.targetDiscord, points: { $lt: 0 } }, { $set: { points: 0 } });
+    const after = await Personnel.findOne({ discord: r.targetDiscord }, { points: 1 });
+    const newPoints = after ? after.points : oldPoints;
+    const gain = delta >= 0;
+    const name = r.targetName || r.targetTag;
+    const byTag = "قيادة الشرطة العسكرية";
+    await pushNoticeTo(r.targetDiscord, `⭐ تم ${gain ? "إضافة" : "خصم"} ${r.amount} نقطة ${gain ? "لك" : "من نقاطك"} بموافقة قيادة الشرطة العسكرية. نقاطك الآن: ${newPoints}.\nالسبب: ${r.reason || "-"}`, r.reviewedBy, byTag);
+    await pushNoticeTo(r.requestedBy, `✅ انقبل طلبك بـ${gain ? "إضافة" : "خصم"} ${r.amount} نقطة لـ${name} من قائد الشرطة العسكرية ونائبه.`, r.reviewedBy, byTag);
+    await logEvent({ action: "تعديل نقاط", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: r.reviewedBy, actorTag: byTag, details: `${oldPoints} ← ${newPoints} (${fmtDelta(delta)}) — طلب ${r.requestedByTag} (شرطة عسكرية) — السبب: ${r.reason || "-"}` });
+    notifyHighCommandOfPoints({
+        targetName: name, targetTag: r.targetTag,
+        oldPoints, newPoints, delta: newPoints - oldPoints,
+        actorTag: byTag + " (طلب " + (r.requestedByName || r.requestedByTag) + ")", reason: r.reason || "-",
+    }).catch(() => {});
+    if (gain) await checkAutoPromotion(r.targetDiscord);
+    return { oldPoints, newPoints };
+}
+
+async function completeMPPointsIfDone(id, actorId, actorTag) {
+    const settings = await getSettings();
+    const r0 = await MPPointsRequest.findById(id);
+    if (!r0 || r0.status !== "pending") return r0;
+    if (!mpPointsApprovalsDone(r0, settings.mpLeadership || {})) return r0;
+    const r = await MPPointsRequest.findOneAndUpdate(
+        { _id: id, status: "pending" },
+        { $set: { status: "approved", reviewedBy: actorId, reviewedByTag: actorTag, reviewedAt: new Date() } },
+        { new: true }
+    );
+    if (!r) return r0;
+    await applyMPPointsRequest(r);
+    return r;
+}
+
+async function decideMPPointsRequest(id, userId, userTag, decision) {
+    try {
+        const settings = await getSettings();
+        const role = getMPRole(userId, settings);
+        if (!role) return { error: "الموافقة على طلبات النقاط لقائد الشرطة العسكرية ونائبه فقط" };
+        const r0 = await MPPointsRequest.findById(id);
+        if (!r0 || r0.status !== "pending") return { error: "هذا الطلب تمت مراجعته مسبقاً" };
+        const roleLabel = role === "commander" ? "القائد" : "النائب";
+        const tag = userTag + " (" + roleLabel + ")";
+        if (decision === "reject") {
+            const r = await MPPointsRequest.findOneAndUpdate(
+                { _id: id, status: "pending" },
+                { $set: { status: "rejected", reviewedBy: userId, reviewedByTag: tag, reviewedAt: new Date() } },
+                { new: true }
+            );
+            if (!r) return { error: "هذا الطلب تمت مراجعته مسبقاً" };
+            await pushNoticeTo(r.requestedBy, `❌ انرفض طلبك بـ${r.direction === "add" ? "إضافة" : "خصم"} ${r.amount} نقطة لـ${r.targetName || r.targetTag} من ${tag}.`, userId, userTag);
+            await logEvent({ action: "رفض طلب نقاط (شرطة عسكرية)", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: userId, actorTag: tag, details: `${r.direction === "add" ? "+" : "-"}${r.amount} — طلب ${r.requestedByTag}` });
+            await refreshMPPointsMessage(r);
+            return { ok: true, status: "rejected" };
+        }
+        const field = role === "commander" ? "commanderApproval" : "deputyApproval";
+        const marked = await MPPointsRequest.findOneAndUpdate(
+            { _id: id, status: "pending", [field + ".by"]: null },
+            { $set: { [field]: { by: userId, byTag: tag, at: new Date() } } },
+            { new: true }
+        );
+        if (!marked) return { error: "وافقت على هذا الطلب مسبقاً، بانتظار الطرف الثاني" };
+        await logEvent({ action: "موافقة على طلب نقاط (شرطة عسكرية)", discordId: marked.targetDiscord, discordTag: marked.targetTag, actorId: userId, actorTag: tag, details: `${marked.direction === "add" ? "+" : "-"}${marked.amount} — طلب ${marked.requestedByTag}` });
+        const fresh = await completeMPPointsIfDone(id, userId, tag);
+        await refreshMPPointsMessage(fresh || marked);
+        return { ok: true, status: fresh ? fresh.status : "pending" };
+    } catch (e) {
+        console.error("❌ خطأ بقرار طلب النقاط:", e.message);
+        return { error: "صار خطأ، حاول مرة ثانية" };
+    }
+}
+
+app.post("/api/mp/points-request", ensureMPMember, async (req, res) => {
+    try {
+        const { target, direction, reason } = req.body;
+        const amount = parseInt(req.body.amount, 10);
+        if (!["add", "deduct"].includes(direction)) return res.status(400).json({ error: "حدد إضافة أو خصم" });
+        if (!amount || amount < 1 || amount > CONFIG.MP_POINTS_REQUEST_MAX) return res.status(400).json({ error: "حط عدد نقاط صحيح (1 - " + CONFIG.MP_POINTS_REQUEST_MAX + ")" });
+        if (!reason || !String(reason).trim()) return res.status(400).json({ error: "لازم تكتب السبب" });
+        if (!target) return res.status(400).json({ error: "حدد العسكري" });
+        if (target === req.user.id) return res.status(400).json({ error: "ما تقدر تطلب نقاط لنفسك" });
+        const t = await Personnel.findOne({ discord: target }, { discord: 1, discordTag: 1, registeredName: 1 });
+        if (!t) return res.status(404).json({ error: "العسكري غير موجود" });
+        const settings = req.settings;
+        const ml = settings.mpLeadership || {};
+        if (!ml.commanderId && !ml.deputyId) return res.status(400).json({ error: "ما فيه قائد أو نائب للشرطة العسكرية معيّن حالياً" });
+        const me = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1 });
+        const role = getMPRole(req.user.id, settings);
+        const roleLabel = role === "commander" ? "قائد" : role === "deputy" ? "نائب" : null;
+        const requesterName = (me && me.registeredName) || req.user.username;
+        const doc = {
+            targetDiscord: t.discord, targetTag: t.discordTag, targetName: t.registeredName,
+            direction, amount, reason: String(reason).trim().slice(0, 500),
+            requestedBy: req.user.id, requestedByTag: req.user.username + (roleLabel ? " (" + roleLabel + " الشرطة العسكرية)" : " (شرطة عسكرية)"), requestedByName: requesterName,
+            status: "pending",
+        };
+        if (role === "commander") doc.commanderApproval = { by: req.user.id, byTag: req.user.username + " (القائد)", at: new Date() };
+        if (role === "deputy") doc.deputyApproval = { by: req.user.id, byTag: req.user.username + " (النائب)", at: new Date() };
+        const created = await MPPointsRequest.create(doc);
+        await logEvent({ action: "طلب نقاط (شرطة عسكرية)", discordId: t.discord, discordTag: t.discordTag, actorId: req.user.id, actorTag: doc.requestedByTag, details: `${direction === "add" ? "+" : "-"}${amount} — السبب: ${doc.reason} — بانتظار موافقة القائد والنائب` });
+        await postMPPointsRequest(created);
+        let fresh = await MPPointsRequest.findById(created._id);
+        if (role) {
+            fresh = await completeMPPointsIfDone(created._id, req.user.id, req.user.username + " (" + roleLabel + ")");
+            if (fresh && fresh.status !== "pending") await refreshMPPointsMessage(fresh);
+        }
+        res.json({ ok: true, done: !!(fresh && fresh.status === "approved") });
+    } catch (e) {
+        console.error("❌ خطأ بطلب النقاط:", e.message);
+        res.status(500).json({ error: "صار خطأ، حاول مرة ثانية" });
+    }
+});
+
+app.get("/api/mp/points-requests", ensureMPLeader, async (req, res) => {
+    const pending = await MPPointsRequest.find({ status: "pending" }).sort({ createdAt: -1 }).limit(100).maxTimeMS(10000).lean();
+    const recent = await MPPointsRequest.find({ status: { $ne: "pending" } }).sort({ reviewedAt: -1 }).limit(20).maxTimeMS(10000).lean();
+    const role = req.mpRole === "commander" || req.mpRole === "deputy" ? req.mpRole : null;
+    res.json({ pending, recent, role });
+});
+app.post("/api/mp/points-requests/:id/approve", ensureMPLeader, async (req, res) => {
+    const out = await decideMPPointsRequest(req.params.id, req.user.id, req.user.username, "approve");
+    if (out.error) return res.status(400).json({ error: out.error });
+    res.json(out);
+});
+app.post("/api/mp/points-requests/:id/reject", ensureMPLeader, async (req, res) => {
+    const out = await decideMPPointsRequest(req.params.id, req.user.id, req.user.username, "reject");
+    if (out.error) return res.status(400).json({ error: out.error });
+    res.json(out);
 });
 
 app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
@@ -14009,6 +14247,7 @@ function renderMPPanel() {
             <div class="tab" onclick="mpTabSwitch('force', this)">🚔 أفراد الشرطة العسكرية</div>
             <div class="tab" onclick="mpTabSwitch('file', this)">📇 عرض ملف عسكري</div>
             <div class="tab" onclick="mpTabSwitch('requests', this)">📣 طلبات الاستدعاء</div>
+            <div class="tab" onclick="mpTabSwitch('points', this)">⭐ طلبات النقاط</div>
             <div class="tab" onclick="mpTabSwitch('reports', this)">📄 التقارير</div>
             <div class="tab" onclick="mpTabSwitch('log', this)">📜 لوق القطاعات</div>
             <div class="tab" onclick="mpTabSwitch('promo', this)">🎖️ سجل الترقيات</div>
@@ -14068,6 +14307,7 @@ function mpTabSwitch(name, el) {
     if (name === 'force') loadMPForceMembers();
     if (name === 'file') renderMPFileSearch();
     if (name === 'requests') loadMPSummonRequests();
+    if (name === 'points') loadMPPointsRequests();
     if (name === 'reports') loadMPReports();
     if (name === 'log') loadMPSectorLog();
     if (name === 'promo') loadMPPromotionLog();
@@ -14119,6 +14359,7 @@ function renderMPLeaderMembersList(list) {
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📝 ملاحظة</button>
                     <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/mp/personnel/')">⚠️ تحذير</button>
+                    <button class="btn sm gray" onclick="openMPPointsForm('\${p.discord}')">⭐ نقاط</button>
                     <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ تحقيق</button>
                     \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📣 استدعاء</button>\` : ''}
                     \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">✅ إنهاء الاستدعاء</button>\` : ''}
@@ -14206,6 +14447,111 @@ function mpSummonReqDecide(discord, action) {
     api('/api/mp/summon-requests/' + discord + '/' + action, { method: 'POST' })
         .then(() => { toast(action === 'approve' ? '✅ تم قبول الاستدعاء' : 'تم رفض الطلب'); loadMPSummonRequests(); })
         .catch(e => toast(e.message));
+}
+let mpPoListCache = [];
+let mpPtsCtx = null;
+function mpEsc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function mpPtsName(discord) {
+    const all = (mpMemberListCache || []).concat(mpLeaderListCache || [], mpPoListCache || []);
+    const f = all.find(x => x.discord === discord);
+    return f ? (f.registeredName || f.discordTag || '') : '';
+}
+function openMPPointsForm(discord) {
+    mpPtsCtx = { discord: discord, direction: 'add' };
+    const name = mpPtsName(discord);
+    const box = document.getElementById('wf-box');
+    box.innerHTML =
+        '<h3>⭐ طلب نقاط' + (name ? ' — ' + mpEsc(name) : '') + '</h3>' +
+        '<p style="font-size:13px;color:var(--muted);margin-top:6px;">ما ينفّذ الطلب إلا بعد موافقة قائد الشرطة العسكرية ونائبه.</p>' +
+        '<div class="wf-choice-row">' +
+            '<button class="wf-notice" id="mpp-add" data-d="add" onclick="mpPtsPick(this.dataset.d)">➕ إضافة</button>' +
+            '<button class="wf-warning" id="mpp-ded" data-d="deduct" onclick="mpPtsPick(this.dataset.d)">➖ خصم</button>' +
+        '</div>' +
+        '<input type="number" id="mpp-amount" min="1" placeholder="عدد النقاط" style="margin-top:10px;">' +
+        '<textarea id="mpp-reason" placeholder="سبب الطلب..."></textarea>' +
+        '<div class="wf-actions">' +
+            '<button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>' +
+            '<button class="btn sm" onclick="submitMPPointsForm()">إرسال الطلب</button>' +
+        '</div>';
+    document.getElementById('wf-overlay').classList.add('open');
+    mpPtsPick('add');
+}
+function mpPtsPick(dir) {
+    if (!mpPtsCtx) return;
+    mpPtsCtx.direction = dir;
+    const a = document.getElementById('mpp-add');
+    const d = document.getElementById('mpp-ded');
+    if (a) a.style.opacity = dir === 'add' ? '1' : '0.4';
+    if (d) d.style.opacity = dir === 'deduct' ? '1' : '0.4';
+}
+async function submitMPPointsForm() {
+    if (!mpPtsCtx) return;
+    const amount = parseInt(document.getElementById('mpp-amount').value, 10);
+    const reason = document.getElementById('mpp-reason').value;
+    if (!amount || amount < 1) return toast('حط عدد نقاط صحيح');
+    if (!reason || !reason.trim()) return toast('لازم تكتب السبب');
+    try {
+        const r = await api('/api/mp/points-request', { method: 'POST', body: JSON.stringify({ target: mpPtsCtx.discord, direction: mpPtsCtx.direction, amount: amount, reason: reason.trim() }) });
+        toast(r && r.done ? '✅ تم تنفيذ الطلب' : '📩 تم إرسال الطلب لقائد الشرطة العسكرية ونائبه');
+        closeWarnForm();
+        if (mpTab === 'points') loadMPPointsRequests();
+    } catch (e) { toast(e.message); }
+}
+function mpPtsAp(ap, label) {
+    return (ap && ap.by)
+        ? '<span style="color:#4ade80;">✅ ' + label + '</span>'
+        : '<span style="color:#fbbf24;">⏳ ' + label + '</span>';
+}
+function mpPtsCard(r, role) {
+    const add = r.direction === 'add';
+    const myField = role === 'commander' ? 'commanderApproval' : 'deputyApproval';
+    const iApproved = !!(role && r[myField] && r[myField].by);
+    let actions = '';
+    if (role) {
+        actions = '<div class="row" style="gap:8px;">' +
+            (iApproved
+                ? '<span style="color:var(--muted);font-size:12px;">وافقت، بانتظار الطرف الثاني</span>'
+                : '<button class="btn sm" data-id="' + r._id + '" onclick="mpPtsApprove(this)">✅ موافقة</button>') +
+            '<button class="btn danger sm" data-id="' + r._id + '" onclick="mpPtsReject(this)">❌ رفض</button>' +
+        '</div>';
+    }
+    return '<div class="card"><div class="row"><div>' +
+        '<b>' + mpEsc(r.targetName || r.targetTag) + '</b> ' +
+        '<span style="font-weight:700;color:' + (add ? '#4ade80' : '#f87171') + ';">' + (add ? '➕ إضافة ' : '➖ خصم ') + r.amount + ' نقطة</span>' +
+        '<div style="font-size:12px;color:var(--muted);margin-top:4px;">مقدّم الطلب: ' + mpEsc(r.requestedByName || r.requestedByTag) + '</div>' +
+        '<div style="margin-top:6px;white-space:pre-wrap;">' + mpEsc(r.reason) + '</div>' +
+        '<div style="font-size:12px;margin-top:6px;display:flex;gap:12px;">' + mpPtsAp(r.commanderApproval, 'القائد') + mpPtsAp(r.deputyApproval, 'النائب') + '</div>' +
+        '</div>' + actions + '</div></div>';
+}
+async function loadMPPointsRequests() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/points-requests'); }
+    catch (e) { if (mpTab !== 'points') return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + mpEsc(e.message) + ')</div>'; return; }
+    if (mpTab !== 'points') return;
+    const role = data.role;
+    let html = data.pending.length === 0
+        ? '<div class="card center" style="color:var(--muted);">لا توجد طلبات نقاط معلّقة</div>'
+        : data.pending.map(r => mpPtsCard(r, role)).join('');
+    if (data.recent.length) {
+        html += '<div class="card"><h3>آخر الطلبات</h3>' + data.recent.map(r =>
+            '<div class="row" style="font-size:13px;padding:4px 0;"><span>' + (r.status === 'approved' ? '✅' : '❌') + ' ' + mpEsc(r.targetName || r.targetTag) + ' — ' + (r.direction === 'add' ? '+' : '-') + r.amount + '</span><span style="color:var(--muted);">' + mpEsc(r.requestedByName || r.requestedByTag) + '</span></div>'
+        ).join('') + '</div>';
+    }
+    box.innerHTML = html;
+}
+function mpPtsApprove(el) { mpPtsDecide(el.dataset.id, 'approve'); }
+function mpPtsReject(el) { mpPtsDecide(el.dataset.id, 'reject'); }
+async function mpPtsDecide(id, action) {
+    try {
+        const r = await api('/api/mp/points-requests/' + id + '/' + action, { method: 'POST' });
+        toast(action === 'reject' ? 'تم رفض الطلب' : (r && r.status === 'approved' ? '✅ تمت الموافقة وتنفيذ النقاط' : '✅ تمت موافقتك، بانتظار الطرف الثاني'));
+        loadMPPointsRequests();
+    } catch (e) { toast(e.message); }
 }
 function renderMPReportCard(r, decideFn, isLeaderView) {
     const statusBadge = r.status === 'approved' ? '<span style="color:#4ade80;font-size:12px;">✅ مقبول</span>'
@@ -14379,13 +14725,15 @@ async function loadMPPOMembers() {
     try { data = await api('/api/mp/po/members'); }
     catch (e) { if (mpPoTab !== 'members') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
     if (mpPoTab !== 'members') return;
+    mpPoListCache = data.list;
     if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء حالياً</div>'; return; }
     box.innerHTML = data.list.map(p => \`
         <div class="card">
             <div class="row">
                 <div><b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span></div>
                 <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/po/personnel/','loadMPPOMembers()')">📝 ملاحظة</button>
-                <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ تحقيق</button>
+                <button class="btn sm gray" onclick="openMPPointsForm('\${p.discord}')">⭐ نقاط</button>
+                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ تحقيق</button>
             </div>
         </div>\`).join('');
 }
@@ -14470,6 +14818,7 @@ function renderMPMemberList(list) {
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📝 ملاحظة</button>
+                    <button class="btn sm gray" onclick="openMPPointsForm('\${p.discord}')">⭐ نقاط</button>
                     <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ تحقيق</button>
                     \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📣 طلب استدعاء</button>\` : ''}
                 </div>
