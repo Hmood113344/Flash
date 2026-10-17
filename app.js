@@ -4572,7 +4572,7 @@ app.post("/api/mp/points-request", ensureMPMember, async (req, res) => {
         const ml = settings.mpLeadership || {};
         if (!ml.commanderId && !ml.deputyId && !CONFIG.MP_COMMANDER_ROLE_ID && !CONFIG.MP_DEPUTY_ROLE_ID) return res.status(400).json({ error: "ما فيه قائد أو نائب للشرطة العسكرية معيّن حالياً" });
         const me = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1 });
-        const role = await getMPApproverRole(req.user.id, settings, "site");
+        const role = (await getMPApproverRole(req.user.id, settings, "site")) || (await getMPApproverRole(req.user.id, settings, "discord"));
         const roleLabel = role === "commander" ? "قائد" : role === "deputy" ? "نائب" : null;
         const requesterName = (me && me.registeredName) || req.user.username;
         const doc = {
@@ -4581,8 +4581,11 @@ app.post("/api/mp/points-request", ensureMPMember, async (req, res) => {
             requestedBy: req.user.id, requestedByTag: req.user.username + (roleLabel ? " (" + roleLabel + " الشرطة العسكرية)" : " (شرطة عسكرية)"), requestedByName: requesterName,
             status: "pending",
         };
-        if (role === "commander") doc.commanderApproval = { by: req.user.id, byTag: req.user.username + " (القائد)", at: new Date() };
-        if (role === "deputy") doc.deputyApproval = { by: req.user.id, byTag: req.user.username + " (النائب)", at: new Date() };
+        if (role) {
+            const selfApproval = { by: req.user.id, byTag: req.user.username + " (" + (role === "commander" ? "القائد" : "النائب") + ")", at: new Date() };
+            doc.commanderApproval = selfApproval;
+            doc.deputyApproval = selfApproval;
+        }
         const created = await MPPointsRequest.create(doc);
         await logEvent({ action: "طلب نقاط (شرطة عسكرية)", discordId: t.discord, discordTag: t.discordTag, actorId: req.user.id, actorTag: doc.requestedByTag, details: `${direction === "add" ? "+" : "-"}${amount} — السبب: ${doc.reason} — بانتظار موافقة القائد والنائب` });
         await postMPPointsRequest(created);
