@@ -93,6 +93,8 @@ const CONFIG = {
     MP_REPORT_POINTS_APPROVE: 1,
     MP_POINTS_CHANNEL_ID: process.env.MP_POINTS_CHANNEL_ID || "1561112154080284693",
     MP_POINTS_REQUEST_MAX: 500,
+    MP_COMMANDER_ROLE_ID: process.env.MP_COMMANDER_ROLE_ID || "1528260320366166114",
+    MP_DEPUTY_ROLE_ID: process.env.MP_DEPUTY_ROLE_ID || "1528260505578508389",
 
     // ── إضافات: الإشعارات / البصمة / الترددات / الاستلام ──
     PUSH_DEFAULT_TITLE: "فلاش",
@@ -1379,7 +1381,7 @@ client.on("interactionCreate", async interaction => {
             if (id.startsWith("mppr_")) {
                 const parts = id.split("_");
                 await interaction.deferUpdate();
-                const out = await decideMPPointsRequest(parts[2], interaction.user.id, interaction.user.username, parts[1] === "ok" ? "approve" : "reject");
+                const out = await decideMPPointsRequest(parts[2], interaction.user.id, interaction.user.username, parts[1] === "ok" ? "approve" : "reject", "discord");
                 if (out.error) return interaction.followUp({ content: "🚫 " + out.error, ephemeral: true });
                 return;
             }
@@ -4386,8 +4388,21 @@ app.post("/api/summon/enter", ensureAuth, async (req, res) => {
     res.json({ ok: true, url: CONFIG.MP_SUMMON_VOICE_URL });
 });
 
+async function getMPApproverRole(userId, settings, source) {
+    if (source !== "discord") return getMPRole(userId, settings);
+    try {
+        const guild = client.guilds.cache.get(CONFIG.GUILD_ID) || await client.guilds.fetch(CONFIG.GUILD_ID).catch(() => null);
+        if (!guild) return null;
+        const member = guild.members.cache.get(userId) || await guild.members.fetch(userId).catch(() => null);
+        if (!member) return null;
+        if (CONFIG.MP_COMMANDER_ROLE_ID && member.roles.cache.has(CONFIG.MP_COMMANDER_ROLE_ID)) return "commander";
+        if (CONFIG.MP_DEPUTY_ROLE_ID && member.roles.cache.has(CONFIG.MP_DEPUTY_ROLE_ID)) return "deputy";
+    } catch (e) {}
+    return null;
+}
+
 function mpPointsApprovalsDone(r, ml) {
-    const needC = !!ml.commanderId, needD = !!ml.deputyId;
+    const needC = !!(ml.commanderId || CONFIG.MP_COMMANDER_ROLE_ID), needD = !!(ml.deputyId || CONFIG.MP_DEPUTY_ROLE_ID);
     if (!needC && !needD) return false;
     const okC = !!(r.commanderApproval && r.commanderApproval.by);
     const okD = !!(r.deputyApproval && r.deputyApproval.by);
@@ -4402,7 +4417,7 @@ function buildMPPointsEmbed(r, settings) {
     const approvalLine = (ap, id) => {
         if (ap && ap.by) return "✅ " + (ap.byTag || ap.by);
         if (r.status === "rejected") return "—";
-        return id ? "⏳ بانتظار <@" + id + ">" : "غير معيّن";
+        return id ? "⏳ بانتظار " + id : "غير معيّن";
     };
     const embed = new EmbedBuilder()
         .setTitle(title)
@@ -4413,8 +4428,8 @@ function buildMPPointsEmbed(r, settings) {
             { name: "عدد النقاط", value: String(r.amount), inline: true },
             { name: "السبب", value: (r.reason || "-").slice(0, 1000), inline: false },
             { name: "مقدّم الطلب", value: (r.requestedByName || r.requestedByTag || "-") + (r.requestedBy ? "\n<@" + r.requestedBy + ">" : ""), inline: true },
-            { name: "موافقة القائد", value: approvalLine(r.commanderApproval, ml.commanderId), inline: true },
-            { name: "موافقة النائب", value: approvalLine(r.deputyApproval, ml.deputyId), inline: true },
+            { name: "موافقة القائد", value: approvalLine(r.commanderApproval, CONFIG.MP_COMMANDER_ROLE_ID ? "<@&" + CONFIG.MP_COMMANDER_ROLE_ID + ">" : (ml.commanderId ? "<@" + ml.commanderId + ">" : null)), inline: true },
+            { name: "موافقة النائب", value: approvalLine(r.deputyApproval, CONFIG.MP_DEPUTY_ROLE_ID ? "<@&" + CONFIG.MP_DEPUTY_ROLE_ID + ">" : (ml.deputyId ? "<@" + ml.deputyId + ">" : null)), inline: true },
         )
         .setFooter({ text: "ID: " + r._id })
         .setTimestamp(r.createdAt || new Date());
@@ -4435,7 +4450,10 @@ async function postMPPointsRequest(r) {
         const settings = await getSettings();
         const ml = settings.mpLeadership || {};
         const channel = await client.channels.fetch(CONFIG.MP_POINTS_CHANNEL_ID);
-        const mentions = [ml.commanderId, ml.deputyId].filter(Boolean).map(i => "<@" + i + ">").join(" ");
+        const mentions = [
+            CONFIG.MP_COMMANDER_ROLE_ID ? "<@&" + CONFIG.MP_COMMANDER_ROLE_ID + ">" : (ml.commanderId ? "<@" + ml.commanderId + ">" : ""),
+            CONFIG.MP_DEPUTY_ROLE_ID ? "<@&" + CONFIG.MP_DEPUTY_ROLE_ID + ">" : (ml.deputyId ? "<@" + ml.deputyId + ">" : ""),
+        ].filter(Boolean).join(" ");
         const msg = await channel.send({
             content: mentions || undefined,
             embeds: [buildMPPointsEmbed(r, settings)],
@@ -4501,10 +4519,10 @@ async function completeMPPointsIfDone(id, actorId, actorTag) {
     return r;
 }
 
-async function decideMPPointsRequest(id, userId, userTag, decision) {
+async function decideMPPointsRequest(id, userId, userTag, decision, source) {
     try {
         const settings = await getSettings();
-        const role = getMPRole(userId, settings);
+        const role = await getMPApproverRole(userId, settings, source);
         if (!role) return { error: "الموافقة على طلبات النقاط لقائد الشرطة العسكرية ونائبه فقط" };
         const r0 = await MPPointsRequest.findById(id);
         if (!r0 || r0.status !== "pending") return { error: "هذا الطلب تمت مراجعته مسبقاً" };
@@ -4552,9 +4570,9 @@ app.post("/api/mp/points-request", ensureMPMember, async (req, res) => {
         if (!t) return res.status(404).json({ error: "العسكري غير موجود" });
         const settings = req.settings;
         const ml = settings.mpLeadership || {};
-        if (!ml.commanderId && !ml.deputyId) return res.status(400).json({ error: "ما فيه قائد أو نائب للشرطة العسكرية معيّن حالياً" });
+        if (!ml.commanderId && !ml.deputyId && !CONFIG.MP_COMMANDER_ROLE_ID && !CONFIG.MP_DEPUTY_ROLE_ID) return res.status(400).json({ error: "ما فيه قائد أو نائب للشرطة العسكرية معيّن حالياً" });
         const me = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1 });
-        const role = getMPRole(req.user.id, settings);
+        const role = await getMPApproverRole(req.user.id, settings, "site");
         const roleLabel = role === "commander" ? "قائد" : role === "deputy" ? "نائب" : null;
         const requesterName = (me && me.registeredName) || req.user.username;
         const doc = {
@@ -4587,12 +4605,12 @@ app.get("/api/mp/points-requests", ensureMPLeader, async (req, res) => {
     res.json({ pending, recent, role });
 });
 app.post("/api/mp/points-requests/:id/approve", ensureMPLeader, async (req, res) => {
-    const out = await decideMPPointsRequest(req.params.id, req.user.id, req.user.username, "approve");
+    const out = await decideMPPointsRequest(req.params.id, req.user.id, req.user.username, "approve", "site");
     if (out.error) return res.status(400).json({ error: out.error });
     res.json(out);
 });
 app.post("/api/mp/points-requests/:id/reject", ensureMPLeader, async (req, res) => {
-    const out = await decideMPPointsRequest(req.params.id, req.user.id, req.user.username, "reject");
+    const out = await decideMPPointsRequest(req.params.id, req.user.id, req.user.username, "reject", "site");
     if (out.error) return res.status(400).json({ error: out.error });
     res.json(out);
 });
