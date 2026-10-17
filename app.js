@@ -121,7 +121,7 @@ const CONFIG = {
 };
 
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); initImageDb().catch(e => console.error("❌ initImageDb:", e.message)); })
+    .then(async () => { console.log("✅ MongoDB connected"); await copyOldMainDb().catch(e => console.error("❌ فشل نسخ القاعدة القديمة:", e.message)); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); initImageDb().catch(e => console.error("❌ initImageDb:", e.message)); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 const PersonnelSchema = new mongoose.Schema({
@@ -1316,6 +1316,53 @@ async function migrateDiscordImages() {
     }
     console.log("🖼️ نقل صور ديسكورد لقاعدة الصور: اننقلت " + moved + " • محذوفة من ديسكورد " + gone + " • فشلت " + failed);
     if (!failed) await Settings.updateOne({}, { $set: { discordImagesMigrated: true } });
+}
+
+// نسخ القاعدة الأساسية القديمة للجديدة (مرة وحدة): حط عنوان القديمة في OLD_MONGO_URI وعنوان الجديدة في MONGO_URI
+// الصور (imageblobs) تروح لقاعدة الصور إذا كانت منفصلة، والباقي للقاعدة الأساسية. النسخ آمن للتكرار (ما يكتب فوق شي موجود).
+async function copyOldMainDb() {
+    const oldUri = (process.env.OLD_MONGO_URI || "").trim();
+    if (!oldUri || oldUri === CONFIG.MONGO_URI) return;
+    const dstDb = mongoose.connection.db;
+    const mark = dstDb.collection("_migrations");
+    if (await mark.findOne({ _id: "mainDbCopy" })) return;
+    console.log("🔄 جاري نسخ القاعدة القديمة للقاعدة الجديدة...");
+    if (IMG_SEPARATE && typeof imgConn.asPromise === "function") await imgConn.asPromise();
+    const src = mongoose.createConnection(oldUri);
+    src.on("error", () => {});
+    const bsonSize = d => {
+        try { return mongoose.mongo.BSON.calculateObjectSize(d); }
+        catch (e) { return d.size ? d.size + 2000 : JSON.stringify(d).length; }
+    };
+    try {
+        await src.asPromise();
+        const cols = await src.db.listCollections({}, { nameOnly: true }).toArray();
+        for (const { name } of cols) {
+            if (name.startsWith("system.") || name === "_migrations") continue;
+            const toImgDb = name === "imageblobs" && IMG_SEPARATE;
+            const dst = (toImgDb ? imgConn.db : dstDb).collection(name);
+            const cur = src.db.collection(name).find({});
+            let batch = [], bytes = 0, n = 0;
+            const flush = async () => {
+                if (!batch.length) return;
+                await dst.bulkWrite(batch, { ordered: false });
+                batch = []; bytes = 0;
+            };
+            let d;
+            while ((d = await cur.next())) {
+                const { _id, ...rest } = d;
+                batch.push({ updateOne: { filter: { _id }, update: { $setOnInsert: rest }, upsert: true } });
+                bytes += bsonSize(d); n++;
+                if (batch.length >= 100 || bytes > 8 * 1024 * 1024) await flush();
+            }
+            await flush();
+            console.log("   ✔ " + name + ": " + n + " مستند" + (toImgDb ? " (لقاعدة الصور)" : ""));
+        }
+        await mark.updateOne({ _id: "mainDbCopy" }, { $set: { at: new Date() } }, { upsert: true });
+        console.log("✅ تم نسخ القاعدة القديمة بالكامل.");
+    } finally {
+        await src.close().catch(() => {});
+    }
 }
 
 async function initImageDb() {
