@@ -30,6 +30,8 @@ const CONFIG = {
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
+    IMAGE_MONGO_URI: (process.env.IMAGE_MONGO_URI || "").trim(),
+    IMAGE_MONGO_URI_OLD: (process.env.IMAGE_MONGO_URI_OLD || "").trim(),
 
     SITE_NAME: "فلاش",
     SITE_URL: process.env.SITE_URL || (process.env.DISCORD_CALLBACK_URL ? process.env.DISCORD_CALLBACK_URL.replace(/\/auth\/discord\/callback.*$/, "") : "https://flash1-gtsp.onrender.com"),
@@ -119,7 +121,7 @@ const CONFIG = {
 };
 
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); })
+    .then(async () => { console.log("✅ MongoDB connected"); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); initImageDb().catch(e => console.error("❌ initImageDb:", e.message)); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 const PersonnelSchema = new mongoose.Schema({
@@ -574,7 +576,9 @@ const SettingsSchema = new mongoose.Schema({
     violationsOfficerId: { type: String, default: null },
     violationsOfficerName: { type: String, default: null },
     violationsChannelId: String,
-    notesChannelId: String,
+    imageDbUriEnc: { type: String, default: null },
+    legacyImagesMigrated: { type: Boolean, default: false },
+    discordImagesMigrated: { type: Boolean, default: false },
     warningPenalties: { type: Array, default: [] },
     leaveBalanceDefault: { type: Number, default: 10 },
     lockSavedLogin: { type: Boolean, default: false },
@@ -1060,84 +1064,301 @@ async function notifyHighCommandOfAutoPromotion(p, fromRank, toRank) {
     }
 }
 
-async function postViolationToChannel(v, rawPhoto) {
+// ================= قاعدة بيانات الصور المنفصلة =================
+// الصور تنحفظ في IMAGE_MONGO_URI (قاعدة مستقلة)، والموقع كله يبقى في MONGO_URI.
+// إذا ما انحط IMAGE_MONGO_URI تنحفظ الصور بنفس القاعدة الأساسية لكن بكولكشن منفصل (imageblobs).
+// وإذا تغيّر IMAGE_MONGO_URI تنتقل كل الصور تلقائياً من القاعدة القديمة للجديدة عند تشغيل السيرفر.
+const IMG_SEPARATE = !!CONFIG.IMAGE_MONGO_URI && CONFIG.IMAGE_MONGO_URI !== CONFIG.MONGO_URI;
+const imgConn = IMG_SEPARATE ? mongoose.createConnection(CONFIG.IMAGE_MONGO_URI) : mongoose.connection;
+if (IMG_SEPARATE) {
+    imgConn.on("connected", () => console.log("✅ Image MongoDB connected"));
+    imgConn.on("error", e => console.log("❌ Image MongoDB error:", e && e.message));
+}
+const ImageBlob = imgConn.model("ImageBlob", new mongoose.Schema({
+    _id: { type: String },
+    mime: String,
+    data: Buffer,
+    thumb: Buffer,
+    size: Number,
+    kind: { type: String, default: "other" },
+    createdAt: { type: Date, default: Date.now },
+}, { versionKey: false }), "imageblobs");
+let imgSyncPromise = Promise.resolve();
+
+const IMG_REF_RE = /^\/api\/img\/([a-f0-9]{24})$/;
+const IMG_DATA_RE = /^data:(image\/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+\/=]+)$/;
+function imgIsRef(v) { return typeof v === "string" && IMG_REF_RE.test(v); }
+
+let sharpLib = null;
+try { sharpLib = require("sharp"); } catch (e) { sharpLib = null; }
+async function imgMakeThumb(buf) {
+    if (!sharpLib) return null;
+    try { return await sharpLib(buf).rotate().resize({ width: 360, height: 360, fit: "inside", withoutEnlargement: true }).webp({ quality: 70 }).toBuffer(); }
+    catch (e) { return null; }
+}
+async function imgSaveBuffer(buf, mime, kind) {
+    const id = crypto.randomBytes(12).toString("hex");
+    const thumb = await imgMakeThumb(buf);
+    const doc = { _id: id, mime, data: buf, size: buf.length, kind: kind || "other" };
+    if (thumb) doc.thumb = thumb;
+    await ImageBlob.create(doc);
+    return "/api/img/" + id;
+}
+async function imgSave(dataUrl, kind) {
+    const m = typeof dataUrl === "string" ? IMG_DATA_RE.exec(dataUrl) : null;
+    if (!m) return null;
+    return imgSaveBuffer(Buffer.from(m[2], "base64"), m[1], kind);
+}
+async function imgSaveSafe(dataUrl, kind) {
+    try { return await imgSave(dataUrl, kind); }
+    catch (e) { console.error("❌ فشل حفظ الصورة بقاعدة الصور:", e.message); return null; }
+}
+function imgBuf(raw) { return Buffer.isBuffer(raw) ? Buffer.from(raw) : (raw && raw.buffer ? Buffer.from(raw.buffer) : null); }
+async function imgGet(ref, wantThumb) {
+    const m = typeof ref === "string" ? IMG_REF_RE.exec(ref) : null;
+    if (!m) return null;
+    try { await imgSyncPromise; } catch (e) {}
+    const d = await ImageBlob.findById(m[1]);
+    if (!d || !d.data) return null;
+    if (wantThumb) {
+        let tb = d.thumb ? imgBuf(d.thumb) : null;
+        if (!tb) {
+            const full = imgBuf(d.data);
+            tb = full ? await imgMakeThumb(full) : null;
+            if (tb) await ImageBlob.updateOne({ _id: m[1] }, { $set: { thumb: tb } }).catch(() => {});
+        }
+        if (tb) return { mime: "image/webp", buf: tb };
+    }
+    const buf = imgBuf(d.data);
+    return buf ? { mime: d.mime, buf } : null;
+}
+// يرجّع data URL سواء كانت القيمة مرجع بقاعدة الصور أو data URL قديم
+async function imgToDataUrl(v) {
+    if (typeof v !== "string" || !v) return null;
+    if (IMG_DATA_RE.test(v)) return v;
+    const g = await imgGet(v);
+    return g ? "data:" + g.mime + ";base64," + g.buf.toString("base64") : null;
+}
+async function imgDelete(ref) {
+    const m = typeof ref === "string" ? IMG_REF_RE.exec(ref) : null;
+    if (!m) return;
+    await ImageBlob.deleteOne({ _id: m[1] }).catch(() => {});
+}
+
+// نقل كل الصور لما يتغيّر IMAGE_MONGO_URI (القديمة تبقى كما هي، ما تنحذف)
+async function syncImageDb() {
     const settings = await getSettings();
-    if (!botReady || !settings.violationsChannelId) {
-        if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
+    const cur = IMG_SEPARATE ? CONFIG.IMAGE_MONGO_URI : "";
+    const saveRec = () => Settings.updateOne({}, { $set: { imageDbUriEnc: encryptText("uri:" + cur) } });
+    let last = null;
+    if (settings.imageDbUriEnc) {
+        const d = decryptText(settings.imageDbUriEnc);
+        if (typeof d === "string" && d.indexOf("uri:") === 0) last = d.slice(4);
+        else if (CONFIG.IMAGE_MONGO_URI_OLD) last = CONFIG.IMAGE_MONGO_URI_OLD;
+        else { console.error("❌ تعذر قراءة عنوان قاعدة الصور السابقة (تغيّر SESSION_SECRET؟). حط IMAGE_MONGO_URI_OLD لنقل الصور."); return; }
+    } else {
+        await saveRec();
         return;
     }
+    if (last === cur) return;
+
+    console.log("🔄 تغيّرت قاعدة الصور، جاري نقل الصور للقاعدة الجديدة...");
+    let srcConn = mongoose.connection, opened = false;
+    try {
+        if (last !== "") {
+            srcConn = mongoose.createConnection(last);
+            srcConn.on("error", () => {});
+            await srcConn.asPromise();
+            opened = true;
+        }
+        const srcCol = srcConn.db.collection("imageblobs");
+        const dstCol = imgConn.db.collection("imageblobs");
+        const cursor = srcCol.find({});
+        let seen = 0, batch = [], bytes = 0;
+        const flush = async () => {
+            if (!batch.length) return;
+            const r = await dstCol.bulkWrite(batch, { ordered: false });
+            const ok = (r.upsertedCount || 0) + (r.matchedCount || 0);
+            if (ok !== batch.length) throw new Error("نقل ناقص: " + ok + "/" + batch.length);
+            batch = []; bytes = 0;
+        };
+        let d;
+        while ((d = await cursor.next())) {
+            seen++;
+            const { _id, ...rest } = d;
+            batch.push({ updateOne: { filter: { _id }, update: { $setOnInsert: rest }, upsert: true } });
+            bytes += d.size || 0;
+            if (batch.length >= 20 || bytes > 8 * 1024 * 1024) await flush();
+        }
+        await flush();
+        await saveRec();
+        console.log("✅ تم نقل " + seen + " صورة لقاعدة الصور الجديدة (القديمة ما انحذفت).");
+    } finally {
+        if (opened) await srcConn.close().catch(() => {});
+    }
+}
+
+// الصور القديمة المحفوظة base64 داخل القاعدة الأساسية تنتقل لقاعدة الصور (مرة وحدة)
+async function migrateLegacyImages() {
+    const s = await getSettings();
+    if (s.legacyImagesMigrated) return;
+    const DATA = /^data:image\//;
+    let moved = 0, failed = 0;
+    const nothing = r => !(r && (r.modifiedCount || r.nModified));
+    const simple = [[Vehicle, "photo", "vehicle"], [Violation, "photo", "violation"], [PromotionRequest, "noteImage", "note"], [AbsenceExcuse, "proof", "excuse"]];
+    for (const [Model, field, kind] of simple) {
+        const cursor = Model.find({ [field]: DATA }).select({ [field]: 1 }).lean().cursor();
+        let d;
+        while ((d = await cursor.next())) {
+            try {
+                const ref = await imgSave(d[field], kind);
+                if (!ref) { failed++; continue; }
+                const r = await Model.updateOne({ _id: d._id, [field]: DATA }, { $set: { [field]: ref } });
+                if (nothing(r)) await imgDelete(ref); else moved++;
+            } catch (e) { failed++; console.error("❌ نقل صورة قديمة:", e.message); }
+        }
+    }
+    const arrays = [[Personnel, "notes", "n", "note"], [SupportTicket, "messages", "m", "support"]];
+    for (const [Model, arr, v, kind] of arrays) {
+        const cursor = Model.find({ [arr + ".image"]: DATA }).select({ [arr]: 1 }).lean().cursor();
+        let d;
+        while ((d = await cursor.next())) {
+            for (const it of (d[arr] || [])) {
+                if (typeof it.image !== "string" || !DATA.test(it.image)) continue;
+                try {
+                    const ref = await imgSave(it.image, kind);
+                    if (!ref) { failed++; continue; }
+                    const r = await Model.updateOne({ _id: d._id }, { $set: { [arr + ".$[" + v + "].image"]: ref } }, { arrayFilters: [{ [v + "._id"]: it._id, [v + ".image"]: DATA }] });
+                    if (nothing(r)) await imgDelete(ref); else moved++;
+                } catch (e) { failed++; console.error("❌ نقل صورة قديمة:", e.message); }
+            }
+        }
+    }
+    console.log("🖼️ نقل الصور القديمة لقاعدة الصور: اننقلت " + moved + " • فشلت " + failed);
+    if (!failed) await Settings.updateOne({}, { $set: { legacyImagesMigrated: true } });
+}
+
+// نقل الصور اللي كانت مرفوعة في ديسكورد (المخالفات والملاحظات وأعذار الغياب) لقاعدة الصور
+async function migrateDiscordImages() {
+    const s0 = await getSettings();
+    if (s0.discordImagesMigrated) return;
+    if (typeof fetch !== "function") { console.error("❌ fetch غير متوفر، تعذر نقل صور ديسكورد"); return; }
+    for (let i = 0; i < 60 && !botReady; i++) await new Promise(r => setTimeout(r, 5000));
+    if (!botReady) { console.log("⏳ البوت مو جاهز، نقل صور ديسكورد يتأجل للتشغيل الجاي"); return; }
+    let moved = 0, gone = 0, failed = 0;
+    const fetchOne = async (channelId, messageId) => {
+        try {
+            const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
+            const msg = await channel.messages.fetch(messageId);
+            const att = msg.attachments.first();
+            if (!att) return { gone: true };
+            const r = await fetch(att.url);
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            const buf = Buffer.from(await r.arrayBuffer());
+            let mime = String(att.contentType || r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+            if (!/^image\/(jpeg|png|webp|gif)$/.test(mime)) {
+                const n = String(att.name || "").toLowerCase();
+                mime = n.endsWith(".png") ? "image/png" : n.endsWith(".webp") ? "image/webp" : n.endsWith(".gif") ? "image/gif" : "image/jpeg";
+            }
+            return { buf, mime };
+        } catch (e) {
+            const code = e && e.code;
+            if (code === 10008 || code === 10003 || code === 50001) return { gone: true };
+            throw e;
+        }
+    };
+    const NOT_NULL = { $nin: [null, ""] };
+    // المخالفات والتقارير
+    {
+        const cursor = Violation.find({ photoChannelId: NOT_NULL, photoMessageId: NOT_NULL }).select({ photo: 1, photoChannelId: 1, photoMessageId: 1 }).lean().cursor();
+        let d;
+        while ((d = await cursor.next())) {
+            try {
+                if (d.photo && imgIsRef(d.photo)) { await Violation.updateOne({ _id: d._id }, { $set: { photoChannelId: null, photoMessageId: null } }); continue; }
+                const f = await fetchOne(d.photoChannelId, d.photoMessageId);
+                if (f.gone) { gone++; continue; }
+                const ref = await imgSaveBuffer(f.buf, f.mime, "violation");
+                await Violation.updateOne({ _id: d._id }, { $set: { photo: ref, photoChannelId: null, photoMessageId: null } });
+                moved++;
+            } catch (e) { failed++; console.error("❌ نقل صورة مخالفة من ديسكورد:", e.message); }
+        }
+    }
+    // أعذار الغياب
+    {
+        const cursor = AbsenceExcuse.find({ proofChannelId: NOT_NULL, proofMessageId: NOT_NULL }).select({ proof: 1, proofChannelId: 1, proofMessageId: 1 }).lean().cursor();
+        let d;
+        while ((d = await cursor.next())) {
+            try {
+                const f = await fetchOne(d.proofChannelId, d.proofMessageId);
+                if (f.gone) { gone++; continue; }
+                const ref = await imgSaveBuffer(f.buf, f.mime, "excuse");
+                await AbsenceExcuse.updateOne({ _id: d._id }, { $set: { proof: ref, hasProof: true, proofChannelId: null, proofMessageId: null } });
+                moved++;
+            } catch (e) { failed++; console.error("❌ نقل دليل عذر من ديسكورد:", e.message); }
+        }
+    }
+    // الملاحظات
+    {
+        const cursor = Personnel.find({ "notes.imageChannelId": NOT_NULL }).select({ notes: 1 }).lean().cursor();
+        let d;
+        while ((d = await cursor.next())) {
+            for (const n of (d.notes || [])) {
+                if (!n.imageChannelId || !n.imageMessageId) continue;
+                try {
+                    const f = await fetchOne(n.imageChannelId, n.imageMessageId);
+                    if (f.gone) { gone++; continue; }
+                    const ref = await imgSaveBuffer(f.buf, f.mime, "note");
+                    await Personnel.updateOne({ _id: d._id }, { $set: { "notes.$[n].image": ref, "notes.$[n].imageChannelId": null, "notes.$[n].imageMessageId": null } }, { arrayFilters: [{ "n._id": n._id }] });
+                    moved++;
+                } catch (e) { failed++; console.error("❌ نقل صورة ملاحظة من ديسكورد:", e.message); }
+            }
+        }
+    }
+    console.log("🖼️ نقل صور ديسكورد لقاعدة الصور: اننقلت " + moved + " • محذوفة من ديسكورد " + gone + " • فشلت " + failed);
+    if (!failed) await Settings.updateOne({}, { $set: { discordImagesMigrated: true } });
+}
+
+async function initImageDb() {
+    // القراءات تنتظر لين يخلص نقل الصور بين القواعد (إن كان مطلوب)
+    let release;
+    imgSyncPromise = new Promise(r => { release = r; });
+    try {
+        if (typeof imgConn.asPromise === "function") await imgConn.asPromise();
+        await syncImageDb();
+    } catch (e) {
+        console.error("❌ قاعدة الصور / نقل الصور بين القواعد:", e.message);
+        release();
+        return;
+    }
+    release();
+    if (IMG_SEPARATE) await migrateLegacyImages().catch(e => console.error("❌ فشل نقل الصور القديمة:", e.message));
+    await migrateDiscordImages().catch(e => console.error("❌ فشل نقل صور ديسكورد:", e.message));
+}
+
+async function postViolationToChannel(v, rawPhoto) {
+    if (rawPhoto) { v.photo = await imgSaveSafe(rawPhoto, "violation"); await v.save().catch(() => {}); }
+    const settings = await getSettings();
+    if (!botReady || !settings.violationsChannelId) return;
     try {
         const channel = await client.channels.fetch(settings.violationsChannelId);
         const embed = buildViolationEmbed(v);
         const components = [buildViolationButtons(v._id.toString())];
-        const files = [];
-        if (rawPhoto && rawPhoto.startsWith("data:image")) {
-            const base64Data = rawPhoto.split(",")[1];
-            const buffer = Buffer.from(base64Data, "base64");
-            const ext = rawPhoto.includes("image/png") ? "png" : "jpg";
-            const fname = `violation_${v._id}.${ext}`;
-            files.push(new AttachmentBuilder(buffer, { name: fname }));
-        }
-        const msg = await channel.send({ embeds: [embed], components, files });
+        const msg = await channel.send({ embeds: [embed], components });
         pendingMessages.set(v._id.toString(), { channelId: msg.channelId, messageId: msg.id });
-        if (rawPhoto) {
-            v.photoChannelId = msg.channelId;
-            v.photoMessageId = msg.id;
-            await v.save();
-        }
     } catch (e) {
         console.error("❌ فشل إرسال المخالفة للقناة:", e.message);
-        if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
     }
 }
 
-function buildNoteEmbed(personnelName, personnelDiscord, text, addedByTag) {
-    return new EmbedBuilder()
-        .setTitle("📝 ملاحظة جديدة")
-        .setColor(0xfacc15)
-        .addFields(
-            { name: "العسكري", value: personnelName || personnelDiscord, inline: true },
-            { name: "بواسطة", value: addedByTag || "-", inline: true },
-            { name: "النص", value: text || "-", inline: false },
-        )
-        .setTimestamp();
-}
-async function postNoteToChannel(personnelDiscord, personnelName, text, addedByTag, rawImage) {
-    const settings = await getSettings();
-    if (!botReady || !settings.notesChannelId || !rawImage) return null;
-    try {
-        const channel = await client.channels.fetch(settings.notesChannelId);
-        const embed = buildNoteEmbed(personnelName, personnelDiscord, text, addedByTag);
-        const files = [];
-        if (rawImage.startsWith("data:image")) {
-            const base64Data = rawImage.split(",")[1];
-            const buffer = Buffer.from(base64Data, "base64");
-            const ext = rawImage.includes("image/png") ? "png" : "jpg";
-            files.push(new AttachmentBuilder(buffer, { name: `note_${Date.now()}.${ext}` }));
-        }
-        const msg = await channel.send({ embeds: [embed], files });
-        return { channelId: msg.channelId, messageId: msg.id };
-    } catch (e) {
-        console.error("❌ فشل إرسال الملاحظة للقناة:", e.message);
-        return null;
-    }
-}
 async function pushNoteWithImage({ discord, text, image, actorId, actorTag }) {
     const p = await Personnel.findOne({ discord });
     if (!p) return null;
-    p.notes.push({ text, image, addedBy: actorId, addedByTag: actorTag, reviewDeadline: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000) });
-    const note = p.notes[p.notes.length - 1];
+    let stored = null;
+    if (image) stored = imgIsRef(image) ? image : await imgSaveSafe(image, "note");
+    p.notes.push({ text, image: stored, addedBy: actorId, addedByTag: actorTag, reviewDeadline: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000) });
     await p.save();
-    const uploaded = await postNoteToChannel(p.discord, p.registeredName || p.discordTag || p.discord, text, actorTag, image);
-    if (uploaded) {
-        note.imageChannelId = uploaded.channelId;
-        note.imageMessageId = uploaded.messageId;
-        note.image = null;
-        await p.save();
-    }
     return p;
 }
-
 
 async function syncViolationMessage(v) {
     const ref = pendingMessages.get(v._id.toString());
@@ -1564,7 +1785,9 @@ const unassignedCache = new Map();
 async function resolveUnassigned(uid) {
     // انعطى رتبة/قطاع/يونت => تنحذف مخالفاته المقبولة (عنده وعند الكبار) والنقاط ترجع نقاط الرتبة فقط
     try {
+        const oldVio = await Violation.find({ reporterDiscord: uid, status: "approved", photo: /^\/api\/img\// }, { photo: 1 }).lean();
         const del = await Violation.deleteMany({ reporterDiscord: uid, status: "approved" });
+        for (const ov of oldVio) await imgDelete(ov.photo);
         const p = await Personnel.findOne({ discord: uid });
         if (p) {
             const settings = await getSettings();
@@ -2221,6 +2444,16 @@ function withTimeout(promise, ms) {
         new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
     ]);
 }
+app.get("/api/img/:id", ensureAuth, async (req, res) => {
+    try {
+        if (!/^[a-f0-9]{24}$/.test(req.params.id)) return res.status(404).end();
+        const g = await imgGet("/api/img/" + req.params.id, req.query.t === "1");
+        if (!g) return res.status(404).end();
+        res.set({ "Content-Type": g.mime, "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff" });
+        res.send(g.buf);
+    } catch (e) { res.status(500).end(); }
+});
+
 app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
     try {
         const v = await Violation.findById(req.params.id).select("photo photoChannelId photoMessageId reporterDiscord");
@@ -2298,8 +2531,11 @@ app.get("/api/notes/:discord/:noteId/photo", ensureAuth, async (req, res) => {
 app.delete("/api/notes/:discord/:noteId", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     if (!getSectorRole(req.user.id, settings) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const preN = await Personnel.findOne({ discord: req.params.discord }, { notes: 1 }).lean();
+    const delNote = preN && (preN.notes || []).find(n => String(n._id) === String(req.params.noteId));
     const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { $pull: { notes: { _id: req.params.noteId } } }, { new: true });
     if (!p) return res.status(404).json({ error: "غير موجود" });
+    if (delNote && delNote.image) await imgDelete(delNote.image);
     await logEvent({ action: "حذف ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: "حذف من مراجعة الملاحظات القديمة" });
     res.json({ ok: true });
 });
@@ -2921,6 +3157,7 @@ app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) =
 app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req, res) => {
     const v = await Violation.findByIdAndDelete(req.params.id);
     if (!v) return res.status(404).json({ error: "غير موجود" });
+    if (v.photo) await imgDelete(v.photo);
     await logEvent({ action: "حذف مخالفة نهائي", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId: req.user.id, actorTag: req.user.username, details: `${v.kind === "report" ? "تقرير" : "مخالفة"} (${v.status === "approved" ? "مقبولة" : "مرفوضة"})` });
     res.json({ ok: true });
 });
@@ -3085,6 +3322,7 @@ app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     const out = settings.toObject();
     delete out.lockSavedLogin;
+    delete out.imageDbUriEnc;
     res.json({ settings: out });
 });
 
@@ -3164,13 +3402,12 @@ app.post("/api/senior/officers-lock", ensureSeniorAdmin, async (req, res) => {
 });
 
 app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
-    const { isMaintenance, disableLogin, disableViolations, violationsChannelId, notesChannelId } = req.body;
+    const { isMaintenance, disableLogin, disableViolations, violationsChannelId } = req.body;
     const s = await getSettings();
     if (typeof isMaintenance === "boolean") s.isMaintenance = isMaintenance;
     if (typeof disableLogin === "boolean") s.disableLogin = disableLogin;
     if (typeof disableViolations === "boolean") s.disableViolations = disableViolations;
     if (typeof violationsChannelId === "string") s.violationsChannelId = violationsChannelId.trim() || null;
-    if (typeof notesChannelId === "string") s.notesChannelId = notesChannelId.trim() || null;
     await s.save();
     await logEvent({ action: "تعديل إعدادات الموقع", actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(req.body) });
     res.json({ ok: true });
@@ -3222,15 +3459,22 @@ app.post("/api/senior/vehicles", ensureSeniorAdmin, async (req, res) => {
     if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
         return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
     }
+    let vPhoto = null;
+    if (photo) {
+        vPhoto = await imgSaveSafe(photo, "vehicle");
+        if (!vPhoto && /^https?:\/\//i.test(String(photo))) vPhoto = String(photo);
+        if (!vPhoto) return res.status(400).json({ error: "الصورة غير صالحة" });
+    }
     try {
-        const v = await Vehicle.create({ name: name.trim(), photo: photo || null, addedBy: req.user.id });
+        const v = await Vehicle.create({ name: name.trim(), photo: vPhoto, addedBy: req.user.id });
         await logEvent({ action: "إضافة مركبة", actorId: req.user.id, actorTag: req.user.username, details: v.name });
         res.json({ ok: true, vehicle: v });
-    } catch (e) { res.status(400).json({ error: "المركبة موجودة مسبقاً" }); }
+    } catch (e) { await imgDelete(vPhoto); res.status(400).json({ error: "المركبة موجودة مسبقاً" }); }
 });
 
 app.delete("/api/senior/vehicles/:id", ensureSeniorAdmin, async (req, res) => {
-    await Vehicle.findByIdAndDelete(req.params.id);
+    const dv = await Vehicle.findByIdAndDelete(req.params.id);
+    if (dv && dv.photo) await imgDelete(dv.photo);
     res.json({ ok: true });
 });
 
@@ -3658,11 +3902,12 @@ app.get("/api/sector/personnel/:discord/warning-info", ensureSectorLeader, async
 async function createNoteRequest({ req, info, roleLabel, discord, text, image }) {
     const p = await Personnel.findOne({ discord }, { registeredName: 1, discordTag: 1, discord: 1 });
     if (!p) return null;
+    const noteRef = image ? await imgSaveSafe(image, "note") : null;
     const tagFull = req.user.username + ` (${roleLabel} ${info.sectorLabel})`;
     const doc = await PromotionRequest.create({
         kind: "note", sector: info.sector, sectorLabel: info.sectorLabel,
         targetDiscord: p.discord, targetTag: p.discordTag, targetName: p.registeredName,
-        noteText: text, noteImage: image || null, hasImage: !!image,
+        noteText: text, noteImage: noteRef, hasImage: !!noteRef,
         requestedBy: req.user.id, requestedByTag: tagFull, status: "pending",
     });
     await logEvent({ action: "طلب ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: tagFull, details: `على ${p.registeredName || p.discord}: ${text} — بانتظار القيادة العليا` });
@@ -3800,12 +4045,14 @@ async function approveExtraRequest(r0, req, res) {
 async function rejectExtraRequest(r0, reason, req, res) {
     const kind = requestKind(r0);
     const byTag = req.user.username + " (القيادة العليا)";
+    const oldNoteImg = ((await PromotionRequest.findById(r0._id, { noteImage: 1 }).lean()) || {}).noteImage;
     const r = await PromotionRequest.findOneAndUpdate(
         { _id: r0._id, status: "pending" },
         { $set: { status: "rejected", rejectReason: reason, reviewedBy: req.user.id, reviewedByTag: byTag, reviewedAt: new Date(), noteImage: null } },
         { new: true }
     );
     if (!r) return res.status(404).json({ error: "غير موجود" });
+    if (oldNoteImg) await imgDelete(oldNoteImg);
     const name = r.targetName || r.targetTag;
     const what = kind === "points" ? `${(r.pointsDelta || 0) >= 0 ? "إضافة" : "خصم"} ${Math.abs(r.pointsDelta || 0)} نقطة لـ${name}` : `إضافة ملاحظة على ${name}`;
     await pushNoticeTo(r.requestedBy, `❌ انرفض طلبك بـ${what} من القيادة العليا. السبب: ${reason}`, req.user.id, req.user.username);
@@ -4547,11 +4794,13 @@ async function supportAskAi(t) {
     if (!CONFIG.ANTHROPIC_API_KEY || typeof fetch !== "function") return null;
     const convo = t.messages.filter(m => m.sender === "user" || m.sender === "ai").slice(-14);
     const msgs = [];
+    const lastMsg = convo[convo.length - 1];
+    const lastImgUrl = lastMsg && lastMsg.sender === "user" && lastMsg.image ? await imgToDataUrl(lastMsg.image) : null;
     convo.forEach((m, idx) => {
         const role = m.sender === "user" ? "user" : "assistant";
         const parts = [];
         if (role === "user" && m.image && idx === convo.length - 1) {
-            const mm = /^data:(image\/[a-z]+);base64,(.+)$/.exec(m.image);
+            const mm = lastImgUrl ? /^data:(image\/[a-z]+);base64,(.+)$/.exec(lastImgUrl) : null;
             if (mm) parts.push({ type: "image", source: { type: "base64", media_type: mm[1], data: mm[2] } });
         }
         parts.push({ type: "text", text: m.text || (m.image ? "(أرسل صورة)" : "...") });
@@ -4783,13 +5032,15 @@ app.post("/api/support/tickets", async (req, res) => {
     const last = await SupportTicket.findOne().sort({ no: -1 }).select("no").lean();
     const category = SUPPORT_CATEGORIES.includes(b.category) ? b.category : "أخرى";
     const place = category === "أخرى" ? "" : String(b.place || "").replace(/[<>]/g, "").trim().slice(0, 60);
+    const imgRef = image ? await imgSaveSafe(image, "support") : null;
+    if (image && !imgRef) return res.status(500).json({ error: "تعذر حفظ الصورة، حاول مرة ثانية" });
     const t = await SupportTicket.create({
         no: ((last && last.no) || 1000) + 1,
         uid, guestToken: uid ? null : gt, deviceToken: gt, name, category, place,
         subject: (text || "صورة").slice(0, 60),
         ua: String(req.get("user-agent") || "").slice(0, 160),
         status: "ai",
-        messages: [{ sender: "user", name, text, image }],
+        messages: [{ sender: "user", name, text, image: imgRef }],
     });
     res.json({ ok: true, id: String(t._id) });
     supportEvent(t, "user", { kind: "new" });
@@ -4846,10 +5097,18 @@ app.get("/api/support/tickets/:id", async (req, res) => {
 app.get("/api/support/tickets/:id/img/:i", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const m = x.t.messages[parseInt(req.params.i, 10)];
-    const mm = m && m.image ? /^data:(image\/[a-z]+);base64,(.+)$/.exec(m.image) : null;
-    if (!mm) return res.status(404).end();
-    res.set({ "Content-Type": mm[1], "Cache-Control": "private, max-age=86400" });
-    res.send(Buffer.from(mm[2], "base64"));
+    let mime = null, buf = null;
+    if (m && m.image) {
+        const g = await imgGet(m.image, req.query.t === "1");
+        if (g) { mime = g.mime; buf = g.buf; }
+        else {
+            const mm = /^data:(image\/[a-z]+);base64,(.+)$/.exec(m.image);
+            if (mm) { mime = mm[1]; buf = Buffer.from(mm[2], "base64"); }
+        }
+    }
+    if (!buf) return res.status(404).end();
+    res.set({ "Content-Type": mime, "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff" });
+    res.send(buf);
 });
 
 const supportMsgThrottle = new Map();
@@ -4869,7 +5128,9 @@ app.post("/api/support/tickets/:id/messages", async (req, res) => {
 
     if (role === "owner") {
         if (await supportBanned(uid, supportGuestToken(req))) return res.status(403).json({ error: SUPPORT_BANNED_MSG });
-        supportAddMsg(t, { sender: "user", name: t.name, text, image });
+        const imgRef = image ? await imgSaveSafe(image, "support") : null;
+        if (image && !imgRef) return res.status(500).json({ error: "تعذر حفظ الصورة، حاول مرة ثانية" });
+        supportAddMsg(t, { sender: "user", name: t.name, text, image: imgRef });
         if (t.status !== "ai") t.unreadAdmin += 1;
         await t.save();
         res.json({ ok: true });
@@ -4880,7 +5141,9 @@ app.post("/api/support/tickets/:id/messages", async (req, res) => {
         if (!senior && t.status !== "active") return res.status(400).json({ error: "استلم التكت أول عشان تقدر ترد" });
         if (!senior && t.adminUid !== uid) return res.status(403).json({ error: "هذا التكت مستلمه " + (t.adminName || "إداري ثاني") });
         if (senior && t.status === "ai") t.status = "waiting";
-        supportAddMsg(t, { sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text, image });
+        const imgRef = image ? await imgSaveSafe(image, "support") : null;
+        if (image && !imgRef) return res.status(500).json({ error: "تعذر حفظ الصورة، حاول مرة ثانية" });
+        supportAddMsg(t, { sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text, image: imgRef });
         t.unreadUser += 1;
         await t.save();
         res.json({ ok: true });
@@ -7862,6 +8125,7 @@ const AbsenceExcuseSchema = new mongoose.Schema({
     rowId: String, dayKey: Number, uid: String, name: String, unit: String, rank: String, sector: String, sectorKey: String,
     type: { type: String, enum: ["medical", "nonmedical"], default: "nonmedical" },
     reason: String, proof: { type: String, default: null }, hasProof: { type: Boolean, default: false },
+    proofChannelId: { type: String, default: null }, proofMessageId: { type: String, default: null },
     status: { type: String, enum: ["pending", "deciding", "accepted", "rejected"], default: "pending" },
     rejectReason: { type: String, default: null }, absenceAt: Date,
     decidedBy: String, decidedByName: String, decidedAt: Date, refunded: { type: Number, default: 0 },
@@ -7873,7 +8137,6 @@ const AbsenceExcuse = mongoose.model("AbsenceExcuse", AbsenceExcuseSchema);
 const EXCUSE_WINDOW_DAYS = 14;
 const EXCUSE_TYPE_LABEL = { medical: "طبي", nonmedical: "بدون طبي" };
 
-// فتح الاستلام: بس يسجّل إنه مفتوح (ما يحسب غياب الحين)
 async function openReceptionDay(openerId, openerName) {
     const now = new Date();
     const dayKey = now.getTime(); // كل استلام له مفتاح خاص (يتكرر باليوم أكثر من مرة)
@@ -7976,20 +8239,26 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
         proof = String(b.proof);
         if (!/^data:image\/(jpeg|png|webp);base64,/.test(proof) || proof.length > 2500000) return res.status(400).json({ error: "الدليل لازم يكون صورة وحجمها صغير" });
     }
+    let proofRef = null;
+    if (proof) {
+        proofRef = await imgSaveSafe(proof, "excuse");
+        if (!proofRef) return res.status(500).json({ error: "تعذر حفظ صورة الدليل، حاول مرة ثانية" });
+    }
     const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
     const row = await RecRow.findOneAndUpdate(
         { _id: rowId, uid: req.user.id, kind: "absent", excuseStatus: "none", dayKey: { $gte: since } },
         { $set: { excuseStatus: "pending" } }, { new: true });
-    if (!row) return res.status(409).json({ error: "ما تقدر تقدم عذر على هذا الغياب" });
+    if (!row) { await imgDelete(proofRef); return res.status(409).json({ error: "ما تقدر تقدم عذر على هذا الغياب" }); }
     let ex;
     try {
         ex = await AbsenceExcuse.create({
             rowId: String(row._id), dayKey: row.dayKey, uid: row.uid, name: row.name, unit: row.unit, rank: row.rank,
-            sector: row.sector, sectorKey: row.sectorKey, type, reason, proof, hasProof: !!proof, absenceAt: row.openedAt,
+            sector: row.sector, sectorKey: row.sectorKey, type, reason, proof: proofRef, hasProof: !!proofRef, absenceAt: row.openedAt,
         });
         await RecRow.updateOne({ _id: row._id }, { $set: { excuseId: String(ex._id) } });
     } catch (e) {
         await RecRow.updateOne({ _id: row._id }, { $set: { excuseStatus: "none" } });
+        await imgDelete(proofRef);
         return res.status(500).json({ error: "تعذر إرسال العذر، حاول مرة ثانية" });
     }
     const settings = await getSettings();
@@ -8018,8 +8287,26 @@ app.get("/api/hc/excuses", ensureHighCommand, async (req, res) => {
 });
 app.get("/api/hc/excuses/:id/proof", ensureHighCommand, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
-    const ex = await AbsenceExcuse.findById(req.params.id, { proof: 1 }).lean();
-    if (!ex || !ex.proof) return res.status(404).json({ error: "ما فيه دليل" });
+    const ex = await AbsenceExcuse.findById(req.params.id, { proof: 1, proofChannelId: 1, proofMessageId: 1 }).lean();
+    if (!ex) return res.status(404).json({ error: "ما فيه دليل" });
+    if (ex.proofChannelId && ex.proofMessageId) {
+        const cacheKey = "excuse:" + String(ex._id);
+        const cached = photoUrlCache.get(cacheKey);
+        if (cached && (Date.now() - cached.fetchedAt) < PHOTO_CACHE_MS) return res.json({ image: cached.url });
+        try {
+            const channel = client.channels.cache.get(ex.proofChannelId) || await withTimeout(client.channels.fetch(ex.proofChannelId), 10000);
+            const msg = await withTimeout(channel.messages.fetch(ex.proofMessageId), 10000);
+            const att = msg.attachments.first();
+            if (att) {
+                photoUrlCache.set(cacheKey, { url: att.url, fetchedAt: Date.now() });
+                return res.json({ image: att.url });
+            }
+        } catch (e) {
+            console.error("❌ فشل جلب دليل العذر من ديسكورد:", e.message);
+            if (!ex.proof) return res.status(503).json({ error: "تعذر جلب الصورة من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+        }
+    }
+    if (!ex.proof) return res.status(404).json({ error: "ما فيه دليل" });
     res.json({ image: ex.proof });
 });
 async function tellExcuseResult(ex, text) {
@@ -8844,7 +9131,7 @@ app.get("/", (req, res) => {
     .sp-role { display: inline-block; font-size: 10px; font-weight: bold; padding: 1px 7px; border-radius: 8px; margin-inline-start: 6px; vertical-align: middle; }
     .sp-role.senior { background: #3d3410; color: #fde047; border: 1px solid #8a7414; }
     .sp-role.admin { background: #12294d; color: #93c5fd; border: 1px solid #2b5aa8; }
-    .sp-img { max-width: 220px; max-height: 220px; border-radius: 10px; margin-top: 6px; display: block; cursor: zoom-in; background: rgba(255,255,255,0.05); }
+    .sp-img { max-width: 120px; max-height: 120px; border-radius: 10px; margin-top: 6px; display: block; cursor: zoom-in; background: rgba(255,255,255,0.05); }
     .sp-dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px; border-radius: 50%; background: #a78bfa; animation: spDot 1s infinite; }
     .sp-dots span:nth-child(2) { animation-delay: 0.15s; } .sp-dots span:nth-child(3) { animation-delay: 0.3s; }
     @keyframes spDot { 0%,60%,100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
@@ -8855,6 +9142,9 @@ app.get("/", (req, res) => {
     .sp-prev img { height: 46px; border-radius: 6px; }
     #sp-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 6000; display: none; align-items: center; justify-content: center; padding: 14px; }
     #sp-lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+    .zthumb { max-width: 120px; max-height: 120px; border-radius: 8px; margin-top: 6px; display: block; cursor: zoom-in; background: rgba(255,255,255,0.05); }
+    #z-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 99999; display: none; align-items: center; justify-content: center; padding: 14px; cursor: zoom-out; }
+    #z-lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
     .off-steps { display: flex; gap: 8px; margin-bottom: 16px; }
     .off-step { flex: 1; text-align: center; padding: 10px 6px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: var(--muted); font-size: 13px; font-weight: 700; }
     .off-step.cur { background: var(--green2); color: #fff; border-color: var(--green2); }
@@ -9046,7 +9336,7 @@ app.get("/", (req, res) => {
         <hr class="warn-line">
         <div class="promo-extra" id="promo-alert-extra"></div>
         <div class="promo-reason" id="promo-alert-reason"></div>
-        <img id="promo-alert-img" style="display:none;max-width:100%;max-height:35vh;border-radius:10px;margin-top:12px;">
+        <img id="promo-alert-img" style="display:none;margin-top:12px;">
     </div>
     <div class="promo-actions">
         <button class="promo-approve-btn" onclick="promoAlertApprove()">✅ قبول</button>
@@ -9168,6 +9458,7 @@ app.get("/", (req, res) => {
     </div>
 </div>
 <div id="sp-lightbox" onclick="this.style.display='none'"><img id="sp-lightbox-img" src=""></div>
+<div id="z-lightbox" onclick="zClose()"><img id="z-lightbox-img" src=""></div>
 <footer><p>جميع الحقوق محفوظة © 2026 | <span style="color:#d4af37;font-weight:bold;">${CONFIG.SITE_NAME}</span></p></footer>
 
 <script>
@@ -9402,6 +9693,8 @@ window.addEventListener('popstate', () => {
     if (pp.classList.contains('open')) closePhotoPage(true);
 });
 async function viewViolationPhoto(id) {
+    var zb = zEventBtn();
+    if (zb) return zLoadThumb(zb, '/api/violations/' + id + '/photo', 'photo');
     openPhotoPage();
     try {
         const { photo } = await api('/api/violations/' + id + '/photo');
@@ -9410,6 +9703,8 @@ async function viewViolationPhoto(id) {
     } catch (e) { setPhotoPageError(e.message); }
 }
 async function viewNotePhoto(discord, noteId) {
+    var zb = zEventBtn();
+    if (zb) return zLoadThumb(zb, '/api/notes/' + discord + '/' + noteId + '/photo', 'photo');
     openPhotoPage();
     try {
         const { photo } = await api('/api/notes/' + discord + '/' + noteId + '/photo');
@@ -10348,7 +10643,7 @@ async function cyFlagResolve(id) {
 async function cyShowImage(url) {
     try {
         var d = await api(url);
-        cyOverlay('<div style="max-height:80vh;overflow-y:auto;"><img src="' + d.image + '" style="max-width:100%;border-radius:10px;"><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
+        cyOverlay('<div style="max-height:80vh;overflow-y:auto;"><img class="zthumb" src="' + zThumbUrl(d.image) + '" data-full="' + d.image + '" onclick="zOpen(this)"><div class="cy-actions"><button class="btn gray" onclick="cyOverlayClose()">إغلاق</button></div></div>');
     } catch (e) { toast(e.message); }
 }
 function cyFlagPhoto(id) { cyShowImage('/api/cyber/flags/' + id + '/photo'); }
@@ -10433,7 +10728,7 @@ function showPromotionAlert(a) {
         if (a.hasImage) {
             const rid = a.id;
             api('/api/high-command/promotion-requests/' + rid + '/image').then(function (d) {
-                if (currentPromoAlertId === rid && d.image) { img.src = d.image; img.style.display = 'block'; }
+                if (currentPromoAlertId === rid && d.image) { zDecorate(img, d.image); }
             }).catch(function () {});
         }
     } else {
@@ -10744,6 +11039,56 @@ function spPaintPrev() {
     if (!p) return;
     p.innerHTML = SP.img ? '<img src="' + SP.img + '"><button class="sp-link" onclick="SP.img=null;spPaintPrev()">✕ إزالة</button>' : '';
 }
+var zCache = {};
+async function zApi(url) { if (zCache[url]) return zCache[url]; var d = await api(url); zCache[url] = d; return d; }
+function zThumbUrl(u) { return (typeof u === 'string' && u.indexOf('/api/img/') === 0 && u.length === 33) ? u + '?t=1' : u; }
+function zOpen(el) {
+    var full = el && el.dataset && el.dataset.full ? el.dataset.full : (el && el.src);
+    if (!full) return;
+    document.getElementById('z-lightbox-img').src = full;
+    document.getElementById('z-lightbox').style.display = 'flex';
+}
+function zClose() { document.getElementById('z-lightbox').style.display = 'none'; document.getElementById('z-lightbox-img').src = ''; }
+function zDecorate(im, full) {
+    im.className = 'zthumb';
+    im.loading = 'lazy';
+    im.src = zThumbUrl(full);
+    im.dataset.full = full;
+    im.style.display = 'block';
+    im.onclick = function (e) { if (e) e.stopPropagation(); zOpen(im); };
+    return im;
+}
+function zEventBtn() { var e = window.event; var t = e && e.target; return t && t.closest ? t.closest('button') : null; }
+function zReplaceBtn(btn, full) { var im = document.createElement('img'); zDecorate(im, full); btn.parentNode.insertBefore(im, btn); btn.remove(); }
+async function zLoadThumb(btn, url, key) {
+    var label = btn.textContent; btn.disabled = true; btn.textContent = '⏳';
+    try {
+        var d = await zApi(url);
+        var full = d && d[key];
+        if (!full) { btn.disabled = false; btn.textContent = label; toast('لا توجد صورة'); return; }
+        zReplaceBtn(btn, full);
+    } catch (e) { btn.disabled = false; btn.textContent = label; toast(e.message); }
+}
+var Z_SEL = 'button[onclick*="viewViolationPhoto"],button[onclick*="viewNotePhoto"],button[onclick*="hcShowImage"],button[onclick*="hcExProof"],button[onclick*="sexProof"]';
+var zIO = null;
+function zObserve(root) {
+    if (!root || !root.querySelectorAll || !zIO) return;
+    var list = (root.matches && root.matches(Z_SEL)) ? [root] : [];
+    var found = root.querySelectorAll(Z_SEL);
+    for (var i = 0; i < found.length; i++) list.push(found[i]);
+    for (var k = 0; k < list.length; k++) { if (!list[k].dataset.zseen) { list[k].dataset.zseen = '1'; zIO.observe(list[k]); } }
+}
+function zInitThumbs() {
+    if (!('IntersectionObserver' in window) || !('MutationObserver' in window)) return;
+    zIO = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) { if (en.isIntersecting) { zIO.unobserve(en.target); if (en.target.isConnected) en.target.click(); } });
+    }, { rootMargin: '200px' });
+    new MutationObserver(function (muts) {
+        muts.forEach(function (m) { m.addedNodes.forEach(function (n) { if (n.nodeType === 1) zObserve(n); }); });
+    }).observe(document.body, { childList: true, subtree: true });
+    zObserve(document.body);
+}
+if (document.body) zInitThumbs(); else document.addEventListener('DOMContentLoaded', zInitThumbs);
 function spViewImg(src) {
     document.getElementById('sp-lightbox-img').src = src;
     document.getElementById('sp-lightbox').style.display = 'flex';
@@ -10809,7 +11154,7 @@ function spMsgHtml(m) {
     var gt = spGuestToken();
     var roleTag = m.sender === 'admin' ? (m.role === 'senior' ? '<span class="sp-role senior">كبار المسؤولين</span>' : '<span class="sp-role admin">إداري</span>') : '';
     var who = m.sender === 'system' ? '' : '<div class="sp-who">' + (m.sender === 'ai' ? '🤖 ' : m.sender === 'admin' ? '🛡️ ' : '') + spEsc(m.name || '') + roleTag + '</div>';
-    var img = m.img ? '<img class="sp-img" loading="lazy" src="/api/support/tickets/' + c.id + '/img/' + m.i + '?gt=' + gt + '" onclick="spViewImg(this.src)">' : '';
+    var img = m.img ? '<img class="sp-img" loading="lazy" src="/api/support/tickets/' + c.id + '/img/' + m.i + '?gt=' + gt + '&t=1" data-full="/api/support/tickets/' + c.id + '/img/' + m.i + '?gt=' + gt + '" onclick="spViewImg(this.dataset.full)">' : '';
     var body = (m.text ? spEsc(m.text) : '') ;
     return '<div class="sp-msg ' + cls + '">' + who + '<div class="sp-b">' + body + img + '</div>' + (m.sender === 'system' ? '' : '<div class="sp-time">' + spTime(m.at) + '</div>') + '</div>';
 }
@@ -11988,7 +12333,7 @@ async function renderNewViolation() {
             <label>المركبة</label>
             \${meta.vehicles.length ? \`<div class="vgrid" id="v-grid">\${meta.vehicles.map((v,i) => \`
                 <div class="vcard" id="vcard-\${i}" onclick="pickVehicle(\${i})">
-                    \${v.photo ? \`<img src="\${v.photo}">\` : ''}
+                    \${v.photo ? \`<img src="\${zThumbUrl(v.photo)}" data-full="\${v.photo}" style="cursor:zoom-in" onclick="event.stopPropagation();zOpen(this)">\` : ''}
                     <div>\${v.name}</div>
                 </div>\`).join('')}</div>\` : '<p style="color:var(--muted);margin-bottom:10px;">لا توجد مركبات مضافة</p>'}
             <label>صورة المخالفة (إجباري)</label>
@@ -12093,7 +12438,7 @@ async function renderReportForm(category) {
             <label>المركبة</label>
             \${meta.vehicles.length ? \`<div class="vgrid" id="rp-v-grid">\${meta.vehicles.map((v,i) => \`
                 <div class="vcard" id="rp-vcard-\${i}" onclick="pickReportVehicle(\${i})">
-                    \${v.photo ? \`<img src="\${v.photo}">\` : ''}
+                    \${v.photo ? \`<img src="\${zThumbUrl(v.photo)}" data-full="\${v.photo}" style="cursor:zoom-in" onclick="event.stopPropagation();zOpen(this)">\` : ''}
                     <div>\${v.name}</div>
                 </div>\`).join('')}</div>\` : '<p style="color:var(--muted);margin-bottom:10px;">لا توجد مركبات مضافة</p>'}
             <h3 style="margin-top:16px;">تفاصيل العملية الميدانية</h3>
@@ -13261,9 +13606,9 @@ async function loadSeniorExcuses(silent) {
     paintSilent(box, 'sex' + SEX.f, chips + rows, silent);
 }
 function sexProof(id, btn) {
-    api('/api/hc/excuses/' + id + '/proof').then(function (d) {
+    zApi('/api/hc/excuses/' + id + '/proof').then(function (d) {
         var im = document.createElement('img');
-        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
+        zDecorate(im, d.image);
         btn.parentNode.appendChild(im); btn.remove();
     }).catch(function (e) { toast(e.message); });
 }
@@ -13281,9 +13626,9 @@ async function sexDecide(id, action) {
         .then(function (r) { toast('✅ انقبل العذر' + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : '')); loadSeniorExcuses(); }).catch(function (e) { toast(e.message); });
 }
 function hcExProof(id, btn) {
-    api('/api/hc/excuses/' + id + '/proof').then(function (d) {
+    zApi('/api/hc/excuses/' + id + '/proof').then(function (d) {
         var im = document.createElement('img');
-        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
+        zDecorate(im, d.image);
         btn.parentNode.appendChild(im); btn.remove();
     }).catch(function (e) { toast(e.message); });
 }
@@ -13429,9 +13774,9 @@ function attPaintReception(d) {
         '<h3 style="margin:14px 0 8px;color:#f87171;">❌ ما حضروا (' + d.list.length + ')</h3>' + abRows;
 }
 function hcShowImage(id, btn) {
-    api('/api/high-command/promotion-requests/' + id + '/image').then(function (d) {
+    zApi('/api/high-command/promotion-requests/' + id + '/image').then(function (d) {
         var im = document.createElement('img');
-        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
+        zDecorate(im, d.image);
         btn.parentNode.appendChild(im); btn.remove();
     }).catch(function (e) { toast(e.message); });
 }
@@ -14596,7 +14941,7 @@ async function loadVehicleList() {
     if (!box) return;
     box.innerHTML = list.map(v => \`
         <div class="vcard">
-            \${v.photo ? \`<img src="\${v.photo}">\` : ''}
+            \${v.photo ? \`<img src="\${zThumbUrl(v.photo)}" data-full="\${v.photo}" style="cursor:zoom-in" onclick="event.stopPropagation();zOpen(this)">\` : ''}
             <div>\${v.name}</div>
             <button class="btn danger sm" style="margin-top:4px;padding:3px 8px;font-size:10px;" onclick="delVehicle('\${v._id}')">حذف</button>
         </div>\`).join('') || '<p style="color:var(--muted);">لا توجد مركبات</p>';
@@ -15511,8 +15856,6 @@ async function loadSettings() {
             <div class="row" style="margin-top:10px;"><span>إغلاق تسجيل المخالفات</span><input type="checkbox" id="s-viol" \${settings.disableViolations ? 'checked' : ''}></div>
             <label style="margin-top:10px;">آيدي قناة إرسال المخالفات والتقارير بديسكورد (اختياري)</label>
             <input id="s-channel" placeholder="آيدي القناة" value="\${settings.violationsChannelId || ''}">
-            <label style="margin-top:10px;">آيدي قناة إرسال صور الملاحظات بديسكورد (اختياري)</label>
-            <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>\`;
     box.insertAdjacentHTML('beforeend', officersLockCardHtml(!!settings.officersLocked));
@@ -15578,7 +15921,6 @@ async function saveSettings() {
         disableLogin: document.getElementById('s-login').checked,
         disableViolations: document.getElementById('s-viol').checked,
         violationsChannelId: document.getElementById('s-channel').value.trim(),
-        notesChannelId: document.getElementById('s-notes-channel').value.trim(),
     };
     try { await api('/api/senior/settings', { method: 'POST', body: JSON.stringify(body) }); toast('تم الحفظ'); }
     catch (e) { toast(e.message); }
