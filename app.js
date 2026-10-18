@@ -93,6 +93,7 @@ const CONFIG = {
     MP_REPORT_POINTS_APPROVE: 1,
     MP_POINTS_CHANNEL_ID: process.env.MP_POINTS_CHANNEL_ID || "1561112154080284693",
     MP_POINTS_REQUEST_MAX: 500,
+    LEAVE_CHANNEL_ID: process.env.LEAVE_CHANNEL_ID || "1561112154080284693",
     MP_COMMANDER_ROLE_ID: process.env.MP_COMMANDER_ROLE_ID || "1528260320366166114",
     MP_DEPUTY_ROLE_ID: process.env.MP_DEPUTY_ROLE_ID || "1528260505578508389",
 
@@ -171,7 +172,7 @@ const PersonnelSchema = new mongoose.Schema({
     blockUntil: { type: Date, default: null },
     isDismissed: { type: Boolean, default: false },
     excusedAbsences: [{
-        excuseId: String, type: String,
+        excuseId: String, type: { type: String },
         absenceAt: Date, approvedAt: Date, approvedByName: String,
     }],
     removedAbsences: [{
@@ -564,6 +565,8 @@ const LeaveRequestSchema = new mongoose.Schema({
     endDate: { type: Date, default: null },
     endedAt: { type: Date, default: null },
     endedByTag: { type: String, default: null },
+    channelId: { type: String, default: null },
+    messageId: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
 });
 LeaveRequestSchema.index({ discord: 1, createdAt: -1 });
@@ -1375,6 +1378,14 @@ client.on("interactionCreate", async interaction => {
                     modal.addComponents(new ActionRowBuilder().addComponents(input));
                     return interaction.showModal(modal);
                 }
+                return;
+            }
+
+            if (id.startsWith("leave_")) {
+                const parts = id.split("_");
+                await interaction.deferUpdate();
+                const out = await decideLeaveRequest(parts[2], interaction.user.id, interaction.user.username, parts[1] === "ok" ? "approve" : "reject");
+                if (out.error) return interaction.followUp({ content: "🚫 " + out.error, ephemeral: true });
                 return;
             }
 
@@ -2937,11 +2948,7 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
         update.rank = newRank;
 
         const explicitPoints = points !== undefined && points !== "" && !isNaN(parseInt(points));
-        if (!explicitPoints) {
-            const newIdx = rankIndex(newRank);
-            if (newIdx > oldIdx) update.points = await pointsForReachingRank(newRank, settings);
-            else if (newIdx < oldIdx) update.points = 0;
-        }
+        if (!explicitPoints && existing && newRank !== existing.rank) update.points = await pointsForReachingRank(newRank, settings);
     }
     if (points !== undefined && points !== "" && !isNaN(parseInt(points))) update.points = Math.max(0, parseInt(points));
 
@@ -3033,6 +3040,104 @@ app.delete("/api/senior/violations/:id/permanent", ensureSeniorAdmin, async (req
     res.json({ ok: true });
 });
 
+async function buildLeaveEmbed(l) {
+    const st = l.status;
+    const color = st === "approved" ? 0x16a34a : st === "rejected" ? 0xef4444 : st === "completed" ? 0x6b7280 : 0xf59e0b;
+    const title = st === "approved" ? "✅ تمت الموافقة على الإجازة" : st === "rejected" ? "❌ تم رفض طلب الإجازة" : st === "completed" ? "🏁 انتهت الإجازة" : "🌴 طلب إجازة جديد";
+    const p = await Personnel.findOne({ discord: l.discord }, { leaveBalance: 1 }).lean();
+    const balance = p ? (p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE) : CONFIG.DEFAULT_LEAVE_BALANCE;
+    const embed = new EmbedBuilder()
+        .setTitle(title)
+        .setColor(color)
+        .addFields(
+            { name: "العسكري", value: (l.name || l.discordTag || "-") + (l.discord ? "\n<@" + l.discord + ">" : ""), inline: true },
+            { name: "الرتبة / الوحدة", value: (l.rank || "-") + " · " + (l.unit || "-"), inline: true },
+            { name: "القطاع", value: l.sectorLabel || "-", inline: true },
+            { name: "مدة الإجازة", value: l.days + " يوم", inline: true },
+            { name: "الرصيد الحالي", value: balance + " يوم", inline: true },
+            { name: "السبب", value: (l.reason || "-").slice(0, 1000), inline: false },
+        )
+        .setFooter({ text: "ID: " + l._id })
+        .setTimestamp(l.createdAt || new Date());
+    if (st !== "pending" && l.reviewedByTag) embed.addFields({ name: "القرار بواسطة", value: l.reviewedByTag, inline: false });
+    return embed;
+}
+
+function buildLeaveButtons(l) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("leave_ok_" + l._id).setLabel("✅ قبول").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("leave_no_" + l._id).setLabel("❌ رفض").setStyle(ButtonStyle.Danger),
+    );
+}
+
+async function postLeaveRequest(l) {
+    if (!botReady) return;
+    try {
+        const channel = await client.channels.fetch(CONFIG.LEAVE_CHANNEL_ID);
+        const msg = await channel.send({ embeds: [await buildLeaveEmbed(l)], components: [buildLeaveButtons(l)] });
+        await LeaveRequest.updateOne({ _id: l._id }, { $set: { channelId: msg.channelId, messageId: msg.id } });
+    } catch (e) {
+        console.error("❌ فشل إرسال طلب الإجازة للديسكورد:", e.message);
+    }
+}
+
+async function refreshLeaveMessage(l) {
+    if (!botReady || !l || !l.channelId || !l.messageId) return;
+    try {
+        const channel = await client.channels.fetch(l.channelId);
+        const msg = await channel.messages.fetch(l.messageId);
+        await msg.edit({ embeds: [await buildLeaveEmbed(l)], components: l.status === "pending" ? [buildLeaveButtons(l)] : [] });
+    } catch (e) {
+        console.error("❌ فشل تحديث رسالة الإجازة:", e.message);
+    }
+}
+
+async function decideLeaveRequest(id, userId, userTag, decision) {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(id)) return { error: "الطلب غير موجود" };
+        const settings = await getSettings();
+        const leave = await LeaveRequest.findById(id);
+        if (!leave || leave.status !== "pending") return { error: "هذا الطلب تمت مراجعته مسبقاً" };
+        const leaderInfo = getSectorRole(userId, settings);
+        const poInfo = getPersonnelOfficerSector(userId, settings);
+        let approverLabel = null;
+        if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
+        else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
+        else if (isSeniorAdmin(userId)) approverLabel = "كبار المسؤولين";
+        else return { error: "ما عندك صلاحية على هذا الطلب" };
+        const tag = userTag + " (" + approverLabel + ")";
+        const now = new Date();
+        if (decision === "reject") {
+            const r = await LeaveRequest.findOneAndUpdate(
+                { _id: id, status: "pending" },
+                { $set: { status: "rejected", rejectReason: null, reviewedBy: userId, reviewedByTag: tag, reviewedAt: now } },
+                { new: true }
+            );
+            if (!r) return { error: "هذا الطلب تمت مراجعته مسبقاً" };
+            await logEvent({ action: "رفض إجازة", discordId: r.discord, discordTag: r.discordTag, actorId: userId, actorTag: userTag, details: "من الديسكورد" });
+            await refreshLeaveMessage(r);
+            return { ok: true };
+        }
+        const p = await Personnel.findOne({ discord: leave.discord });
+        if (!p) return { error: "الفرد غير موجود" };
+        const balance = p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE;
+        if (leave.days > balance) return { error: "رصيد الفرد الحالي ما يكفي لهذا الطلب" };
+        const r = await LeaveRequest.findOneAndUpdate(
+            { _id: id, status: "pending" },
+            { $set: { status: "approved", reviewedBy: userId, reviewedByTag: tag, reviewedAt: now, startDate: now, endDate: new Date(now.getTime() + leave.days * 24 * 60 * 60 * 1000) } },
+            { new: true }
+        );
+        if (!r) return { error: "هذا الطلب تمت مراجعته مسبقاً" };
+        await Personnel.updateOne({ discord: leave.discord }, { $set: { leaveBalance: balance - leave.days } });
+        await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: userId, actorTag: userTag, details: `${leave.days} يوم (بواسطة ${approverLabel} من الديسكورد) — الرصيد المتبقي: ${balance - leave.days}` });
+        await refreshLeaveMessage(r);
+        return { ok: true };
+    } catch (e) {
+        console.error("❌ خطأ بقرار الإجازة:", e.message);
+        return { error: "صار خطأ، حاول مرة ثانية" };
+    }
+}
+
 app.get("/api/leave/mine", ensureAuth, async (req, res) => {
     const p = await Personnel.findOne({ discord: req.user.id }, { leaveBalance: 1 });
     const list = await LeaveRequest.find({ discord: req.user.id }).sort({ createdAt: -1 }).limit(50).lean();
@@ -3075,6 +3180,7 @@ app.post("/api/leave/request", ensureAuth, async (req, res) => {
         reason: reason.trim(), days: d,
     });
     await logEvent({ action: "طلب إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: p.discord, actorTag: p.discordTag, details: `${d} يوم — ${reason.trim()}` });
+    await postLeaveRequest(leave);
     res.json({ ok: true, leave });
 });
 
@@ -3141,6 +3247,7 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
     await leave.save();
 
     await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${leave.days} يوم (بواسطة ${approverLabel}) — الرصيد المتبقي: ${p.leaveBalance}` });
+    await refreshLeaveMessage(leave);
     res.json({ ok: true, leave });
 });
 
@@ -3162,6 +3269,7 @@ app.post("/api/leave/:id/end", ensureAuth, async (req, res) => {
     leave.endedByTag = req.user.username + ` (${approverLabel})`;
     await leave.save();
     await logEvent({ action: "إنهاء إجازة", discordId: leave.discord, discordTag: leave.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `بواسطة ${approverLabel}` });
+    await refreshLeaveMessage(leave);
     res.json({ ok: true });
 });
 
@@ -3186,6 +3294,7 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
     await leave.save();
 
     await logEvent({ action: "رفض إجازة", discordId: leave.discord, discordTag: leave.discordTag, actorId: req.user.id, actorTag: req.user.username, details: leave.rejectReason || "-" });
+    await refreshLeaveMessage(leave);
     res.json({ ok: true, leave });
 });
 
@@ -5299,6 +5408,46 @@ app.get("/api/support/admin/tickets", async (req, res) => {
         : { $or: [{ status: "waiting" }, { status: "active", adminUid: req.user.id }] };
     const list = await SupportTicket.find(q).sort({ updatedAt: -1 }).limit(100).select("-messages.image").lean();
     res.json({ tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadAdmin || 0, last: ((t.messages[t.messages.length - 1] || {}).text || "").slice(0, 60) })) });
+});
+
+app.get("/api/support/admin/tickets/:id/person", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "التعديل لكبار المسؤولين فقط" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
+    const t = await SupportTicket.findById(req.params.id).select("uid no").lean();
+    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
+    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له ملف عسكري بالموقع" });
+    const p = await Personnel.findOne({ discord: t.uid }, { registeredName: 1, unit: 1, rank: 1, points: 1 }).lean();
+    if (!p) return res.status(404).json({ error: "هذا الشخص ما عنده ملف عسكري بالموقع" });
+    res.json({ name: p.registeredName || "", unit: p.unit || "", rank: p.rank || "", points: p.points || 0, ranks: CONFIG.MILITARY_RANKS });
+});
+
+app.post("/api/support/admin/tickets/:id/person", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "التعديل لكبار المسؤولين فقط" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
+    const t = await SupportTicket.findById(req.params.id).select("uid no").lean();
+    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
+    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له ملف عسكري بالموقع" });
+    const p = await Personnel.findOne({ discord: t.uid });
+    if (!p) return res.status(404).json({ error: "هذا الشخص ما عنده ملف عسكري بالموقع" });
+    const { name, unit, rank } = req.body || {};
+    const update = {};
+    if (typeof name === "string" && name.trim()) update.registeredName = name.trim().slice(0, 80);
+    if (typeof unit === "string" && unit.trim()) update.unit = unit.trim().slice(0, 80);
+    if (typeof rank === "string" && rank.trim()) {
+        const newRank = rank.trim();
+        if (!CONFIG.MILITARY_RANKS.includes(newRank)) return res.status(400).json({ error: "رتبة غير موجودة" });
+        if (newRank !== p.rank) {
+            update.rank = newRank;
+            update.points = await pointsForReachingRank(newRank);
+        }
+    }
+    if (!Object.keys(update).length) return res.status(400).json({ error: "ما تغيّر شي" });
+    const np = await Personnel.findOneAndUpdate({ discord: t.uid }, { $set: update }, { new: true });
+    if (update.registeredName) await SupportTicket.updateOne({ _id: t._id }, { $set: { name: update.registeredName } });
+    await logEvent({ action: "تعديل ملف عسكري", discordId: np.discord, discordTag: np.discordTag, actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(update) + " — من تكت خدمة العملاء #" + t.no });
+    await checkAutoPromotion(t.uid);
+    const after = await Personnel.findOne({ discord: t.uid }, { registeredName: 1, unit: 1, rank: 1, points: 1 }).lean();
+    res.json({ ok: true, name: after.registeredName, unit: after.unit, rank: after.rank, points: after.points });
 });
 
 app.post("/api/support/admin/tickets/:id/ban", async (req, res) => {
@@ -11130,7 +11279,7 @@ async function spOpenTicket(id, mode, box) {
     var el = document.getElementById(box);
     el.innerHTML =
         '<div class="sp-chat">' +
-        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-notify" onclick="spNotifyUser()" style="color:#93c5fd;display:none;">🔔 إشعار</button><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button><button class="sp-link" id="sp-ban" onclick="spBanUser()" style="color:#fca5a5;display:none;">🚫 حظر</button></div>' +
+        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-edit" onclick="spEditPerson()" style="color:#fbbf24;display:none;">✏️ تعديل</button><button class="sp-link" id="sp-notify" onclick="spNotifyUser()" style="color:#93c5fd;display:none;">🔔 إشعار</button><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button><button class="sp-link" id="sp-ban" onclick="spBanUser()" style="color:#fca5a5;display:none;">🚫 حظر</button></div>' +
         '<div class="sp-state" id="sp-state"></div>' +
         '<div class="sp-msgs" id="sp-msgs"></div>' +
         '<div id="sp-prev" class="sp-prev"></div>' +
@@ -11221,6 +11370,8 @@ function spPaintState() {
     document.getElementById('sp-close').style.display = (closed || !(adm || isSen)) ? 'none' : 'inline';
     var banBtn = document.getElementById('sp-ban');
     if (banBtn) banBtn.style.display = (adm && isSen) ? 'inline' : 'none';
+    var editBtn = document.getElementById('sp-edit');
+    if (editBtn) editBtn.style.display = (adm && isSen && !t.guest) ? 'inline' : 'none';
     var delBtn = document.getElementById('sp-del');
     if (delBtn) delBtn.style.display = (closed && adm && ME && ME.isSeniorAdmin) ? 'inline' : 'none';
     var nb = document.getElementById('sp-notify');
@@ -11267,6 +11418,42 @@ async function spDeleteTicket() {
     if (!(await confirmModal('تبي تحذف هذا التكت نهائياً؟ ما يرجع بعد الحذف.'))) return;
     try { await spApi('/api/support/admin/tickets/' + c.id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spBack(); }
     catch (e) { toast(e.message); }
+}
+async function spEditPerson() {
+    var c = SP.cur; if (!c) return;
+    var d;
+    try { d = await spApi('/api/support/admin/tickets/' + c.id + '/person'); }
+    catch (e) { toast(e.message); return; }
+    var opts = d.ranks.map(function (r) { return '<option value="' + spEsc(r) + '"' + (r === d.rank ? ' selected' : '') + '>' + spEsc(r) + '</option>'; }).join('');
+    var box = document.getElementById('wf-box');
+    box.innerHTML =
+        '<h3>✏️ تعديل بيانات العسكري</h3>' +
+        '<label style="font-size:13px;color:var(--muted);">الاسم</label>' +
+        '<input id="ep-name" value="' + spEsc(d.name) + '">' +
+        '<label style="font-size:13px;color:var(--muted);">الوحدة</label>' +
+        '<input id="ep-unit" value="' + spEsc(d.unit) + '">' +
+        '<label style="font-size:13px;color:var(--muted);">الرتبة</label>' +
+        '<select id="ep-rank">' + opts + '</select>' +
+        '<p style="font-size:12px;color:var(--muted);margin-top:8px;">نقاطه الحالية: ' + d.points + ' — إذا غيّرت الرتبة تنحط له نقاط الرتبة المحددة تلقائياً.</p>' +
+        '<div class="wf-actions">' +
+            '<button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>' +
+            '<button class="btn sm" onclick="spSavePerson()">حفظ</button>' +
+        '</div>';
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function spSavePerson() {
+    var c = SP.cur; if (!c) return;
+    var body = {
+        name: document.getElementById('ep-name').value,
+        unit: document.getElementById('ep-unit').value,
+        rank: document.getElementById('ep-rank').value,
+    };
+    try {
+        var r = await spApi('/api/support/admin/tickets/' + c.id + '/person', { method: 'POST', body: JSON.stringify(body) });
+        toast('✅ تم التعديل — ' + r.rank + ' · ' + r.points + ' نقطة');
+        closeWarnForm();
+        await spLoadNew();
+    } catch (e) { toast(e.message); }
 }
 async function spBanUser() {
     var c = SP.cur; if (!c) return;
