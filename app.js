@@ -271,6 +271,7 @@ const AccountSchema = new mongoose.Schema({
     status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
     isSenior: { type: Boolean, default: false },
     isOwner: { type: Boolean, default: false },
+    suspended: { type: Boolean, default: false },
     tempSenior: { type: Boolean, default: false },
     sector: { type: String, default: null },
     isMP: { type: Boolean, default: false },
@@ -315,11 +316,15 @@ function decryptText(str) {
 
 const seniorUids = new Set();
 const ownerUids = new Set();
+const suspendedUids = new Set();
 let STEALTH_MODE = false;
 async function refreshSeniors() {
     const list = await Account.find({ $or: [{ isSenior: true }, { isOwner: true }], status: "approved" }, { uid: 1, isOwner: 1 }).lean();
     seniorUids.clear(); ownerUids.clear();
     list.forEach(a => { seniorUids.add(a.uid); if (a.isOwner) ownerUids.add(a.uid); });
+    const sus = await Account.find({ suspended: true }, { uid: 1 }).lean();
+    suspendedUids.clear();
+    sus.forEach(a => suspendedUids.add(a.uid));
 }
 function isOwnerUid(userId) { return ownerUids.has(userId); }
 function hiddenOwnerIds(req) {
@@ -1639,6 +1644,11 @@ app.use(session({
 }));
 app.use(passport.initialize());
 app.use(passport.session());
+app.use("/api", (req, res, next) => {
+    if (!req.user || !suspendedUids.has(req.user.id)) return next();
+    if (req.path === "/me" || req.path === "/events") return next();
+    return res.status(403).json({ error: "⛔ أنت موقوف", suspended: true });
+});
 
 const sseClients = new Set();
 function sseBroadcast(event, data, filter) {
@@ -2092,6 +2102,26 @@ app.post("/api/owner/accounts/:uid/senior", async (req, res) => {
     res.json({ ok: true });
 });
 
+app.get("/api/owner/accounts", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const list = await Account.find({}, { uid: 1, email: 1, fullName: 1, status: 1, isSenior: 1, isOwner: 1, suspended: 1 }).sort({ createdAt: -1 }).limit(3000).maxTimeMS(10000).lean();
+    res.json({ list: list.map(a => ({ uid: a.uid, email: a.email, fullName: a.fullName, status: a.status, isSenior: !!a.isSenior, isOwner: !!a.isOwner, suspended: !!a.suspended })) });
+});
+
+app.post("/api/owner/accounts/:uid/suspend", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const a = await Account.findOne({ uid: req.params.uid }, { uid: 1, isOwner: 1 });
+    if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
+    if (a.isOwner || a.uid === req.user.id) return res.status(400).json({ error: "غير مسموح" });
+    const value = !!(req.body || {}).value;
+    await Account.updateOne({ uid: a.uid }, { $set: { suspended: value } });
+    if (value) suspendedUids.add(a.uid); else suspendedUids.delete(a.uid);
+    sseBroadcast("suspend", { on: value }, c => c.uid === a.uid);
+    res.json({ ok: true });
+});
+
 app.post("/api/senior/accounts/:uid/status", ensureSeniorAdmin, async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid });
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
@@ -2120,6 +2150,7 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
 });
 
 app.get("/api/me", ensureAuth, async (req, res) => {
+    if (suspendedUids.has(req.user.id)) return res.json({ blocked: true, suspended: true, reason: "⛔ أنت موقوف من قبل الإدارة." });
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
     if (settings.ownerLockdown && !isOwnerUid(req.user.id)) {
@@ -3472,7 +3503,8 @@ app.post("/api/senior/thresholds", ensureSeniorAdmin, async (req, res) => {
 
 app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
     const hid = hiddenOwnerIds(req);
-    const list = await Log.find(hid.length ? { actorId: { $nin: hid }, discordId: { $nin: hid } } : {}).sort({ createdAt: -1 }).limit(200);
+    const list = await Log.find(hid.length ? { discordId: { $nin: hid } } : {}).sort({ createdAt: -1 }).limit(200).lean();
+    if (hid.length) list.forEach(l => { if (l.actorId && hid.includes(l.actorId)) { l.actorTag = "كبار المسؤولين"; l.actorId = null; } });
     const settings = await getSettings();
     res.json({ list, logClearAvailable: !settings.logClearUsed });
 });
@@ -5416,9 +5448,10 @@ app.get("/api/support/admin/tickets/:id/person", async (req, res) => {
     const t = await SupportTicket.findById(req.params.id).select("uid no").lean();
     if (!t) return res.status(404).json({ error: "التكت غير موجود" });
     if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له ملف عسكري بالموقع" });
-    const p = await Personnel.findOne({ discord: t.uid }, { registeredName: 1, unit: 1, rank: 1, points: 1 }).lean();
+    const p = await Personnel.findOne({ discord: t.uid }, { registeredName: 1, unit: 1, rank: 1, points: 1, sector: 1 }).lean();
     if (!p) return res.status(404).json({ error: "هذا الشخص ما عنده ملف عسكري بالموقع" });
-    res.json({ name: p.registeredName || "", unit: p.unit || "", rank: p.rank || "", points: p.points || 0, ranks: CONFIG.MILITARY_RANKS });
+    const acc = await Account.findOne({ uid: t.uid }, { sector: 1 }).lean();
+    res.json({ name: p.registeredName || "", unit: p.unit || "", rank: p.rank || "", points: p.points || 0, sector: (acc ? acc.sector : p.sector) || "", ranks: CONFIG.MILITARY_RANKS, sectors: CONFIG.SECTORS });
 });
 
 app.post("/api/support/admin/tickets/:id/person", async (req, res) => {
@@ -5429,8 +5462,9 @@ app.post("/api/support/admin/tickets/:id/person", async (req, res) => {
     if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له ملف عسكري بالموقع" });
     const p = await Personnel.findOne({ discord: t.uid });
     if (!p) return res.status(404).json({ error: "هذا الشخص ما عنده ملف عسكري بالموقع" });
-    const { name, unit, rank } = req.body || {};
+    const { name, unit, rank, sector } = req.body || {};
     const update = {};
+    let secAcc = null, newSector = null, sectorChanged = false;
     if (typeof name === "string" && name.trim()) update.registeredName = name.trim().slice(0, 80);
     if (typeof unit === "string" && unit.trim()) update.unit = unit.trim().slice(0, 80);
     if (typeof rank === "string" && rank.trim()) {
@@ -5441,13 +5475,34 @@ app.post("/api/support/admin/tickets/:id/person", async (req, res) => {
             update.points = await pointsForReachingRank(newRank);
         }
     }
+    if (sector !== undefined) {
+        newSector = sector ? String(sector) : null;
+        if (newSector && !CONFIG.SECTORS[newSector]) return res.status(400).json({ error: "قطاع غير صحيح" });
+        secAcc = await Account.findOne({ uid: t.uid });
+        if (secAcc && (secAcc.sector || null) !== newSector) {
+            if (secAcc.isSenior && secAcc.uid !== req.user.id && !isOwnerUid(req.user.id)) return res.status(403).json({ error: "حساب كبير المسؤولين خاص بصاحبه، ما تقدر تغيّر قطاعه" });
+            sectorChanged = true;
+            update.sector = newSector;
+            const oldLabel = secAcc.sector ? CONFIG.SECTORS[secAcc.sector] : null;
+            const curUnit = update.unit !== undefined ? update.unit : p.unit;
+            if (!curUnit || curUnit === "غير محدد" || (oldLabel && curUnit === oldLabel)) {
+                update.unit = newSector ? CONFIG.SECTORS[newSector] : "غير محدد";
+            }
+        }
+    }
     if (!Object.keys(update).length) return res.status(400).json({ error: "ما تغيّر شي" });
     const np = await Personnel.findOneAndUpdate({ discord: t.uid }, { $set: update }, { new: true });
+    if (sectorChanged && secAcc) {
+        const oldSec = secAcc.sector || null;
+        secAcc.sector = newSector;
+        await secAcc.save();
+        await logEvent({ action: "تغيير قطاع", discordId: np.discord, discordTag: np.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${np.registeredName || np.discord}: ${oldSec ? CONFIG.SECTORS[oldSec] : "بدون قطاع"} ← ${newSector ? CONFIG.SECTORS[newSector] : "بدون قطاع"} — من تكت خدمة العملاء #${t.no}` });
+    }
     if (update.registeredName) await SupportTicket.updateOne({ _id: t._id }, { $set: { name: update.registeredName } });
     await logEvent({ action: "تعديل ملف عسكري", discordId: np.discord, discordTag: np.discordTag, actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(update) + " — من تكت خدمة العملاء #" + t.no });
     await checkAutoPromotion(t.uid);
     const after = await Personnel.findOne({ discord: t.uid }, { registeredName: 1, unit: 1, rank: 1, points: 1 }).lean();
-    res.json({ ok: true, name: after.registeredName, unit: after.unit, rank: after.rank, points: after.points });
+    res.json({ ok: true, name: after.registeredName, unit: after.unit, rank: after.rank, points: after.points, sector: newSector });
 });
 
 app.post("/api/support/admin/tickets/:id/ban", async (req, res) => {
@@ -9258,6 +9313,8 @@ app.get("/", (req, res) => {
     #cy-hardlock .btn { margin-top: 14px; }
     body.ua-frozen #app, body.ua-frozen nav, body.ua-frozen #warn-banner, body.ua-frozen #owner-toolbar, body.ua-frozen #sp-fab, body.ua-frozen #mobile-menu, body.ua-frozen #menu-backdrop { display: none !important; }
     body.ua-frozen { overflow: hidden; background: #060d1a; }
+    body.sus-frozen #app, body.sus-frozen nav, body.sus-frozen #warn-banner, body.sus-frozen #owner-toolbar, body.sus-frozen #sp-fab, body.sus-frozen #sp-modal, body.sus-frozen #mobile-menu, body.sus-frozen #menu-backdrop, body.sus-frozen #owner-modal-overlay { display: none !important; }
+    body.sus-frozen { overflow: hidden; background: #060d1a; }
     body.ua-frozen #sp-modal { z-index: 5600; }
     #ua-hardlock { position: fixed; inset: 0; z-index: 5000; background: radial-gradient(circle at 50% 35%, #12305e 0%, #060d1a 72%); display: flex; align-items: center; justify-content: center; padding: 20px; text-align: center; color: #e2e8f0; }
     #ua-hardlock .ua-box { max-width: 440px; width: 100%; line-height: 1.9; background: rgba(13,31,60,0.92); border: 1px solid rgba(239,68,68,0.5); border-radius: 16px; padding: 24px 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
@@ -9747,6 +9804,27 @@ document.addEventListener('click', function (e) {
 
 const __inflight = new Map();
 function __cloneData(d) { try { return structuredClone(d); } catch (e) { try { return JSON.parse(JSON.stringify(d)); } catch (e2) { return d; } } }
+function showSuspended() {
+    window.SUSPENDED = true;
+    if (document.getElementById('suspended-overlay')) return;
+    var o = document.createElement('div');
+    o.id = 'suspended-overlay';
+    o.style.cssText = 'position:fixed;inset:0;z-index:2147483000;background:rgba(2,6,15,0.92);display:flex;align-items:center;justify-content:center;padding:20px;';
+    o.innerHTML = '<div style="background:#10151f;border:2px solid #ef4444;border-radius:18px;max-width:340px;width:100%;padding:28px 20px;text-align:center;box-shadow:0 0 40px rgba(239,68,68,0.35);">' +
+        '<div style="width:84px;height:84px;margin:0 auto 14px;border-radius:50%;background:#ef4444;color:#fff;font-size:54px;line-height:84px;font-weight:700;">✕</div>' +
+        '<div style="font-size:24px;font-weight:700;color:#fca5a5;">أنت موقوف</div>' +
+        '<div style="margin-top:8px;font-size:13px;color:#94a3b8;">تم إيقاف حسابك من قبل الإدارة.</div>' +
+        '<a href="/auth/logout" style="display:inline-block;margin-top:18px;padding:9px 20px;border-radius:10px;background:#374151;color:#fff;text-decoration:none;font-size:14px;">تسجيل خروج</a>' +
+        '</div>';
+    document.body.appendChild(o);
+    document.body.style.overflow = 'hidden';
+    document.body.classList.add('sus-frozen');
+    var hi = setTimeout(function () {}, 0);
+    for (var i = 0; i <= hi; i++) { clearInterval(i); clearTimeout(i); }
+    setInterval(function () {
+        fetch('/api/me', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) { if (d && !d.suspended) location.reload(); }).catch(function () {});
+    }, 4000);
+}
 async function __rawFetch(url, opts, timeoutMs) {
     let ctrl = null, timer = null;
     if (timeoutMs && typeof AbortController !== 'undefined') {
@@ -9756,6 +9834,7 @@ async function __rawFetch(url, opts, timeoutMs) {
     try {
         const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' }, cache: 'no-store' }, opts, ctrl ? { signal: ctrl.signal } : {}));
         const data = await r.json().catch(() => ({}));
+        if (r.status === 403 && data && data.suspended) showSuspended();
         if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; throw err; }
         return data;
     } catch (e) {
@@ -11058,6 +11137,7 @@ function spConnect() {
         });
         es.addEventListener('changed', function () { spLiveRefresh(); liveSyncSoon(); });
         es.addEventListener('ver', function (e) { try { verCheck(JSON.parse(e.data).v); } catch (x) {} });
+        es.addEventListener('suspend', function (e) { try { var d = JSON.parse(e.data); if (d.on) showSuspended(); else location.reload(); } catch (x) {} });
         es.addEventListener('cyber', function () { try { cyberCheck(); if (CY.roomId) cyLoadRoom(); if (document.getElementById('cy-panel')) cyPanelLoad(); } catch (x) {} });
         es.addEventListener('cyreload', function () {
             try {
@@ -11425,6 +11505,7 @@ async function spEditPerson() {
     try { d = await spApi('/api/support/admin/tickets/' + c.id + '/person'); }
     catch (e) { toast(e.message); return; }
     var opts = d.ranks.map(function (r) { return '<option value="' + spEsc(r) + '"' + (r === d.rank ? ' selected' : '') + '>' + spEsc(r) + '</option>'; }).join('');
+    var secOpts = '<option value="">بدون قطاع</option>' + Object.keys(d.sectors || {}).map(function (k) { return '<option value="' + spEsc(k) + '"' + (k === d.sector ? ' selected' : '') + '>' + spEsc(d.sectors[k]) + '</option>'; }).join('');
     var box = document.getElementById('wf-box');
     box.innerHTML =
         '<h3>✏️ تعديل بيانات العسكري</h3>' +
@@ -11434,6 +11515,8 @@ async function spEditPerson() {
         '<input id="ep-unit" value="' + spEsc(d.unit) + '">' +
         '<label style="font-size:13px;color:var(--muted);">الرتبة</label>' +
         '<select id="ep-rank">' + opts + '</select>' +
+        '<label style="font-size:13px;color:var(--muted);">القطاع</label>' +
+        '<select id="ep-sector">' + secOpts + '</select>' +
         '<p style="font-size:12px;color:var(--muted);margin-top:8px;">نقاطه الحالية: ' + d.points + ' — إذا غيّرت الرتبة تنحط له نقاط الرتبة المحددة تلقائياً.</p>' +
         '<div class="wf-actions">' +
             '<button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>' +
@@ -11447,6 +11530,7 @@ async function spSavePerson() {
         name: document.getElementById('ep-name').value,
         unit: document.getElementById('ep-unit').value,
         rank: document.getElementById('ep-rank').value,
+        sector: document.getElementById('ep-sector').value,
     };
     try {
         var r = await spApi('/api/support/admin/tickets/' + c.id + '/person', { method: 'POST', body: JSON.stringify(body) });
@@ -11606,6 +11690,7 @@ function ccRenderHtml(d) {
         '<div class="card" style="flex:1;font-size:12px;">👻 وضع التخفي: <b style="color:' + (d.stealth ? '#a78bfa' : '#4ade80') + ';">' + (d.stealth ? 'مفعّل' : 'مطفي') + '</b></div>' +
         '</div>';
     h += '</div>';
+    h += '<div style="margin-bottom:10px;"><button class="btn sm" style="width:100%;background:#0e7490;" onclick="offaOpenAccounts()">👥 كل الحسابات (توقيف)</button></div>';
     h += flCcPushHtml();
     h += '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">🧊 تجميد فوري لحساب</b>' +
         '<div style="margin-top:6px;"><input id="cc-freeze-q" type="text" placeholder="اكتب الإيميل أو الاسم..." oninput="ccFreezeSearch(this.value)" onkeydown="if(event.keyCode===13){this.blur();}" style="width:100%;"></div>' +
@@ -11679,6 +11764,51 @@ async function offaFreezeAccount() {
     } catch (e) { toast(e.message); }
 }
 
+var ACC_ALL = [];
+function offaAccRow(a) {
+    var tag = a.isOwner ? ' <span style="color:#a78bfa;">(المالك)</span>' : (a.isSenior ? ' <span style="color:#fbbf24;">(كبير مسؤولين)</span>' : '');
+    var st = a.status === 'approved' ? '' : ' <span style="color:#94a3b8;font-size:11px;">(' + (a.status === 'pending' ? 'قيد المراجعة' : 'مرفوض') + ')</span>';
+    var btn = a.isOwner ? '' : '<button class="btn sm ' + (a.suspended ? '' : 'danger') + '" data-uid="' + spEsc(a.uid) + '" onclick="offaToggleSuspend(this)">' + (a.suspended ? '✅ رفع التوقيف' : '⛔ توقيف') + '</button>';
+    return '<div class="card" style="margin-bottom:6px;padding:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;' + (a.suspended ? 'border:1px solid #ef4444;' : '') + '">' +
+        '<div style="min-width:0;"><b style="font-size:13px;">' + spEsc(a.fullName || '—') + '</b>' + tag + st + (a.suspended ? ' <span style="color:#f87171;font-size:11px;">⛔ موقوف</span>' : '') +
+        '<div style="font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;" dir="ltr">' + spEsc(a.email || '') + '</div></div>' + btn + '</div>';
+}
+function offaAccPaint() {
+    var box = document.getElementById('acc-list');
+    if (!box) return;
+    var q = ((document.getElementById('acc-q') || {}).value || '').trim().toLowerCase();
+    var list = ACC_ALL.filter(function (a) {
+        return !q || (a.fullName || '').toLowerCase().indexOf(q) !== -1 || (a.email || '').toLowerCase().indexOf(q) !== -1;
+    });
+    box.innerHTML = list.length ? list.map(offaAccRow).join('') : '<div style="color:var(--muted);font-size:12px;text-align:center;padding:14px;">ما فيه نتائج</div>';
+}
+async function offaOpenAccounts() {
+    ccStopLive();
+    ownerModalOpen('👥 كل الحسابات', '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/owner/accounts', { noLock: true });
+        ACC_ALL = d.list;
+        ownerModalOpen('👥 كل الحسابات (' + ACC_ALL.length + ')',
+            '<div style="margin-bottom:8px;"><button class="btn sm gray" onclick="offaOpenCommandCenter()">↩ رجوع لغرفة التحكم</button></div>' +
+            '<input id="acc-q" type="text" placeholder="ابحث بالاسم أو الإيميل..." oninput="offaAccPaint()" style="width:100%;margin-bottom:8px;">' +
+            '<div id="acc-list"></div>');
+        offaAccPaint();
+    } catch (e) { toast(e.message); }
+}
+async function offaToggleSuspend(el) {
+    var uid = el.dataset.uid;
+    var acc = ACC_ALL.find(function (a) { return a.uid === uid; });
+    if (!acc) return;
+    var next = !acc.suspended;
+    var nm = acc.fullName || acc.email;
+    if (!(await confirmModal(next ? 'توقيف حساب ' + nm + '؟ بيطلع له "أنت موقوف" وما يقدر يستخدم الموقع.' : 'رفع التوقيف عن ' + nm + '؟'))) return;
+    acc.suspended = next;
+    offaAccPaint();
+    try {
+        await api('/api/owner/accounts/' + encodeURIComponent(uid) + '/suspend', { method: 'POST', body: JSON.stringify({ value: next }), noLock: true });
+        toast(next ? '⛔ تم التوقيف' : '✅ تم رفع التوقيف');
+    } catch (e) { acc.suspended = !next; offaAccPaint(); toast(e.message); }
+}
 function ccPatch(d) {
     var tmp = document.createElement('div');
     tmp.innerHTML = ccRenderHtml(d);
@@ -11908,7 +12038,7 @@ async function init() {
     if (ME.unassigned) { uaHardLock(); return; }
     uaHardClear();
     markOwnerSaved();
-    if (ME.blocked) { renderBlocked(ME.reason); return; }
+    if (ME.blocked) { if (ME.suspended) showSuspended(); renderBlocked(ME.reason); return; }
     if (ME.isOwner) {
         document.getElementById('owner-toolbar').style.display = 'flex';
         api('/api/owner/lockdown', { noLock: true }).then(function (d) { updateLockBtn(d.on); }).catch(function () {});
