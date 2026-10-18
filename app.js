@@ -2140,15 +2140,20 @@ app.delete("/api/senior/accounts/:uid", ensureSeniorAdmin, async (req, res) => {
     if (!a) return res.status(404).json({ error: "الحساب غير موجود" });
     if (a.isSenior && a.uid === req.user.id) return res.status(400).json({ error: "ما تقدر تحذف حسابك اللي داخل فيه" });
     if (a.isSenior && !a.tempSenior && !isOwnerUid(req.user.id)) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير مسؤولين غيّر صاحبه كلمة المرور" });
-    await Account.deleteOne({ uid: a.uid });
-    await Personnel.deleteOne({ discord: a.uid });
-    await LeaveRequest.deleteMany({ discord: a.uid });
-    await PromotionRequest.deleteMany({ targetDiscord: a.uid });
-    await Settings.updateMany({}, { $pull: { adminList: a.uid } });
-    if (a.isSenior) await refreshSeniors();
+    await purgeUserEverywhere(a.uid, a.isSenior);
     await logEvent({ action: "حذف حساب نهائي", actorId: req.user.id, actorTag: req.user.username, details: a.fullName + " — " + a.email });
     res.json({ ok: true });
 });
+
+// حذف متبادل: حذف الحساب يحذف الملف العسكري، وحذف الملف العسكري يحذف الحساب
+async function purgeUserEverywhere(uid, wasSenior) {
+    await Account.deleteOne({ uid });
+    await Personnel.deleteOne({ discord: uid });
+    await LeaveRequest.deleteMany({ discord: uid });
+    await PromotionRequest.deleteMany({ targetDiscord: uid });
+    await Settings.updateMany({}, { $pull: { adminList: uid } });
+    if (wasSenior) await refreshSeniors();
+}
 
 app.get("/api/me", ensureAuth, async (req, res) => {
     if (suspendedUids.has(req.user.id)) return res.json({ blocked: true, suspended: true, reason: "⛔ أنت موقوف من قبل الإدارة." });
@@ -2588,7 +2593,31 @@ app.get("/api/senior/personnel/:discord/file", ensureSeniorAdmin, async (req, re
     const p = await Personnel.findOne({ discord: req.params.discord });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     const progress = await rankProgress(p, await getSettings());
-    res.json({ personnel: p, progress });
+    const [acc, att, recRows] = await Promise.all([
+        Account.findOne({ uid: p.discord }).lean(),
+        AttStatus.findOne({ uid: p.discord }).lean(),
+        RecRow.find({ uid: p.discord }).sort({ openedAt: -1, dayKey: -1 }).limit(300).lean(),
+    ]);
+    let account = null;
+    if (acc) {
+        const showPw = !(acc.isSenior && acc.uid !== req.user.id && !ownerUids.has(req.user.id));
+        account = {
+            uid: acc.uid, email: acc.email, fullName: acc.fullName, age: acc.age, nationality: acc.nationality,
+            status: acc.status, isSenior: !!acc.isSenior, isOwner: !!acc.isOwner, tempSenior: !!acc.tempSenior, suspended: !!acc.suspended,
+            sector: acc.sector || null, isMP: !!acc.isMP, isOfficer: !!acc.isOfficer, officerRank: acc.officerRank || null,
+            createdAt: acc.createdAt, reviewedByTag: acc.reviewedByTag || null, reviewedAt: acc.reviewedAt || null,
+            password: showPw ? decryptText(acc.passwordEnc) : null, passwordHidden: !showPw,
+        };
+    }
+    const attendance = att ? { status: att.status, lastCheckInAt: att.lastCheckInAt || null, lastCheckOutAt: att.lastCheckOutAt || null } : null;
+    const receipts = recRows.map(r => ({ dayKey: r.dayKey, openedAt: r.openedAt, kind: r.kind, gained: r.gained || 0, deducted: r.deducted || 0, refunded: r.refunded || 0, excuseStatus: r.excuseStatus || "none", removed: !!r.removedAt }));
+    const receiptStats = {
+        total: receipts.length,
+        attended: receipts.filter(r => r.kind === "attended").length,
+        absent: receipts.filter(r => r.kind === "absent").length,
+        leave: receipts.filter(r => r.kind === "leave").length,
+    };
+    res.json({ personnel: p, progress, account, attendance, receipts, receiptStats });
 });
 
 app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, res) => {
@@ -2941,9 +2970,17 @@ app.post("/api/senior/personnel/:discord/block", ensureSeniorAdmin, async (req, 
 });
 
 app.delete("/api/senior/personnel/:discord", ensureSeniorAdmin, async (req, res) => {
-    const p = await Personnel.findOneAndDelete({ discord: req.params.discord });
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "حذف حساب نهائي", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: p.registeredName || p.discordTag || p.discord });
+    const uid = req.params.discord;
+    if (ownerUids.has(uid) && !isOwnerUid(req.user.id)) return res.status(404).json({ error: "غير موجود" });
+    const a = await Account.findOne({ uid });
+    const p = await Personnel.findOne({ discord: uid });
+    if (!p && !a) return res.status(404).json({ error: "غير موجود" });
+    if (a) {
+        if (a.isSenior && a.uid === req.user.id) return res.status(400).json({ error: "ما تقدر تحذف حسابك اللي داخل فيه" });
+        if (a.isSenior && !a.tempSenior && !isOwnerUid(req.user.id)) return res.status(400).json({ error: "ما تقدر تحذف حساب كبير مسؤولين غيّر صاحبه كلمة المرور" });
+    }
+    await purgeUserEverywhere(uid, a && a.isSenior);
+    await logEvent({ action: "حذف حساب نهائي", discordId: uid, discordTag: p ? p.discordTag : (a ? a.email : uid), actorId: req.user.id, actorTag: req.user.username, details: (p && (p.registeredName || p.discordTag)) || (a && (a.fullName + " — " + a.email)) || uid });
     res.json({ ok: true });
 });
 
@@ -14075,6 +14112,80 @@ async function sfRunSearch() {
             '<button class="btn sm" data-d="' + cyEsc(p.discord) + '" onclick="sfView(this.dataset.d)">عرض الملف</button></div></div>';
     }).join('') : '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
 }
+function sfRow(k, v) { return '<tr><td style="white-space:nowrap;">' + k + '</td><td style="word-break:break-all;">' + v + '</td></tr>'; }
+function sfFull(t) {
+    if (!t) return '—';
+    try { return new Date(t).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; }
+}
+function sfExtra(d) {
+    var p = d.personnel, a = d.account, at = d.attendance, rs = d.receipts || [], st = d.receiptStats || {};
+    var yn = function (b) { return b ? 'نعم' : 'لا'; };
+    var out = '';
+    // معلومات الحساب
+    var acRows = a ? (
+        sfRow('الاسم الكامل', cardEsc(a.fullName || '-')) +
+        sfRow('الإيميل', cardEsc(a.email || '-')) +
+        sfRow('كلمة المرور', a.passwordHidden ? '<span style="color:var(--muted);">مخفية (حساب كبير مسؤولين)</span>' : (a.password ? '<span style="direction:ltr;unicode-bidi:plaintext;">' + cardEsc(a.password) + '</span>' : '—')) +
+        sfRow('العمر', cardEsc(a.age == null ? '-' : a.age)) +
+        sfRow('الجنسية', cardEsc(a.nationality || '-')) +
+        sfRow('حالة الحساب', cardEsc(a.status === 'approved' ? 'مقبول' : a.status === 'rejected' ? 'مرفوض' : 'معلّق')) +
+        sfRow('كبير مسؤولين', yn(a.isSenior)) +
+        sfRow('موقوف', yn(a.suspended)) +
+        sfRow('شرطة عسكرية', yn(a.isMP)) +
+        sfRow('تاريخ التسجيل', sfFull(a.createdAt)) +
+        sfRow('راجعه', cardEsc(a.reviewedByTag || '-'))
+    ) : sfRow('الحساب', '<span style="color:var(--muted);">ما له حساب مسجّل</span>');
+    out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🔐 معلومات الحساب</div><table>' + acRows + '</table></div>';
+    // معلومات الملف العسكري
+    var warns = (p.warnings || []).length, notesN = (p.notes || []).length;
+    out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🪖 معلومات الملف العسكري</div><table>' +
+        sfRow('الاسم المسجّل', cardEsc(p.registeredName || '-')) +
+        sfRow('معرّف الديسكورد', cardEsc(p.discord)) +
+        sfRow('يوزر الديسكورد', cardEsc(p.discordTag || '-')) +
+        sfRow('رقم البطاقة', cardEsc(p.cardNumber || '-')) +
+        sfRow('اليونت', cardEsc(p.unit || '-')) +
+        sfRow('القطاع', cardEsc(p.sector || (a && a.sector) || '-')) +
+        sfRow('الرتبة', cardEsc(p.rank || '-')) +
+        sfRow('النقاط', cardEsc(p.points)) +
+        sfRow('رصيد الإجازات', cardEsc(p.leaveBalance == null ? '-' : p.leaveBalance)) +
+        sfRow('موقوف (بند)', yn(p.isBlocked)) +
+        sfRow('مفصول', yn(p.isDismissed)) +
+        sfRow('عدد التحذيرات', warns) +
+        sfRow('عدد الملاحظات', notesN) +
+        sfRow('تاريخ إنشاء الملف', sfFull(p.createdAt)) +
+        '</table></div>';
+    // البصمة
+    var attRows = at ? (
+        sfRow('الحالة الحالية', at.status === 'in' ? '<b style="color:#4ade80;">🟢 حاضر</b>' : '<b style="color:#f87171;">🔴 منصرف</b>') +
+        sfRow('آخر تسجيل حضور', sfFull(at.lastCheckInAt)) +
+        sfRow('آخر تسجيل انصراف', sfFull(at.lastCheckOutAt))
+    ) : sfRow('البصمة', '<span style="color:var(--muted);">ما سجّل حضور ولا مرة</span>');
+    out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🕒 البصمة</div><table>' + attRows + '</table></div>';
+    // الاستلامات
+    var kindLbl = function (r) {
+        if (r.kind === 'attended') return '<span style="color:#4ade80;">✅ حضر (+' + (r.gained || 1) + ')</span>';
+        if (r.kind === 'leave') return '<span style="color:#fbbf24;">🌴 إجازة</span>';
+        var ex = (r.excuseStatus === 'accepted' || r.removed || r.excuseStatus === 'removed') ? ' <span style="color:#4ade80;">(انشال الغياب' + (r.refunded ? ' • رجعت ' + r.refunded : '') + ')</span>'
+            : r.excuseStatus === 'pending' ? ' <span style="color:#fbbf24;">(عذر معلّق)</span>'
+            : r.excuseStatus === 'rejected' ? ' <span style="color:#f87171;">(عذر مرفوض)</span>' : '';
+        return '<span style="color:#f87171;">❌ غاب' + (r.deducted ? ' (-' + r.deducted + ')' : '') + '</span>' + ex;
+    };
+    var last = rs[0] || null;
+    var lastAtt = rs.filter(function (r) { return r.kind === 'attended'; })[0] || null;
+    var recHead = '<div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">📣 الاستلامات (' + (st.total || 0) + ')</div>' +
+        '<table>' +
+        sfRow('آخر استلام', last ? sfFull(last.openedAt) + ' — ' + kindLbl(last) : '<span style="color:var(--muted);">ما له أي استلام</span>') +
+        sfRow('آخر استلام حضره', lastAtt ? sfFull(lastAtt.openedAt) : '—') +
+        sfRow('إجمالي الحضور', '<b style="color:#4ade80;">' + (st.attended || 0) + '</b>') +
+        sfRow('إجمالي الغياب', '<b style="color:#f87171;">' + (st.absent || 0) + '</b>') +
+        sfRow('إجمالي الإجازة', '<b>' + (st.leave || 0) + '</b>') +
+        '</table>';
+    var recList = rs.length ? '<div style="max-height:260px;overflow-y:auto;margin-top:10px;">' + rs.map(function (r) {
+        return '<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><span>' + sfFull(r.openedAt || r.dayKey) + '</span><span>' + kindLbl(r) + '</span></div>';
+    }).join('') + '</div>' : '';
+    out += '<div class="id-card" style="margin-top:16px;">' + recHead + recList + '</div>';
+    return out;
+}
 async function sfView(discord) {
     var box = document.getElementById('sf-view');
     if (!box) return;
@@ -14090,7 +14201,8 @@ async function sfView(discord) {
         box.innerHTML = '<div style="margin-top:16px;">' + cardBlock(p, { hasProgress: !!progress, nextRank: progress && progress.nextRank, remaining: progress && progress.remaining }) + '</div>' +
             '<div class="id-card" style="margin-top:16px;"><div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">' + cardEsc(p.registeredName || p.discordTag) + '</div>' +
             '<div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري</div>' +
-            '<table><tr><td>اليونت</td><td>' + cardEsc(p.unit || '-') + '</td></tr><tr><td>الرتبة</td><td>' + cardEsc(p.rank) + '</td></tr></table>' + notes + '</div>';
+            '<table><tr><td>اليونت</td><td>' + cardEsc(p.unit || '-') + '</td></tr><tr><td>الرتبة</td><td>' + cardEsc(p.rank) + '</td></tr></table>' + notes + '</div>' +
+            sfExtra(d);
     } catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cardEsc(e.message) + '</div>'; }
 }
 function attPaintReception(d) {
