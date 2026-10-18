@@ -94,6 +94,7 @@ const CONFIG = {
     MP_POINTS_CHANNEL_ID: process.env.MP_POINTS_CHANNEL_ID || "1561112154080284693",
     MP_POINTS_REQUEST_MAX: 500,
     LEAVE_CHANNEL_ID: process.env.LEAVE_CHANNEL_ID || "1561112154080284693",
+    LEAVE_REVIEWER_ROLE_ID: process.env.LEAVE_REVIEWER_ROLE_ID || "1505185480394932455",
     MP_COMMANDER_ROLE_ID: process.env.MP_COMMANDER_ROLE_ID || "1528260320366166114",
     MP_DEPUTY_ROLE_ID: process.env.MP_DEPUTY_ROLE_ID || "1528260505578508389",
 
@@ -1389,7 +1390,7 @@ client.on("interactionCreate", async interaction => {
             if (id.startsWith("leave_")) {
                 const parts = id.split("_");
                 await interaction.deferUpdate();
-                const out = await decideLeaveRequest(parts[2], interaction.user.id, interaction.user.username, parts[1] === "ok" ? "approve" : "reject");
+                const out = await decideLeaveRequest(parts[2], interaction.user.id, interaction.user.username, parts[1] === "ok" ? "approve" : "reject", interaction.member);
                 if (out.error) return interaction.followUp({ content: "🚫 " + out.error, ephemeral: true });
                 return;
             }
@@ -3123,7 +3124,7 @@ async function refreshLeaveMessage(l) {
     }
 }
 
-async function decideLeaveRequest(id, userId, userTag, decision) {
+async function decideLeaveRequest(id, userId, userTag, decision, member) {
     try {
         if (!mongoose.Types.ObjectId.isValid(id)) return { error: "الطلب غير موجود" };
         const settings = await getSettings();
@@ -3135,6 +3136,7 @@ async function decideLeaveRequest(id, userId, userTag, decision) {
         if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
         else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
         else if (isSeniorAdmin(userId)) approverLabel = "كبار المسؤولين";
+        else if (CONFIG.LEAVE_REVIEWER_ROLE_ID && member && member.roles && member.roles.cache && member.roles.cache.has(CONFIG.LEAVE_REVIEWER_ROLE_ID)) approverLabel = "مسؤول الإجازات";
         else return { error: "ما عندك صلاحية على هذا الطلب" };
         const tag = userTag + " (" + approverLabel + ")";
         const now = new Date();
