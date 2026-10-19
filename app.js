@@ -4978,6 +4978,7 @@ const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
     discordMsgId: { type: String, default: null },
     unreadUser: { type: Number, default: 0 },
     unreadAdmin: { type: Number, default: 0 },
+    shared: { type: [String], default: [] },
     messages: [{
         sender: String,
         name: String,
@@ -5372,7 +5373,8 @@ app.get("/api/support/tickets/:id", async (req, res) => {
     const msgs = t.messages.map((m, i) => supportPubMsg(m, i)).slice(after);
     if (role === "owner" && t.unreadUser) { t.unreadUser = 0; await t.save(); }
     if (role === "admin" && t.unreadAdmin) { t.unreadAdmin = 0; await t.save(); }
-    res.json({ ticket: supportPubTicket(t), role, msgs, n: t.messages.length });
+    const canInspect = role === "admin" && supportCanInspect(t, x.uid);
+    res.json({ ticket: supportPubTicket(t), role, msgs, n: t.messages.length, shared: (role === "owner" || canInspect) ? (t.shared || []) : [], canInspect });
 });
 
 app.get("/api/support/tickets/:id/img/:i", async (req, res) => {
@@ -5470,6 +5472,117 @@ app.post("/api/support/tickets/:id/close", async (req, res) => {
     await t.save();
     res.json({ ok: true });
     supportEvent(t, "system", { kind: "close" });
+});
+
+// ---------- فحص العضو داخل التكت (عرض معلومات للعضو) ----------
+const SUPPORT_INFO_LABELS = { account: "معلومات الحساب", attendance: "عدد الانصراف", file: "معلومات الملف العسكري", receipt: "آخر استلام" };
+const SUPPORT_INFO_KEYS = Object.keys(SUPPORT_INFO_LABELS);
+function supportCanInspect(t, uid) {
+    return !!uid && (isSeniorAdmin(uid) || (t.status === "active" && t.adminUid === uid));
+}
+async function supportBuildInfo(t) {
+    const uid = t.uid;
+    const keys = (t.shared || []).filter(k => SUPPORT_INFO_KEYS.includes(k));
+    const items = [];
+    const D = (l, v) => ({ l, v: v ? new Date(v).toISOString() : "—", d: !!v });
+    const R = (l, v) => ({ l, v: v == null || v === "" ? "—" : String(v) });
+    const yn = b => b ? "نعم" : "لا";
+    for (const k of SUPPORT_INFO_ORDER(keys)) {
+        const rows = [];
+        if (k === "account") {
+            const a = await Account.findOne({ uid }).lean();
+            if (!a) rows.push(R("الحساب", "ما له حساب مسجّل"));
+            else {
+                rows.push(R("الاسم الكامل", a.fullName), R("الإيميل", a.email), R("العمر", a.age), R("الجنسية", a.nationality),
+                    R("حالة الحساب", a.status === "approved" ? "مقبول" : a.status === "rejected" ? "مرفوض" : "معلّق"),
+                    R("القطاع", CONFIG.SECTORS[a.sector] || "—"), D("تاريخ التسجيل", a.createdAt));
+            }
+        } else if (k === "attendance") {
+            const [st, outs] = await Promise.all([
+                AttStatus.findOne({ uid }).lean(),
+                AttLog.countDocuments({ uid, type: "out" }).maxTimeMS(10000),
+            ]);
+            rows.push(R("الحالة الحالية", st ? (st.status === "in" ? "حاضر" : "منصرف") : "ما سجّل بصمة"),
+                R("عدد مرات الانصراف", outs),
+                D("آخر تسجيل حضور", st && st.lastCheckInAt), D("آخر تسجيل انصراف", st && st.lastCheckOutAt));
+        } else if (k === "file") {
+            const [p, a] = await Promise.all([Personnel.findOne({ discord: uid }).lean(), Account.findOne({ uid }, { sector: 1 }).lean()]);
+            if (!p) rows.push(R("الملف العسكري", "ما عنده ملف عسكري"));
+            else {
+                const sec = p.sector || (a && a.sector) || null;
+                rows.push(R("الاسم المسجّل", p.registeredName), R("اليونت", p.unit), R("الرتبة", p.rank), R("النقاط", p.points),
+                    R("القطاع", CONFIG.SECTORS[sec] || "—"), R("رقم البطاقة", p.cardNumber), R("رصيد الإجازات", p.leaveBalance),
+                    R("عدد التحذيرات", (p.warnings || []).length), R("موقوف (بند)", yn(p.isBlocked)));
+            }
+        } else if (k === "receipt") {
+            const [last, grp] = await Promise.all([
+                RecRow.findOne({ uid }).sort({ openedAt: -1, dayKey: -1 }).lean(),
+                RecRow.aggregate([{ $match: { uid } }, { $group: { _id: "$kind", n: { $sum: 1 } } }]).option({ maxTimeMS: 10000 }),
+            ]);
+            if (!last) rows.push(R("الاستلام", "ما له أي استلام"));
+            else {
+                const ex = last.excuseStatus === "accepted" || last.removedAt ? " (انشال الغياب)" : last.excuseStatus === "pending" ? " (عذر معلّق)" : last.excuseStatus === "rejected" ? " (عذر مرفوض)" : "";
+                const res_ = last.kind === "attended" ? "حضر (+" + (last.gained || 1) + ")" : last.kind === "leave" ? "إجازة" : "غاب" + (last.deducted ? " (-" + last.deducted + ")" : "") + ex;
+                const cnt = kind => (grp.find(g => g._id === kind) || {}).n || 0;
+                rows.push(D("تاريخ آخر استلام", last.openedAt || last.dayKey), R("النتيجة", res_),
+                    R("إجمالي الحضور", cnt("attended")), R("إجمالي الغياب", cnt("absent")), R("إجمالي الإجازة", cnt("leave")));
+            }
+        }
+        items.push({ key: k, title: SUPPORT_INFO_LABELS[k], rows });
+    }
+    return items;
+}
+function SUPPORT_INFO_ORDER(keys) { return SUPPORT_INFO_KEYS.filter(k => keys.includes(k)); }
+
+app.get("/api/support/tickets/:id/info", async (req, res) => {
+    const x = await supportLoad(req, res); if (!x) return;
+    const { t, role, uid } = x;
+    if (role === "owner") {
+        if (!uid || uid !== t.uid) return res.status(403).json({ error: "سجّل دخولك بحسابك عشان تشوف المعلومات" });
+    } else if (!supportCanInspect(t, uid)) return res.status(403).json({ error: "هذي المعلومات للإداري المستلم وكبار المسؤولين فقط" });
+    if (!t.uid || !(t.shared || []).length) return res.json({ items: [] });
+    res.json({ items: await supportBuildInfo(t) });
+});
+
+app.post("/api/support/admin/tickets/:id/share", async (req, res) => {
+    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
+    const x = await supportLoad(req, res); if (!x) return;
+    const { t } = x;
+    if (!supportCanInspect(t, req.user.id)) return res.status(403).json({ error: "الفحص للإداري المستلم وكبار المسؤولين فقط" });
+    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
+    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له حساب بالموقع" });
+    const raw = Array.isArray((req.body || {}).keys) ? req.body.keys.map(String) : [];
+    const keys = SUPPORT_INFO_ORDER(raw);
+    if ((t.shared || []).join(",") === keys.join(",")) return res.json({ ok: true, shared: keys });
+    t.shared = keys;
+    supportAddMsg(t, { sender: "system", name: "النظام", text: keys.length ? "🔎 " + req.user.username + " عرض لك: " + keys.map(k => SUPPORT_INFO_LABELS[k]).join("، ") : "🔎 تم إخفاء المعلومات المعروضة" });
+    t.unreadUser += 1;
+    await t.save();
+    res.json({ ok: true, shared: keys });
+    supportEvent(t, "system", { kind: "share" });
+});
+
+// "فلان يكتب..." بين أطراف التكت (العضو والإداري المستلم وكبار المسؤولين)
+const supportPeerTypingThrottle = new Map();
+app.post("/api/support/tickets/:id/typing", async (req, res) => {
+    const x = await supportLoad(req, res); if (!x) return;
+    const { t, role, uid } = x;
+    if (t.status === "closed") return res.json({ ok: true });
+    const gt = supportGuestToken(req);
+    const key = String(t._id) + ":" + (uid || gt || "x");
+    const now = Date.now();
+    if (now - (supportPeerTypingThrottle.get(key) || 0) < 1500) return res.json({ ok: true });
+    supportPeerTypingThrottle.set(key, now);
+    if (supportPeerTypingThrottle.size > 3000) for (const [k, v] of supportPeerTypingThrottle) if (now - v > 60000) supportPeerTypingThrottle.delete(k);
+    const senior = role === "admin" && isSeniorAdmin(uid);
+    const payload = role === "owner"
+        ? { id: String(t._id), name: t.name || "عضو", tag: t.uid ? "عضو" : "زائر", kind: "owner" }
+        : { id: String(t._id), name: req.user.username, tag: senior ? "كبار المسؤولين" : "إدارة", kind: senior ? "senior" : "admin" };
+    sseBroadcast("ptyping", payload, c => {
+        if ((uid && c.uid === uid) || (role === "owner" && gt && c.gt === gt)) return false;
+        return c.isAdmin || (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt) || (c.gt && t.deviceToken && t.deviceToken === c.gt);
+    });
+    res.json({ ok: true });
 });
 
 app.get("/api/support/admin/tickets", async (req, res) => {
@@ -9464,6 +9577,17 @@ app.get("/", (req, res) => {
     .sp-role { display: inline-block; font-size: 10px; font-weight: bold; padding: 1px 7px; border-radius: 8px; margin-inline-start: 6px; vertical-align: middle; }
     .sp-role.senior { background: #3d3410; color: #fde047; border: 1px solid #8a7414; }
     .sp-role.admin { background: #12294d; color: #93c5fd; border: 1px solid #2b5aa8; }
+    .sp-role.member { background: #123524; color: #86efac; border: 1px solid #2f7a4d; }
+    .sp-peers { display: flex; flex-direction: column; gap: 4px; padding: 2px 4px; }
+    .sp-peer { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+    .sp-peer-n { color: var(--text); font-weight: bold; }
+    .sp-peer .sp-dots { display: inline-flex; align-items: center; }
+    .sp-info { background: #0f1a30; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; max-height: 34vh; overflow-y: auto; }
+    .sp-info-h { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+    .sp-info-c { border-top: 1px dashed var(--border); padding-top: 6px; margin-top: 6px; }
+    .sp-info-t { font-size: 12px; color: var(--gold-soft); font-weight: bold; margin-bottom: 4px; }
+    .sp-info-r { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 2px 0; }
+    .sp-info-r b { font-weight: normal; text-align: left; word-break: break-word; }
     .sp-img { max-width: 220px; max-height: 220px; border-radius: 10px; margin-top: 6px; display: block; cursor: zoom-in; background: rgba(255,255,255,0.05); }
     .sp-dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px; border-radius: 50%; background: #a78bfa; animation: spDot 1s infinite; }
     .sp-dots span:nth-child(2) { animation-delay: 0.15s; } .sp-dots span:nth-child(3) { animation-delay: 0.3s; }
@@ -11174,6 +11298,7 @@ function spConnect() {
         es.addEventListener('typing', function (e) {
             try { var d = JSON.parse(e.data); if (SP.cur && SP.cur.id === d.id) { SP.cur.typing = !!d.on; spShowTyping(); } } catch (x) {}
         });
+        es.addEventListener('ptyping', function (e) { try { spPeerTyping(JSON.parse(e.data)); } catch (x) {} });
         es.addEventListener('changed', function () { spLiveRefresh(); liveSyncSoon(); });
         es.addEventListener('ver', function (e) { try { verCheck(JSON.parse(e.data).v); } catch (x) {} });
         es.addEventListener('suspend', function (e) { try { var d = JSON.parse(e.data); if (d.on) showSuspended(); else location.reload(); } catch (x) {} });
@@ -11398,8 +11523,9 @@ async function spOpenTicket(id, mode, box) {
     var el = document.getElementById(box);
     el.innerHTML =
         '<div class="sp-chat">' +
-        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-edit" onclick="spEditPerson()" style="color:#fbbf24;display:none;">✏️ تعديل</button><button class="sp-link" id="sp-notify" onclick="spNotifyUser()" style="color:#93c5fd;display:none;">🔔 إشعار</button><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button><button class="sp-link" id="sp-ban" onclick="spBanUser()" style="color:#fca5a5;display:none;">🚫 حظر</button></div>' +
+        '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-edit" onclick="spEditPerson()" style="color:#fbbf24;display:none;">✏️ تعديل</button><button class="sp-link" id="sp-inspect" onclick="spInspect()" style="color:#86efac;display:none;">🔍 فحص</button><button class="sp-link" id="sp-notify" onclick="spNotifyUser()" style="color:#93c5fd;display:none;">🔔 إشعار</button><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button><button class="sp-link" id="sp-ban" onclick="spBanUser()" style="color:#fca5a5;display:none;">🚫 حظر</button></div>' +
         '<div class="sp-state" id="sp-state"></div>' +
+        '<div class="sp-info" id="sp-info" style="display:none;"></div>' +
         '<div class="sp-msgs" id="sp-msgs"></div>' +
         '<div id="sp-prev" class="sp-prev"></div>' +
         '<div class="sp-compose" id="sp-compose">' +
@@ -11409,7 +11535,7 @@ async function spOpenTicket(id, mode, box) {
         '</div></div>';
     var ta = document.getElementById('sp-in');
     ta.onkeydown = function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); spSend(); } };
-    ta.oninput = function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; };
+    ta.oninput = function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; spTypingPing(); };
     await spLoadNew(true);
 }
 function spBack() {
@@ -11423,19 +11549,25 @@ async function spLoadNew(first) {
     try {
         var d = await spApi('/api/support/tickets/' + c.id + '?after=' + c.n);
         if (SP.cur !== c) return;
-        c.t = d.ticket; c.role = d.role;
+        c.t = d.ticket; c.role = d.role; c.canInspect = !!d.canInspect;
+        var skNew = (d.shared || []).join(','), skChanged = (c.sharedKey !== skNew);
+        c.sharedKey = skNew; c.shared = d.shared || [];
         var box = document.getElementById('sp-msgs');
         if (!box) return;
         var near = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
         var tp = document.getElementById('sp-typing'); if (tp) tp.remove();
+        var pp = document.getElementById('sp-peers'); if (pp) pp.remove();
         d.msgs.forEach(function (m) {
+            if (c.peers) Object.keys(c.peers).forEach(function (k) { var q = c.peers[k]; if ((m.sender === 'user' && q.kind === 'owner') || (m.sender === 'admin' && q.kind !== 'owner' && q.name === m.name)) delete c.peers[k]; });
             box.insertAdjacentHTML('beforeend', spMsgHtml(m));
             if (m.sender === 'ai') { c.typing = false; c.suggest = !!m.suggest; }
             if (m.sender === 'user') c.suggest = false;
         });
         c.n = d.n;
         spShowTyping();
+        spShowPeers();
         spPaintState();
+        if (skChanged) spLoadInfo();
         if (first || near || d.msgs.some(function (m) { return m.sender === (c.mode === 'admin' ? 'admin' : 'user'); })) box.scrollTop = box.scrollHeight;
         if (d.msgs.length) spBadges();
     } catch (e) {
@@ -11493,6 +11625,8 @@ function spPaintState() {
     if (editBtn) editBtn.style.display = (adm && isSen && !t.guest) ? 'inline' : 'none';
     var delBtn = document.getElementById('sp-del');
     if (delBtn) delBtn.style.display = (closed && adm && ME && ME.isSeniorAdmin) ? 'inline' : 'none';
+    var ib = document.getElementById('sp-inspect');
+    if (ib) ib.style.display = (adm && c.canInspect && !t.guest && !closed) ? 'inline' : 'none';
     var nb = document.getElementById('sp-notify');
     if (nb) nb.style.display = (adm && !t.guest && !closed) ? 'inline' : 'none';
     var hb = document.getElementById('sp-human');
@@ -11537,6 +11671,89 @@ async function spDeleteTicket() {
     if (!(await confirmModal('تبي تحذف هذا التكت نهائياً؟ ما يرجع بعد الحذف.'))) return;
     try { await spApi('/api/support/admin/tickets/' + c.id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spBack(); }
     catch (e) { toast(e.message); }
+}
+var SP_INFO_LBL = { account: 'معلومات الحساب', attendance: 'عدد الانصراف', file: 'معلومات الملف العسكري', receipt: 'آخر استلام' };
+function spFmtDate(v) {
+    try { return new Date(v).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; }
+}
+async function spLoadInfo() {
+    var c = SP.cur; if (!c) return;
+    var box = document.getElementById('sp-info'); if (!box) return;
+    if (!c.shared || !c.shared.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    box.style.display = 'block';
+    if (!box.innerHTML) box.innerHTML = '<div style="font-size:12px;color:var(--muted);">جارِ التحميل...</div>';
+    try {
+        var d = await spApi('/api/support/tickets/' + c.id + '/info');
+        if (SP.cur !== c) return;
+        box = document.getElementById('sp-info'); if (!box) return;
+        var adm = c.mode === 'admin';
+        box.innerHTML = '<div class="sp-info-h"><b>🔎 ' + (adm ? 'المعلومات المعروضة للعضو' : 'معلومات من الإدارة') + '</b><button class="sp-link" style="font-size:12px;" onclick="spLoadInfo()">🔄 تحديث</button></div>' +
+            d.items.map(function (it) {
+                return '<div class="sp-info-c"><div class="sp-info-t">' + spEsc(it.title) + '</div>' + it.rows.map(function (r) {
+                    return '<div class="sp-info-r"><span>' + spEsc(r.l) + '</span><b>' + spEsc(r.d ? spFmtDate(r.v) : r.v) + '</b></div>';
+                }).join('') + '</div>';
+            }).join('');
+    } catch (e) {
+        box = document.getElementById('sp-info');
+        if (box) box.innerHTML = '<div style="color:#fca5a5;font-size:12px;">' + spEsc(e.message) + '</div>';
+    }
+}
+function spInspect() {
+    var c = SP.cur; if (!c) return;
+    var cur = c.shared || [];
+    var box = document.getElementById('wf-box');
+    box.innerHTML = '<h3>🔍 فحص العضو</h3>' +
+        '<p style="font-size:12px;color:var(--muted);margin:0 0 8px;">اختر وش تبي يظهر للعضو داخل التكت. تقدر تختار أكثر من خيار وتشيل أي واحد بأي وقت. ما يشوفها إلا العضو والإداري المستلم وكبار المسؤولين.</p>' +
+        Object.keys(SP_INFO_LBL).map(function (k) {
+            return '<label style="display:flex;align-items:center;gap:8px;padding:8px 0;font-size:14px;cursor:pointer;"><input type="checkbox" class="sp-inspect-ck" value="' + k + '"' + (cur.indexOf(k) >= 0 ? ' checked' : '') + ' style="width:auto;margin:0;">' + SP_INFO_LBL[k] + '</label>';
+        }).join('') +
+        '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button><button class="btn danger sm" onclick="spInspectSave(true)">إخفاء الكل</button><button class="btn sm" onclick="spInspectSave(false)">حفظ</button></div>';
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function spInspectSave(clear) {
+    var c = SP.cur; if (!c) return;
+    var keys = clear ? [] : Array.prototype.map.call(document.querySelectorAll('.sp-inspect-ck:checked'), function (x) { return x.value; });
+    try {
+        await spApi('/api/support/admin/tickets/' + c.id + '/share', { method: 'POST', body: JSON.stringify({ keys: keys }) });
+        toast(keys.length ? '✅ انعرضت المعلومات للعضو' : '🙈 انخفت المعلومات عن العضو');
+        closeWarnForm();
+        await spLoadNew();
+    } catch (e) { toast(e.message); }
+}
+function spTypingPing() {
+    var c = SP.cur; if (!c) return;
+    var ta = document.getElementById('sp-in'); if (!ta || !ta.value.trim()) return;
+    if (c.t && (c.t.status === 'closed' || (c.t.status === 'ai' && c.mode === 'user'))) return;
+    var now = Date.now();
+    if (now - (c.pingAt || 0) < 2500) return;
+    c.pingAt = now;
+    spApi('/api/support/tickets/' + c.id + '/typing', { method: 'POST', body: '{}' }).catch(function () {});
+}
+function spPeerTyping(d) {
+    var c = SP.cur; if (!c || c.id !== d.id) return;
+    if (!c.peers) c.peers = {};
+    c.peers[d.kind + '|' + d.name] = { name: d.name, tag: d.tag, kind: d.kind, t: Date.now() };
+    spShowPeers();
+    if (!c.peerT) c.peerT = setInterval(function () {
+        if (SP.cur !== c) { clearInterval(c.peerT); c.peerT = null; return; }
+        var now = Date.now(), any = false;
+        Object.keys(c.peers).forEach(function (k) { if (now - c.peers[k].t > 4500) delete c.peers[k]; else any = true; });
+        spShowPeers();
+        if (!any) { clearInterval(c.peerT); c.peerT = null; }
+    }, 1000);
+}
+function spShowPeers() {
+    var c = SP.cur, box = document.getElementById('sp-msgs'); if (!c || !box) return;
+    var old = document.getElementById('sp-peers');
+    var keys = Object.keys(c.peers || {});
+    if (!keys.length) { if (old) old.remove(); return; }
+    var near = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
+    var html = keys.map(function (k) {
+        var p = c.peers[k], cls = p.kind === 'senior' ? 'senior' : p.kind === 'admin' ? 'admin' : 'member';
+        return '<div class="sp-peer"><span class="sp-peer-n">' + spEsc(p.name) + '</span><span class="sp-role ' + cls + '">' + spEsc(p.tag) + '</span><span>يكتب</span><span class="sp-dots"><span></span><span></span><span></span></span></div>';
+    }).join('');
+    if (old) old.innerHTML = html; else box.insertAdjacentHTML('beforeend', '<div id="sp-peers" class="sp-peers">' + html + '</div>');
+    if (near) box.scrollTop = box.scrollHeight;
 }
 async function spEditPerson() {
     var c = SP.cur; if (!c) return;
