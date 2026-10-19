@@ -571,6 +571,8 @@ const LeaveRequestSchema = new mongoose.Schema({
     endDate: { type: Date, default: null },
     endedAt: { type: Date, default: null },
     endedByTag: { type: String, default: null },
+    usedDays: { type: Number, default: null },
+    deductMode: { type: String, default: null },
     channelId: { type: String, default: null },
     messageId: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
@@ -755,19 +757,54 @@ async function checkAgingNotesForSector(sectorKey, sectorLabel, settings) {
     }
 }
 
+const LEAVE_DAY_MS = 24 * 60 * 60 * 1000;
+// عدد الأيام الفعلية اللي قضاها في الإجازة (اليوم الجزئي يُحسب يوم كامل، والحد الأدنى يوم، والأعلى مدة الإجازة)
+function leaveUsedDays(leave, endAt) {
+    const start = leave.startDate ? new Date(leave.startDate).getTime() : new Date(endAt).getTime();
+    const elapsed = Math.max(0, new Date(endAt).getTime() - start);
+    return Math.min(leave.days, Math.max(1, Math.ceil(elapsed / LEAVE_DAY_MS)));
+}
+// إنهاء إجازة نشطة وخصم الأيام المستخدمة فقط من الرصيد
+async function finalizeLeave(leave, endedByTag, endAt) {
+    const now = endAt || new Date();
+    const used = leaveUsedDays(leave, now);
+    const r = await LeaveRequest.findOneAndUpdate(
+        { _id: leave._id, status: "approved" },
+        { $set: { status: "completed", endedAt: now, endedByTag, usedDays: used } },
+        { new: true }
+    );
+    if (!r) return null;
+    const p = await Personnel.findOne({ discord: r.discord });
+    if (p) {
+        const balance = p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE;
+        // الإجازات القديمة انخصمت كاملة وقت القبول => نرجّع الأيام اللي ما استخدمها
+        const delta = r.deductMode === "days" ? -used : (r.days - used);
+        await Personnel.updateOne({ discord: r.discord }, { $set: { leaveBalance: Math.max(0, balance + delta) } });
+    }
+    await logEvent({
+        action: "إنهاء إجازة", discordId: r.discord, discordTag: r.discordTag,
+        actorId: "system", actorTag: "النظام", details: `${endedByTag} — استخدم ${used} من ${r.days} يوم`,
+    });
+    await refreshLeaveMessage(r);
+    return r;
+}
+// انتهت مدتها => تنتهي تلقائياً وتُخصم كاملة (دخول الموقع ما يلغيها)
 async function autoEndActiveLeave(discordId) {
     const leave = await LeaveRequest.findOne({ discord: discordId, status: "approved" });
+    if (!leave || !leave.endDate || leave.endDate > new Date()) return;
+    await finalizeLeave(leave, "تلقائي (انتهت المدة)", leave.endDate);
+}
+async function sweepExpiredLeaves() {
+    const list = await LeaveRequest.find({ status: "approved", endDate: { $lte: new Date() } }).limit(200);
+    for (const l of list) { try { await finalizeLeave(l, "تلقائي (انتهت المدة)", l.endDate); } catch (e) { console.error("❌ فشل إنهاء إجازة منتهية:", e.message); } }
+}
+setInterval(() => { sweepExpiredLeaves().catch(() => {}); }, 5 * 60 * 1000);
+setTimeout(() => { sweepExpiredLeaves().catch(() => {}); }, 20000);
+// تسجيل حضور أثناء الإجازة => تنتهي الإجازة ويُخصم من الرصيد الأيام اللي قضاها فقط
+async function endLeaveOnAttendance(uid) {
+    const leave = await LeaveRequest.findOne({ discord: uid, status: "approved" });
     if (!leave) return;
-    const now = new Date();
-    const expired = leave.endDate && leave.endDate <= now;
-    leave.status = "completed";
-    leave.endedAt = now;
-    leave.endedByTag = expired ? "تلقائي (انتهت المدة)" : "تلقائي (دخول للموقع أثناء الإجازة)";
-    await leave.save();
-    await logEvent({
-        action: "إنهاء إجازة تلقائي", discordId: leave.discord, discordTag: leave.discordTag,
-        actorId: "system", actorTag: "النظام", details: leave.endedByTag,
-    });
+    await finalizeLeave(leave, "تلقائي (سجّل حضور أثناء الإجازة)");
 }
 
 function getSectorRole(userId, settings) {
@@ -3194,12 +3231,12 @@ async function decideLeaveRequest(id, userId, userTag, decision, member) {
         if (leave.days > balance) return { error: "رصيد الفرد الحالي ما يكفي لهذا الطلب" };
         const r = await LeaveRequest.findOneAndUpdate(
             { _id: id, status: "pending" },
-            { $set: { status: "approved", reviewedBy: userId, reviewedByTag: tag, reviewedAt: now, startDate: now, endDate: new Date(now.getTime() + leave.days * 24 * 60 * 60 * 1000) } },
+            { $set: { status: "approved", deductMode: "days", reviewedBy: userId, reviewedByTag: tag, reviewedAt: now, startDate: now, endDate: new Date(now.getTime() + leave.days * 24 * 60 * 60 * 1000) } },
             { new: true }
         );
         if (!r) return { error: "هذا الطلب تمت مراجعته مسبقاً" };
-        await Personnel.updateOne({ discord: leave.discord }, { $set: { leaveBalance: balance - leave.days } });
-        await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: userId, actorTag: userTag, details: `${leave.days} يوم (بواسطة ${approverLabel} من الديسكورد) — الرصيد المتبقي: ${balance - leave.days}` });
+        const wasOut = await attForceOut(leave.discord, "system:leave").catch(() => false);
+        await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: userId, actorTag: userTag, details: `${leave.days} يوم (بواسطة ${approverLabel} من الديسكورد) — الخصم يتم عند انتهاء الإجازة بالأيام الفعلية${wasOut ? " — انسجّل انصرافه تلقائياً" : ""}` });
         await refreshLeaveMessage(r);
         return { ok: true };
     } catch (e) {
@@ -3260,7 +3297,7 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
     const poInfo = getPersonnelOfficerSector(req.user.id, settings);
     if (!leaderInfo && !poInfo && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "ليست لديك صلاحية" });
 
-    let query = { status: { $in: ["pending", "approved"] } };
+    let query = { status: { $in: ["pending", "approved", "rejected", "completed"] } };
     if (isSeniorAdmin(req.user.id) && !leaderInfo && !poInfo) {
         const q = (req.query.sector || "").trim();
         if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
@@ -3279,7 +3316,7 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
 });
 
 app.get("/api/senior/leave/pending", ensureSeniorAdmin, async (req, res) => {
-    const list = await LeaveRequest.find({ status: { $in: ["pending", "approved"] } }).sort({ createdAt: -1 }).limit(200).lean();
+    const list = await LeaveRequest.find({ status: { $in: ["pending", "approved", "rejected", "completed"] } }).sort({ createdAt: -1 }).limit(200).lean();
     res.json({ list });
 });
 
@@ -3305,10 +3342,9 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
     if (!p) return res.status(404).json({ error: "الفرد غير موجود" });
     const balance = p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE;
     if (leave.days > balance) return res.status(400).json({ error: "رصيد الفرد الحالي ما يكفي لهذا الطلب" });
-    p.leaveBalance = balance - leave.days;
-    await p.save();
 
     leave.status = "approved";
+    leave.deductMode = "days";
     leave.reviewedBy = req.user.id;
     leave.reviewedByTag = req.user.username + ` (${approverLabel})`;
     leave.reviewedAt = new Date();
@@ -3316,7 +3352,8 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
     leave.endDate = new Date(Date.now() + leave.days * 24 * 60 * 60 * 1000);
     await leave.save();
 
-    await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${leave.days} يوم (بواسطة ${approverLabel}) — الرصيد المتبقي: ${p.leaveBalance}` });
+    const wasOut = await attForceOut(leave.discord, "system:leave").catch(() => false);
+    await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${leave.days} يوم (بواسطة ${approverLabel}) — الخصم يتم عند انتهاء الإجازة بالأيام الفعلية${wasOut ? " — انسجّل انصرافه تلقائياً" : ""}` });
     await refreshLeaveMessage(leave);
     res.json({ ok: true, leave });
 });
@@ -3334,13 +3371,38 @@ app.post("/api/leave/:id/end", ensureAuth, async (req, res) => {
     else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
     else return res.status(403).json({ error: "ليست لديك صلاحية إنهاء هذه الإجازة" });
 
-    leave.status = "completed";
-    leave.endedAt = new Date();
-    leave.endedByTag = req.user.username + ` (${approverLabel})`;
-    await leave.save();
-    await logEvent({ action: "إنهاء إجازة", discordId: leave.discord, discordTag: leave.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `بواسطة ${approverLabel}` });
-    await refreshLeaveMessage(leave);
-    res.json({ ok: true });
+    const done = await finalizeLeave(leave, req.user.username + ` (${approverLabel})`);
+    if (!done) return res.status(404).json({ error: "غير موجودة أو مو نشطة" });
+    res.json({ ok: true, usedDays: done.usedDays });
+});
+
+app.delete("/api/leave/:id", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    const leave = await LeaveRequest.findById(req.params.id);
+    if (!leave) return res.status(404).json({ error: "غير موجود" });
+    if (leave.status !== "rejected" && leave.status !== "completed") return res.status(400).json({ error: "تقدر تحذف المرفوضة والمنتهية فقط" });
+
+    const leaderInfo = getSectorRole(req.user.id, settings);
+    const poInfo = getPersonnelOfficerSector(req.user.id, settings);
+    let approverLabel = null;
+    if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
+    else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
+    else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
+    else return res.status(403).json({ error: "ليست لديك صلاحية" });
+
+    // الرصيد يرجع: المرفوضة ما انخصم منها شي، والمنتهية يرجع اللي انخصم منها
+    const refund = leave.status === "completed" ? (leave.usedDays ?? leave.days) : 0;
+    const del = await LeaveRequest.findOneAndDelete({ _id: leave._id, status: leave.status });
+    if (!del) return res.status(404).json({ error: "غير موجود" });
+    if (refund > 0) {
+        const p = await Personnel.findOne({ discord: leave.discord });
+        if (p) await Personnel.updateOne({ discord: leave.discord }, { $set: { leaveBalance: (p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE) + refund } });
+    }
+    await logEvent({ action: "حذف إجازة", discordId: leave.discord, discordTag: leave.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${leave.status === "rejected" ? "مرفوضة" : "منتهية"} — بواسطة ${approverLabel}${refund ? " — رجع للرصيد " + refund + " يوم" : ""}` });
+    if (leave.channelId && leave.messageId && botReady) {
+        try { const ch = await client.channels.fetch(leave.channelId); const m = await ch.messages.fetch(leave.messageId); await m.delete(); } catch (e) {}
+    }
+    res.json({ ok: true, refunded: refund });
 });
 
 app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
@@ -8187,6 +8249,7 @@ app.post("/api/attendance/scan", ensureAuth, async (req, res) => {
     if (next === "in") st.lastCheckInAt = now; else st.lastCheckOutAt = now;
     await st.save();
     await AttLog.create({ uid: req.user.id, name, type: next, at: now });
+    if (next === "in") await endLeaveOnAttendance(req.user.id).catch(e => console.error("❌ فشل إنهاء الإجازة عند الحضور:", e.message));
     if (next === "out") {
         // طلع => يطلع من أي تردد هو فيه
         for (const n of Array.from(offLive.keys())) {
@@ -8303,6 +8366,7 @@ app.post("/api/senior/att/members/:uid/force/:type", ensureSeniorAdmin, async (r
     if (type === "in") st.lastCheckInAt = now; else st.lastCheckOutAt = now;
     await st.save();
     await AttLog.create({ uid, name, type, at: now, by: req.user.id });
+    if (type === "in") await endLeaveOnAttendance(uid).catch(e => console.error("❌ فشل إنهاء الإجازة عند الحضور:", e.message));
     if (type === "out") {
         for (const n of Array.from(offLive.keys())) {
             if (offIsFreq(n) && offLive.get(n) && offLive.get(n).has(uid)) { offSendTo(uid, { t: "kicked", n }); offRemove(uid, n); }
@@ -9378,6 +9442,7 @@ app.get("/", (req, res) => {
     .badge.pending { background: rgba(234,179,8,0.15); color: #fbbf24; border: 1px solid #eab308; }
     .badge.approved { background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid #22c55e; }
     .badge.rejected { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid #ef4444; }
+    .badge.completed { background: rgba(148,163,184,0.15); color: #cbd5e1; border: 1px solid #64748b; }
     .stat { text-align: center; padding: 14px; background: rgba(255,255,255,0.03); border-radius: 10px; border: 1px solid var(--border); }
     .stat .num { font-size: 24px; font-weight: 900; color: var(--gold-soft); }
     .stat .lbl { font-size: 12px; color: var(--muted); }
@@ -12553,8 +12618,9 @@ async function loadMyLeave() {
                             <b>\${l.days} يوم</b>
                             <div style="color:var(--muted);font-size:13px;">\${l.reason}</div>
                         </div>
-                        <span class="badge \${l.status}">\${l.status === 'pending' ? 'قيد المراجعة' : l.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>
+                        <span class="badge \${l.status}">\${l.status === 'pending' ? 'قيد المراجعة' : l.status === 'approved' ? 'مقبولة (نشطة)' : l.status === 'completed' ? 'منتهية' : 'مرفوضة'}</span>
                     </div>
+                    \${l.status === 'completed' && l.usedDays != null ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">انخصم من رصيدك \${l.usedDays} يوم (من \${l.days})</div>\` : ''}
                     \${l.status === 'rejected' && l.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">سبب الرفض: \${l.rejectReason}</div>\` : ''}
                 </div>\`).join('');
     } catch (e) { toast(e.message); }
@@ -13757,24 +13823,43 @@ async function loadSeniorLeavePage() {
     if (currentAdminTab !== 'leave') return;
     box.innerHTML = renderLeaveRequestsList(list, true);
 }
+var leaveSubTab = 'requests';
+function setLeaveTab(t, senior) { leaveSubTab = t; senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
 function renderLeaveRequestsList(list, reload) {
-    if (!list.length) return '<div class="card center" style="color:var(--muted);">لا توجد طلبات إجازة</div>';
-    return list.map(l => {
-        const isActive = l.status === 'approved';
-        let actions = \`
+    const reqs = list.filter(l => l.status === 'pending');
+    const done = list.filter(l => l.status !== 'pending');
+    const tabs = \`<div class="row" style="gap:8px;margin-bottom:10px;">
+        <button class="btn sm \${leaveSubTab === 'requests' ? '' : 'gray'}" onclick="setLeaveTab('requests', \${reload})">📥 الطلبات (\${reqs.length})</button>
+        <button class="btn sm \${leaveSubTab === 'done' ? '' : 'gray'}" onclick="setLeaveTab('done', \${reload})">✅ المقبولة والمرفوضة (\${done.length})</button>
+    </div>\`;
+    const shown = leaveSubTab === 'done' ? done : reqs;
+    if (!shown.length) return tabs + '<div class="card center" style="color:var(--muted);">' + (leaveSubTab === 'done' ? 'لا توجد إجازات مقبولة أو مرفوضة' : 'لا توجد طلبات جديدة') + '</div>';
+    return tabs + shown.map(l => {
+        let actions = '', extra = '', badge = '';
+        if (l.status === 'pending') {
+            actions = \`
             <button class="btn sm" onclick="approveLeave('\${l._id}', \${reload})">قبول</button>
             <button class="btn danger sm" onclick="rejectLeave('\${l._id}', \${reload})">رفض</button>\`;
-        let extra = '';
-        if (isActive) {
+        } else if (l.status === 'approved') {
             const daysLeft = l.endDate ? Math.max(0, Math.ceil((new Date(l.endDate) - Date.now()) / 86400000)) : '-';
-            extra = \`<div style="color:#4ade80;margin-top:4px;">⏳ نشطة — متبقي \${daysLeft} يوم</div>\`;
+            const spent = l.startDate ? Math.min(l.days, Math.max(1, Math.ceil((Date.now() - new Date(l.startDate)) / 86400000))) : '-';
+            badge = '<span class="badge approved">مقبولة</span>';
+            extra = \`<div style="color:#4ade80;margin-top:4px;">⏳ نشطة — متبقي \${daysLeft} يوم (مضى \${spent})</div>\`;
             actions = \`<button class="btn danger sm" onclick="endLeave('\${l._id}', \${reload})">🏁 إنهاء الإجازة</button>\`;
+        } else if (l.status === 'completed') {
+            badge = '<span class="badge completed">منتهية</span>';
+            extra = \`<div style="color:var(--muted);margin-top:4px;font-size:12px;">انخصم \${l.usedDays != null ? l.usedDays : l.days} يوم\${l.endedByTag ? ' • ' + l.endedByTag : ''}</div>\`;
+            actions = \`<button class="btn danger sm" onclick="deleteLeave('\${l._id}', \${reload})">🗑️ حذف</button>\`;
+        } else if (l.status === 'rejected') {
+            badge = '<span class="badge rejected">مرفوضة</span>';
+            extra = l.rejectReason ? \`<div style="color:var(--muted);margin-top:4px;font-size:12px;">سبب الرفض: \${l.rejectReason}</div>\` : '';
+            actions = \`<button class="btn danger sm" onclick="deleteLeave('\${l._id}', \${reload})">🗑️ حذف</button>\`;
         }
         return \`
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div>
-                    <b>\${l.name}</b> <span style="color:var(--muted);font-size:12px;">(\${l.unit || '-'} • \${l.rank || '-'} • \${l.sectorLabel || '-'})</span>
+                    <b>\${l.name}</b> \${badge} <span style="color:var(--muted);font-size:12px;">(\${l.unit || '-'} • \${l.rank || '-'} • \${l.sectorLabel || '-'})</span>
                     <div style="color:var(--gold-soft);margin-top:4px;">📅 \${l.days} يوم</div>
                     <div style="color:var(--muted);font-size:13px;">\${l.reason}</div>
                     \${extra}
@@ -13783,6 +13868,11 @@ function renderLeaveRequestsList(list, reload) {
             </div>
         </div>\`;
     }).join('');
+}
+async function deleteLeave(id, senior) {
+    if (!(await confirmModal('متأكد تبي تحذف هذي الإجازة؟ لو كان انخصم منها رصيد بيرجع للعضو.'))) return;
+    try { const r = await api('/api/leave/' + id, { method: 'DELETE' }); toast(r.refunded ? ('🗑️ تم الحذف ورجع ' + r.refunded + ' يوم للرصيد') : '🗑️ تم الحذف'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
+    catch (e) { toast(e.message); }
 }
 async function approveLeave(id, senior) {
     try { await api('/api/leave/' + id + '/approve', { method: 'POST' }); toast('✅ تمت الموافقة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
@@ -13794,8 +13884,8 @@ async function rejectLeave(id, senior) {
     catch (e) { toast(e.message); }
 }
 async function endLeave(id, senior) {
-    if (!(await confirmModal('متأكد تبي تنهي هذي الإجازة الآن؟'))) return;
-    try { await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
+    if (!(await confirmModal('متأكد تبي تنهي هذي الإجازة الآن؟ بينخصم من الرصيد الأيام اللي مضت فقط.'))) return;
+    try { const r = await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة' + (r && r.usedDays ? ' — انخصم ' + r.usedDays + ' يوم' : '')); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
     catch (e) { toast(e.message); }
 }
 
