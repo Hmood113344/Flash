@@ -5474,66 +5474,104 @@ app.post("/api/support/tickets/:id/close", async (req, res) => {
     supportEvent(t, "system", { kind: "close" });
 });
 
-// ---------- فحص العضو داخل التكت (عرض معلومات للعضو) ----------
-const SUPPORT_INFO_LABELS = { account: "معلومات الحساب", attendance: "عدد الانصراف", file: "معلومات الملف العسكري", receipt: "آخر استلام" };
-const SUPPORT_INFO_KEYS = Object.keys(SUPPORT_INFO_LABELS);
+// ---------- فحص العضو داخل التكت (الإداري يختار كل خانة تظهر للعضو) ----------
+const SUPPORT_CATS = {
+    account: { title: "معلومات الحساب", keys: ["account.name", "account.email", "account.password", "account.age", "account.nationality", "account.status", "account.sector", "account.created"] },
+    attendance: { title: "عدد الانصراف", keys: ["attn.outs", "attn.ins", "attn.status", "attn.lastIn", "attn.lastOut"] },
+    file: { title: "معلومات الملف العسكري", keys: ["file.name", "file.unit", "file.rank", "file.points", "file.sector", "file.card", "file.leave", "file.warns", "file.blocked"] },
+    receipt: { title: "آخر استلام", keys: ["rec.date", "rec.result", "rec.attended", "rec.absent", "rec.leave"] },
+    log: { title: "لوق العضو", keys: [] },
+};
+const SUPPORT_FIXED_KEYS = [].concat(...Object.values(SUPPORT_CATS).map(c => c.keys));
+const SUPPORT_DYN_KEY = /^(log|att):[a-f0-9]{24}$/;
 function supportCanInspect(t, uid) {
     return !!uid && (isSeniorAdmin(uid) || (t.status === "active" && t.adminUid === uid));
 }
-async function supportBuildInfo(t) {
-    const uid = t.uid;
-    const keys = (t.shared || []).filter(k => SUPPORT_INFO_KEYS.includes(k));
-    const items = [];
-    const D = (l, v) => ({ l, v: v ? new Date(v).toISOString() : "—", d: !!v });
-    const R = (l, v) => ({ l, v: v == null || v === "" ? "—" : String(v) });
-    const yn = b => b ? "نعم" : "لا";
-    for (const k of SUPPORT_INFO_ORDER(keys)) {
-        const rows = [];
-        if (k === "account") {
-            const a = await Account.findOne({ uid }).lean();
-            if (!a) rows.push(R("الحساب", "ما له حساب مسجّل"));
-            else {
-                rows.push(R("الاسم الكامل", a.fullName), R("الإيميل", a.email), R("العمر", a.age), R("الجنسية", a.nationality),
-                    R("حالة الحساب", a.status === "approved" ? "مقبول" : a.status === "rejected" ? "مرفوض" : "معلّق"),
-                    R("القطاع", CONFIG.SECTORS[a.sector] || "—"), D("تاريخ التسجيل", a.createdAt));
-            }
-        } else if (k === "attendance") {
-            const [st, outs] = await Promise.all([
-                AttStatus.findOne({ uid }).lean(),
-                AttLog.countDocuments({ uid, type: "out" }).maxTimeMS(10000),
-            ]);
-            rows.push(R("الحالة الحالية", st ? (st.status === "in" ? "حاضر" : "منصرف") : "ما سجّل بصمة"),
-                R("عدد مرات الانصراف", outs),
-                D("آخر تسجيل حضور", st && st.lastCheckInAt), D("آخر تسجيل انصراف", st && st.lastCheckOutAt));
-        } else if (k === "file") {
-            const [p, a] = await Promise.all([Personnel.findOne({ discord: uid }).lean(), Account.findOne({ uid }, { sector: 1 }).lean()]);
-            if (!p) rows.push(R("الملف العسكري", "ما عنده ملف عسكري"));
-            else {
-                const sec = p.sector || (a && a.sector) || null;
-                rows.push(R("الاسم المسجّل", p.registeredName), R("اليونت", p.unit), R("الرتبة", p.rank), R("النقاط", p.points),
-                    R("القطاع", CONFIG.SECTORS[sec] || "—"), R("رقم البطاقة", p.cardNumber), R("رصيد الإجازات", p.leaveBalance),
-                    R("عدد التحذيرات", (p.warnings || []).length), R("موقوف (بند)", yn(p.isBlocked)));
-            }
-        } else if (k === "receipt") {
-            const [last, grp] = await Promise.all([
-                RecRow.findOne({ uid }).sort({ openedAt: -1, dayKey: -1 }).lean(),
-                RecRow.aggregate([{ $match: { uid } }, { $group: { _id: "$kind", n: { $sum: 1 } } }]).option({ maxTimeMS: 10000 }),
-            ]);
-            if (!last) rows.push(R("الاستلام", "ما له أي استلام"));
-            else {
-                const ex = last.excuseStatus === "accepted" || last.removedAt ? " (انشال الغياب)" : last.excuseStatus === "pending" ? " (عذر معلّق)" : last.excuseStatus === "rejected" ? " (عذر مرفوض)" : "";
-                const res_ = last.kind === "attended" ? "حضر (+" + (last.gained || 1) + ")" : last.kind === "leave" ? "إجازة" : "غاب" + (last.deducted ? " (-" + last.deducted + ")" : "") + ex;
-                const cnt = kind => (grp.find(g => g._id === kind) || {}).n || 0;
-                rows.push(D("تاريخ آخر استلام", last.openedAt || last.dayKey), R("النتيجة", res_),
-                    R("إجمالي الحضور", cnt("attended")), R("إجمالي الغياب", cnt("absent")), R("إجمالي الإجازة", cnt("leave")));
-            }
-        }
-        items.push({ key: k, title: SUPPORT_INFO_LABELS[k], rows });
-    }
-    return items;
+// كلمة المرور تنعرض لكبار المسؤولين فقط (نفس قاعدة صفحة الحسابات)
+function supportPwAllowed(staffUid, acc) {
+    return isSeniorAdmin(staffUid) && !(acc && acc.isSenior && acc.uid !== staffUid && !ownerUids.has(staffUid));
 }
-function SUPPORT_INFO_ORDER(keys) { return SUPPORT_INFO_KEYS.filter(k => keys.includes(k)); }
+async function supportCatRows(cat, uid, opts) {
+    const only = opts.only || null, staffUid = opts.staffUid || null;
+    if (only) {
+        const has = cat === "log" ? Array.from(only).some(k => SUPPORT_DYN_KEY.test(k)) : SUPPORT_CATS[cat].keys.some(k => only.has(k));
+        if (!has) return [];
+    }
+    const R = (k, l, v) => ({ k, l, v: v == null || v === "" ? "—" : String(v) });
+    const D = (k, l, v) => ({ k, l, v: v ? new Date(v).toISOString() : "—", d: !!v });
+    const yn = b => b ? "نعم" : "لا";
+    let rows = [];
+    if (cat === "account") {
+        const a = await Account.findOne({ uid }).lean();
+        if (!a) return [R("account.name", "الحساب", "ما له حساب مسجّل")].filter(r => !only || only.has(r.k));
+        rows.push(R("account.name", "الاسم الكامل", a.fullName), R("account.email", "الإيميل", a.email));
+        if (!staffUid || supportPwAllowed(staffUid, a)) rows.push(R("account.password", "كلمة المرور", decryptText(a.passwordEnc)));
+        rows.push(R("account.age", "العمر", a.age), R("account.nationality", "الجنسية", a.nationality),
+            R("account.status", "حالة الحساب", a.status === "approved" ? "مقبول" : a.status === "rejected" ? "مرفوض" : "معلّق"),
+            R("account.sector", "القطاع", CONFIG.SECTORS[a.sector] || "—"), D("account.created", "تاريخ التسجيل", a.createdAt));
+    } else if (cat === "attendance") {
+        const [st, outs, ins] = await Promise.all([
+            AttStatus.findOne({ uid }).lean(),
+            AttLog.countDocuments({ uid, type: "out" }).maxTimeMS(10000),
+            AttLog.countDocuments({ uid, type: "in" }).maxTimeMS(10000),
+        ]);
+        rows.push(R("attn.outs", "عدد مرات الانصراف", outs), R("attn.ins", "عدد مرات الحضور", ins),
+            R("attn.status", "الحالة الحالية", st ? (st.status === "in" ? "حاضر" : "منصرف") : "ما سجّل بصمة"),
+            D("attn.lastIn", "آخر تسجيل حضور", st && st.lastCheckInAt), D("attn.lastOut", "آخر تسجيل انصراف", st && st.lastCheckOutAt));
+    } else if (cat === "file") {
+        const [p, a] = await Promise.all([Personnel.findOne({ discord: uid }).lean(), Account.findOne({ uid }, { sector: 1 }).lean()]);
+        if (!p) return [R("file.name", "الملف العسكري", "ما عنده ملف عسكري")].filter(r => !only || only.has(r.k));
+        const sec = p.sector || (a && a.sector) || null;
+        rows.push(R("file.name", "الاسم المسجّل", p.registeredName), R("file.unit", "اليونت", p.unit), R("file.rank", "الرتبة", p.rank),
+            R("file.points", "النقاط", p.points), R("file.sector", "القطاع", CONFIG.SECTORS[sec] || "—"), R("file.card", "رقم البطاقة", p.cardNumber),
+            R("file.leave", "رصيد الإجازات", p.leaveBalance), R("file.warns", "عدد التحذيرات", (p.warnings || []).length), R("file.blocked", "موقوف (بند)", yn(p.isBlocked)));
+    } else if (cat === "receipt") {
+        const [last, grp] = await Promise.all([
+            RecRow.findOne({ uid }).sort({ openedAt: -1, dayKey: -1 }).lean(),
+            RecRow.aggregate([{ $match: { uid } }, { $group: { _id: "$kind", n: { $sum: 1 } } }]).option({ maxTimeMS: 10000 }),
+        ]);
+        if (!last) return [R("rec.date", "الاستلام", "ما له أي استلام")].filter(r => !only || only.has(r.k));
+        const ex = last.excuseStatus === "accepted" || last.removedAt ? " (انشال الغياب)" : last.excuseStatus === "pending" ? " (عذر معلّق)" : last.excuseStatus === "rejected" ? " (عذر مرفوض)" : "";
+        const result = last.kind === "attended" ? "حضر (+" + (last.gained || 1) + ")" : last.kind === "leave" ? "إجازة" : "غاب" + (last.deducted ? " (-" + last.deducted + ")" : "") + ex;
+        const cnt = kind => (grp.find(g => g._id === kind) || {}).n || 0;
+        rows.push(D("rec.date", "تاريخ آخر استلام", last.openedAt || last.dayKey), R("rec.result", "النتيجة", result),
+            R("rec.attended", "إجمالي الحضور", cnt("attended")), R("rec.absent", "إجمالي الغياب", cnt("absent")), R("rec.leave", "إجمالي الإجازة", cnt("leave")));
+    } else if (cat === "log") {
+        const ids = only ? Array.from(only).filter(k => SUPPORT_DYN_KEY.test(k)) : null;
+        const logIds = ids ? ids.filter(k => k.startsWith("log:")).map(k => k.slice(4)) : null;
+        const attIds = ids ? ids.filter(k => k.startsWith("att:")).map(k => k.slice(4)) : null;
+        const own = { $or: [{ actorId: uid }, { discordId: uid }] };
+        const [logs, atts] = await Promise.all([
+            Log.find(ids ? { $and: [own, { _id: { $in: logIds } }] } : own).sort({ createdAt: -1 }).limit(ids ? 400 : 100).lean(),
+            AttLog.find(ids ? { uid, _id: { $in: attIds } } : { uid }).sort({ at: -1 }).limit(ids ? 400 : 60).lean(),
+        ]);
+        logs.forEach(l => {
+            const other = l.actorId && l.actorId !== uid;
+            const who = other ? (ownerUids.has(l.actorId) ? "كبار المسؤولين" : (l.actorTag || "")) : "";
+            rows.push({ k: "log:" + l._id, l: l.action || "عملية", v: ((l.details || "") + (who ? " — بواسطة " + who : "")).slice(0, 300), at: new Date(l.createdAt).toISOString() });
+        });
+        atts.forEach(l => rows.push({ k: "att:" + l._id, l: l.type === "in" ? "بصمة حضور" : "بصمة انصراف", v: l.by && l.by !== uid ? "يدوي من إداري" : "", at: new Date(l.at).toISOString() }));
+        rows.sort((a, b) => (a.at < b.at ? 1 : -1));
+        return rows.slice(0, ids ? 800 : 120);
+    }
+    return rows.filter(r => !only || only.has(r.k));
+}
 
+// الإداري المستلم / كبار المسؤولين: قائمة خانات قسم معيّن (مع حالة الظهور للعضو)
+app.get("/api/support/admin/tickets/:id/inspect/:cat", async (req, res) => {
+    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
+    const cat = req.params.cat;
+    if (!SUPPORT_CATS[cat]) return res.status(400).json({ error: "قسم غير معروف" });
+    const x = await supportLoad(req, res); if (!x) return;
+    const { t } = x;
+    if (!supportCanInspect(t, req.user.id)) return res.status(403).json({ error: "الفحص للإداري المستلم وكبار المسؤولين فقط" });
+    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له حساب بالموقع" });
+    const rows = await supportCatRows(cat, t.uid, { staffUid: req.user.id });
+    const sh = new Set(t.shared || []);
+    res.json({ cat, title: SUPPORT_CATS[cat].title, rows: rows.map(r => Object.assign(r, { shown: sh.has(r.k) })) });
+});
+
+// اللي ظاهر للعضو حالياً (يشوفه العضو + الإداري المستلم + كبار المسؤولين فقط)
 app.get("/api/support/tickets/:id/info", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const { t, role, uid } = x;
@@ -5541,9 +5579,16 @@ app.get("/api/support/tickets/:id/info", async (req, res) => {
         if (!uid || uid !== t.uid) return res.status(403).json({ error: "سجّل دخولك بحسابك عشان تشوف المعلومات" });
     } else if (!supportCanInspect(t, uid)) return res.status(403).json({ error: "هذي المعلومات للإداري المستلم وكبار المسؤولين فقط" });
     if (!t.uid || !(t.shared || []).length) return res.json({ items: [] });
-    res.json({ items: await supportBuildInfo(t) });
+    const only = new Set(t.shared);
+    const items = [];
+    for (const cat of Object.keys(SUPPORT_CATS)) {
+        const rows = await supportCatRows(cat, t.uid, { only });
+        if (rows.length) items.push({ cat, title: SUPPORT_CATS[cat].title, rows });
+    }
+    res.json({ items });
 });
 
+// إظهار / إخفاء خانات للعضو: body = { show: [keys], hide: [keys] }
 app.post("/api/support/admin/tickets/:id/share", async (req, res) => {
     if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
     const x = await supportLoad(req, res); if (!x) return;
@@ -5551,14 +5596,33 @@ app.post("/api/support/admin/tickets/:id/share", async (req, res) => {
     if (!supportCanInspect(t, req.user.id)) return res.status(403).json({ error: "الفحص للإداري المستلم وكبار المسؤولين فقط" });
     if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
     if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له حساب بالموقع" });
-    const raw = Array.isArray((req.body || {}).keys) ? req.body.keys.map(String) : [];
-    const keys = SUPPORT_INFO_ORDER(raw);
-    if ((t.shared || []).join(",") === keys.join(",")) return res.json({ ok: true, shared: keys });
-    t.shared = keys;
-    supportAddMsg(t, { sender: "system", name: "النظام", text: keys.length ? "🔎 " + req.user.username + " عرض لك: " + keys.map(k => SUPPORT_INFO_LABELS[k]).join("، ") : "🔎 تم إخفاء المعلومات المعروضة" });
-    t.unreadUser += 1;
+    const arr = v => Array.isArray(v) ? v.map(String).slice(0, 500) : [];
+    const show = arr((req.body || {}).show), hide = arr((req.body || {}).hide);
+    const fixed = new Set(SUPPORT_FIXED_KEYS);
+    const okShow = show.filter(k => fixed.has(k));
+    const dyn = show.filter(k => SUPPORT_DYN_KEY.test(k));
+    if (okShow.includes("account.password")) {
+        const a = await Account.findOne({ uid: t.uid }, { uid: 1, isSenior: 1 }).lean();
+        if (!supportPwAllowed(req.user.id, a)) return res.status(403).json({ error: "كلمة المرور تنعرض من كبار المسؤولين فقط" });
+    }
+    const logIds = Array.from(new Set(dyn.filter(k => k.startsWith("log:")).map(k => k.slice(4))));
+    const attIds = Array.from(new Set(dyn.filter(k => k.startsWith("att:")).map(k => k.slice(4))));
+    if (logIds.length && await Log.countDocuments({ _id: { $in: logIds }, $or: [{ actorId: t.uid }, { discordId: t.uid }] }) !== logIds.length) return res.status(400).json({ error: "سجل غير صالح" });
+    if (attIds.length && await AttLog.countDocuments({ _id: { $in: attIds }, uid: t.uid }) !== attIds.length) return res.status(400).json({ error: "سجل غير صالح" });
+    const before = (t.shared || []).slice();
+    const cur = new Set(before);
+    hide.forEach(k => cur.delete(k));
+    okShow.concat(dyn).forEach(k => cur.add(k));
+    if (cur.size > 400) return res.status(400).json({ error: "كثير، خفّ بعض اللي ظاهر أول" });
+    const next = Array.from(cur);
+    if (next.join(",") === before.join(",")) return res.json({ ok: true, shared: next });
+    t.shared = next;
+    if (!before.length && next.length) {
+        supportAddMsg(t, { sender: "system", name: "النظام", text: "🔎 " + req.user.username + " عرض لك معلومات، تلقاها بأعلى التكت" });
+        t.unreadUser += 1;
+    }
     await t.save();
-    res.json({ ok: true, shared: keys });
+    res.json({ ok: true, shared: next });
     supportEvent(t, "system", { kind: "share" });
 });
 
@@ -9588,6 +9652,9 @@ app.get("/", (req, res) => {
     .sp-info-t { font-size: 12px; color: var(--gold-soft); font-weight: bold; margin-bottom: 4px; }
     .sp-info-r { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 2px 0; }
     .sp-info-r b { font-weight: normal; text-align: left; word-break: break-word; }
+    .sp-ins-list { max-height: 46vh; overflow-y: auto; }
+    .sp-ins-r { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 0; border-top: 1px dashed var(--border); }
+    .sp-ins-r.on { background: rgba(34,197,94,0.07); }
     .sp-img { max-width: 220px; max-height: 220px; border-radius: 10px; margin-top: 6px; display: block; cursor: zoom-in; background: rgba(255,255,255,0.05); }
     .sp-dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px; border-radius: 50%; background: #a78bfa; animation: spDot 1s infinite; }
     .sp-dots span:nth-child(2) { animation-delay: 0.15s; } .sp-dots span:nth-child(3) { animation-delay: 0.3s; }
@@ -11672,9 +11739,16 @@ async function spDeleteTicket() {
     try { await spApi('/api/support/admin/tickets/' + c.id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spBack(); }
     catch (e) { toast(e.message); }
 }
-var SP_INFO_LBL = { account: 'معلومات الحساب', attendance: 'عدد الانصراف', file: 'معلومات الملف العسكري', receipt: 'آخر استلام' };
+var SP_INS_CATS = [['account', '🔐 معلومات الحساب'], ['attendance', '🕒 عدد الانصراف'], ['file', '🪖 معلومات الملف العسكري'], ['receipt', '📣 آخر استلام'], ['log', '📜 آخر لوق للعضو']];
 function spFmtDate(v) {
     try { return new Date(v).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; }
+}
+function spCatOf(k) {
+    return k.indexOf('account.') === 0 ? 'account' : k.indexOf('attn.') === 0 ? 'attendance' : k.indexOf('file.') === 0 ? 'file' : k.indexOf('rec.') === 0 ? 'receipt' : 'log';
+}
+function spInfoRowHtml(r) {
+    if (r.at) return '<div class="sp-info-r"><span>' + spEsc(r.l) + (r.v && r.v !== '—' ? ' <small style="color:var(--muted);">— ' + spEsc(r.v) + '</small>' : '') + '</span><b>' + spEsc(spFmtDate(r.at)) + '</b></div>';
+    return '<div class="sp-info-r"><span>' + spEsc(r.l) + '</span><b>' + spEsc(r.d ? spFmtDate(r.v) : r.v) + '</b></div>';
 }
 async function spLoadInfo() {
     var c = SP.cur; if (!c) return;
@@ -11687,11 +11761,9 @@ async function spLoadInfo() {
         if (SP.cur !== c) return;
         box = document.getElementById('sp-info'); if (!box) return;
         var adm = c.mode === 'admin';
-        box.innerHTML = '<div class="sp-info-h"><b>🔎 ' + (adm ? 'المعلومات المعروضة للعضو' : 'معلومات من الإدارة') + '</b><button class="sp-link" style="font-size:12px;" onclick="spLoadInfo()">🔄 تحديث</button></div>' +
+        box.innerHTML = '<div class="sp-info-h"><b>🔎 ' + (adm ? 'المعروض للعضو' : 'معلومات من الإدارة') + '</b><button class="sp-link" style="font-size:12px;" onclick="spLoadInfo()">🔄 تحديث</button></div>' +
             d.items.map(function (it) {
-                return '<div class="sp-info-c"><div class="sp-info-t">' + spEsc(it.title) + '</div>' + it.rows.map(function (r) {
-                    return '<div class="sp-info-r"><span>' + spEsc(r.l) + '</span><b>' + spEsc(r.d ? spFmtDate(r.v) : r.v) + '</b></div>';
-                }).join('') + '</div>';
+                return '<div class="sp-info-c"><div class="sp-info-t">' + spEsc(it.title) + '</div>' + it.rows.map(spInfoRowHtml).join('') + '</div>';
             }).join('');
     } catch (e) {
         box = document.getElementById('sp-info');
@@ -11700,25 +11772,72 @@ async function spLoadInfo() {
 }
 function spInspect() {
     var c = SP.cur; if (!c) return;
-    var cur = c.shared || [];
+    c.insp = null;
+    var cnt = {};
+    (c.shared || []).forEach(function (k) { var q = spCatOf(k); cnt[q] = (cnt[q] || 0) + 1; });
     var box = document.getElementById('wf-box');
     box.innerHTML = '<h3>🔍 فحص العضو</h3>' +
-        '<p style="font-size:12px;color:var(--muted);margin:0 0 8px;">اختر وش تبي يظهر للعضو داخل التكت. تقدر تختار أكثر من خيار وتشيل أي واحد بأي وقت. ما يشوفها إلا العضو والإداري المستلم وكبار المسؤولين.</p>' +
-        Object.keys(SP_INFO_LBL).map(function (k) {
-            return '<label style="display:flex;align-items:center;gap:8px;padding:8px 0;font-size:14px;cursor:pointer;"><input type="checkbox" class="sp-inspect-ck" value="' + k + '"' + (cur.indexOf(k) >= 0 ? ' checked' : '') + ' style="width:auto;margin:0;">' + SP_INFO_LBL[k] + '</label>';
+        '<p style="font-size:12px;color:var(--muted);margin:0 0 8px;">اختر القسم، وبعدها تضغط على الخانة اللي تبي تظهر للعضو. ما يشوفها إلا العضو والإداري المستلم وكبار المسؤولين.</p>' +
+        SP_INS_CATS.map(function (x) {
+            return '<button class="btn sm" style="width:100%;margin:4px 0;display:flex;justify-content:space-between;align-items:center;" data-c="' + x[0] + '" onclick="spInspectCat(this.dataset.c)"><span>' + x[1] + '</span>' + (cnt[x[0]] ? '<span style="color:#bbf7d0;">' + cnt[x[0]] + ' ظاهر</span>' : '') + '</button>';
         }).join('') +
-        '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button><button class="btn danger sm" onclick="spInspectSave(true)">إخفاء الكل</button><button class="btn sm" onclick="spInspectSave(false)">حفظ</button></div>';
+        '<div class="wf-actions"><button class="btn danger sm" onclick="spInspectHideAll()">🙈 إخفاء الكل عن العضو</button><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>';
     document.getElementById('wf-overlay').classList.add('open');
 }
-async function spInspectSave(clear) {
+async function spInspectCat(cat) {
     var c = SP.cur; if (!c) return;
-    var keys = clear ? [] : Array.prototype.map.call(document.querySelectorAll('.sp-inspect-ck:checked'), function (x) { return x.value; });
+    var box = document.getElementById('wf-box');
+    box.innerHTML = '<div style="padding:14px;color:var(--muted);">جارِ التحميل...</div>';
     try {
-        await spApi('/api/support/admin/tickets/' + c.id + '/share', { method: 'POST', body: JSON.stringify({ keys: keys }) });
-        toast(keys.length ? '✅ انعرضت المعلومات للعضو' : '🙈 انخفت المعلومات عن العضو');
-        closeWarnForm();
-        await spLoadNew();
+        var d = await spApi('/api/support/admin/tickets/' + c.id + '/inspect/' + cat);
+        c.insp = { cat: cat, title: d.title, rows: d.rows };
+        spInspectPaint();
+    } catch (e) { toast(e.message); spInspect(); }
+}
+function spInspectPaint() {
+    var c = SP.cur, I = c && c.insp; if (!I) return;
+    var box = document.getElementById('wf-box'); if (!box) return;
+    var sh = c.shared || [];
+    var shownN = I.rows.filter(function (r) { return sh.indexOf(r.k) >= 0; }).length;
+    var rows = I.rows.length ? I.rows.map(function (r) {
+        var on = sh.indexOf(r.k) >= 0;
+        var main = r.at
+            ? '<div style="font-size:12px;color:var(--muted);">' + spEsc(spFmtDate(r.at)) + '</div><div style="font-size:13px;word-break:break-word;"><b>' + spEsc(r.l) + '</b>' + (r.v && r.v !== '—' ? ' — ' + spEsc(r.v) : '') + '</div>'
+            : '<div style="font-size:12px;color:var(--muted);">' + spEsc(r.l) + '</div><div style="font-size:14px;word-break:break-word;">' + spEsc(r.d ? spFmtDate(r.v) : r.v) + '</div>';
+        return '<div class="sp-ins-r' + (on ? ' on' : '') + '"><div style="flex:1;min-width:0;">' + main + '</div><button class="btn sm ' + (on ? 'danger' : '') + '" data-k="' + spEsc(r.k) + '" onclick="spInspectToggle(this.dataset.k)">' + (on ? '🙈 إخفاء' : '👁 إظهار') + '</button></div>';
+    }).join('') : '<div style="color:var(--muted);font-size:13px;padding:10px 0;">ما فيه بيانات</div>';
+    box.innerHTML = '<h3>' + spEsc(I.title) + '</h3>' +
+        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">اضغط على اللي تبي يشوفه العضو (' + shownN + ' من ' + I.rows.length + ' ظاهر)</div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;"><button class="btn sm" onclick="spInspectAll(true)">👁 إظهار الكل</button><button class="btn sm gray" onclick="spInspectAll(false)">🙈 إخفاء الكل</button></div>' +
+        '<div class="sp-ins-list">' + rows + '</div>' +
+        '<div class="wf-actions"><button class="btn gray sm" onclick="spInspect()">‹ رجوع</button><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>';
+}
+async function spShare(body) {
+    var c = SP.cur; if (!c) return;
+    try {
+        var r = await spApi('/api/support/admin/tickets/' + c.id + '/share', { method: 'POST', body: JSON.stringify(body) });
+        c.shared = r.shared || []; c.sharedKey = c.shared.join(',');
+        if (c.insp) spInspectPaint();
+        spLoadInfo();
     } catch (e) { toast(e.message); }
+}
+function spInspectToggle(k) {
+    var c = SP.cur; if (!c) return;
+    spShare((c.shared || []).indexOf(k) >= 0 ? { hide: [k] } : { show: [k] });
+}
+function spInspectAll(on) {
+    var c = SP.cur; if (!c || !c.insp) return;
+    var sh = c.shared || [];
+    var keys = c.insp.rows.map(function (r) { return r.k; }).filter(function (k) { return on ? sh.indexOf(k) < 0 : sh.indexOf(k) >= 0; });
+    if (!keys.length) return;
+    spShare(on ? { show: keys } : { hide: keys });
+}
+async function spInspectHideAll() {
+    var c = SP.cur; if (!c) return;
+    if (!(c.shared || []).length) { toast('ما فيه شي ظاهر للعضو'); return; }
+    c.insp = null;
+    await spShare({ hide: (c.shared || []).slice() });
+    spInspect();
 }
 function spTypingPing() {
     var c = SP.cur; if (!c) return;
