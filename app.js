@@ -1241,6 +1241,20 @@ async function discordImageUrl(channelId, messageId, cacheKey) {
     photoUrlCache.set(cacheKey, { url: att.url, fetchedAt: Date.now() });
     return att.url;
 }
+// رفع الرسائل الصوتية لديسكورد (نفس قناة الصور) بدل تخزينها في قاعدة البيانات
+async function discordSaveAudio(buf, ext, label) {
+    try {
+        const settings = await getSettings();
+        if (!botReady || !settings.notesChannelId) return null;
+        const channel = await client.channels.fetch(settings.notesChannelId);
+        const file = new AttachmentBuilder(buf, { name: (label || "voice") + "_" + Date.now() + "." + ext });
+        const msg = await channel.send({ content: label ? "🎙️ " + label : undefined, files: [file] });
+        return { channelId: msg.channelId, messageId: msg.id };
+    } catch (e) {
+        console.error("❌ فشل رفع الرسالة الصوتية لديسكورد:", e.message);
+        return null;
+    }
+}
 // يجهّز حقول الصورة لرسالة تكت: ديسكورد إذا متاح، وإلا تبقى بالقاعدة
 async function supportImageFields(image) {
     if (!image) return {};
@@ -5047,6 +5061,9 @@ const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
         text: String,
         image: String,
         imageChannelId: { type: String, default: null }, imageMessageId: { type: String, default: null },
+        audio: { type: Buffer, default: undefined },
+        audioChannelId: { type: String, default: null }, audioMessageId: { type: String, default: null },
+        audioMime: { type: String, default: null }, audioDuration: { type: Number, default: null }, audioWave: { type: String, default: null },
         suggest: Boolean,
         role: String,
         createdAt: { type: Date, default: Date.now },
@@ -5093,9 +5110,41 @@ function supportCleanImage(v) {
     if (v.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return null;
     return /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+\/=]+$/.test(v) ? v : null;
 }
-async function supportLoad(req, res) {
+const SUPPORT_AUDIO_MAX_BYTES = 4 * 1024 * 1024;
+const SUPPORT_AUDIO_MAX_SEC = 600;
+const SUPPORT_AUDIO_EXT = { "audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/mpeg": "mp3" };
+function supportCleanAudio(b) {
+    if (!b || typeof b.audio !== "string") return null;
+    const mime = String(b.audioMime || "").split(";")[0].trim().toLowerCase();
+    const ext = SUPPORT_AUDIO_EXT[mime];
+    if (!ext) return null;
+    if (b.audio.length > SUPPORT_AUDIO_MAX_BYTES * 1.4 || !/^[A-Za-z0-9+/=]+$/.test(b.audio)) return null;
+    const buf = Buffer.from(b.audio, "base64");
+    if (buf.length < 200 || buf.length > SUPPORT_AUDIO_MAX_BYTES) return null;
+    const okMagic = (ext === "webm" && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3)
+        || (ext === "ogg" && buf.toString("latin1", 0, 4) === "OggS")
+        || (ext === "m4a" && buf.toString("latin1", 4, 8) === "ftyp")
+        || (ext === "mp3" && (buf.toString("latin1", 0, 3) === "ID3" || (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0)));
+    if (!okMagic) return null;
+    let dur = Math.round(Number(b.audioDuration) || 0);
+    dur = Math.min(SUPPORT_AUDIO_MAX_SEC, Math.max(1, dur));
+    let wf = typeof b.audioWave === "string" && b.audioWave.length <= 400 && /^[A-Za-z0-9+/=]*$/.test(b.audioWave) ? b.audioWave : "";
+    return { buf, mime, ext, dur, wf };
+}
+async function supportAudioFields(c) {
+    const base = { audioMime: c.mime, audioDuration: c.dur, audioWave: c.wf };
+    const up = await discordSaveAudio(c.buf, c.ext, "ticket-voice");
+    return up ? Object.assign(base, { audioChannelId: up.channelId, audioMessageId: up.messageId }) : Object.assign(base, { audio: c.buf });
+}
+function supportLastPreview(t) {
+    const m = (t.messages && t.messages[t.messages.length - 1]) || {};
+    return (m.text || ((m.audioDuration || m.audioChannelId) ? "🎙️ رسالة صوتية" : "")).slice(0, 60);
+}
+async function supportLoad(req, res, full) {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) { res.status(404).json({ error: "التكت غير موجود" }); return null; }
-    const t = await SupportTicket.findById(req.params.id);
+    const q = SupportTicket.findById(req.params.id);
+    if (!full) q.select("-messages.audio");
+    const t = await q;
     if (!t) { res.status(404).json({ error: "التكت غير موجود" }); return null; }
     const uid = req.user ? req.user.id : null;
     const gt = supportGuestToken(req);
@@ -5109,7 +5158,7 @@ async function supportLoad(req, res) {
     return { t, role, uid };
 }
 function supportPubMsg(m, i) {
-    return { i, sender: m.sender, name: m.name, text: m.text || "", img: !!(m.image || m.imageChannelId), suggest: !!m.suggest, role: m.role || null, at: m.createdAt };
+    return { i, sender: m.sender, name: m.name, text: m.text || "", img: !!(m.image || m.imageChannelId), aud: !!(m.audio || m.audioChannelId || m.audioDuration), dur: m.audioDuration || 0, wf: m.audioWave || "", suggest: !!m.suggest, role: m.role || null, at: m.createdAt };
 }
 function supportPubTicket(t) {
     return { id: String(t._id), no: t.no, name: t.name, category: t.category, place: t.place, subject: t.subject, status: t.status, adminName: t.adminName, guest: !t.uid, updatedAt: t.updatedAt, createdAt: t.createdAt };
@@ -5149,7 +5198,7 @@ async function supportAskAi(t) {
             const mm = lastImgDataUrl ? /^data:(image\/[a-z]+);base64,(.+)$/.exec(lastImgDataUrl) : null;
             if (mm) parts.push({ type: "image", source: { type: "base64", media_type: mm[1], data: mm[2] } });
         }
-        parts.push({ type: "text", text: m.text || ((m.image || m.imageChannelId) ? "(أرسل صورة)" : "...") });
+        parts.push({ type: "text", text: m.text || ((m.image || m.imageChannelId) ? "(أرسل صورة)" : (m.audioDuration ? "(أرسل رسالة صوتية)" : "...")) });
         const last = msgs[msgs.length - 1];
         if (last && last.role === role) last.content.push(...parts); else msgs.push({ role, content: parts });
     });
@@ -5400,8 +5449,8 @@ app.get("/api/support/tickets", async (req, res) => {
     if (gt) or.push({ guestToken: gt, uid: null }, { deviceToken: gt });
     if (!or.length) return res.json({ tickets: [] });
     const banned = !!(await supportBanned(uid, gt));
-    const list = await SupportTicket.find({ $or: or }).sort({ updatedAt: -1 }).limit(50).select("-messages.image").lean();
-    res.json({ banned, tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadUser || 0, last: ((t.messages[t.messages.length - 1] || {}).text || "").slice(0, 60) })) });
+    const list = await SupportTicket.find({ $or: or }).sort({ updatedAt: -1 }).limit(50).select("-messages.image -messages.audio").lean();
+    res.json({ banned, tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadUser || 0, last: supportLastPreview(t) })) });
 });
 
 app.get("/api/support/badges", async (req, res) => {
@@ -5455,6 +5504,47 @@ app.get("/api/support/tickets/:id/img/:i", async (req, res) => {
     res.send(Buffer.from(mm[2], "base64"));
 });
 
+app.get("/api/support/tickets/:id/audio/:i", async (req, res) => {
+    const x = await supportLoad(req, res, true); if (!x) return;
+    const m = x.t.messages[parseInt(req.params.i, 10)];
+    if (!m) return res.status(404).end();
+    const hasDb = !!(m.audio && m.audio.length);
+    if (!hasDb && m.audioChannelId && m.audioMessageId) {
+        try {
+            const u = await discordImageUrl(m.audioChannelId, m.audioMessageId, "tkv:" + String(m._id));
+            if (u) return res.redirect(u);
+        } catch (e) { console.error("❌ فشل جلب الرسالة الصوتية من ديسكورد:", e.message); }
+        return res.status(503).end();
+    }
+    if (!hasDb) return res.status(404).end();
+    const buf = Buffer.from(m.audio);
+    const size = buf.length;
+    const h = { "Content-Type": m.audioMime || "audio/webm", "Accept-Ranges": "bytes", "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff" };
+    const rg = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
+    if (rg && (rg[1] || rg[2])) {
+        let start, end;
+        if (rg[1] === "") { start = Math.max(0, size - parseInt(rg[2], 10)); end = size - 1; }
+        else { start = parseInt(rg[1], 10); end = rg[2] ? Math.min(parseInt(rg[2], 10), size - 1) : size - 1; }
+        if (!(start <= end) || start >= size) { res.set("Content-Range", "bytes */" + size); return res.status(416).end(); }
+        res.status(206).set(Object.assign(h, { "Content-Range": "bytes " + start + "-" + end + "/" + size, "Content-Length": end - start + 1 }));
+        return res.end(buf.subarray(start, end + 1));
+    }
+    res.set(Object.assign(h, { "Content-Length": size }));
+    res.end(buf);
+});
+
+// رد المساعد الآلي على الرسالة الصوتية (ما يسمع الصوت)
+async function supportVoiceAiReply(id) {
+    try {
+        const t = await SupportTicket.findById(id).select("-messages.audio");
+        if (!t || t.status !== "ai") return;
+        supportAddMsg(t, { sender: "ai", name: "المساعد الآلي", text: "🎙️ وصلتني رسالتك الصوتية، بس أنا مساعد آلي وما أقدر أسمع الصوت. اكتب مشكلتك كتابة وأساعدك، أو اضغط «تحدث مع عضو حقيقي» عشان الإداري يسمع رسالتك.", suggest: true });
+        t.unreadUser += 1;
+        await t.save();
+        supportEvent(t, "ai");
+    } catch (e) { console.error("❌ supportVoiceAiReply:", e.message); }
+}
+
 const supportMsgThrottle = new Map();
 app.post("/api/support/tickets/:id/messages", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
@@ -5463,27 +5553,30 @@ app.post("/api/support/tickets/:id/messages", async (req, res) => {
     const key = String(t._id) + ":" + role;
     if (Date.now() - (supportMsgThrottle.get(key) || 0) < 700) return res.status(429).json({ error: "على راحتك شوي" });
     supportMsgThrottle.set(key, Date.now());
-    const text = String((req.body || {}).text || "").trim().slice(0, 1500);
-    const image = supportCleanImage((req.body || {}).image);
-    if ((req.body || {}).image && !image) return res.status(400).json({ error: "الصورة غير صالحة أو حجمها كبير" });
-    if (!text && !image) return res.status(400).json({ error: "اكتب رسالة أو أرفق صورة" });
+    const audioIn = (req.body || {}).audio ? supportCleanAudio(req.body) : null;
+    if ((req.body || {}).audio && !audioIn) return res.status(400).json({ error: "الرسالة الصوتية غير صالحة أو حجمها كبير" });
+    const text = audioIn ? "" : String((req.body || {}).text || "").trim().slice(0, 1500);
+    const image = audioIn ? null : supportCleanImage((req.body || {}).image);
+    if (!audioIn && (req.body || {}).image && !image) return res.status(400).json({ error: "الصورة غير صالحة أو حجمها كبير" });
+    if (!text && !image && !audioIn) return res.status(400).json({ error: "اكتب رسالة أو أرفق صورة" });
+    if (audioIn && t.messages.filter(m => m.audioDuration || m.audioChannelId).length >= 25) return res.status(400).json({ error: "وصلت الحد الأقصى للرسائل الصوتية بهذا التكت" });
     if (t.messages.length >= 300) return res.status(400).json({ error: "وصل التكت للحد الأقصى من الرسائل، افتح تكت جديد" });
     if (image && t.messages.filter(m => m.image || m.imageChannelId).length >= 10) return res.status(400).json({ error: "وصلت الحد الأقصى للصور بهذا التكت" });
 
     if (role === "owner") {
         if (await supportBanned(uid, supportGuestToken(req))) return res.status(403).json({ error: SUPPORT_BANNED_MSG });
-        supportAddMsg(t, Object.assign({ sender: "user", name: t.name, text }, await supportImageFields(image)));
+        supportAddMsg(t, Object.assign({ sender: "user", name: t.name, text }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
         if (t.status !== "ai") t.unreadAdmin += 1;
         await t.save();
         res.json({ ok: true });
         supportEvent(t, "user");
-        if (t.status === "ai") supportRunAi(String(t._id));
+        if (t.status === "ai") { if (audioIn) supportVoiceAiReply(String(t._id)); else supportRunAi(String(t._id)); }
     } else {
         const senior = isSeniorAdmin(uid);
         if (!senior && t.status !== "active") return res.status(400).json({ error: "استلم التكت أول عشان تقدر ترد" });
         if (!senior && t.adminUid !== uid) return res.status(403).json({ error: "هذا التكت مستلمه " + (t.adminName || "إداري ثاني") });
         if (senior && t.status === "ai") t.status = "waiting";
-        supportAddMsg(t, Object.assign({ sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text }, await supportImageFields(image)));
+        supportAddMsg(t, Object.assign({ sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
         t.unreadUser += 1;
         await t.save();
         res.json({ ok: true });
@@ -5716,8 +5809,8 @@ app.get("/api/support/admin/tickets", async (req, res) => {
     const q = isSeniorAdmin(req.user.id)
         ? { status: ["ai", "waiting", "active", "closed"].includes(req.query.status) ? req.query.status : "waiting" }
         : { $or: [{ status: "waiting" }, { status: "active", adminUid: req.user.id }] };
-    const list = await SupportTicket.find(q).sort({ updatedAt: -1 }).limit(100).select("-messages.image").lean();
-    res.json({ tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadAdmin || 0, last: ((t.messages[t.messages.length - 1] || {}).text || "").slice(0, 60) })) });
+    const list = await SupportTicket.find(q).sort({ updatedAt: -1 }).limit(100).select("-messages.image -messages.audio").lean();
+    res.json({ tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadAdmin || 0, last: supportLastPreview(t) })) });
 });
 
 app.get("/api/support/admin/tickets/:id/person", async (req, res) => {
@@ -9727,6 +9820,26 @@ app.get("/", (req, res) => {
     .sp-compose { display: flex; align-items: flex-end; gap: 8px; margin-top: 10px; }
     .sp-compose textarea { flex: 1; resize: none; max-height: 110px; margin: 0; }
     .sp-attach { background: #1c2b48; border-radius: 8px; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; flex-shrink: 0; }
+    .sp-cin { display: flex; align-items: flex-end; gap: 8px; flex: 1; min-width: 0; }
+    .sp-mic { background: #1c2b48; border: none; color: inherit; border-radius: 8px; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; flex-shrink: 0; }
+    .sp-mic:hover { background: #26395e; }
+    .sp-vbar { display: none; align-items: center; gap: 10px; flex: 1; min-width: 0; background: #1c2b48; border-radius: 24px; padding: 4px 6px; direction: ltr; }
+    .sp-vb-ic { background: transparent; border: none; color: #fca5a5; font-size: 18px; cursor: pointer; width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0; }
+    .sp-vb-ic:hover { background: rgba(239,68,68,0.18); }
+    .sp-vb-stop { background: #ef4444; border: none; color: #fff; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; font-size: 14px; flex-shrink: 0; }
+    .sp-rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; flex-shrink: 0; animation: spRecPulse 1s infinite; }
+    @keyframes spRecPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+    .sp-rec-time { font-size: 13px; min-width: 34px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .sp-wave { display: flex; align-items: center; gap: 2px; height: 32px; flex: 1; min-width: 0; overflow: hidden; direction: ltr; }
+    .sp-wave i { display: block; flex: 1; max-width: 4px; min-width: 2px; min-height: 4px; border-radius: 2px; background: rgba(255,255,255,0.4); }
+    .sp-wave i.on { background: #fff; }
+    .sp-vbar .sp-wave i { background: #7c8db0; }
+    .sp-vbar .sp-wave i.on { background: #fff; }
+    .sp-vm { display: flex; align-items: center; gap: 8px; width: 270px; max-width: 100%; direction: ltr; }
+    .sp-vm-play { width: 36px; height: 36px; border-radius: 50%; border: none; background: #fff; color: #0a1628; cursor: pointer; flex-shrink: 0; font-size: 13px; display: flex; align-items: center; justify-content: center; padding: 0; }
+    .sp-vm-wave { cursor: pointer; }
+    .sp-vm-dur { font-size: 12px; min-width: 32px; text-align: center; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .sp-vm-speed { background: rgba(255,255,255,0.18); border: none; color: inherit; border-radius: 10px; padding: 3px 7px; font-size: 11px; cursor: pointer; flex-shrink: 0; font-family: inherit; }
     .sp-prev { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--muted); }
     .sp-prev img { height: 46px; border-radius: 6px; }
     #sp-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 6000; display: none; align-items: center; justify-content: center; padding: 14px; }
@@ -11650,6 +11763,7 @@ function spViewImg(src) {
 }
 
 async function spOpenTicket(id, mode, box) {
+    spVoiceReset(); spVmStopAll();
     SP.cur = { id: id, mode: mode, box: box, n: 0, t: null, role: null, typing: false };
     SP.img = null;
     var el = document.getElementById(box);
@@ -11661,9 +11775,13 @@ async function spOpenTicket(id, mode, box) {
         '<div class="sp-msgs" id="sp-msgs"></div>' +
         '<div id="sp-prev" class="sp-prev"></div>' +
         '<div class="sp-compose" id="sp-compose">' +
-            '<label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label>' +
-            '<textarea id="sp-in" class="sp-field" rows="1" placeholder="اكتب رسالتك..."></textarea>' +
-            '<button class="sp-btn" id="sp-send" onclick="spSend()">➤</button>' +
+            '<div class="sp-cin" id="sp-cin">' +
+                '<label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label>' +
+                '<button class="sp-mic" id="sp-mic" title="رسالة صوتية" onclick="spVoiceStart()">🎙️</button>' +
+                '<textarea id="sp-in" class="sp-field" rows="1" placeholder="اكتب رسالتك..."></textarea>' +
+                '<button class="sp-btn" id="sp-send" onclick="spSend()">➤</button>' +
+            '</div>' +
+            '<div class="sp-vbar" id="sp-vbar"></div>' +
         '</div></div>';
     var ta = document.getElementById('sp-in');
     ta.onkeydown = function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); spSend(); } };
@@ -11671,6 +11789,7 @@ async function spOpenTicket(id, mode, box) {
     await spLoadNew(true);
 }
 function spBack() {
+    spVoiceReset(); spVmStopAll();
     SP.cur = null; SP.img = null;
     if (document.getElementById('spa-body')) spaShowList(); else spShowList();
 }
@@ -11718,6 +11837,7 @@ function spMsgHtml(m) {
     var who = m.sender === 'system' ? '' : '<div class="sp-who">' + (m.sender === 'ai' ? '🤖 ' : m.sender === 'admin' ? '🛡️ ' : '') + spEsc(m.name || '') + roleTag + '</div>';
     var img = m.img ? '<img class="sp-img" loading="lazy" src="/api/support/tickets/' + c.id + '/img/' + m.i + '?gt=' + gt + '" onclick="spViewImg(this.src)">' : '';
     var body = (m.text ? spEsc(m.text) : '') ;
+    if (m.aud) body += spVoiceHtml(m, c);
     return '<div class="sp-msg ' + cls + '">' + who + '<div class="sp-b">' + body + img + '</div>' + (m.sender === 'system' ? '' : '<div class="sp-time">' + spTime(m.at) + '</div>') + '</div>';
 }
 function spShowTyping() {
@@ -11780,6 +11900,236 @@ async function spSend() {
         }
     } catch (e) { toast(e.message); }
     btn.disabled = false; ta.focus();
+}
+
+/* ---------------- الرسائل الصوتية (مثل ديسكورد) ---------------- */
+var SPV = { rec: null, stream: null, chunks: [], mime: '', t0: 0, timer: null, ctx: null, an: null, samples: [], blob: null, dur: 0, wf: '', cancelled: false, pa: null, praf: null };
+var SPVP = { a: null, el: null, raf: null, rate: 1 };
+var SPV_MAX_SEC = 600, SPV_LIVE_BARS = 36, SPV_BARS = 32;
+function spFmtDur(sec) { sec = Math.max(0, Math.floor(sec || 0)); var s = sec % 60; return Math.floor(sec / 60) + ':' + (s < 10 ? '0' : '') + s; }
+function spVoiceSupported() { return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder); }
+function spVoicePickMime() {
+    var c = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+    for (var i = 0; i < c.length; i++) { try { if (MediaRecorder.isTypeSupported(c[i])) return c[i]; } catch (e) {} }
+    return '';
+}
+function spWfDecode(wf) {
+    var out = [];
+    try { var s = atob(wf || ''); for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i) / 255); } catch (e) {}
+    return out;
+}
+function spWaveHtml(vals, n) {
+    var h = '';
+    for (var i = 0; i < n; i++) {
+        var v = 0.18;
+        if (vals.length) {
+            var a = Math.floor(i * vals.length / n), b = Math.max(a + 1, Math.floor((i + 1) * vals.length / n)), sum = 0;
+            for (var k = a; k < b; k++) sum += vals[k] || 0;
+            v = sum / (b - a);
+        }
+        h += '<i style="height:' + Math.round(4 + Math.max(0.05, v) * 24) + 'px"></i>';
+    }
+    return h;
+}
+function spVoicePaint(mode) {
+    var cin = document.getElementById('sp-cin'), bar = document.getElementById('sp-vbar');
+    if (!cin || !bar) return;
+    if (!mode) { bar.style.display = 'none'; bar.innerHTML = ''; cin.style.display = 'flex'; return; }
+    cin.style.display = 'none'; bar.style.display = 'flex';
+    if (mode === 'rec') {
+        bar.innerHTML = '<button class="sp-vb-ic" title="إلغاء" onclick="spVoiceCancel()">🗑️</button><span class="sp-rec-dot"></span><span class="sp-rec-time" id="spv-time">0:00</span><div class="sp-wave" id="spv-live">' + spWaveHtml([], SPV_LIVE_BARS) + '</div><button class="sp-vb-stop" title="إيقاف التسجيل" onclick="spVoiceStop()">⏹</button>';
+    } else {
+        bar.innerHTML = '<button class="sp-vb-ic" title="حذف" onclick="spVoiceCancel()">🗑️</button><button class="sp-vm-play" id="spv-play" onclick="spVoicePreviewToggle()">▶</button><div class="sp-wave sp-vm-wave" id="spv-wave" onclick="spVoicePreviewSeek(event)">' + spWaveHtml(spWfDecode(SPV.wf), SPV_BARS) + '</div><span class="sp-rec-time" id="spv-dur">' + spFmtDur(SPV.dur) + '</span><button class="sp-btn" id="spv-send" onclick="spVoiceSend()">➤</button>';
+    }
+}
+async function spVoiceStart() {
+    if (SPV.rec || SPV.blob) return;
+    if (!spVoiceSupported()) { toast('متصفحك ما يدعم تسجيل الصوت'); return; }
+    spVmStopAll();
+    var stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+    catch (e) { toast('اسمح للمايك من إعدادات المتصفح عشان تسجل رسالة صوتية'); return; }
+    var mime = spVoicePickMime(), rec;
+    try { rec = mime ? new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 }) : new MediaRecorder(stream); }
+    catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); toast('تعذر بدء التسجيل'); return; }
+    SPV.stream = stream; SPV.rec = rec; SPV.chunks = []; SPV.samples = []; SPV.cancelled = false; SPV.blob = null;
+    SPV.mime = String(rec.mimeType || mime || 'audio/webm').split(';')[0];
+    rec.ondataavailable = function (e) { if (e.data && e.data.size) SPV.chunks.push(e.data); };
+    rec.onstop = spVoiceOnStop;
+    try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        SPV.ctx = new AC();
+        if (SPV.ctx.resume) SPV.ctx.resume();
+        var src = SPV.ctx.createMediaStreamSource(stream);
+        SPV.an = SPV.ctx.createAnalyser(); SPV.an.fftSize = 512;
+        src.connect(SPV.an);
+    } catch (e) { SPV.an = null; }
+    SPV.t0 = Date.now();
+    rec.start(250);
+    spVoicePaint('rec');
+    SPV.timer = setInterval(spVoiceTick, 100);
+}
+function spVoiceTick() {
+    var el = Date.now() - SPV.t0, v;
+    if (SPV.an) {
+        var buf = new Uint8Array(SPV.an.fftSize), sum = 0;
+        SPV.an.getByteTimeDomainData(buf);
+        for (var i = 0; i < buf.length; i++) { var d = (buf[i] - 128) / 128; sum += d * d; }
+        v = Math.min(1, Math.sqrt(Math.sqrt(sum / buf.length)) * 1.5);
+    } else { v = 0.2 + Math.random() * 0.3; }
+    SPV.samples.push(v);
+    var t = document.getElementById('spv-time'); if (t) t.textContent = spFmtDur(el / 1000);
+    var live = document.getElementById('spv-live');
+    if (live) {
+        var last = SPV.samples.slice(-SPV_LIVE_BARS), bars = live.children, off = SPV_LIVE_BARS - last.length;
+        for (var k = 0; k < bars.length; k++) { var x = k - off; bars[k].style.height = Math.round(4 + (x >= 0 ? Math.max(0.05, last[x]) : 0.05) * 24) + 'px'; }
+    }
+    if (el >= SPV_MAX_SEC * 1000) spVoiceStop();
+}
+function spVoiceStop() { try { if (SPV.rec && SPV.rec.state !== 'inactive') SPV.rec.stop(); } catch (e) {} }
+function spVoiceRelease() {
+    if (SPV.timer) { clearInterval(SPV.timer); SPV.timer = null; }
+    try { if (SPV.stream) SPV.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { if (SPV.ctx) SPV.ctx.close(); } catch (e) {}
+    SPV.stream = null; SPV.ctx = null; SPV.an = null;
+}
+function spVoiceOnStop() {
+    var dur = (Date.now() - SPV.t0) / 1000;
+    spVoiceRelease();
+    SPV.rec = null;
+    if (SPV.cancelled) { SPV.chunks = []; SPV.samples = []; return; }
+    if (dur < 1 || !SPV.chunks.length) { SPV.chunks = []; SPV.samples = []; spVoicePaint(null); toast('التسجيل قصير'); return; }
+    var blob = new Blob(SPV.chunks, { type: SPV.mime });
+    SPV.chunks = [];
+    if (blob.size > 3.8 * 1024 * 1024) { SPV.samples = []; spVoicePaint(null); toast('الرسالة الصوتية كبيرة، قصّر التسجيل'); return; }
+    var n = 64, vals = [], mx = 0.05;
+    for (var i = 0; i < n; i++) {
+        var a = Math.floor(i * SPV.samples.length / n), b = Math.max(a + 1, Math.floor((i + 1) * SPV.samples.length / n)), sum = 0;
+        for (var k = a; k < b; k++) sum += SPV.samples[k] || 0;
+        var v = sum / (b - a); vals.push(v); if (v > mx) mx = v;
+    }
+    var bytes = vals.map(function (v) { return Math.max(18, Math.min(255, Math.round(v / mx * 255))); });
+    SPV.wf = btoa(String.fromCharCode.apply(null, bytes));
+    SPV.samples = [];
+    SPV.blob = blob; SPV.dur = Math.min(SPV_MAX_SEC, Math.max(1, Math.round(dur)));
+    spVoicePaint('preview');
+}
+function spVoiceCancel() {
+    SPV.cancelled = true;
+    if (SPV.rec && SPV.rec.state !== 'inactive') { try { SPV.rec.stop(); } catch (e) {} }
+    spVoiceReset();
+}
+function spVoiceReset() {
+    if (SPV.rec) { SPV.cancelled = true; try { if (SPV.rec.state !== 'inactive') SPV.rec.stop(); } catch (e) {} SPV.rec = null; }
+    spVoiceRelease();
+    if (SPV.pa) { try { SPV.pa.pause(); } catch (e) {} if (SPV.pa.src) { try { URL.revokeObjectURL(SPV.pa.src); } catch (e) {} } SPV.pa = null; }
+    if (SPV.praf) { cancelAnimationFrame(SPV.praf); SPV.praf = null; }
+    SPV.blob = null; SPV.chunks = []; SPV.samples = []; SPV.wf = ''; SPV.dur = 0;
+    spVoicePaint(null);
+}
+function spVoicePreviewPaint(frac, playing) {
+    var w = document.getElementById('spv-wave'), p = document.getElementById('spv-play'), d = document.getElementById('spv-dur');
+    if (p) p.textContent = playing ? '⏸' : '▶';
+    if (w) { var on = Math.round(frac * w.children.length); for (var i = 0; i < w.children.length; i++) w.children[i].className = i < on ? 'on' : ''; }
+    if (d) d.textContent = spFmtDur(playing || frac > 0 ? frac * SPV.dur : SPV.dur);
+}
+function spVoicePreviewTick() {
+    var a = SPV.pa; if (!a) return;
+    spVoicePreviewPaint(Math.min(1, a.currentTime / SPV.dur), !a.paused);
+    if (!a.paused) SPV.praf = requestAnimationFrame(spVoicePreviewTick);
+}
+function spVoicePreviewToggle() {
+    if (!SPV.blob) return;
+    if (!SPV.pa) {
+        var a = new Audio(URL.createObjectURL(SPV.blob));
+        a.onended = function () { a.currentTime = 0; spVoicePreviewPaint(0, false); };
+        a.onpause = function () { spVoicePreviewTick(); };
+        a.onplay = function () { spVoicePreviewTick(); };
+        SPV.pa = a;
+    }
+    if (SPV.pa.paused) { spVmStopAll(); SPV.pa.play().catch(function () { toast('تعذر تشغيل التسجيل'); }); } else SPV.pa.pause();
+}
+function spVoicePreviewSeek(ev) {
+    var w = document.getElementById('spv-wave'); if (!w || !SPV.blob) return;
+    var r = w.getBoundingClientRect(), f = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+    if (!SPV.pa) spVoicePreviewToggle();
+    var a = SPV.pa; if (!a) return;
+    try { a.currentTime = f * SPV.dur; } catch (e) {}
+    spVoicePreviewPaint(f, !a.paused);
+}
+function spBlobToB64(blob) {
+    return new Promise(function (res, rej) {
+        var fr = new FileReader();
+        fr.onload = function () { var s = String(fr.result); res(s.slice(s.indexOf(',') + 1)); };
+        fr.onerror = function () { rej(new Error('تعذر قراءة التسجيل')); };
+        fr.readAsDataURL(blob);
+    });
+}
+async function spVoiceSend() {
+    var c = SP.cur; if (!c || !SPV.blob) return;
+    var btn = document.getElementById('spv-send'); if (btn) btn.disabled = true;
+    if (SPV.pa) { try { SPV.pa.pause(); } catch (e) {} }
+    try {
+        var b64 = await spBlobToB64(SPV.blob);
+        await spApi('/api/support/tickets/' + c.id + '/messages', { method: 'POST', body: JSON.stringify({ audio: b64, audioMime: SPV.blob.type || SPV.mime, audioDuration: SPV.dur, audioWave: SPV.wf }) });
+        spVoiceReset();
+        await spLoadNew();
+    } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
+}
+/* مشغّل الرسالة الصوتية داخل الشات */
+function spVoiceHtml(m, c) {
+    var src = '/api/support/tickets/' + c.id + '/audio/' + m.i + '?gt=' + spGuestToken();
+    return '<div class="sp-vm" data-src="' + spEsc(src) + '" data-dur="' + (m.dur || 0) + '">' +
+        '<button class="sp-vm-play" onclick="spVmToggle(this.parentNode)">▶</button>' +
+        '<div class="sp-wave sp-vm-wave" onclick="spVmSeek(event, this)">' + spWaveHtml(spWfDecode(m.wf), SPV_BARS) + '</div>' +
+        '<span class="sp-vm-dur">' + spFmtDur(m.dur) + '</span>' +
+        '<button class="sp-vm-speed" onclick="spVmSpeed(this.parentNode)">' + SPVP.rate + 'x</button></div>';
+}
+function spVmDur(box) { return parseFloat(box.getAttribute('data-dur')) || 0; }
+function spVmPaint(box, frac, playing) {
+    if (!box) return;
+    var p = box.querySelector('.sp-vm-play'), w = box.querySelector('.sp-vm-wave'), d = box.querySelector('.sp-vm-dur'), dur = spVmDur(box);
+    if (p) p.textContent = playing ? '⏸' : '▶';
+    if (w) { var on = Math.round(frac * w.children.length); for (var i = 0; i < w.children.length; i++) w.children[i].className = i < on ? 'on' : ''; }
+    if (d) d.textContent = spFmtDur(playing || frac > 0 ? frac * dur : dur);
+    var sp = box.querySelector('.sp-vm-speed'); if (sp) sp.textContent = SPVP.rate + 'x';
+}
+function spVmTick() {
+    var a = SPVP.a, box = SPVP.el; if (!a || !box) return;
+    var dur = spVmDur(box) || (isFinite(a.duration) ? a.duration : 0);
+    spVmPaint(box, dur ? Math.min(1, a.currentTime / dur) : 0, !a.paused);
+    if (!a.paused) SPVP.raf = requestAnimationFrame(spVmTick);
+}
+function spVmStopAll() {
+    if (SPVP.raf) { cancelAnimationFrame(SPVP.raf); SPVP.raf = null; }
+    if (SPVP.a) { try { SPVP.a.pause(); SPVP.a.removeAttribute('src'); SPVP.a.load(); } catch (e) {} }
+    if (SPVP.el) spVmPaint(SPVP.el, 0, false);
+    SPVP.a = null; SPVP.el = null;
+}
+function spVmToggle(box) {
+    if (SPVP.a && SPVP.el === box) { if (SPVP.a.paused) SPVP.a.play().catch(function () {}); else SPVP.a.pause(); return; }
+    spVmStopAll();
+    if (SPV.pa && !SPV.pa.paused) SPV.pa.pause();
+    var a = new Audio(box.getAttribute('data-src'));
+    a.preload = 'auto'; a.playbackRate = SPVP.rate;
+    a.onplay = function () { spVmTick(); };
+    a.onpause = function () { spVmTick(); };
+    a.onended = function () { a.currentTime = 0; spVmPaint(box, 0, false); };
+    a.onerror = function () { toast('تعذر تشغيل الرسالة الصوتية'); if (SPVP.a === a) { SPVP.a = null; SPVP.el = null; } spVmPaint(box, 0, false); };
+    SPVP.a = a; SPVP.el = box;
+    a.play().catch(function () { toast('تعذر تشغيل الرسالة الصوتية'); });
+}
+function spVmSeek(ev, wave) {
+    var box = wave.parentNode, r = wave.getBoundingClientRect(), f = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)), dur = spVmDur(box);
+    if (!(SPVP.a && SPVP.el === box)) spVmToggle(box);
+    var a = SPVP.a; if (!a || !dur) return;
+    var go = function () { try { a.currentTime = f * dur; } catch (e) {} spVmPaint(box, f, !a.paused); };
+    if (a.readyState >= 1) go(); else a.addEventListener('loadedmetadata', go, { once: true });
+}
+function spVmSpeed(box) {
+    SPVP.rate = SPVP.rate === 1 ? 1.5 : SPVP.rate === 1.5 ? 2 : 1;
+    if (SPVP.a) SPVP.a.playbackRate = SPVP.rate;
+    var sp = box.querySelector('.sp-vm-speed'); if (sp) sp.textContent = SPVP.rate + 'x';
 }
 async function spHuman() {
     var c = SP.cur; if (!c) return;
