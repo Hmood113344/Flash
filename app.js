@@ -660,6 +660,7 @@ const SettingsSchema = new mongoose.Schema({
     notifTitle: { type: String, default: null },
     notifBody: { type: String, default: null },
     receptionOfficers: { type: [{ id: String, name: String }], default: [] },
+    supportCanned: { type: [{ title: String, text: String }], default: [] },
     attConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     vapid: { type: mongoose.Schema.Types.Mixed, default: null },
 }, { minimize: false });
@@ -1322,7 +1323,8 @@ async function approveViolation(v, actorId, actorTag) {
     if (await isUnassignedUid(v.reporterDiscord)) return { blocked: true, unassigned: true };
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
-    v.status = "approved"; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
+    const hideActor = STEALTH_MODE && isOwnerUid(actorId);
+    v.status = "approved"; v.reviewedBy = hideActor ? null : actorId; v.reviewedByTag = hideActor ? "كبار المسؤولين" : actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_APPROVE : CONFIG.POINTS_ON_APPROVE;
     await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: pts } });
@@ -1337,7 +1339,8 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     if (underInvestigation.has(v.reporterDiscord)) return { blocked: true, investigation: true };
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
-    v.status = "rejected"; v.rejectReason = reason; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
+    const hideActor = STEALTH_MODE && isOwnerUid(actorId);
+    v.status = "rejected"; v.rejectReason = reason; v.reviewedBy = hideActor ? null : actorId; v.reviewedByTag = hideActor ? "كبار المسؤولين" : actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_REJECT : CONFIG.POINTS_ON_REJECT;
     await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: -pts } });
@@ -3678,6 +3681,32 @@ app.get("/api/owner/command-center", ensureAuth, async (req, res) => {
     });
 });
 
+app.get("/api/owner/live", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const uids = new Set();
+    for (const c of sseClients) { if (c.uid) uids.add(c.uid); }
+    const after = req.query.after ? new Date(String(req.query.after)) : null;
+    const hasAfter = !!(after && !isNaN(after.getTime()));
+    const safe = pr => Promise.resolve(pr).catch(() => 0);
+    const [events, pv, pl, pp, wt, ci, accs] = await Promise.all([
+        Log.find(hasAfter ? { createdAt: { $gt: after } } : {}).sort({ createdAt: hasAfter ? 1 : -1 }).limit(hasAfter ? 60 : 40).maxTimeMS(8000).lean().catch(() => []),
+        safe(Violation.countDocuments({ status: "pending" })),
+        safe(LeaveRequest.countDocuments({ status: "pending" })),
+        safe(PromotionRequest.countDocuments({ status: "pending" })),
+        safe(SupportTicket.countDocuments({ status: "waiting" })),
+        safe(AttStatus.countDocuments({ status: "in" })),
+        Account.find({ uid: { $in: Array.from(uids).slice(0, 15) } }, { fullName: 1, email: 1 }).lean().catch(() => []),
+    ]);
+    const list = hasAfter ? events : events.reverse();
+    const last = list.length ? list[list.length - 1].createdAt : (hasAfter ? after : null);
+    res.json({
+        online: uids.size, onlineNames: accs.map(a => a.fullName || a.email),
+        pendingViolations: pv, pendingLeaves: pl, pendingPromos: pp, waitingTickets: wt, checkedIn: ci,
+        events: list.map(e => ({ action: e.action, actorTag: e.actorTag, discordTag: e.discordTag, details: e.details, createdAt: e.createdAt })),
+        last: last ? new Date(last).toISOString() : null,
+    });
+});
+
 // 🟢 المتصلين الآن (للمالك فقط)
 app.get("/api/owner/online", ensureAuth, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
@@ -5054,6 +5083,12 @@ const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
     discordMsgId: { type: String, default: null },
     unreadUser: { type: Number, default: 0 },
     unreadAdmin: { type: Number, default: 0 },
+    ratingRequired: { type: Boolean, default: false },
+    rating: { type: Number, default: null },
+    ratingComment: { type: String, default: null },
+    ratedAt: { type: Date, default: null },
+    closedByUid: { type: String, default: null },
+    closedByName: { type: String, default: null },
     shared: { type: [String], default: [] },
     messages: [{
         sender: String,
@@ -5069,6 +5104,20 @@ const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
         createdAt: { type: Date, default: Date.now },
     }],
 }, { timestamps: true }));
+
+const SupportRating = mongoose.model("SupportRating", new mongoose.Schema({
+    ticketId: String, no: Number, uid: String, name: String, category: String,
+    adminUid: { type: String, index: true }, adminName: String,
+    stars: Number, comment: String,
+    at: { type: Date, default: Date.now },
+}));
+const SUPPORT_CANNED_SEEDS = [
+    { title: "ترحيب", text: "هلا والله 👋 معك الإدارة، كيف أقدر أخدمك؟" },
+    { title: "نحتاج لقطة شاشة", text: "ممكن ترسل لقطة شاشة توضح المشكلة؟" },
+    { title: "جاري المراجعة", text: "استلمنا طلبك وجاري المراجعة، لا تقفل التكت وبنرد عليك بأقرب وقت 🙏" },
+    { title: "تم الحل", text: "تم حل المشكلة ✅ لو احتجت أي شي ثاني افتح تكت جديد، وبنسكّر هذا التكت." },
+    { title: "التعميم", text: "تقدر تقرأ التعليمات بالتفصيل في تعميم الأمن العام." },
+];
 
 const SupportBan = mongoose.model("SupportBan", new mongoose.Schema({
     uid: { type: String, default: null, index: true },
@@ -5136,8 +5185,10 @@ async function supportAudioFields(c) {
     const up = await discordSaveAudio(c.buf, c.ext, "ticket-voice");
     return up ? Object.assign(base, { audioChannelId: up.channelId, audioMessageId: up.messageId }) : Object.assign(base, { audio: c.buf });
 }
-function supportLastPreview(t) {
-    const m = (t.messages && t.messages[t.messages.length - 1]) || {};
+function supportLastPreview(t, forUser) {
+    let m = {};
+    const arr = t.messages || [];
+    for (let i = arr.length - 1; i >= 0; i--) { if (!(forUser && arr[i].sender === "note")) { m = arr[i]; break; } }
     return (m.text || ((m.audioDuration || m.audioChannelId) ? "🎙️ رسالة صوتية" : "")).slice(0, 60);
 }
 async function supportLoad(req, res, full) {
@@ -5161,7 +5212,7 @@ function supportPubMsg(m, i) {
     return { i, sender: m.sender, name: m.name, text: m.text || "", img: !!(m.image || m.imageChannelId), aud: !!(m.audio || m.audioChannelId || m.audioDuration), dur: m.audioDuration || 0, wf: m.audioWave || "", suggest: !!m.suggest, role: m.role || null, at: m.createdAt };
 }
 function supportPubTicket(t) {
-    return { id: String(t._id), no: t.no, name: t.name, category: t.category, place: t.place, subject: t.subject, status: t.status, adminName: t.adminName, guest: !t.uid, updatedAt: t.updatedAt, createdAt: t.createdAt };
+    return { id: String(t._id), no: t.no, name: t.name, category: t.category, place: t.place, subject: t.subject, status: t.status, adminName: t.adminName, guest: !t.uid, updatedAt: t.updatedAt, createdAt: t.createdAt, rating: t.rating == null ? null : t.rating, needRate: !!(t.status === "closed" && t.ratingRequired && t.rating == null) };
 }
 function supportEvent(t, from, extra) {
     const payload = Object.assign({ id: String(t._id), status: t.status, n: t.messages.length, from }, extra || {});
@@ -5424,6 +5475,8 @@ app.post("/api/support/tickets", async (req, res) => {
     if (gt) idOr.push({ deviceToken: gt }, { guestToken: gt });
     const open = await SupportTicket.countDocuments({ status: { $ne: "closed" }, $or: idOr });
     if (open >= 1) return res.status(400).json({ error: "عندك تكت مفتوح على هذا الجهاز، لازم تسكّره أول عشان تقدر تفتح تكت جديد" });
+    const unrated = await SupportTicket.findOne({ status: "closed", ratingRequired: true, rating: null, $or: idOr }).select("_id").lean();
+    if (unrated) return res.status(400).json({ error: "لازم تقيّم تكتك السابق أول عشان تقدر تفتح تكت جديد", needRate: String(unrated._id) });
     const last = await SupportTicket.findOne().sort({ no: -1 }).select("no").lean();
     const category = SUPPORT_CATEGORIES.includes(b.category) ? b.category : "أخرى";
     const place = category === "أخرى" ? "" : String(b.place || "").replace(/[<>]/g, "").trim().slice(0, 60);
@@ -5450,7 +5503,7 @@ app.get("/api/support/tickets", async (req, res) => {
     if (!or.length) return res.json({ tickets: [] });
     const banned = !!(await supportBanned(uid, gt));
     const list = await SupportTicket.find({ $or: or }).sort({ updatedAt: -1 }).limit(50).select("-messages.image -messages.audio").lean();
-    res.json({ banned, tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadUser || 0, last: supportLastPreview(t) })) });
+    res.json({ banned, tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadUser || 0, last: supportLastPreview(t, true) })) });
 });
 
 app.get("/api/support/badges", async (req, res) => {
@@ -5481,7 +5534,7 @@ app.get("/api/support/tickets/:id", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const after = Math.max(0, parseInt(req.query.after, 10) || 0);
     const { t, role } = x;
-    const msgs = t.messages.map((m, i) => supportPubMsg(m, i)).slice(after);
+    const msgs = t.messages.map((m, i) => supportPubMsg(m, i)).slice(after).filter(m => role === "admin" || m.sender !== "note");
     if (role === "owner" && t.unreadUser) { t.unreadUser = 0; await t.save(); }
     if (role === "admin" && t.unreadAdmin) { t.unreadAdmin = 0; await t.save(); }
     const canInspect = role === "admin" && supportCanInspect(t, x.uid);
@@ -5622,11 +5675,96 @@ app.post("/api/support/tickets/:id/close", async (req, res) => {
     if (role !== "admin" && !(uid && isSeniorAdmin(uid))) return res.status(403).json({ error: "إغلاق التكت من الإدارة فقط" });
     if (t.status === "closed") return res.json({ ok: true });
     t.status = "closed";
+    t.ratingRequired = true;
+    t.closedByUid = uid; t.closedByName = req.user.username;
     supportAddMsg(t, { sender: "system", name: "النظام", text: "🔒 تم إغلاق التكت بواسطة " + req.user.username });
     t.unreadUser += 1;
     await t.save();
     res.json({ ok: true });
     supportEvent(t, "system", { kind: "close" });
+});
+
+app.post("/api/support/tickets/:id/rate", async (req, res) => {
+    const x = await supportLoad(req, res); if (!x) return;
+    const { t, role } = x;
+    if (role !== "owner") return res.status(403).json({ error: "التقييم لصاحب التكت فقط" });
+    if (t.status !== "closed") return res.status(400).json({ error: "التكت لسا مفتوح" });
+    const stars = parseInt((req.body || {}).stars, 10);
+    if (!(stars >= 1 && stars <= 5)) return res.status(400).json({ error: "اختر من 1 إلى 5 نجوم" });
+    const comment = String((req.body || {}).comment || "").replace(/[<>]/g, "").trim().slice(0, 300);
+    const r = await SupportTicket.updateOne({ _id: t._id, rating: null }, { $set: { rating: stars, ratingComment: comment, ratedAt: new Date() } });
+    if (!(r.modifiedCount ?? r.nModified)) return res.status(400).json({ error: "سبق وقيّمت هذا التكت" });
+    const who = t.adminUid ? { uid: t.adminUid, name: t.adminName } : { uid: t.closedByUid || "none", name: t.closedByName || "غير محدد" };
+    await SupportRating.create({ ticketId: String(t._id), no: t.no, uid: t.uid, name: t.name, category: t.category, adminUid: who.uid, adminName: who.name, stars, comment });
+    res.json({ ok: true });
+    supportEvent(t, "user", { kind: "rate" });
+});
+
+app.get("/api/support/admin/ratings", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
+    const cnt = n => ({ $sum: { $cond: [{ $eq: ["$stars", n] }, 1, 0] } });
+    const admins = await SupportRating.aggregate([
+        { $group: { _id: "$adminUid", name: { $last: "$adminName" }, count: { $sum: 1 }, avg: { $avg: "$stars" }, s1: cnt(1), s2: cnt(2), s3: cnt(3), s4: cnt(4), s5: cnt(5) } },
+        { $sort: { avg: -1, count: -1 } },
+    ]);
+    const recent = await SupportRating.find({ comment: { $nin: [null, ""] } }).sort({ at: -1 }).limit(30).lean();
+    const total = admins.reduce((a, r) => a + r.count, 0);
+    const sum = admins.reduce((a, r) => a + r.avg * r.count, 0);
+    res.json({
+        total, avg: total ? sum / total : 0,
+        admins: admins.map(r => ({ uid: r._id, name: r.name || "-", count: r.count, avg: r.avg, dist: [r.s1, r.s2, r.s3, r.s4, r.s5] })),
+        recent: recent.map(r => ({ no: r.no, name: r.name, adminName: r.adminName, stars: r.stars, comment: r.comment, category: r.category, at: r.at })),
+    });
+});
+
+app.post("/api/support/tickets/:id/note", async (req, res) => {
+    const x = await supportLoad(req, res); if (!x) return;
+    const { t, role, uid } = x;
+    if (role !== "admin") return res.status(403).json({ error: "الملاحظات الداخلية للإدارة فقط" });
+    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
+    const senior = isSeniorAdmin(uid);
+    if (!senior && t.adminUid !== uid) return res.status(403).json({ error: "استلم التكت أول" });
+    const text = String((req.body || {}).text || "").trim().slice(0, 1000);
+    if (!text) return res.status(400).json({ error: "اكتب الملاحظة" });
+    if (t.messages.length >= 300) return res.status(400).json({ error: "وصل التكت للحد الأقصى من الرسائل" });
+    supportAddMsg(t, { sender: "note", name: req.user.username, role: senior ? "senior" : "admin", text });
+    await t.save();
+    res.json({ ok: true });
+    sseBroadcast("ticket", { id: String(t._id), status: t.status, n: t.messages.length, from: "note" }, c => c.isAdmin);
+});
+
+async function supportCannedList() {
+    const s = await getSettings();
+    if (!s.supportCanned || !s.supportCanned.length) {
+        s.supportCanned = SUPPORT_CANNED_SEEDS.map(r => ({ title: r.title, text: r.text }));
+        await s.save();
+    }
+    return s;
+}
+app.get("/api/support/admin/canned", async (req, res) => {
+    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
+    const s = await supportCannedList();
+    res.json({ list: s.supportCanned.map(r => ({ id: String(r._id), title: r.title, text: r.text })) });
+});
+app.post("/api/support/admin/canned", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
+    const title = String((req.body || {}).title || "").replace(/[<>]/g, "").trim().slice(0, 40);
+    const text = String((req.body || {}).text || "").replace(/[<>]/g, "").trim().slice(0, 500);
+    if (!title || !text) return res.status(400).json({ error: "اكتب العنوان والنص" });
+    const s = await supportCannedList();
+    if (s.supportCanned.length >= 30) return res.status(400).json({ error: "وصلت الحد الأقصى (30 رد)" });
+    s.supportCanned.push({ title, text });
+    await s.save();
+    res.json({ ok: true });
+});
+app.delete("/api/support/admin/canned/:rid", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
+    const s = await supportCannedList();
+    const before = s.supportCanned.length;
+    s.supportCanned = s.supportCanned.filter(r => String(r._id) !== req.params.rid);
+    if (s.supportCanned.length === before) return res.status(404).json({ error: "غير موجود" });
+    await s.save();
+    res.json({ ok: true });
 });
 
 // ---------- فحص العضو داخل التكت (الإداري يختار كل خانة تظهر للعضو) ----------
@@ -9840,6 +9978,18 @@ app.get("/", (req, res) => {
     .sp-vm-wave { cursor: pointer; }
     .sp-vm-dur { font-size: 12px; min-width: 32px; text-align: center; font-variant-numeric: tabular-nums; flex-shrink: 0; }
     .sp-vm-speed { background: rgba(255,255,255,0.18); border: none; color: inherit; border-radius: 10px; padding: 3px 7px; font-size: 11px; cursor: pointer; flex-shrink: 0; font-family: inherit; }
+    .sp-mic.on { background: #92400e; }
+    #sp-in.note-mode { border-color: #f59e0b; background: #2a2310; }
+    .sp-msg.note { align-self: center; max-width: 94%; }
+    .sp-msg.note .sp-b { background: #2a2310; border: 1px dashed #f59e0b; color: #fde68a; }
+    .sp-canned { background: #0f1a30; border: 1px solid var(--border); border-radius: 10px; margin-top: 8px; max-height: 40vh; overflow-y: auto; }
+    .sp-canned-h { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; }
+    .sp-canned-r { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px dashed var(--border); cursor: pointer; }
+    .sp-canned-r:hover { background: rgba(59,130,246,0.12); }
+    .sp-rate { background: #0f1a30; border: 1px solid var(--gold-soft); border-radius: 12px; padding: 12px; margin-top: 10px; text-align: center; }
+    .sp-stars { display: flex; justify-content: center; gap: 6px; margin: 8px 0; direction: ltr; }
+    .sp-stars button { background: none; border: none; font-size: 32px; cursor: pointer; color: #475569; padding: 0 2px; }
+    .sp-stars button.on { color: #facc15; }
     .sp-prev { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--muted); }
     .sp-prev img { height: 46px; border-radius: 6px; }
     #sp-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 6000; display: none; align-items: center; justify-content: center; padding: 14px; }
@@ -10119,6 +10269,7 @@ app.get("/", (req, res) => {
 </div>
 <div id="owner-toolbar" style="position:fixed;bottom:92px;left:16px;z-index:4500;display:none;flex-direction:column;gap:8px;">
     <button class="btn sm" style="background:#0e7490;" onclick="offaOpenCommandCenter()">🖥️ غرفة التحكم</button>
+    <button class="btn sm" style="background:#be123c;" onclick="offaOpenLive()">📡 العمليات الحية</button>
     <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenUpdates()">🛠️ تحديثات المطور</button>
     <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
     <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
@@ -11684,6 +11835,8 @@ async function spLoadList() {
     var box = document.getElementById('sp-list'); if (!box) return;
     try {
         var d = await spApi('/api/support/tickets');
+        var unrated = d.tickets.filter(function (t) { return t.needRate; })[0];
+        if (unrated && !d.banned) { spOpenTicket(unrated.id, 'user', 'sp-body'); return; }
         var hasOpen = d.tickets.some(function (t) { return t.status !== 'closed'; });
         var nb = document.getElementById('sp-newbtn');
         if (nb) {
@@ -11763,7 +11916,7 @@ function spViewImg(src) {
 }
 
 async function spOpenTicket(id, mode, box) {
-    spVoiceReset(); spVmStopAll();
+    spVoiceReset(); spVmStopAll(); SP.noteMode = false;
     SP.cur = { id: id, mode: mode, box: box, n: 0, t: null, role: null, typing: false };
     SP.img = null;
     var el = document.getElementById(box);
@@ -11773,11 +11926,13 @@ async function spOpenTicket(id, mode, box) {
         '<div class="sp-state" id="sp-state"></div>' +
         '<div class="sp-info" id="sp-info" style="display:none;"></div>' +
         '<div class="sp-msgs" id="sp-msgs"></div>' +
+        '<div id="sp-rate" class="sp-rate" style="display:none;"></div>' +
         '<div id="sp-prev" class="sp-prev"></div>' +
         '<div class="sp-compose" id="sp-compose">' +
             '<div class="sp-cin" id="sp-cin">' +
                 '<label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label>' +
                 '<button class="sp-mic" id="sp-mic" title="رسالة صوتية" onclick="spVoiceStart()">🎙️</button>' +
+                (mode === 'admin' ? '<button class="sp-mic" id="sp-note-btn" title="ملاحظة داخلية (للإدارة فقط)" onclick="spNoteToggle()">📝</button><button class="sp-mic" title="ردود جاهزة" onclick="spCannedOpen()">⚡</button>' : '') +
                 '<textarea id="sp-in" class="sp-field" rows="1" placeholder="اكتب رسالتك..."></textarea>' +
                 '<button class="sp-btn" id="sp-send" onclick="spSend()">➤</button>' +
             '</div>' +
@@ -11789,7 +11944,7 @@ async function spOpenTicket(id, mode, box) {
     await spLoadNew(true);
 }
 function spBack() {
-    spVoiceReset(); spVmStopAll();
+    spVoiceReset(); spVmStopAll(); SP.noteMode = false;
     SP.cur = null; SP.img = null;
     if (document.getElementById('spa-body')) spaShowList(); else spShowList();
 }
@@ -11830,6 +11985,10 @@ async function spLoadNew(first) {
     }
 }
 function spMsgHtml(m) {
+    if (m.sender === 'note') {
+        var rt = m.role === 'senior' ? '<span class="sp-role senior">كبار المسؤولين</span>' : '<span class="sp-role admin">إداري</span>';
+        return '<div class="sp-msg note"><div class="sp-who">📝 ملاحظة داخلية (ما تظهر للعضو) — ' + spEsc(m.name || '') + rt + '</div><div class="sp-b">' + spEsc(m.text || '') + '</div><div class="sp-time">' + spTime(m.at) + '</div></div>';
+    }
     var c = SP.cur, mine = c.mode === 'admin' ? m.sender === 'admin' : m.sender === 'user';
     var cls = m.sender === 'system' ? 'sys' : (mine ? 'me' : 'other') + (m.sender === 'ai' ? ' ai' : '') + (m.sender === 'admin' && !mine ? ' admin' : '');
     var gt = spGuestToken();
@@ -11863,13 +12022,18 @@ function spPaintState() {
     } else if (t.status === 'active') {
         html = '<span>✅ الإداري ' + spEsc(t.adminName || '') + ' ' + (adm ? 'مستلم التكت' : 'معك الحين') + '</span>';
     } else {
-        html = '<span>🔒 التكت مغلق</span>';
+        html = '<span>🔒 التكت مغلق' + (adm ? (t.rating ? ' — التقييم ⭐ ' + t.rating + '/5' : (t.needRate ? ' — بانتظار تقييم العضو' : '')) : '') + '</span>';
     }
     st.innerHTML = html;
     var closed = t.status === 'closed';
     var isSen = !!(ME && ME.isSeniorAdmin);
     var canWrite = !closed && (!adm || t.status === 'active' || isSen);
     document.getElementById('sp-compose').style.display = canWrite ? 'flex' : 'none';
+    var rb = document.getElementById('sp-rate');
+    if (rb) {
+        if (!adm && t.needRate) { rb.style.display = 'block'; if (!rb.firstChild) rb.innerHTML = spRateHtml(); }
+        else { rb.style.display = 'none'; rb.innerHTML = ''; }
+    }
     document.getElementById('sp-close').style.display = (closed || !(adm || isSen)) ? 'none' : 'inline';
     var banBtn = document.getElementById('sp-ban');
     if (banBtn) banBtn.style.display = (adm && isSen) ? 'inline' : 'none';
@@ -11891,10 +12055,11 @@ async function spSend() {
     if (!text && !SP.img) return;
     btn.disabled = true;
     try {
-        await spApi('/api/support/tickets/' + c.id + '/messages', { method: 'POST', body: JSON.stringify({ text: text, image: SP.img }) });
+        if (SP.noteMode && SP.img) { toast('الملاحظة الداخلية نص فقط'); btn.disabled = false; return; }
+        await spApi('/api/support/tickets/' + c.id + (SP.noteMode ? '/note' : '/messages'), { method: 'POST', body: JSON.stringify(SP.noteMode ? { text: text } : { text: text, image: SP.img }) });
         ta.value = ''; ta.style.height = 'auto'; SP.img = null; spPaintPrev();
         await spLoadNew();
-        if (c.mode === 'user' && c.t && c.t.status === 'ai') {
+        if (!SP.noteMode && c.mode === 'user' && c.t && c.t.status === 'ai') {
             c.typing = true; spShowTyping();
             setTimeout(function () { if (SP.cur === c && c.typing) { c.typing = false; spShowTyping(); } }, 40000);
         }
@@ -12130,6 +12295,98 @@ function spVmSpeed(box) {
     SPVP.rate = SPVP.rate === 1 ? 1.5 : SPVP.rate === 1.5 ? 2 : 1;
     if (SPVP.a) SPVP.a.playbackRate = SPVP.rate;
     var sp = box.querySelector('.sp-vm-speed'); if (sp) sp.textContent = SPVP.rate + 'x';
+}
+
+/* ---------------- التقييم الإجباري + الردود الجاهزة + الملاحظات الداخلية ---------------- */
+var SPR = { n: 0 };
+function spRateHtml() {
+    SPR.n = 0;
+    return '<div style="font-weight:bold;">⭐ قيّم خدمة الدعم</div><div style="font-size:12px;color:var(--muted);margin-top:2px;">التقييم إجباري عشان تقدر تفتح تكت جديد</div>' +
+        '<div class="sp-stars" id="sp-stars">' + [1, 2, 3, 4, 5].map(function (n) { return '<button onclick="spRateStar(' + n + ')">★</button>'; }).join('') + '</div>' +
+        '<textarea id="sp-rate-c" class="sp-field" rows="2" maxlength="300" placeholder="تعليق (اختياري)" style="margin-bottom:8px;"></textarea>' +
+        '<button class="sp-btn" id="sp-rate-go" disabled onclick="spRateSend()">إرسال التقييم</button>';
+}
+function spRateStar(n) {
+    SPR.n = n;
+    var b = document.getElementById('sp-stars').children;
+    for (var i = 0; i < b.length; i++) b[i].className = i < n ? 'on' : '';
+    document.getElementById('sp-rate-go').disabled = false;
+}
+async function spRateSend() {
+    var c = SP.cur; if (!c || !SPR.n) return;
+    var btn = document.getElementById('sp-rate-go'); if (btn) btn.disabled = true;
+    try {
+        var cm = document.getElementById('sp-rate-c');
+        await spApi('/api/support/tickets/' + c.id + '/rate', { method: 'POST', body: JSON.stringify({ stars: SPR.n, comment: cm ? cm.value.trim() : '' }) });
+        toast('🙏 شكراً لتقييمك');
+        var rb = document.getElementById('sp-rate'); if (rb) { rb.style.display = 'none'; rb.innerHTML = ''; }
+        await spLoadNew();
+    } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
+}
+async function spLoadRatings() {
+    var box = document.getElementById('spa-list'); if (!box) return;
+    try {
+        var d = await spApi('/api/support/admin/ratings');
+        if (!d.total) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه تقييمات للحين</div>'; return; }
+        var html = '<div class="sp-row" style="cursor:default;"><div class="t1"><span>📊 الإجمالي</span><span>⭐ ' + d.avg.toFixed(2) + ' (' + d.total + ' تقييم)</span></div></div>';
+        html += d.admins.map(function (a) {
+            var dist = [5, 4, 3, 2, 1].map(function (n) { return n + '★ ' + a.dist[n - 1]; }).join(' • ');
+            return '<div class="sp-row" style="cursor:default;"><div class="t1"><span>🛡️ ' + spEsc(a.name) + '</span><span>⭐ ' + a.avg.toFixed(2) + ' (' + a.count + ')</span></div><div class="t2">' + dist + '</div></div>';
+        }).join('');
+        if (d.recent.length) {
+            html += '<div style="margin:12px 4px 6px;font-weight:bold;">💬 آخر التعليقات</div>' + d.recent.map(function (r) {
+                return '<div class="sp-row" style="cursor:default;"><div class="t1"><span>#' + r.no + ' — ' + spEsc(r.name || '-') + '</span><span>' + '★'.repeat(r.stars) + '</span></div><div class="t2">' + spEsc(r.comment) + '</div><div class="t2">الإداري: ' + spEsc(r.adminName || '-') + '</div></div>';
+            }).join('');
+        }
+        box.innerHTML = html;
+    } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
+}
+function spNoteToggle() {
+    SP.noteMode = !SP.noteMode;
+    var b = document.getElementById('sp-note-btn'), ta = document.getElementById('sp-in');
+    if (b) b.className = 'sp-mic' + (SP.noteMode ? ' on' : '');
+    if (ta) { ta.className = 'sp-field' + (SP.noteMode ? ' note-mode' : ''); ta.placeholder = SP.noteMode ? '📝 ملاحظة داخلية، الإدارة فقط تشوفها...' : 'اكتب رسالتك...'; ta.focus(); }
+}
+function spCannedClose() { var b = document.getElementById('sp-canned'); if (b) b.remove(); }
+async function spCannedOpen() {
+    if (document.getElementById('sp-canned')) { spCannedClose(); return; }
+    var comp = document.getElementById('sp-compose'); if (!comp) return;
+    var box = document.createElement('div'); box.id = 'sp-canned'; box.className = 'sp-canned';
+    box.innerHTML = '<div style="color:var(--muted);padding:10px;text-align:center;">جارِ التحميل...</div>';
+    comp.parentNode.insertBefore(box, comp);
+    await spCannedPaint();
+}
+async function spCannedPaint() {
+    var box = document.getElementById('sp-canned'); if (!box) return;
+    try {
+        var d = await spApi('/api/support/admin/canned');
+        SP.canned = d.list;
+        var sen = !!(ME && ME.isSeniorAdmin);
+        box.innerHTML = '<div class="sp-canned-h"><b>⚡ ردود جاهزة</b><button class="sp-link" onclick="spCannedClose()">✕</button></div>' +
+            (d.list.length ? d.list.map(function (r, i) {
+                return '<div class="sp-canned-r" onclick="spCannedUse(' + i + ')"><div><b>' + spEsc(r.title) + '</b><div style="font-size:12px;color:var(--muted);">' + spEsc(r.text) + '</div></div>' +
+                    (sen ? '<button class="sp-link" style="color:#fca5a5;" onclick="event.stopPropagation();spCannedDel(&quot;' + r.id + '&quot;)">🗑️</button>' : '') + '</div>';
+            }).join('') : '<div style="padding:10px;color:var(--muted);">ما فيه ردود</div>') +
+            (sen ? '<button class="sp-btn" style="margin:8px;width:calc(100% - 16px);" onclick="spCannedAdd()">➕ إضافة رد جاهز</button>' : '');
+    } catch (e) { box.innerHTML = '<div style="color:#fca5a5;padding:10px;">' + spEsc(e.message) + '</div>'; }
+}
+function spCannedUse(i) {
+    var r = SP.canned && SP.canned[i]; if (!r) return;
+    var ta = document.getElementById('sp-in'); if (!ta) return;
+    ta.value = (ta.value ? ta.value + ' ' : '') + r.text;
+    ta.dispatchEvent(new Event('input'));
+    spCannedClose(); ta.focus();
+}
+async function spCannedAdd() {
+    var title = await promptModal('عنوان الرد الجاهز'); if (!title || !title.trim()) return;
+    var text = await promptModal('نص الرد'); if (!text || !text.trim()) return;
+    try { await spApi('/api/support/admin/canned', { method: 'POST', body: JSON.stringify({ title: title.trim(), text: text.trim() }) }); toast('✅ تمت الإضافة'); spCannedPaint(); }
+    catch (e) { toast(e.message); }
+}
+async function spCannedDel(id) {
+    if (!(await confirmModal('تبي تحذف هذا الرد الجاهز؟'))) return;
+    try { await spApi('/api/support/admin/canned/' + id, { method: 'DELETE' }); toast('🗑️ تم الحذف'); spCannedPaint(); }
+    catch (e) { toast(e.message); }
 }
 async function spHuman() {
     var c = SP.cur; if (!c) return;
@@ -12383,7 +12640,7 @@ function renderSupportAdmin() {
 function spaShowList() {
     SP.cur = null; SP.img = null;
     var senior = !!(ME && ME.isSeniorAdmin);
-    var tabs = senior ? [['waiting', '⏳ انتظار الإدارة'], ['active', '✅ قيد المتابعة'], ['ai', '🤖 عند المساعد'], ['closed', '🔒 مغلقة'], ['bans', '🚫 المحظورين']] : [['waiting', '⏳ انتظار الإدارة']];
+    var tabs = senior ? [['waiting', '⏳ انتظار الإدارة'], ['active', '✅ قيد المتابعة'], ['ai', '🤖 عند المساعد'], ['closed', '🔒 مغلقة'], ['rates', '⭐ التقييمات'], ['bans', '🚫 المحظورين']] : [['waiting', '⏳ انتظار الإدارة']];
     if (!senior) SP.atab = 'waiting';
     document.getElementById('spa-tabs').innerHTML = tabs.map(function (t) {
         return '<button class="sp-tab ' + (SP.atab === t[0] ? 'on' : '') + '" onclick="SP.atab=&quot;' + t[0] + '&quot;;spaShowList()">' + t[1] + '</button>';
@@ -12394,6 +12651,7 @@ function spaShowList() {
 async function spaLoadList() {
     var box = document.getElementById('spa-list'); if (!box) return;
     if (SP.atab === 'bans') return spLoadBans();
+    if (SP.atab === 'rates') return spLoadRatings();
     try {
         var d = await spApi('/api/support/admin/tickets?status=' + SP.atab);
         if (!d.tickets.length) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه تكتات هنا</div>'; return; }
@@ -12497,6 +12755,55 @@ function ccRenderHtml(d) {
     }).join('') : '<div style="color:var(--muted);font-size:12px;">لا شي بعد</div>') + '</div>';
     h += '</div>';
     return h;
+}
+
+/* ---------------- غرفة العمليات الحية (للمالك فقط) ---------------- */
+var LV = { last: null, timer: null };
+function offaLiveStop() { if (LV.timer) { clearInterval(LV.timer); LV.timer = null; } }
+function offaLiveRow(e, isNew) {
+    var t = '';
+    try { t = new Date(e.createdAt).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch (x) {}
+    return '<div class="card" style="padding:8px 10px;margin:0 0 6px;' + (isNew ? 'border-color:#38bdf8;' : '') + '">' +
+        '<div style="display:flex;justify-content:space-between;gap:8px;"><b style="font-size:13px;">' + spEsc(e.action || '') + '</b><span style="font-size:11px;color:var(--muted);">' + t + '</span></div>' +
+        '<div style="font-size:12px;color:var(--muted);margin-top:2px;">' + (e.actorTag ? 'بواسطة ' + spEsc(e.actorTag) : '') + (e.discordTag ? ' • على ' + spEsc(e.discordTag) : '') + '</div>' +
+        (e.details ? '<div style="font-size:12px;margin-top:2px;">' + spEsc(e.details) + '</div>' : '') + '</div>';
+}
+async function offaLiveTick() {
+    var feed = document.getElementById('lv-feed');
+    if (!feed) { offaLiveStop(); return; }
+    var dot = document.getElementById('lv-dot');
+    try {
+        var d = await api('/api/owner/live' + (LV.last ? '?after=' + encodeURIComponent(LV.last) : ''), { noLock: true });
+        feed = document.getElementById('lv-feed');
+        if (!feed) { offaLiveStop(); return; }
+        var st = [['🟢', 'متصلين', d.online], ['🚨', 'مخالفات معلّقة', d.pendingViolations], ['🌴', 'إجازات معلّقة', d.pendingLeaves], ['🎖️', 'ترقيات معلّقة', d.pendingPromos], ['🎧', 'تكتات منتظرة', d.waitingTickets], ['🖐️', 'حاضرين الحين', d.checkedIn]];
+        document.getElementById('lv-stats').innerHTML = st.map(function (x) {
+            return '<div class="card" style="padding:8px;text-align:center;margin:0;"><div style="font-size:18px;">' + x[0] + '</div><div style="font-size:20px;font-weight:bold;">' + (x[2] || 0) + '</div><div style="font-size:11px;color:var(--muted);">' + x[1] + '</div></div>';
+        }).join('');
+        document.getElementById('lv-online').textContent = d.onlineNames && d.onlineNames.length ? '🟢 ' + d.onlineNames.join('، ') : '';
+        var first = !LV.last;
+        var ph = feed.querySelector('[data-empty]'); if (ph && d.events.length) ph.remove();
+        if (d.events.length) {
+            feed.insertAdjacentHTML('afterbegin', d.events.map(function (e) { return offaLiveRow(e, !first); }).reverse().join(''));
+            while (feed.children.length > 150) feed.removeChild(feed.lastChild);
+        } else if (first) feed.innerHTML = '<div data-empty="1" style="color:var(--muted);text-align:center;padding:16px;">ما فيه أحداث للحين</div>';
+        if (d.last) LV.last = d.last;
+        else if (first) LV.last = new Date().toISOString();
+        if (dot) { dot.textContent = '● مباشر'; dot.style.color = '#4ade80'; }
+    } catch (e) {
+        if (dot) { dot.textContent = '● انقطع الاتصال'; dot.style.color = '#f87171'; }
+    }
+}
+function offaOpenLive() {
+    ccStopLive(); offaLiveStop();
+    LV.last = null;
+    ownerModalOpen('📡 العمليات الحية',
+        '<div id="lv-stats" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;"></div>' +
+        '<div id="lv-online" style="font-size:12px;color:var(--muted);margin-bottom:8px;"></div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><b>⚡ بث الأحداث</b><span id="lv-dot" style="font-size:11px;color:#4ade80;">● مباشر</span></div>' +
+        '<div id="lv-feed" style="max-height:48vh;overflow-y:auto;"><div data-empty="1" style="color:var(--muted);text-align:center;padding:16px;">جارِ التحميل...</div></div>');
+    offaLiveTick();
+    LV.timer = setInterval(function () { if (!OWNER_MODAL_OPEN) { offaLiveStop(); return; } offaLiveTick(); }, 3000);
 }
 async function offaOpenCommandCenter() {
     ccStopLive();
