@@ -6203,6 +6203,13 @@ async function ensureTrainerOrSenior(req, res, next) {
     if (await offIsTrainer(req.user.id)) return next();
     return res.status(403).json({ error: "هذا القسم للمدربين وكبار المسؤولين فقط" });
 }
+async function ensureRecAccess(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (isSeniorAdmin(req.user.id)) return next();
+    if (await offIsTrainer(req.user.id)) return next();
+    if ((await courtRole(req.user.id)).staff) return next();
+    return res.status(403).json({ error: "غير مصرح" });
+}
 const offRecActive = new Map();
 function offRecEnd(n, graceful) {
     const r = offRecActive.get(n);
@@ -6219,7 +6226,10 @@ function offRecIsActive(n) {
 }
 async function offRecCleanup() {
     try {
-        const old = await OfficerRec.find({ startedAt: { $lt: new Date(Date.now() - 14 * 24 * 3600 * 1000) } }).select("sid").lean();
+        const old = await OfficerRec.find({ $or: [
+            { n: { $not: { $gte: 950, $lte: 979 } }, startedAt: { $lt: new Date(Date.now() - 14 * 24 * 3600 * 1000) } },
+            { n: { $gte: 950, $lte: 979 }, startedAt: { $lt: new Date(Date.now() - 30 * 24 * 3600 * 1000) } },
+        ] }).select("sid").lean();
         if (!old.length) return;
         const sids = old.map(r => r.sid);
         await OfficerRecChunk.deleteMany({ sid: { $in: sids } });
@@ -6323,7 +6333,7 @@ function offRemove(uid, n) {
     if (cfg.speakerUid === uid) cfg.speakerUid = null;
     const rr = offRecActive.get(n);
     if (rr && rr.uid === uid) offRecEnd(n, true);
-    if (!offIsCyber(n) && !offIsFreq(n) && !offIsCourt(n)) OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, role: p.role, action: "leave" }).catch(() => {});
+    if (!offIsCyber(n) && !offIsFreq(n)) OfficerRoomLog.create({ n, uid, name: p.name, isSenior: p.isSenior, role: p.role, action: "leave" }).catch(() => {});
     offPushState(n);
 }
 function offRemoveEverywhere(uid) {
@@ -6637,12 +6647,14 @@ app.delete("/api/officers/admin/rooms/:n", ensureSeniorAdmin, async (req, res) =
     res.json({ ok: true, movedTo: target, moved: mv.modifiedCount || 0 });
 });
 
-app.post("/api/officers/rec/start", ensureTrainerOrSenior, async (req, res) => {
+app.post("/api/officers/rec/start", ensureRecAccess, async (req, res) => {
     const n = offParseN(req.body && req.body.n);
     const m = n ? offLive.get(n) : null;
     const me = m ? m.get(req.user.id) : null;
-    if (!me || !(me.isSenior || (offIsTrain(n) && me.role === "trainer"))) return res.status(403).json({ error: "لازم تكون داخل الروم" });
-    if (!Array.from(m.values()).some(x => !x.isSenior && x.role !== "trainer")) return res.json({ ok: false });
+    const courtRec = !!(me && offIsCourt(n) && (await courtRole(req.user.id)).staff);
+    if (!me || !(me.isSenior || (offIsTrain(n) && me.role === "trainer") || courtRec)) return res.status(403).json({ error: "لازم تكون داخل الروم" });
+    if (offIsCourt(n)) { if (m.size < 2) return res.json({ ok: false }); }
+    else if (!Array.from(m.values()).some(x => !x.isSenior && x.role !== "trainer")) return res.json({ ok: false });
     if (offRecIsActive(n)) return res.json({ ok: false, busy: true });
     const mime = String((req.body && req.body.mime) || "audio/webm").slice(0, 60);
     const sid = n + "-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex");
@@ -6652,7 +6664,7 @@ app.post("/api/officers/rec/start", ensureTrainerOrSenior, async (req, res) => {
     res.json({ ok: true, sid });
 });
 
-app.post("/api/officers/rec/chunk", ensureTrainerOrSenior, express.raw({ type: "*/*", limit: "3mb" }), async (req, res) => {
+app.post("/api/officers/rec/chunk", ensureRecAccess, express.raw({ type: "*/*", limit: "3mb" }), async (req, res) => {
     const sid = String(req.query.sid || "");
     const seq = parseInt(req.query.seq, 10);
     const meta = await OfficerRec.findOne({ sid }).select("uid n").lean();
@@ -6666,7 +6678,7 @@ app.post("/api/officers/rec/chunk", ensureTrainerOrSenior, express.raw({ type: "
     res.json({ ok: true });
 });
 
-app.post("/api/officers/rec/events", ensureTrainerOrSenior, async (req, res) => {
+app.post("/api/officers/rec/events", ensureRecAccess, async (req, res) => {
     const sid = String((req.body && req.body.sid) || "");
     const meta = await OfficerRec.findOne({ sid }).select("uid speechN").lean();
     if (!meta || meta.uid !== req.user.id) return res.status(404).json({ error: "تسجيل غير موجود" });
@@ -6683,7 +6695,7 @@ app.post("/api/officers/rec/events", ensureTrainerOrSenior, async (req, res) => 
     res.json({ ok: true });
 });
 
-app.post("/api/officers/rec/stop", ensureTrainerOrSenior, async (req, res) => {
+app.post("/api/officers/rec/stop", ensureRecAccess, async (req, res) => {
     const sid = String((req.body && req.body.sid) || "");
     const meta = await OfficerRec.findOne({ sid }).select("uid n endedAt").lean();
     if (!meta || meta.uid !== req.user.id) return res.status(404).json({ error: "تسجيل غير موجود" });
@@ -6718,7 +6730,7 @@ app.get("/api/officers/admin/rec/:sid", ensureSeniorAdmin, async (req, res) => {
 
 app.get("/api/officers/admin/interview-log", ensureSeniorAdmin, async (req, res) => {
     const since = new Date(Date.now() - 60 * 24 * 3600 * 1000);
-    const logs = await OfficerRoomLog.find({ at: { $gte: since } }).sort({ at: 1 }).limit(8000).maxTimeMS(10000).lean();
+    const logs = await OfficerRoomLog.find({ at: { $gte: since }, n: { $not: { $gte: 950, $lte: 979 } } }).sort({ at: 1 }).limit(8000).maxTimeMS(10000).lean();
     const byRoom = new Map();
     for (const l of logs) {
         if (!byRoom.has(l.n)) byRoom.set(l.n, []);
@@ -6817,9 +6829,11 @@ app.post("/api/officers/admin/interview-log/clear", ensureSeniorAdmin, async (re
     if (settings.interviewLogClearUsed) return res.status(403).json({ error: "تم استخدام زر حذف سجلات المقابلة من قبل" });
     settings.interviewLogClearUsed = true;
     await settings.save();
-    await OfficerRoomLog.deleteMany({});
-    await OfficerRecChunk.deleteMany({});
-    await OfficerRec.deleteMany({});
+    const notCourt = { $not: { $gte: 950, $lte: 979 } };
+    const clrSids = (await OfficerRec.find({ n: notCourt }).select("sid").lean()).map(r => r.sid);
+    await OfficerRoomLog.deleteMany({ n: notCourt });
+    await OfficerRecChunk.deleteMany({ sid: { $in: clrSids } });
+    await OfficerRec.deleteMany({ n: notCourt });
     await logEvent({ action: "حذف سجلات تسجيل المقابلة", actorId: req.user.id, actorTag: req.user.username, details: "تم حذف كل سجلات المقابلات والتسجيلات الصوتية" });
     res.json({ ok: true });
 });
@@ -7059,7 +7073,7 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res, next) => {
     const uid = req.user.id;
     const cc = await CourtCase.findOne({ voiceN: n, status: "active" });
     if (!cc) return res.status(404).json({ error: "المحكمة غير موجودة أو انتهت" });
-    const isT = cc.targetUid === uid;
+    const isT = courtIsTarget(cc, uid);
     const r = await courtRole(uid);
     if (!isT && !r.staff) return res.status(403).json({ error: "ليست لديك صلاحية دخول المحكمة" });
     if (!isT && underCourt.has(uid)) return res.status(403).json({ error: "⚖️ أنت مطلوب للمحكمة العسكرية" });
@@ -7070,7 +7084,9 @@ app.post("/api/officers/rooms/:n/join", ensureAuth, async (req, res, next) => {
     let m = offLive.get(n);
     if (!m) { m = new Map(); offLive.set(n, m); }
     const existing = Array.from(m.keys()).filter(u => u !== uid);
+    const wasInC = m.has(uid);
     m.set(uid, { uid, name, isSenior: false, role, muted: (cc.muted || []).includes(uid), joinedAt: Date.now() });
+    if (!wasInC) OfficerRoomLog.create({ n, uid, name, isSenior: !!r.senior, role, action: "join" }).catch(() => {});
     offPushState(n);
     const ch = offChat.get(n);
     res.json({ ok: true, state: offState(n, uid), existing, iceServers: offIce(), ivQuestions: null, chat: ch ? ch.msgs : [], caseId: String(cc._id) });
@@ -9328,7 +9344,12 @@ const CourtCase = mongoose.model("CourtCase", new mongoose.Schema({
     startedAt: { type: Date, default: Date.now },
     at: { type: Date, default: null }, approvedBy: String, approvedByName: String,
     endedAt: { type: Date, default: null }, endedBy: String, endedByName: String,
+    extra: { type: [{ uid: String, name: String }], default: [] },   // متهمين إضافيين مضمومين لنفس المحكمة
 }));
+function courtTargets(c) { return [{ uid: c.targetUid, name: c.targetName }].concat((c.extra || []).map(e => ({ uid: e.uid, name: e.name }))); }
+function courtTargetUids(c) { return courtTargets(c).map(t => t.uid); }
+function courtIsTarget(c, uid) { return courtTargetUids(c).includes(uid); }
+function courtTargetNames(c) { return courtTargets(c).map(t => t.name).join("، "); }
 const soonCourt = new Map();   // targetUid -> { id, at, reason } (موعد محكمة جاي)
 const courtSoonOf = uid => soonCourt.get(uid) || null;
 function courtFmt(d) {
@@ -9340,8 +9361,8 @@ const courtLite = c => ({ id: String(c._id), n: c.voiceN, reason: c.reason || ""
 async function loadCourt() {
     try {
         underCourt.clear(); soonCourt.clear();
-        (await CourtCase.find({ status: "active" }).lean()).forEach(c => underCourt.set(c.targetUid, courtLite(c)));
-        (await CourtCase.find({ status: "scheduled" }).lean()).forEach(c => soonCourt.set(c.targetUid, { id: String(c._id), at: c.at, reason: c.reason || "" }));
+        (await CourtCase.find({ status: "active" }).lean()).forEach(c => courtTargetUids(c).forEach(u => underCourt.set(u, courtLite(c))));
+        (await CourtCase.find({ status: "scheduled" }).lean()).forEach(c => courtTargetUids(c).forEach(u => soonCourt.set(u, { id: String(c._id), at: c.at, reason: c.reason || "" })));
     } catch (e) { console.error("❌ فشل تحميل المحكمة:", e.message); }
 }
 function courtCaseOf(uid) { return underCourt.get(uid) || null; }
@@ -9354,12 +9375,12 @@ async function courtRole(uid) {
     return { staff: !!mem, leader: !!mpRole, senior: false };
 }
 function courtPub(c) {
-    return { id: String(c._id), status: c.status, targetUid: c.targetUid, targetName: c.targetName, reason: c.reason || "", by: c.startedBy || "", byName: c.startedByName || "", byRole: c.startedByRole || "", n: c.voiceN, at: c.at || null, startedAt: c.startedAt, endedAt: c.endedAt || null, endedByName: c.endedByName || null, approvedByName: c.approvedByName || null };
+    return { id: String(c._id), status: c.status, targetUid: c.targetUid, targetName: courtTargetNames(c), targets: courtTargets(c), reason: c.reason || "", by: c.startedBy || "", byName: c.startedByName || "", byRole: c.startedByRole || "", n: c.voiceN, at: c.at || null, startedAt: c.startedAt, endedAt: c.endedAt || null, endedByName: c.endedByName || null, approvedByName: c.approvedByName || null };
 }
 // المشاركين بالمحكمة: المتحقق معه + فاتح التحقيق + اللي داخل الروم الحين
 async function courtMembers(c, viewerUid) {
     const ids = new Map();
-    ids.set(c.targetUid, "target");
+    courtTargetUids(c).forEach(u => ids.set(u, "target"));
     if (c.startedBy && !ids.has(c.startedBy)) ids.set(c.startedBy, "starter");
     const live = c.status === "active" && c.voiceN ? offLive.get(c.voiceN) : null;
     const inRoom = new Set(live ? Array.from(live.keys()) : []);
@@ -9388,8 +9409,9 @@ async function courtAudience() {
 }
 async function courtPush(targetUid) {
     try {
+        const tl = Array.isArray(targetUid) ? targetUid : [targetUid];
         const set = await courtAudience();
-        sseBroadcast("court", { t: Date.now() }, c => !!c.uid && (set.has(c.uid) || c.uid === targetUid || isSeniorAdmin(c.uid)));
+        sseBroadcast("court", { t: Date.now() }, c => !!c.uid && (set.has(c.uid) || tl.includes(c.uid) || isSeniorAdmin(c.uid)));
     } catch (e) {}
 }
 function courtVoiceClose(c) {
@@ -9435,7 +9457,40 @@ app.post("/api/court/start", ensureAuth, async (req, res) => {
     const at = offBuildDate(b.date, b.hour, b.minute);
     if (!at) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
     if (at.getTime() < Date.now() - 5 * 60 * 1000) return res.status(400).json({ error: "الموعد لازم يكون من الحين وطالع" });
-    if (underCourt.has(targetUid) || await CourtCase.exists({ targetUid, status: { $in: ["pending", "scheduled", "active"] } })) return res.status(409).json({ error: "هذا العضو عليه محكمة أو طلب تحقيق حالياً" });
+    if (underCourt.has(targetUid) || await CourtCase.exists({ $or: [{ targetUid }, { "extra.uid": targetUid }], status: { $in: ["pending", "scheduled", "active"] } })) return res.status(409).json({ error: "هذا العضو عليه محكمة أو طلب تحقيق حالياً" });
+    {
+        const dir = !!(r.senior || r.leader);
+        const mode = b.mode === "join" ? "join" : (b.mode === "separate" ? "separate" : "");
+        const openCases = await CourtCase.find({ status: { $in: ["pending", "scheduled", "active"] } }).sort({ startedAt: -1 }).limit(10).lean();
+        const joinable = openCases.filter(x => (x.status === "pending" || dir) && courtTargets(x).length < 5);
+        if (!mode && joinable.length) {
+            return res.status(409).json({
+                error: "فيه محكمة قائمة، اختر: ضمه لها أو محكمة منفصلة", choose: true,
+                cases: joinable.map(x => ({ id: String(x._id), status: x.status, targetName: courtTargetNames(x), at: x.at, n: x.voiceN || null, startedAt: x.startedAt })),
+            });
+        }
+        if (mode === "join") {
+            const jc = joinable.find(x => String(x._id) === String(b.joinId));
+            if (!jc) return res.status(404).json({ error: "هذي المحكمة ما تقبل الضم حالياً" });
+            const jName = await cyName(targetUid), byN = await cyName(req.user.id);
+            const upd = await CourtCase.findOneAndUpdate({ _id: jc._id, status: jc.status }, { $push: { extra: { uid: targetUid, name: jName } } }, { new: true });
+            if (!upd) return res.status(409).json({ error: "المحكمة تغيّرت حالتها، حاول مرة ثانية" });
+            if (upd.status === "active") {
+                underCourt.set(targetUid, courtLite(upd));
+                pushUid(targetUid, { title: CONFIG.SITE_NAME, body: "⚖️ أنت مطلوب للمحكمة العسكرية، ادخل الموقع الحين", tag: "court", ttl: 1800 }).catch(() => {});
+            } else if (upd.status === "scheduled") {
+                soonCourt.set(targetUid, { id: String(upd._id), at: upd.at, reason: upd.reason || "" });
+                pushUid(targetUid, { title: CONFIG.SITE_NAME, body: "⚖️ تم تحديد موعد محكمة عسكرية لك: " + courtFmt(upd.at), tag: "court-soon", ttl: 86400 }).catch(() => {});
+            } else {
+                courtNotifyLeaders("⚖️ " + byN + " ضم " + jName + " لطلب التحقيق مع " + upd.targetName);
+            }
+            sseBroadcast("courtlock", { t: Date.now() }, cl => cl.uid === targetUid);
+            await logEvent({ action: "ضم عضو لمحكمة عسكرية", discordId: targetUid, actorId: req.user.id, actorTag: byN, details: jName + " ← محكمة " + courtTargetNames(upd) });
+            courtPush(courtTargetUids(upd));
+            courtTick();
+            return res.json({ ok: true, id: String(upd._id), status: upd.status, joined: true });
+        }
+    }
     const direct = r.senior || r.leader;
     const byName = await cyName(req.user.id), targetName = await cyName(targetUid);
     const c = await CourtCase.create({ status: direct ? "scheduled" : "pending", targetUid, targetName, reason, startedBy: req.user.id, startedByName: byName, startedByRole: r.senior ? "senior" : (r.leader ? "leader" : "mp"), at });
@@ -9456,11 +9511,54 @@ async function courtAccess(req, res, needLead) {
     const c = await CourtCase.findById(req.params.id);
     if (!c) { res.status(404).json({ error: "غير موجود" }); return null; }
     const r = await courtRole(req.user.id);
-    const isT = c.targetUid === req.user.id;
+    const isT = courtIsTarget(c, req.user.id);
     if (!isT && !r.staff) { res.status(403).json({ error: "ليست لديك صلاحية" }); return null; }
     if (needLead && (isT || !(r.leader || c.startedBy === req.user.id))) { res.status(403).json({ error: "هذا الإجراء لقيادة الشرطة العسكرية أو اللي فتح التحقيق أو الكبار" }); return null; }
     return { c, r, isT };
 }
+app.get("/api/court/admin/records", ensureSeniorAdmin, async (req, res) => {
+    const list = await CourtCase.find({ status: { $in: ["active", "ended", "cancelled"] }, voiceN: { $ne: null } }).sort({ startedAt: -1 }).limit(60).lean();
+    const since = list.length ? new Date(new Date(list[list.length - 1].startedAt).getTime() - 3 * 60000) : new Date();
+    const recs = await OfficerRec.find({ n: { $gte: 950, $lte: 979 }, startedAt: { $gte: since }, chunks: { $gt: 0 } }).select("n startedAt").lean();
+    res.json({
+        list: list.map(c => {
+            const lo = new Date(c.startedAt).getTime() - 120000;
+            const hi = (c.endedAt ? new Date(c.endedAt).getTime() : Date.now()) + 120000;
+            const rc = recs.filter(r => r.n === c.voiceN && new Date(r.startedAt).getTime() >= lo && new Date(r.startedAt).getTime() <= hi).length;
+            return { id: String(c._id), status: c.status, targetName: courtTargetNames(c), reason: c.reason || "", byName: c.startedByName || "", startedAt: c.startedAt, endedAt: c.endedAt || null, endedByName: c.endedByName || null, n: c.voiceN, recs: rc };
+        }),
+    });
+});
+app.get("/api/court/admin/:id/session", ensureSeniorAdmin, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+    const c = await CourtCase.findById(req.params.id).lean();
+    if (!c || !c.voiceN) return res.status(404).json({ error: "هذي المحكمة ما بدأت أو ما لها سجل" });
+    const startMs = new Date(c.startedAt).getTime();
+    const lo = new Date(startMs - 120000);
+    const hi = c.endedAt ? new Date(new Date(c.endedAt).getTime() + 120000) : new Date();
+    const logs = await OfficerRoomLog.find({ n: c.voiceN, at: { $gte: lo, $lte: hi } }).sort({ at: 1 }).limit(2000).lean();
+    const stays = [], open = new Map();
+    for (const l of logs) {
+        const t = new Date(l.at).getTime();
+        if (l.action === "join") {
+            const prev = open.get(l.uid); if (prev) { prev.lost = true; open.delete(l.uid); }
+            const st = { uid: l.uid, name: l.name, isSenior: !!l.isSenior || l.role === "senior", role: l.role, start: t, end: null, lost: false, ongoing: false };
+            open.set(l.uid, st); stays.push(st);
+        } else if (l.action === "leave") {
+            const st = open.get(l.uid); if (st) { st.end = t; open.delete(l.uid); }
+        }
+    }
+    const live = c.status === "active";
+    const liveNow = live ? (offLive.get(c.voiceN) || new Map()) : new Map();
+    for (const st of open.values()) { if (live && liveNow.has(st.uid)) st.ongoing = true; else st.lost = true; }
+    const recs = await OfficerRec.find({ n: c.voiceN, startedAt: { $gte: lo, $lte: hi }, chunks: { $gt: 0 } }).sort({ startedAt: 1 }).select("sid n name mime startedAt endedAt lastAt speech").lean();
+    const lastEnd = stays.reduce((m, x) => Math.max(m, x.end || 0), 0);
+    const end = c.endedAt ? new Date(c.endedAt).getTime() : (live ? null : (lastEnd || startMs));
+    res.json({ session: {
+        room: c.voiceN, title: "محكمة " + courtTargetNames(c), training: false, start: startMs, end, live, stays,
+        recs: recs.map(r => ({ sid: r.sid, name: r.name, mime: r.mime, start: new Date(r.startedAt).getTime(), end: r.endedAt ? new Date(r.endedAt).getTime() : (r.lastAt ? new Date(r.lastAt).getTime() : null), speech: r.speech || [] })),
+    } });
+});
 app.post("/api/court/:id/end", ensureAuth, async (req, res) => {
     const x = await courtAccess(req, res, true); if (!x) return;
     const st = x.c.status;
@@ -9468,14 +9566,16 @@ app.post("/api/court/:id/end", ensureAuth, async (req, res) => {
     const name = await cyName(req.user.id);
     const c = await CourtCase.findOneAndUpdate({ _id: x.c._id, status: st }, { $set: { status: st === "active" ? "ended" : "cancelled", endedAt: new Date(), endedBy: req.user.id, endedByName: name } }, { new: true });
     if (!c) return res.status(409).json({ error: "المحكمة انتهت أو انلغت مسبقاً" });
-    if (st === "active") { underCourt.delete(c.targetUid); courtVoiceClose(c); }
+    if (st === "active") { courtTargetUids(c).forEach(u => underCourt.delete(u)); courtVoiceClose(c); }
     else {
-        soonCourt.delete(c.targetUid);
-        if (st === "scheduled") pushUid(c.targetUid, { title: CONFIG.SITE_NAME, body: "⚖️ تم إلغاء موعد المحكمة العسكرية", tag: "court-soon", ttl: 86400 }).catch(() => {});
+        courtTargetUids(c).forEach(u => {
+            soonCourt.delete(u);
+            if (st === "scheduled") pushUid(u, { title: CONFIG.SITE_NAME, body: "⚖️ تم إلغاء موعد المحكمة العسكرية", tag: "court-soon", ttl: 86400 }).catch(() => {});
+        });
     }
     await logEvent({ action: st === "active" ? "إنهاء تحقيق المحكمة العسكرية" : "إلغاء محكمة عسكرية", discordId: c.targetUid, actorId: req.user.id, actorTag: name, details: c.targetName });
-    courtPush(c.targetUid);
-    sseBroadcast("courtlock", { t: Date.now() }, cl => cl.uid === c.targetUid);
+    courtPush(courtTargetUids(c));
+    sseBroadcast("courtlock", { t: Date.now() }, cl => courtIsTarget(c, cl.uid));
     res.json({ ok: true });
 });
 // قيادة الشرطة العسكرية: قبول / رفض طلب التحقيق
@@ -9485,12 +9585,12 @@ app.post("/api/court/:id/approve", ensureAuth, async (req, res) => {
     const name = await cyName(req.user.id);
     const c = await CourtCase.findOneAndUpdate({ _id: x.c._id, status: "pending" }, { $set: { status: "scheduled", approvedBy: req.user.id, approvedByName: name } }, { new: true });
     if (!c) return res.status(409).json({ error: "هذا الطلب انبت فيه مسبقاً" });
-    soonCourt.set(c.targetUid, { id: String(c._id), at: c.at, reason: c.reason || "" });
+    courtTargetUids(c).forEach(u => soonCourt.set(u, { id: String(c._id), at: c.at, reason: c.reason || "" }));
     await logEvent({ action: "قبول طلب تحقيق بالمحكمة العسكرية", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الشرطة العسكرية)", details: c.targetName + " — " + courtFmt(c.at) });
-    pushUid(c.targetUid, { title: CONFIG.SITE_NAME, body: "⚖️ تم تحديد موعد محكمة عسكرية لك: " + courtFmt(c.at), tag: "court-soon", ttl: 86400 }).catch(() => {});
+    courtTargetUids(c).forEach(u => pushUid(u, { title: CONFIG.SITE_NAME, body: "⚖️ تم تحديد موعد محكمة عسكرية لك: " + courtFmt(c.at), tag: "court-soon", ttl: 86400 }).catch(() => {}));
     if (c.startedBy) pushUid(c.startedBy, { title: CONFIG.SITE_NAME, body: "✅ وافقت القيادة على طلب التحقيق مع " + c.targetName, tag: "court-req", ttl: 86400 }).catch(() => {});
-    sseBroadcast("courtlock", { t: Date.now() }, cl => cl.uid === c.targetUid);
-    courtPush(c.targetUid);
+    sseBroadcast("courtlock", { t: Date.now() }, cl => courtIsTarget(c, cl.uid));
+    courtPush(courtTargetUids(c));
     courtTick();
     res.json({ ok: true });
 });
@@ -9502,7 +9602,7 @@ app.post("/api/court/:id/reject", ensureAuth, async (req, res) => {
     if (!c) return res.status(409).json({ error: "هذا الطلب انبت فيه مسبقاً" });
     await logEvent({ action: "رفض طلب تحقيق بالمحكمة العسكرية", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الشرطة العسكرية)", details: c.targetName });
     if (c.startedBy) pushUid(c.startedBy, { title: CONFIG.SITE_NAME, body: "❌ رفضت القيادة طلب التحقيق مع " + c.targetName, tag: "court-req", ttl: 86400 }).catch(() => {});
-    courtPush(c.targetUid);
+    courtPush(courtTargetUids(c));
     res.json({ ok: true });
 });
 app.post("/api/court/:id/voice", ensureAuth, async (req, res) => {
@@ -9516,7 +9616,7 @@ app.post("/api/court/:id/mute", ensureAuth, async (req, res) => {
     if (x.isT) return res.status(403).json({ error: "ليست لديك صلاحية" });
     const target = String((req.body || {}).uid || ""), on = !!(req.body || {}).on;
     if (!target || target === req.user.id) return res.status(400).json({ error: "حدد الشخص" });
-    if (!x.r.leader && target !== x.c.targetUid) return res.status(403).json({ error: "تقدر تسكّت المتحقق معه فقط" });
+    if (!x.r.leader && !courtIsTarget(x.c, target)) return res.status(403).json({ error: "تقدر تسكّت المتحقق معه فقط" });
     await CourtCase.updateOne({ _id: x.c._id }, on ? { $addToSet: { muted: target } } : { $pull: { muted: target } });
     const vm = x.c.voiceN ? offLive.get(x.c.voiceN) : null;
     if (vm && vm.has(target)) { vm.get(target).muted = on; offPushState(x.c.voiceN); }
@@ -9529,25 +9629,24 @@ app.post("/api/court/:id/kick", ensureAuth, async (req, res) => {
     if (!target || target === req.user.id) return res.status(400).json({ error: "حدد الشخص" });
     if (isOwnerUid(target) && !isOwnerUid(req.user.id)) return res.status(403).json({ error: "ما يمديك تطرد المالك" });
     if (isSeniorAdmin(target) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "ما يمديك تطرد أحد من الكبار" });
-    if (target !== x.c.targetUid) await CourtCase.updateOne({ _id: x.c._id }, { $addToSet: { kicked: target } });
+    if (!courtIsTarget(x.c, target)) await CourtCase.updateOne({ _id: x.c._id }, { $addToSet: { kicked: target } });
     if (x.c.voiceN) { offSendTo(target, { t: "kicked", n: x.c.voiceN }); offRemove(target, x.c.voiceN); }
     res.json({ ok: true });
 });
 
 // لما يجي موعد المحكمة تنفتح تلقائياً: العضو ينقفل عليه وينفتح الروم الصوتي
 async function courtActivate(c) {
-    if (underCourt.has(c.targetUid)) return;
+    if (courtTargetUids(c).some(u => underCourt.has(u))) return;
     const used = new Set((await CourtCase.find({ status: "active", voiceN: { $ne: null } }, { voiceN: 1 }).lean()).map(z => z.voiceN));
     let n = 950; while (used.has(n) && n < 979) n++;
     if (used.has(n)) return; // المحكمة ممتلئة، يعيد المحاولة بالدورة الجاية
     const u = await CourtCase.findOneAndUpdate({ _id: c._id, status: "scheduled" }, { $set: { status: "active", voiceN: n, startedAt: new Date() } }, { new: true });
     if (!u) return;
-    soonCourt.delete(u.targetUid);
-    underCourt.set(u.targetUid, courtLite(u));
-    await logEvent({ action: "بدء محكمة عسكرية", discordId: u.targetUid, actorId: "system", actorTag: "النظام", details: u.targetName + (u.reason ? " — " + u.reason : "") });
-    courtPush(u.targetUid);
-    sseBroadcast("courtlock", { t: Date.now() }, cl => cl.uid === u.targetUid);
-    pushUid(u.targetUid, { title: CONFIG.SITE_NAME, body: "⚖️ أنت مطلوب للمحكمة العسكرية، ادخل الموقع الحين", tag: "court", ttl: 1800 }).catch(() => {});
+    courtTargetUids(u).forEach(t => { soonCourt.delete(t); underCourt.set(t, courtLite(u)); });
+    await logEvent({ action: "بدء محكمة عسكرية", discordId: u.targetUid, actorId: "system", actorTag: "النظام", details: courtTargetNames(u) + (u.reason ? " — " + u.reason : "") });
+    courtPush(courtTargetUids(u));
+    sseBroadcast("courtlock", { t: Date.now() }, cl => courtIsTarget(u, cl.uid));
+    courtTargetUids(u).forEach(t => pushUid(t, { title: CONFIG.SITE_NAME, body: "⚖️ أنت مطلوب للمحكمة العسكرية، ادخل الموقع الحين", tag: "court", ttl: 1800 }).catch(() => {}));
 }
 let _courtTicking = false;
 async function courtTick() {
@@ -10394,7 +10493,7 @@ async function __rawFetch(url, opts, timeoutMs) {
         const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' }, cache: 'no-store' }, opts, ctrl ? { signal: ctrl.signal } : {}));
         const data = await r.json().catch(() => ({}));
         if (r.status === 403 && data && data.suspended) showSuspended();
-        if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; throw err; }
+        if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; err.data = data; throw err; }
         return data;
     } catch (e) {
         if (e && e.name === 'AbortError') { const err = new Error('انتهت مهلة الاتصال، حاول مرة ثانية'); err.status = 0; throw err; }
@@ -14042,6 +14141,7 @@ function renderAdmin(startTab) {
             <div class="tab" id="tab-excuses" onclick="adminTab('excuses', this)">🩺 غياب بعذر</div>
             <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
             <div class="tab" id="tab-officers" onclick="adminTab('officers', this)">🎖️ إدارة سلك الضباط</div>
+            <div class="tab" id="tab-court" onclick="adminTab('court', this)">⚖️ المحكمة العسكرية</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
@@ -14079,6 +14179,7 @@ function adminTab(name, el) {
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
     if (name === 'officers') renderOfficerAdmin();
+    if (name === 'court') courtAdminTab();
     if (name === 'push') flPushTab();
     if (name === 'freq') flFreqAdmin();
 }
@@ -17974,8 +18075,9 @@ function offRecMime() {
 }
 function offRecCheck() {
     var v = VC;
-    if (!v || !(v.isSenior || offMyRole() === 'trainer') || !offRecSupported()) return;
-    var hasApplicant = v.state.participants.some(function (p) { return !p.isSenior && p.role !== 'trainer'; });
+    var courtRec = !!(v && v.state && v.state.court && ME && ME.courtStaff);
+    if (!v || !(v.isSenior || offMyRole() === 'trainer' || courtRec) || !offRecSupported()) return;
+    var hasApplicant = courtRec ? v.state.participants.length >= 2 : v.state.participants.some(function (p) { return !p.isSenior && p.role !== 'trainer'; });
     if (v.rec) { if (!hasApplicant) offRecStopFor(v); return; }
     if (!hasApplicant || v.state.rec || v.recBusy || Date.now() < (v.recRetry || 0)) return;
     v.recBusy = true;
@@ -18227,7 +18329,7 @@ function offPaintNote() {
     var box = document.getElementById('ov-note');
     if (!box || !VC) return;
     if (VC.state.freq) { var fme = offFindP(VC.state, VC.me); box.textContent = (fme && fme.muted) ? '🔇 تم إسكاتك — تسمع الباقي فقط.' : (VC.micOn ? '📻 المايك مفتوح — الكل يتكلم ويسمع. وانت داخل اللعبة تتحكم بالمايك: على آيفون من مركز التحكم أو شاشة القفل (⏸ كتم / ▶️ فتح)، وعلى أندرويد من «🪟 نافذة عائمة».' : '🔇 المايك مكتوم — اضغط زر المايك تحت لما تبي تتكلم.'); return; }
-    if (VC.state.court) { var kme = offFindP(VC.state, VC.me); box.textContent = (kme && kme.muted) ? '🔇 تم إسكاتك في المحكمة — تسمع الباقي فقط.' : '⚖️ المحكمة العسكرية — الجميع يتكلم ويسمع.'; return; }
+    if (VC.state.court) { var kme = offFindP(VC.state, VC.me); box.textContent = ((kme && kme.muted) ? '🔇 تم إسكاتك في المحكمة — تسمع الباقي فقط.' : '⚖️ المحكمة العسكرية — الجميع يتكلم ويسمع.') + (VC.state.rec ? ' 🔴 الجلسة مسجّلة.' : ''); return; }
     if (VC.state.cyber) {
         var cme = offFindP(VC.state, VC.me);
         var cstaff = cme && (cme.role === 'leader' || cme.role === 'member');
@@ -19034,7 +19136,7 @@ function offaBindSessSwipe(box) {
 
 var REP = null;
 function offaReplayShell(s) {
-    var h = '<h3>🎬 فيديو توضيحي — مقابلة ' + s.room + '</h3>';
+    var h = '<h3>🎬 فيديو توضيحي — ' + spEsc(s.title || ('مقابلة ' + s.room)) + '</h3>';
     h += '<div class="rp-clock" id="rp-clock">--</div>';
     h += '<div style="text-align:center;font-size:12px;color:var(--muted);">مضى: <span id="rp-elapsed">0 ث</span> — داخل الروم: <b id="rp-count">0</b><span id="rp-aud"></span></div>';
     h += '<div class="rp-prog"><div id="rp-bar"></div></div>';
@@ -19068,7 +19170,7 @@ function offaReplay(i) {
     offModalOpen(offaReplayGate(s, segs.length > 0));
 }
 function offaReplayGate(s, hasAudio) {
-    return '<h3>🎬 فيديو توضيحي — مقابلة ' + s.room + '</h3>' +
+    return '<h3>🎬 فيديو توضيحي — ' + spEsc(s.title || ('مقابلة ' + s.room)) + '</h3>' +
         '<div style="text-align:center;margin:14px 0;"><div style="font-size:46px;">' + (hasAudio ? '🎧' : '🎬') + '</div>' +
         '<p style="color:var(--muted);font-size:13px;line-height:1.9;margin:8px 0 0;">' +
         (hasAudio ? 'هذي المقابلة فيها تسجيل صوتي. اضغط تشغيل ويشتغل الصوت مع الخط الزمني، وجنب اسم اللي يتكلم يطلع المايك.' : 'هذي الجلسة بدون تسجيل صوتي. اضغط تشغيل لإعادة الدخول والخروج.') + '</p></div>' +
@@ -20249,7 +20351,69 @@ async function courtSubmit() {
         closeWarnForm();
         toast(r.status === 'pending' ? '📨 انرسل الطلب لقيادة الشرطة العسكرية، بانتظار موافقتهم' : '⚖️ تم تحديد موعد المحكمة');
         if (document.getElementById('court-body')) courtPanelLoad(true);
-    } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
+    } catch (e) {
+        if (e && e.data && e.data.choose) { COURT.pending = body; courtChoose(e.data.cases || []); return; }
+        toast(e.message); if (btn) btn.disabled = false;
+    }
+}
+function courtChoose(cases) {
+    var f = COURT.form || {};
+    var box = document.getElementById('wf-box'); if (!box) return;
+    box.innerHTML = '<h3>⚖️ فيه محكمة قائمة</h3>' +
+        '<div style="color:var(--muted);font-size:13px;line-height:1.9;margin-bottom:6px;">تبي تضم <b>' + spEsc(f.name || 'العضو') + '</b> مع محكمة قائمة، أو تفتح له محكمة منفصلة؟</div>' +
+        cases.map(function (c) {
+            var when = c.status === 'active' ? '🔴 جارية الحين' : (c.status === 'scheduled' ? '🕒 الموعد: ' + courtAtText(c.at) : '📥 بانتظار موافقة القيادة • الموعد: ' + courtAtText(c.at));
+            return '<div class="card" style="padding:10px;margin-top:8px;"><b>' + spEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:12px;margin:4px 0 8px;">' + when + '</div>' +
+                '<button class="btn sm" data-m="join" data-id="' + c.id + '" onclick="courtSubmitMode(this.dataset.m, this.dataset.id)">👥 ضمه لهذي المحكمة</button></div>';
+        }).join('') +
+        '<div class="wf-actions" style="margin-top:12px;"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>' +
+        '<button class="btn sm" data-m="separate" onclick="courtSubmitMode(this.dataset.m)">➕ محكمة منفصلة</button></div>';
+}
+async function courtSubmitMode(mode, joinId) {
+    var body = COURT.pending; if (!body) return;
+    body = Object.assign({}, body, { mode: mode, joinId: joinId || null });
+    try {
+        var r = await api('/api/court/start', { method: 'POST', body: JSON.stringify(body) });
+        closeWarnForm(); COURT.pending = null;
+        toast(r.joined ? '👥 تم ضمه للمحكمة القائمة' : (r.status === 'pending' ? '📨 انرسل الطلب لقيادة الشرطة العسكرية، بانتظار موافقتهم' : '⚖️ تم تحديد موعد المحكمة'));
+        if (document.getElementById('court-body')) courtPanelLoad(true);
+    } catch (e) { toast(e.message); }
+}
+function courtAdminTab() {
+    var box = document.getElementById('admin-content'); if (!box) return;
+    box.innerHTML = '<div class="tabs" style="margin-bottom:10px;"><div class="tab active" id="ct-sub-0" onclick="courtSubTab(0)">⚖️ المحاكم</div><div class="tab" id="ct-sub-1" onclick="courtSubTab(1)">📼 سجلات المحاكم</div></div><div id="ct-sub-body"></div>';
+    courtSubTab(0);
+}
+function courtSubTab(i) {
+    var a = document.getElementById('ct-sub-0'), b = document.getElementById('ct-sub-1');
+    if (a) a.classList.toggle('active', i === 0);
+    if (b) b.classList.toggle('active', i === 1);
+    if (i === 0) courtMount('ct-sub-body'); else courtRecordsLoad();
+}
+async function courtRecordsLoad() {
+    var b = document.getElementById('ct-sub-body'); if (!b) return;
+    b.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try {
+        var d = await api('/api/court/admin/records', { noLock: true });
+        b = document.getElementById('ct-sub-body'); if (!b) return;
+        b.innerHTML = d.list.length ? d.list.map(courtRecRow).join('') : '<div class="card" style="color:var(--muted);text-align:center;">ما فيه سجلات محاكم للحين</div>';
+    } catch (e) { if (b) b.innerHTML = '<div class="card" style="color:#f87171;">' + spEsc(e.message) + '</div>'; }
+}
+function courtRecRow(c) {
+    var lbl = c.status === 'active' ? 'جارية' : (c.status === 'ended' ? 'منتهية' : 'ملغية');
+    var cls = c.status === 'ended' ? 'approved' : (c.status === 'active' ? 'pending' : 'rejected');
+    var mins = Math.max(1, Math.round(((c.endedAt ? new Date(c.endedAt).getTime() : Date.now()) - new Date(c.startedAt).getTime()) / 60000));
+    var meta = (c.reason ? 'السبب: ' + spEsc(c.reason) + ' • ' : '') + 'فتحه: ' + spEsc(c.byName || '-') + ' • ' + flTime(c.startedAt) + ' • المدة: ' + mins + ' د' + (c.endedByName ? ' • أنهاها: ' + spEsc(c.endedByName) : '');
+    return '<div class="card"><div class="row"><div><b>' + spEsc(c.targetName || '') + '</b> <span class="badge ' + cls + '">' + lbl + '</span>' +
+        '<div style="color:var(--muted);font-size:12px;margin-top:3px;">' + meta + '</div></div>' +
+        '<button class="btn sm" data-id="' + c.id + '" onclick="courtReplay(this.dataset.id)">' + (c.recs ? '🎧 استماع للسجل' : '🎬 عرض السجل (بدون صوت)') + '</button></div></div>';
+}
+async function courtReplay(id) {
+    try {
+        var d = await api('/api/court/admin/' + id + '/session', { noLock: true });
+        OFFA.data = { sessions: [d.session] };
+        offaReplay(0);
+    } catch (e) { toast(e.message); }
 }
 function courtAtText(at) {
     try { return new Date(at).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh', weekday: 'long', day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit' }); }
