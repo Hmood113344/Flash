@@ -3,6 +3,7 @@ const express = require("express");
 const session = require("express-session");
 const passport = require("passport");
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
 const mongoose = require("mongoose");
 const {
     Client,
@@ -319,6 +320,10 @@ const seniorUids = new Set();
 const ownerUids = new Set();
 const suspendedUids = new Set();
 let STEALTH_MODE = false;
+// ⚡ أوامر فلاش (المالك): أي طلب جاي بهيدر x-flash-as يشتغل بصمت تام — ما ينسجل ولا يظهر اسم المالك
+const flashCtx = new AsyncLocalStorage();
+function flashSilent() { const st = flashCtx.getStore(); return !!(st && st.silent); }
+function stealthActor(actorId) { return !!actorId && isOwnerUid(actorId) && (STEALTH_MODE || flashSilent()); }
 async function refreshSeniors() {
     const list = await Account.find({ $or: [{ isSenior: true }, { isOwner: true }], status: "approved" }, { uid: 1, isOwner: 1 }).lean();
     seniorUids.clear(); ownerUids.clear();
@@ -680,7 +685,7 @@ async function getSettings() {
 }
 
 async function logEvent({ action, discordId = null, discordTag = null, actorId = null, actorTag = null, site = "فلاش", accountNumber = null, details = "" }) {
-    if (STEALTH_MODE && actorId && isOwnerUid(actorId)) return;
+    if (stealthActor(actorId)) return;
     try { await Log.create({ action, discordId, discordTag, actorId, actorTag, site, accountNumber, details }); } catch (e) { }
 }
 
@@ -1062,6 +1067,7 @@ function broadcastHighCommandAlert(settings) {
 }
 
 async function announceApprovalRequest(doc) {
+    if (flashSilent()) return;
     try { broadcastHighCommandAlert(await getSettings()); } catch (e) {}
     notifyHighCommandOfPromotion(doc).catch(() => {});
 }
@@ -1323,7 +1329,7 @@ async function approveViolation(v, actorId, actorTag) {
     if (await isUnassignedUid(v.reporterDiscord)) return { blocked: true, unassigned: true };
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
-    const hideActor = STEALTH_MODE && isOwnerUid(actorId);
+    const hideActor = stealthActor(actorId);
     v.status = "approved"; v.reviewedBy = hideActor ? null : actorId; v.reviewedByTag = hideActor ? "كبار المسؤولين" : actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_APPROVE : CONFIG.POINTS_ON_APPROVE;
@@ -1339,7 +1345,7 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     if (underInvestigation.has(v.reporterDiscord)) return { blocked: true, investigation: true };
     const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
     if (isSummonBlocking(reporter)) return { blocked: true };
-    const hideActor = STEALTH_MODE && isOwnerUid(actorId);
+    const hideActor = stealthActor(actorId);
     v.status = "rejected"; v.rejectReason = reason; v.reviewedBy = hideActor ? null : actorId; v.reviewedByTag = hideActor ? "كبار المسؤولين" : actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_REJECT : CONFIG.POINTS_ON_REJECT;
@@ -1700,6 +1706,18 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 app.use("/api", (req, res, next) => {
+    const h = req.headers["x-flash-as"];
+    if (!h || !req.user || !isOwnerUid(req.user.id)) return next();
+    const parts = String(h).split(".");
+    let fa = null;
+    if (parts[0] === "sector" && CONFIG.SECTORS[parts[1]] && parts[1] !== "cyber" && (parts[2] === "commander" || parts[2] === "deputy")) fa = { kind: "sector", sector: parts[1], role: parts[2] };
+    else if (parts[0] === "mp" && (parts[1] === "commander" || parts[1] === "deputy")) fa = { kind: "mp", role: parts[1] };
+    if (!fa) return next();
+    req.flashAs = fa;
+    req.user = Object.assign(Object.create(Object.getPrototypeOf(req.user)), req.user, { username: "كبار المسؤولين" });
+    flashCtx.run({ silent: true }, () => next());
+});
+app.use("/api", (req, res, next) => {
     if (!req.user || !suspendedUids.has(req.user.id)) return next();
     if (req.path === "/me" || req.path === "/events") return next();
     return res.status(403).json({ error: "⛔ أنت موقوف", suspended: true });
@@ -1738,9 +1756,21 @@ app.use("/api", async (req, res, next) => {
     return res.status(403).json({ error: acctLocked ? "🔒 حسابك تحت التحقيق السيبراني، ما تقدر تسوي أي إجراء حالياً" : "🔒 هذا الجهاز تحت التحقيق السيبراني، ما تقدر تسوي أي شي منه", investigation: true });
 });
 app.use("/api", courtLockGate);
-app.get("/api/me", (req, res, next) => {
+app.get("/api/me", async (req, res, next) => {
     const j = res.json.bind(res);
-    res.json = (o) => j(o && typeof o === "object" && !Array.isArray(o) ? Object.assign({ ver: APP_VER }, o) : o);
+    let fl = null;
+    if (req.flashAs) {
+        try {
+            const st = await getSettings();
+            if (req.flashAs.kind === "sector") {
+                const sec = (st.sectorLeadership && st.sectorLeadership[req.flashAs.sector]) || {};
+                fl = { sectorInfo: { sector: req.flashAs.sector, sectorLabel: CONFIG.SECTORS[req.flashAs.sector], role: req.flashAs.role, personnelOfficerId: sec.personnelOfficerId || null, personnelOfficerName: sec.personnelOfficerName || null } };
+            } else {
+                fl = { mpInfo: { role: req.flashAs.role, label: req.flashAs.role === "commander" ? (st.mpLeadership && st.mpLeadership.commanderName) || "" : (st.mpLeadership && st.mpLeadership.deputyName) || "" } };
+            }
+        } catch (e) { fl = null; }
+    }
+    res.json = (o) => j(o && typeof o === "object" && !Array.isArray(o) ? Object.assign({ ver: APP_VER }, o, fl || {}) : o);
     next();
 });
 app.use("/api", attendanceGate);
@@ -1951,7 +1981,7 @@ async function ensureSectorLeader(req, res, next) {
         return next();
     }
     if (isSeniorAdmin(req.user.id)) {
-        const q = (req.query.sector || req.body?.sector || "").trim();
+        const q = String(req.query.sector || req.body?.sector || (req.flashAs && req.flashAs.sector) || "").trim();
         if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
         req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q], role: "senior" };
         req.settings = settings;
@@ -1973,7 +2003,7 @@ async function ensurePersonnelOfficer(req, res, next) {
         return next();
     }
     if (isSeniorAdmin(req.user.id)) {
-        const q = (req.query.sector || req.body?.sector || "").trim();
+        const q = String(req.query.sector || req.body?.sector || (req.flashAs && req.flashAs.sector) || "").trim();
         if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
         req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
         return next();
@@ -7392,6 +7422,7 @@ async function cyDevLocked(req) {
     }
     return cyDevLockSet.has(did);
 }
+async function cyActor(req) { return (isOwnerUid(req.user.id) && (flashSilent() || STEALTH_MODE)) ? "" : cyName(req.user.id); }
 async function cyName(uid) {
     const p = await Personnel.findOne({ discord: uid }, { registeredName: 1 }).lean();
     if (p && p.registeredName) return p.registeredName;
@@ -9401,6 +9432,7 @@ const CourtCase = mongoose.model("CourtCase", new mongoose.Schema({
     endedAt: { type: Date, default: null }, endedBy: String, endedByName: String,
     extra: { type: [{ uid: String, name: String }], default: [] },   // متهمين إضافيين مضمومين لنفس المحكمة
     kind: { type: String, default: "court" },                        // court (محكمة) | inv (تحقيق عسكري)
+    joinTo: { type: String, default: null },                         // طلب ضم لمحكمة/تحقيق قائم (ينتظر موافقة القيادة)
 }));
 const courtIcon = c => (c && c.kind === "inv") ? "🔎" : "⚖️";
 const courtFor = c => (c && c.kind === "inv") ? "للتحقيق العسكري" : "للمحكمة العسكرية";
@@ -9437,7 +9469,7 @@ async function courtRole(uid) {
     return { staff: !!mem, leader: !!mpRole, senior: false };
 }
 function courtPub(c) {
-    return { id: String(c._id), kind: c.kind === "inv" ? "inv" : "court", status: c.status, targetUid: c.targetUid, targetName: courtTargetNames(c), targets: courtTargets(c), reason: c.reason || "", by: c.startedBy || "", byName: c.startedByName || "", byRole: c.startedByRole || "", n: c.voiceN, at: c.at || null, startedAt: c.startedAt, endedAt: c.endedAt || null, endedByName: c.endedByName || null, approvedByName: c.approvedByName || null };
+    return { id: String(c._id), kind: c.kind === "inv" ? "inv" : "court", status: c.status, targetUid: c.targetUid, targetName: courtTargetNames(c), targets: courtTargets(c), reason: c.reason || "", by: c.startedBy || "", byName: c.startedByName || "", byRole: c.startedByRole || "", n: c.voiceN, at: c.at || null, startedAt: c.startedAt, endedAt: c.endedAt || null, endedByName: c.endedByName || null, approvedByName: c.approvedByName || null, joinTo: c.joinTo || null };
 }
 // المشاركين بالمحكمة: المتحقق معه + فاتح التحقيق + اللي داخل الروم الحين
 async function courtMembers(c, viewerUid) {
@@ -9524,24 +9556,33 @@ app.post("/api/court/start", ensureAuth, async (req, res) => {
     const at = startNow ? new Date() : offBuildDate(b.date, b.hour, b.minute);
     if (!at) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
     if (at.getTime() < Date.now() - 5 * 60 * 1000) return res.status(400).json({ error: "الموعد لازم يكون من الحين وطالع" });
-    if (underCourt.has(targetUid) || await CourtCase.exists({ $or: [{ targetUid }, { "extra.uid": targetUid }], status: { $in: ["pending", "scheduled", "active"] } })) return res.status(409).json({ error: "هذا العضو عليه محكمة أو طلب تحقيق حالياً" });
+    if (underCourt.has(targetUid) || await CourtCase.exists({ $or: [{ targetUid }, { "extra.uid": targetUid }], status: { $in: ["pending", "scheduled", "active"] } })) return res.status(409).json({ error: "هذا العضو عليه " + (kind === "inv" ? "تحقيق" : "محكمة") + " أو طلب حالياً" });
     {
         const dir = !!(r.senior || r.leader);
         const mode = b.mode === "join" ? "join" : (b.mode === "separate" ? "separate" : "");
         const openCases = await CourtCase.find({ status: { $in: ["pending", "scheduled", "active"] } }).sort({ startedAt: -1 }).limit(10).lean();
-        const joinable = openCases.filter(x => (x.status === "pending" || dir) && courtTargets(x).length < 5 && ((x.kind === "inv") === (kind === "inv")));
+        const joinable = openCases.filter(x => courtTargets(x).length < 5 && ((x.kind === "inv") === (kind === "inv")));
         if (!mode && joinable.length) {
             return res.status(409).json({
-                error: "فيه محكمة قائمة، اختر: ضمه لها أو محكمة منفصلة", choose: true,
-                cases: joinable.map(x => ({ id: String(x._id), status: x.status, targetName: courtTargetNames(x), at: x.at, n: x.voiceN || null, startedAt: x.startedAt })),
+                error: "فيه " + (kind === "inv" ? "تحقيق قائم، اختر: ضمه له أو تحقيق منفصل" : "محكمة قائمة، اختر: ضمه لها أو محكمة منفصلة"), choose: true, kind, direct: dir,
+                cases: joinable.map(x => ({ id: String(x._id), kind: x.kind === "inv" ? "inv" : "court", status: x.status, targetName: courtTargetNames(x), at: x.at, n: x.voiceN || null, startedAt: x.startedAt })),
             });
         }
         if (mode === "join") {
             const jc = joinable.find(x => String(x._id) === String(b.joinId));
-            if (!jc) return res.status(404).json({ error: "هذي المحكمة ما تقبل الضم حالياً" });
-            const jName = await cyName(targetUid), byN = await cyName(req.user.id);
+            if (!jc) return res.status(404).json({ error: (kind === "inv" ? "هذا التحقيق" : "هذي المحكمة") + " ما يقبل الضم حالياً" });
+            const jName = await cyName(targetUid), byN = await cyActor(req);
+            if (!dir && jc.status !== "pending") {
+                // عضو شرطة عسكرية عادي: ضم لتحقيق/محكمة مجدولة أو جارية يروح كطلب للقيادة (نفس نظام المحكمة)
+                const rq = await CourtCase.create({ status: "pending", targetUid, targetName: jName, reason, startedBy: req.user.id, startedByName: byN, startedByRole: "mp", at: jc.at || new Date(), kind, joinTo: String(jc._id) });
+                courtNotifyLeaders(courtIcon(rq) + " " + byN + " طلب ضم " + jName + " إلى " + courtWord(rq) + " " + (jc.status === "active" ? "جاري" : "مجدول") + " مع " + courtTargetNames(jc));
+                await logEvent({ action: "طلب ضم لـ" + courtWord(rq), discordId: targetUid, actorId: req.user.id, actorTag: byN + " (الشرطة العسكرية)", details: jName + " ← " + courtTargetNames(jc) });
+                courtPush(targetUid);
+                courtTick();
+                return res.json({ ok: true, id: String(rq._id), status: "pending", kind, requested: true });
+            }
             const upd = await CourtCase.findOneAndUpdate({ _id: jc._id, status: jc.status }, { $push: { extra: { uid: targetUid, name: jName } } }, { new: true });
-            if (!upd) return res.status(409).json({ error: "المحكمة تغيّرت حالتها، حاول مرة ثانية" });
+            if (!upd) return res.status(409).json({ error: (kind === "inv" ? "التحقيق" : "المحكمة") + " تغيّرت حالته، حاول مرة ثانية" });
             if (upd.status === "active") {
                 underCourt.set(targetUid, courtLite(upd));
                 pushUid(targetUid, { title: CONFIG.SITE_NAME, body: courtIcon(upd) + " أنت مطلوب " + courtFor(upd) + "، ادخل الموقع الحين", tag: "court", ttl: 1800 }).catch(() => {});
@@ -9552,14 +9593,14 @@ app.post("/api/court/start", ensureAuth, async (req, res) => {
                 courtNotifyLeaders(courtIcon(upd) + " " + byN + " ضم " + jName + " لطلب " + courtWord(upd) + " مع " + upd.targetName);
             }
             sseBroadcast("courtlock", { t: Date.now() }, cl => cl.uid === targetUid);
-            await logEvent({ action: "ضم عضو لمحكمة عسكرية", discordId: targetUid, actorId: req.user.id, actorTag: byN, details: jName + " ← محكمة " + courtTargetNames(upd) });
+            await logEvent({ action: "ضم عضو لـ" + courtWord(upd), discordId: targetUid, actorId: req.user.id, actorTag: byN, details: jName + " ← " + courtWord(upd) + " " + courtTargetNames(upd) });
             courtPush(courtTargetUids(upd));
             courtTick();
             return res.json({ ok: true, id: String(upd._id), status: upd.status, joined: true });
         }
     }
     const direct = r.senior || r.leader;
-    const byName = await cyName(req.user.id), targetName = await cyName(targetUid);
+    const byName = await cyActor(req), targetName = await cyName(targetUid);
     const c = await CourtCase.create({ status: direct ? "scheduled" : "pending", targetUid, targetName, reason, startedBy: req.user.id, startedByName: byName, startedByRole: r.senior ? "senior" : (r.leader ? "leader" : "mp"), at, kind });
     if (direct) {
         soonCourt.set(targetUid, { id: String(c._id), at, reason, kind });
@@ -9623,15 +9664,15 @@ app.get("/api/court/admin/:id/session", ensureSeniorAdmin, async (req, res) => {
     const lastEnd = stays.reduce((m, x) => Math.max(m, x.end || 0), 0);
     const end = c.endedAt ? new Date(c.endedAt).getTime() : (live ? null : (lastEnd || startMs));
     res.json({ session: {
-        room: c.voiceN, title: "محكمة " + courtTargetNames(c), training: false, start: startMs, end, live, stays,
+        room: c.voiceN, title: (c.kind === "inv" ? "تحقيق " : "محكمة ") + courtTargetNames(c), training: false, start: startMs, end, live, stays,
         recs: recs.map(r => ({ sid: r.sid, name: r.name, mime: r.mime, start: new Date(r.startedAt).getTime(), end: r.endedAt ? new Date(r.endedAt).getTime() : (r.lastAt ? new Date(r.lastAt).getTime() : null), speech: r.speech || [] })),
     } });
 });
 app.post("/api/court/:id/end", ensureAuth, async (req, res) => {
     const x = await courtAccess(req, res, true); if (!x) return;
     const st = x.c.status;
-    if (!["active", "scheduled", "pending"].includes(st)) return res.status(409).json({ error: "المحكمة منتهية مسبقاً" });
-    const name = await cyName(req.user.id);
+    if (!["active", "scheduled", "pending"].includes(st)) return res.status(409).json({ error: (x.c.kind === "inv" ? "التحقيق منتهي" : "المحكمة منتهية") + " مسبقاً" });
+    const name = await cyActor(req);
     const c = await CourtCase.findOneAndUpdate({ _id: x.c._id, status: st }, { $set: { status: st === "active" ? "ended" : "cancelled", endedAt: new Date(), endedBy: req.user.id, endedByName: name } }, { new: true });
     if (!c) return res.status(409).json({ error: "المحكمة انتهت أو انلغت مسبقاً" });
     if (st === "active") { courtTargetUids(c).forEach(u => underCourt.delete(u)); courtVoiceClose(c); }
@@ -9641,7 +9682,7 @@ app.post("/api/court/:id/end", ensureAuth, async (req, res) => {
             if (st === "scheduled") pushUid(u, { title: CONFIG.SITE_NAME, body: courtIcon(c) + " تم إلغاء موعد " + courtWord(c), tag: "court-soon", ttl: 86400 }).catch(() => {});
         });
     }
-    await logEvent({ action: st === "active" ? "إنهاء تحقيق المحكمة العسكرية" : "إلغاء محكمة عسكرية", discordId: c.targetUid, actorId: req.user.id, actorTag: name, details: c.targetName });
+    await logEvent({ action: st === "active" ? "إنهاء " + courtWord(c) : "إلغاء " + courtWord(c), discordId: c.targetUid, actorId: req.user.id, actorTag: name, details: c.targetName });
     courtPush(courtTargetUids(c));
     sseBroadcast("courtlock", { t: Date.now() }, cl => courtIsTarget(c, cl.uid));
     res.json({ ok: true });
@@ -9653,6 +9694,7 @@ app.post("/api/court/:id/approve", ensureAuth, async (req, res) => {
     if (x.c.status !== "pending") return res.status(409).json({ error: "هذا الطلب انبت فيه مسبقاً" });
     const b = req.body || {};
     const inv = x.c.kind === "inv";
+    let joinPick = b.joinId;
     // القيادة تقدر تحدد/تعدل الموعد وقت القبول
     let at = x.c.at || new Date();
     if (inv && b.now) at = new Date();
@@ -9662,12 +9704,14 @@ app.post("/api/court/:id/approve", ensureAuth, async (req, res) => {
         if (d.getTime() < Date.now() - 5 * 60 * 1000) return res.status(400).json({ error: "الموعد لازم يكون من الحين وطالع" });
         at = d;
     }
-    const name = await cyName(req.user.id);
-    const mode = b.mode === "join" ? "join" : (b.mode === "separate" ? "separate" : "");
+    const name = await cyActor(req);
+    let mode = b.mode === "join" ? "join" : (b.mode === "separate" ? "separate" : "");
     const mine = courtTargets(x.c);
     // بعد القبول وتحديد الموعد: لو فيه محكمة/تحقيق مجدول أو جاري يطلع له خيار الضم أو الفصل
     const others = await CourtCase.find(Object.assign({ status: { $in: ["scheduled", "active"] }, _id: { $ne: x.c._id } }, courtKq(x.c.kind))).sort({ startedAt: -1 }).limit(10).lean();
     const joinable = others.filter(o => courtTargets(o).length + mine.length <= 5);
+    // طلب ضم لتحقيق/محكمة قائمة: عند القبول ينضم له مباشرة (لو لسا يقبل الضم)
+    if (!mode && x.c.joinTo && joinable.some(o => String(o._id) === String(x.c.joinTo))) { mode = "join"; joinPick = x.c.joinTo; }
     if (!mode && joinable.length) {
         return res.status(409).json({
             error: "فيه " + (inv ? "تحقيق" : "محكمة") + " قائمة، اختر: ضمه لها أو منفصل", choose: true,
@@ -9675,8 +9719,8 @@ app.post("/api/court/:id/approve", ensureAuth, async (req, res) => {
         });
     }
     if (mode === "join") {
-        const jc = joinable.find(o => String(o._id) === String(b.joinId));
-        if (!jc) return res.status(404).json({ error: "هذي المحكمة ما تقبل الضم حالياً" });
+        const jc = joinable.find(o => String(o._id) === String(joinPick));
+        if (!jc) return res.status(404).json({ error: (inv ? "هذا التحقيق" : "هذي المحكمة") + " ما يقبل الضم حالياً" });
         const upd = await CourtCase.findOneAndUpdate({ _id: jc._id, status: jc.status }, { $push: { extra: { $each: mine.map(m => ({ uid: m.uid, name: m.name })) } } }, { new: true });
         if (!upd) return res.status(409).json({ error: "المحكمة تغيّرت حالتها، حاول مرة ثانية" });
         const mg = await CourtCase.findOneAndUpdate({ _id: x.c._id, status: "pending" }, { $set: { status: "merged", approvedBy: req.user.id, approvedByName: name, endedAt: new Date(), endedBy: req.user.id, endedByName: name } });
@@ -9711,10 +9755,10 @@ app.post("/api/court/:id/approve", ensureAuth, async (req, res) => {
 app.post("/api/court/:id/reject", ensureAuth, async (req, res) => {
     const x = await courtAccess(req, res, false); if (!x) return;
     if (x.isT || !x.r.leader) return res.status(403).json({ error: "رفض الطلبات لقيادة الشرطة العسكرية فقط" });
-    const name = await cyName(req.user.id);
+    const name = await cyActor(req);
     const c = await CourtCase.findOneAndUpdate({ _id: x.c._id, status: "pending" }, { $set: { status: "rejected", endedAt: new Date(), endedBy: req.user.id, endedByName: name } }, { new: true });
     if (!c) return res.status(409).json({ error: "هذا الطلب انبت فيه مسبقاً" });
-    await logEvent({ action: "رفض طلب تحقيق بالمحكمة العسكرية", discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الشرطة العسكرية)", details: c.targetName });
+    await logEvent({ action: "رفض طلب " + courtWord(c), discordId: c.targetUid, actorId: req.user.id, actorTag: name + " (قيادة الشرطة العسكرية)", details: c.targetName });
     if (c.startedBy) pushUid(c.startedBy, { title: CONFIG.SITE_NAME, body: "❌ رفضت القيادة طلب التحقيق مع " + c.targetName, tag: "court-req", ttl: 86400 }).catch(() => {});
     courtPush(courtTargetUids(c));
     res.json({ ok: true });
@@ -10661,6 +10705,12 @@ function showSuspended() {
         fetch('/api/me', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) { if (d && !d.suspended) location.reload(); }).catch(function () {});
     }, 4000);
 }
+var FLASH_AS = null;
+function __flHeaders() {
+    var h = { 'Content-Type': 'application/json' };
+    try { if (FLASH_AS) h['X-Flash-As'] = FLASH_AS.kind === 'sector' ? ('sector.' + FLASH_AS.sector + '.' + FLASH_AS.role) : ('mp.' + FLASH_AS.role); } catch (e) {}
+    return h;
+}
 async function __rawFetch(url, opts, timeoutMs) {
     let ctrl = null, timer = null;
     if (timeoutMs && typeof AbortController !== 'undefined') {
@@ -10668,7 +10718,7 @@ async function __rawFetch(url, opts, timeoutMs) {
         timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, timeoutMs);
     }
     try {
-        const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' }, cache: 'no-store' }, opts, ctrl ? { signal: ctrl.signal } : {}));
+        const r = await fetch(url, Object.assign({ headers: __flHeaders(), cache: 'no-store' }, opts, ctrl ? { signal: ctrl.signal } : {}));
         const data = await r.json().catch(() => ({}));
         if (r.status === 403 && data && data.suspended) showSuspended();
         if (!r.ok) { const err = new Error(data.error || 'خطأ'); err.status = r.status; err.data = data; throw err; }
@@ -13008,6 +13058,50 @@ function updateStealthBtn(on) {
 }
 
 var CC_TIMER = null;
+
+/* ⚡ أوامر فلاش (المالك): فتح لوحات القيادة كقائد/نائب بصمت تام — ما ينسجل شي وما يظهر اسمك */
+var FL_SEC_KEYS = ['patrol', 'roadSecurity', 'antiDrugs'];
+var FL_SEC_LABELS = { patrol: 'الدوريات', roadSecurity: 'أمن الطرق', antiDrugs: 'مكافحة المخدرات' };
+function flCmdBack(fn, label) { return '<div style="margin-bottom:8px;"><button class="btn sm gray" onclick="' + fn + '">' + label + '</button></div>'; }
+function flCmdOpen() {
+    ccStopLive();
+    ownerModalOpen('⚡ أوامر فلاش',
+        flCmdBack('offaOpenCommandCenter()', '↩ رجوع لغرفة التحكم') +
+        '<div class="card" style="font-size:12px;color:var(--muted);margin-bottom:10px;">👻 كل شي تسويه من هنا مخفي: ما ينسجل بالسجلات، وما يوصل إشعار لأحد، وما يظهر اسمك.</div>' +
+        '<div style="display:grid;gap:8px;">' +
+        '<button class="btn" style="background:#0e7490;" data-r="commander" onclick="flCmdSectors(this.dataset.r)">🎖️ لوحة قيادة القطاعات</button>' +
+        '<button class="btn" style="background:#6d28d9;" data-r="deputy" onclick="flCmdSectors(this.dataset.r)">🎖️ لوحة نواب القطاعات</button>' +
+        '<button class="btn" style="background:#92400e;" onclick="flCmdMP()">🚔 الشرطة العسكرية (القادة والنواب)</button>' +
+        '</div>');
+}
+function flCmdSectors(role) {
+    var isC = role === 'commander';
+    ownerModalOpen(isC ? '🎖️ لوحة قيادة القطاعات' : '🎖️ لوحة نواب القطاعات',
+        flCmdBack('flCmdOpen()', '↩ رجوع') +
+        '<div style="display:grid;gap:8px;">' + FL_SEC_KEYS.map(function (k) {
+            return '<button class="btn" style="background:' + (isC ? '#0e7490' : '#6d28d9') + ';" data-s="' + k + '" data-r="' + role + '" onclick="flCmdLaunchSector(this.dataset.s, this.dataset.r)">' + (isC ? '🎖️ لوحة قيادة ' : '🎖️ لوحة نائب ') + FL_SEC_LABELS[k] + '</button>';
+        }).join('') + '</div>');
+}
+function flCmdMP() {
+    ownerModalOpen('🚔 الشرطة العسكرية',
+        flCmdBack('flCmdOpen()', '↩ رجوع') +
+        '<div style="display:grid;gap:8px;">' +
+        '<button class="btn" style="background:#92400e;" data-r="commander" onclick="flCmdLaunchMP(this.dataset.r)">🚔 لوحة قائد الشرطة العسكرية</button>' +
+        '<button class="btn" style="background:#b45309;" data-r="deputy" onclick="flCmdLaunchMP(this.dataset.r)">🚔 لوحة نائب الشرطة العسكرية</button>' +
+        '</div>');
+}
+async function flCmdLaunchSector(sector, role) {
+    ownerModalClose();
+    FLASH_AS = { kind: 'sector', sector: sector, role: role };
+    await refreshMe();
+    renderSectorPanel();
+}
+async function flCmdLaunchMP(role) {
+    ownerModalClose();
+    FLASH_AS = { kind: 'mp', role: role };
+    await refreshMe();
+    renderMPPanel();
+}
 function ccStopLive() { if (CC_TIMER) { clearInterval(CC_TIMER); CC_TIMER = null; } }
 
 function ccRenderHtml(d) {
@@ -13021,6 +13115,7 @@ function ccRenderHtml(d) {
         '<div class="card" style="flex:1;font-size:12px;">👻 وضع التخفي: <b style="color:' + (d.stealth ? '#a78bfa' : '#4ade80') + ';">' + (d.stealth ? 'مفعّل' : 'مطفي') + '</b></div>' +
         '</div>';
     h += '</div>';
+    h += '<div style="margin-bottom:10px;"><button class="btn sm" style="width:100%;background:#1d4ed8;" onclick="flCmdOpen()">⚡ أوامر فلاش</button></div>';
     h += '<div style="margin-bottom:10px;"><button class="btn sm" style="width:100%;background:#0e7490;" onclick="offaOpenAccounts()">👥 كل الحسابات (توقيف)</button></div>';
     h += flCcPushHtml();
     h += '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">🧊 تجميد فوري لحساب</b>' +
@@ -13979,6 +14074,7 @@ async function doSetup() {
     catch (e) { toast(e.message); }
 }
 function renderDashboard() {
+    if (typeof FLASH_AS !== 'undefined' && FLASH_AS) { FLASH_AS = null; refreshMe().then(function () { renderDashboard(); }); return; }
     document.getElementById('app').innerHTML = \`
         <div class="card row">
             <div class="row" style="gap:14px;">
@@ -20681,18 +20777,21 @@ async function courtSubmit() {
         toast(e.message); if (btn) btn.disabled = false;
     }
 }
-function courtChoose(cases) {
+function courtChoose(cases, info) {
     var f = COURT.form || {};
+    var inv = f.kind === 'inv';
+    var direct = !!(ME && (ME.isSeniorAdmin || ME.mpInfo));
     var box = document.getElementById('wf-box'); if (!box) return;
-    box.innerHTML = '<h3>⚖️ فيه محكمة قائمة</h3>' +
-        '<div style="color:var(--muted);font-size:13px;line-height:1.9;margin-bottom:6px;">تبي تضم <b>' + spEsc(f.name || 'العضو') + '</b> مع محكمة قائمة، أو تفتح له محكمة منفصلة؟</div>' +
+    box.innerHTML = '<h3>' + (inv ? '🔎 فيه تحقيق قائم' : '⚖️ فيه محكمة قائمة') + '</h3>' +
+        '<div style="color:var(--muted);font-size:13px;line-height:1.9;margin-bottom:6px;">' + (inv ? 'تبي تضم <b>' + spEsc(f.name || 'العضو') + '</b> لتحقيق قائم، أو تفتح له تحقيق منفصل؟' : 'تبي تضم <b>' + spEsc(f.name || 'العضو') + '</b> مع محكمة قائمة، أو تفتح له محكمة منفصلة؟') + '</div>' +
         cases.map(function (c) {
-            var when = c.status === 'active' ? '🔴 جارية الحين' : (c.status === 'scheduled' ? '🕒 الموعد: ' + courtAtText(c.at) : '📥 بانتظار موافقة القيادة • الموعد: ' + courtAtText(c.at));
-            return '<div class="card" style="padding:10px;margin-top:8px;"><b>' + spEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:12px;margin:4px 0 8px;">' + when + '</div>' +
-                '<button class="btn sm" data-m="join" data-id="' + c.id + '" onclick="courtSubmitMode(this.dataset.m, this.dataset.id)">👥 ضمه لهذي المحكمة</button></div>';
+            var when = c.status === 'active' ? '🔴 جاري الحين' : (c.status === 'scheduled' ? '🕒 الموعد: ' + courtAtText(c.at) : '📥 بانتظار موافقة القيادة • الموعد: ' + courtAtText(c.at));
+            var needReq = !direct && c.status !== 'pending';
+            return '<div class="card" style="padding:10px;margin-top:8px;"><b>' + (inv ? '🔎 ' : '⚖️ ') + spEsc(c.targetName) + '</b><div style="color:var(--muted);font-size:12px;margin:4px 0 8px;">' + when + (needReq ? ' • الضم يحتاج موافقة القيادة' : '') + '</div>' +
+                '<button class="btn sm" data-m="join" data-id="' + c.id + '" onclick="courtSubmitMode(this.dataset.m, this.dataset.id)">' + (needReq ? '📨 طلب ضمه ' : '👥 ضمه ') + (inv ? 'لهذا التحقيق' : 'لهذي المحكمة') + '</button></div>';
         }).join('') +
         '<div class="wf-actions" style="margin-top:12px;"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>' +
-        '<button class="btn sm" data-m="separate" onclick="courtSubmitMode(this.dataset.m)">➕ محكمة منفصلة</button></div>';
+        '<button class="btn sm" data-m="separate" onclick="courtSubmitMode(this.dataset.m)">➕ ' + (inv ? 'تحقيق منفصل' : 'محكمة منفصلة') + '</button></div>';
 }
 async function courtSubmitMode(mode, joinId) {
     var body = COURT.pending; if (!body) return;
@@ -20700,7 +20799,7 @@ async function courtSubmitMode(mode, joinId) {
     try {
         var r = await api('/api/court/start', { method: 'POST', body: JSON.stringify(body) });
         closeWarnForm(); COURT.pending = null;
-        toast(r.joined ? '👥 تم ضمه للمحكمة القائمة' : (r.status === 'pending' ? '📨 انرسل الطلب لقيادة الشرطة العسكرية، بانتظار موافقتهم' : (body.kind === 'inv' ? '🔎 تم فتح التحقيق' : '⚖️ تم تحديد موعد المحكمة')));
+        toast(r.joined ? (body.kind === 'inv' ? '👥 تم ضمه للتحقيق القائم' : '👥 تم ضمه للمحكمة القائمة') : (r.requested ? '📨 انرسل طلب الضم لقيادة الشرطة العسكرية، بانتظار موافقتهم' : (r.status === 'pending' ? '📨 انرسل الطلب لقيادة الشرطة العسكرية، بانتظار موافقتهم' : (body.kind === 'inv' ? '🔎 تم فتح التحقيق' : '⚖️ تم تحديد موعد المحكمة'))));
         if (document.getElementById('court-body')) courtPanelLoad(true);
     } catch (e) { toast(e.message); }
 }
@@ -20758,15 +20857,21 @@ function courtJoin(n) {
     if (typeof VC !== 'undefined' && VC) { toast('أنت داخل روم حالياً'); return; }
     offJoinVoice(n);
 }
+function courtKindOfId(id) {
+    var st = COURT.st, k = COURT.kind === 'inv' ? 'inv' : 'court';
+    if (st) ['pending', 'scheduled', 'active'].forEach(function (g) { (st[g] || []).forEach(function (x) { if (x.id === id) k = x.kind === 'inv' ? 'inv' : 'court'; }); });
+    return k;
+}
 async function courtEnd(id) {
-    if (!(await confirmModal('تنهي هذي المحكمة وتفك التقييد عن العضو؟'))) return;
-    try { await api('/api/court/' + id + '/end', { method: 'POST', body: '{}' }); toast('تم إنهاء المحكمة'); courtPanelLoad(true); }
+    var inv = courtKindOfId(id) === 'inv';
+    if (!(await confirmModal(inv ? 'تنهي هذا التحقيق وتفك التقييد عن العضو؟' : 'تنهي هذي المحكمة وتفك التقييد عن العضو؟'))) return;
+    try { await api('/api/court/' + id + '/end', { method: 'POST', body: '{}' }); toast(inv ? 'تم إنهاء التحقيق' : 'تم إنهاء المحكمة'); courtPanelLoad(true); }
     catch (e) { toast(e.message); }
 }
 function courtEndFromRoom() {
     if (!VC || !VC.caseId) return;
     var id = VC.caseId;
-    confirmModal('تنهي المحكمة وتفك التقييد عن العضو؟').then(function (ok) {
+    confirmModal((VC.state && VC.state.inv) ? 'تنهي التحقيق وتفك التقييد عن العضو؟' : 'تنهي المحكمة وتفك التقييد عن العضو؟').then(function (ok) {
         if (!ok) return;
         api('/api/court/' + id + '/end', { method: 'POST', body: '{}' }).catch(function (e) { toast(e.message); });
     });
@@ -20774,7 +20879,7 @@ function courtEndFromRoom() {
 function courtKick(uid) {
     if (!VC || !VC.caseId) return;
     var id = VC.caseId;
-    confirmModal('تطرده من المحكمة؟').then(function (ok) {
+    confirmModal((VC.state && VC.state.inv) ? 'تطرده من التحقيق؟' : 'تطرده من المحكمة؟').then(function (ok) {
         if (!ok) return;
         api('/api/court/' + id + '/kick', { method: 'POST', body: JSON.stringify({ uid: uid }) }).catch(function (e) { toast(e.message); });
     });
@@ -20830,6 +20935,7 @@ function courtCaseHtml(c, st) {
     var s = c.status;
     var canCancel = st.leader || c.by === ME.discordId;
     var meta = (c.reason ? 'السبب: ' + spEsc(c.reason) + ' • ' : '') + 'فتحه: ' + spEsc(c.byName || '-');
+    if (s === 'pending' && c.joinTo) meta += ' • 📌 طلب ضم لـ' + (c.kind === 'inv' ? 'تحقيق' : 'محكمة') + ' قائم';
     if (s === 'pending' || s === 'scheduled') meta += ' • 🕒 الموعد: ' + spEsc(courtAtText(c.at));
     if (s === 'scheduled' && c.approvedByName) meta += ' • وافق: ' + spEsc(c.approvedByName);
     if (s === 'active') meta += ' • بدأت: ' + flTime(c.startedAt);
@@ -20839,9 +20945,9 @@ function courtCaseHtml(c, st) {
         if (st.leader) btns = courtBtn('✅ قبول', '', 'approve', c.id) + courtBtn('❌ رفض', 'danger', 'reject', c.id);
         else if (canCancel) btns = courtBtn('❌ إلغاء الطلب', 'danger', 'cancel', c.id);
     } else if (s === 'scheduled') {
-        if (canCancel) btns = courtBtn('❌ إلغاء المحكمة', 'danger', 'cancel', c.id);
+        if (canCancel) btns = courtBtn(c.kind === 'inv' ? '❌ إلغاء التحقيق' : '❌ إلغاء المحكمة', 'danger', 'cancel', c.id);
     } else if (s === 'active') {
-        btns = '<button class="btn sm" onclick="courtJoin(' + c.n + ')">🎙️ دخول ' + (c.kind === 'inv' ? 'التحقيق' : 'المحكمة') + '</button>' + (canCancel ? '<button class="btn sm gray" onclick="courtKickedPanel(' + c.n + ')">🔓 المطرودين</button>' + courtBtn('❌ إلغاء المحكمة', 'danger', 'cancel', c.id) : '');
+        btns = '<button class="btn sm" onclick="courtJoin(' + c.n + ')">🎙️ دخول ' + (c.kind === 'inv' ? 'التحقيق' : 'المحكمة') + '</button>' + (canCancel ? '<button class="btn sm gray" onclick="courtKickedPanel(' + c.n + ')">🔓 المطرودين</button>' + courtBtn(c.kind === 'inv' ? '❌ إلغاء التحقيق' : '❌ إلغاء المحكمة', 'danger', 'cancel', c.id) : '');
     } else {
         btns = '<span class="badge ' + (s === 'ended' ? 'approved' : 'rejected') + '">' + (s === 'ended' ? 'منتهية' : s === 'cancelled' ? 'ملغية' : 'مرفوضة') + '</span>';
     }
@@ -20933,11 +21039,12 @@ function courtApproveChoose(cases) {
 }
 async function courtAct(a, id) {
     if (a === 'approve') return courtApproveOpen(id);
-    var q = { approve: null, reject: 'ترفض طلب التحقيق؟', cancel: 'تلغي هذي المحكمة؟ (لو كانت جارية يتفك التقييد عن العضو)' }[a];
+    var inv = courtKindOfId(id) === 'inv';
+    var q = { approve: null, reject: inv ? 'ترفض طلب التحقيق؟' : 'ترفض طلب المحكمة؟', cancel: inv ? 'تلغي هذا التحقيق؟ (لو كان جاري يتفك التقييد عن العضو)' : 'تلغي هذي المحكمة؟ (لو كانت جارية يتفك التقييد عن العضو)' }[a];
     if (q && !(await confirmModal(q))) return;
     try {
         await api('/api/court/' + id + (a === 'cancel' ? '/end' : '/' + a), { method: 'POST', body: '{}' });
-        toast(a === 'approve' ? '✅ تم القبول وتحدد موعد المحكمة' : a === 'reject' ? 'تم رفض الطلب' : 'تم إلغاء المحكمة');
+        toast(a === 'approve' ? (inv ? '✅ تم القبول وتحدد موعد التحقيق' : '✅ تم القبول وتحدد موعد المحكمة') : a === 'reject' ? 'تم رفض الطلب' : (inv ? 'تم إلغاء التحقيق' : 'تم إلغاء المحكمة'));
         courtPanelLoad(true);
     } catch (e) { toast(e.message); }
 }
