@@ -9035,6 +9035,26 @@ async function closeReceptionDay(closerId, closerName) {
     const pm = new Map(ps.map(p => [p.discord, p]));
     const sm = new Map(sts.map(s => [s.uid, s]));
     const lv = new Set(leaves.filter(l => !l.endDate || l.endDate > now).map(l => l.discord));
+    // اللي حضر وقعد 15 دقيقة على الأقل بعد فتح الاستلام وسوا انصراف قبل الإغلاق = يحسب حاضر (مو غياب)
+    const REC_MIN_STAY_MS = 15 * 60 * 1000;
+    const stayed = new Set();
+    try {
+        const winS = new Date(rd.openedAt).getTime(), winE = now.getTime();
+        const logs = await AttLog.find({ at: { $gte: new Date(winS - ATT_SESSION_CAP) } }, { uid: 1, type: 1, at: 1 }).sort({ at: 1 }).limit(60000).maxTimeMS(10000).lean();
+        const cur = new Map();
+        for (const l of logs) {
+            const tt = new Date(l.at).getTime();
+            if (l.type === "in") { if (!cur.has(l.uid)) cur.set(l.uid, tt); }
+            else if (l.type === "out") {
+                const s0 = cur.get(l.uid);
+                if (s0 !== undefined) {
+                    const ov = Math.min(tt, winE) - Math.max(s0, tt - ATT_SESSION_CAP, winS);
+                    if (ov >= REC_MIN_STAY_MS) stayed.add(l.uid);
+                    cur.delete(l.uid);
+                }
+            }
+        }
+    } catch (e) { console.error("❌ فشل حساب مدة بقاء الاستلام:", e.message); }
     const rows = [], ops = [];
     let attended = 0, absent = 0, leave = 0;
     for (const a of accs) {
@@ -9045,7 +9065,7 @@ async function closeReceptionDay(closerId, closerName) {
         if (!p.unit || !key) continue;
         const st = sm.get(a.uid);
         const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: rd.openedAt };
-        if (st && st.status === "in") {
+        if ((st && st.status === "in") || stayed.has(a.uid)) {
             rows.push({ ...base, kind: "attended", gained: 1 });
             ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
             attended++;
@@ -9479,10 +9499,12 @@ app.get("/api/court/state", ensureAuth, async (req, res) => {
     const out = { lock: courtCaseOf(req.user.id), mine: courtSoonOf(req.user.id), staff: r.staff, leader: r.leader, senior: r.senior, pending: [], scheduled: [], active: [], recent: [] };
     if (r.staff) {
         const full = list => Promise.all(list.map(c => courtPubFull(c, req.user.id)));
-        out.pending = await full(await CourtCase.find({ status: "pending" }).sort({ at: 1 }).limit(40).lean());
-        out.scheduled = await full(await CourtCase.find({ status: "scheduled" }).sort({ at: 1 }).limit(40).lean());
-        out.active = await full(await CourtCase.find({ status: "active" }).sort({ startedAt: -1 }).limit(40).lean());
-        out.recent = (await CourtCase.find({ status: { $in: ["ended", "cancelled", "rejected"] } }).sort({ endedAt: -1 }).limit(15).lean()).map(courtPub);
+        const kq0 = String(req.query.kind || "");
+        const kf = kq0 === "inv" ? courtKq("inv") : (kq0 === "court" ? courtKq("court") : {});
+        out.pending = await full(await CourtCase.find(Object.assign({ status: "pending" }, kf)).sort({ at: 1 }).limit(40).lean());
+        out.scheduled = await full(await CourtCase.find(Object.assign({ status: "scheduled" }, kf)).sort({ at: 1 }).limit(40).lean());
+        out.active = await full(await CourtCase.find(Object.assign({ status: "active" }, kf)).sort({ startedAt: -1 }).limit(40).lean());
+        out.recent = (await CourtCase.find(Object.assign({ status: { $in: ["ended", "cancelled", "rejected"] } }, kf)).sort({ endedAt: -1 }).limit(30).lean()).map(courtPub);
     }
     res.json(out);
 });
@@ -9562,7 +9584,8 @@ async function courtAccess(req, res, needLead) {
     return { c, r, isT };
 }
 app.get("/api/court/admin/records", ensureSeniorAdmin, async (req, res) => {
-    const list = await CourtCase.find({ status: { $in: ["active", "ended", "cancelled"] }, voiceN: { $ne: null } }).sort({ startedAt: -1 }).limit(60).lean();
+    const kq1 = String(req.query.kind || "");
+    const list = await CourtCase.find(Object.assign({ status: { $in: ["active", "ended", "cancelled"] }, voiceN: { $ne: null } }, kq1 === "inv" ? courtKq("inv") : (kq1 === "court" ? courtKq("court") : {}))).sort({ startedAt: -1 }).limit(60).lean();
     const since = list.length ? new Date(new Date(list[list.length - 1].startedAt).getTime() - 3 * 60000) : new Date();
     const recs = await OfficerRec.find({ n: { $gte: 950, $lte: 979 }, startedAt: { $gte: since }, chunks: { $gt: 0 } }).select("n startedAt").lean();
     res.json({
@@ -9723,6 +9746,59 @@ app.post("/api/court/:id/kick", ensureAuth, async (req, res) => {
     if (!courtIsTarget(x.c, target)) await CourtCase.updateOne({ _id: x.c._id }, { $addToSet: { kicked: target } });
     if (x.c.voiceN) { offSendTo(target, { t: "kicked", n: x.c.voiceN }); offRemove(target, x.c.voiceN); }
     res.json({ ok: true });
+});
+
+// ---------- فك الطرد (المحكمة + التحقيق العسكري + التحقيق السيبراني) ----------
+async function kickCtx(req, res) {
+    const n = offParseN(req.params.n);
+    const uid = req.user.id;
+    if (n && offIsCourt(n)) {
+        const c = await CourtCase.findOne({ voiceN: n, status: "active" });
+        if (!c) { res.status(404).json({ error: "المحكمة غير موجودة أو انتهت" }); return null; }
+        const r = await courtRole(uid);
+        if (courtIsTarget(c, uid) || !(r.leader || c.startedBy === uid)) { res.status(403).json({ error: "فك الطرد لقيادة الشرطة العسكرية أو اللي فتح التحقيق أو الكبار" }); return null; }
+        return { type: "court", c, n };
+    }
+    if (n && offIsCyber(n)) {
+        const c = await CyberCase.findOne({ voiceN: n, status: "investigating" });
+        if (!c) { res.status(404).json({ error: "التحقيق غير موجود أو منتهي" }); return null; }
+        const rl = await cyberRoleOf(uid);
+        if (c.targetUid === uid || !(rl.isLeader || isSeniorAdmin(uid))) { res.status(403).json({ error: "فك الطرد لقيادة الأمن السيبراني فقط" }); return null; }
+        return { type: "cyber", c, n };
+    }
+    res.status(400).json({ error: "الطرد من هذا الروم مؤقت، تقدر ترجع تدخل على طول" });
+    return null;
+}
+app.get("/api/officers/rooms/:n/kicked", ensureAuth, async (req, res) => {
+    const x = await kickCtx(req, res); if (!x) return;
+    const list = [];
+    for (const u of (x.c.kicked || [])) list.push({ uid: u, name: await cyName(u) });
+    res.json({ list });
+});
+app.post("/api/officers/rooms/:n/unkick", ensureAuth, async (req, res) => {
+    const x = await kickCtx(req, res); if (!x) return;
+    const target = String((req.body || {}).uid || "");
+    if (!(x.c.kicked || []).includes(target)) return res.status(404).json({ error: "هذا الشخص مو مطرود" });
+    const Model = x.type === "court" ? CourtCase : CyberCase;
+    await Model.updateOne({ _id: x.c._id }, { $pull: { kicked: target } });
+    const name = await cyName(req.user.id), tn = await cyName(target);
+    if (x.type === "cyber") { await cySystemMsg(x.c._id, "🔓 " + name + " فك الطرد عن " + tn); cyberPush(x.c); }
+    await logEvent({ action: "فك طرد من روم", discordId: target, actorId: req.user.id, actorTag: name, details: tn + " — روم " + x.n });
+    pushUid(target, { title: CONFIG.SITE_NAME, body: "🔓 تم فك الطرد عنك، تقدر تدخل الروم", tag: "unkick", ttl: 3600 }).catch(() => {});
+    res.json({ ok: true });
+});
+app.post("/api/cyber/cases/:id/unkick", ensureAuth, async (req, res) => {
+    try {
+        const x = await cyAccess(req, res, true); if (!x) return;
+        const target = String((req.body && req.body.uid) || "");
+        if (!(x.c.kicked || []).includes(target)) return res.status(404).json({ error: "هذا الشخص مو مطرود" });
+        await CyberCase.updateOne({ _id: x.c._id }, { $pull: { kicked: target } });
+        const name = await cyName(req.user.id), tn = await cyName(target);
+        await cySystemMsg(x.c._id, "🔓 " + name + " فك الطرد عن " + tn);
+        cyberPush(x.c);
+        pushUid(target, { title: CONFIG.SITE_NAME, body: "🔓 تم فك الطرد عنك من التحقيق", tag: "unkick", ttl: 3600 }).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر فك الطرد" }); }
 });
 
 // لما يجي موعد المحكمة تنفتح تلقائياً: العضو ينقفل عليه وينفتح الروم الصوتي
@@ -11398,7 +11474,7 @@ async function cyLoadRoomInner() {
         var kicked = (d.kicked || []).indexOf(p.uid) >= 0;
         var canMute = live && (d.me.role === 'leader' ? p.uid !== d.me.uid : (d.me.role === 'member' && p.role === 'target'));
         return '<div class="cy-chip"><span style="color:' + (p.online ? '#4ade80' : '#64748b') + '">●</span> ' + cyEsc(p.name) + ' <small style="color:#94a3b8">' + (CY_ROLE[p.role] || '') + '</small>' + (muted ? ' 🔇' : '') +
-            (canMute ? ' <button class="btn sm gray" data-u="' + cyEsc(p.uid) + '" data-on="' + (muted ? 0 : 1) + '" onclick="cyMute(this)">' + (muted ? '🔊 فك' : '🔇 إسكات') + '</button>' : '') + (kicked ? ' 🚫' : '') + (live && d.me.role === 'leader' && p.uid !== d.me.uid && !kicked ? ' <button class="btn sm danger" data-u="' + cyEsc(p.uid) + '" onclick="cyKick(this)">🚫 طرد</button>' : '') + '</div>';
+            (canMute ? ' <button class="btn sm gray" data-u="' + cyEsc(p.uid) + '" data-on="' + (muted ? 0 : 1) + '" onclick="cyMute(this)">' + (muted ? '🔊 فك' : '🔇 إسكات') + '</button>' : '') + (kicked ? ' 🚫' + (live && d.me.role === 'leader' ? ' <button class="btn sm" data-u="' + cyEsc(p.uid) + '" onclick="cyUnkick(this)">🔓 فك الطرد</button>' : '') : '') + (live && d.me.role === 'leader' && p.uid !== d.me.uid && !kicked ? ' <button class="btn sm danger" data-u="' + cyEsc(p.uid) + '" onclick="cyKick(this)">🚫 طرد</button>' : '') + '</div>';
     }).join('');
     var box = document.getElementById('cy-msgs');
     var atBottom = CY.first || (box.scrollHeight - box.scrollTop - box.clientHeight < 60);
@@ -11761,6 +11837,12 @@ async function cyKick(btn) {
     if (!id) return;
     if (!(await confirmModal('متأكد تبي تطرده من التحقيق؟'))) return;
     try { await api('/api/cyber/cases/' + id + '/kick', { method: 'POST', body: JSON.stringify({ uid: uid }) }); toast('🚫 تم الطرد'); if (CY.roomId === id) { CY.sig = ''; cyLoadRoom(); } }
+    catch (e) { toast(e.message); }
+}
+async function cyUnkick(btn) {
+    var id = CY.roomId, uid = btn.dataset.u;
+    if (!id) return;
+    try { await api('/api/cyber/cases/' + id + '/unkick', { method: 'POST', body: JSON.stringify({ uid: uid }) }); toast('🔓 تم فك الطرد'); if (CY.roomId === id) { CY.sig = ''; cyLoadRoom(); } }
     catch (e) { toast(e.message); }
 }
 let currentPromoAlertId = null;
@@ -13398,6 +13480,7 @@ function buildNav() {
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.courtStaff) items.push({ label: '⚖️ المحكمة العسكرية', fn: 'renderCourtPanel()' });
+    if (ME.courtStaff) items.push({ label: '🔎 التحقيق العسكري', fn: 'renderInvPanel()' });
     if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
@@ -14244,6 +14327,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
             <div class="tab" id="tab-officers" onclick="adminTab('officers', this)">🎖️ إدارة سلك الضباط</div>
             <div class="tab" id="tab-court" onclick="adminTab('court', this)">⚖️ المحكمة العسكرية</div>
+            <div class="tab" id="tab-inv" onclick="adminTab('inv', this)">🔎 التحقيق العسكري</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
@@ -14281,7 +14365,8 @@ function adminTab(name, el) {
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
     if (name === 'officers') renderOfficerAdmin();
-    if (name === 'court') courtAdminTab();
+    if (name === 'court') courtAdminTab('court');
+    if (name === 'inv') courtAdminTab('inv');
     if (name === 'push') flPushTab();
     if (name === 'freq') flFreqAdmin();
 }
@@ -15991,6 +16076,7 @@ function renderMPPanel() {
             <div class="tab" onclick="mpTabSwitch('promo', this)">🎖️ سجل الترقيات</div>
             <div class="tab" onclick="mpTabSwitch('po', this)">👮 مسؤول الأفراد</div>
             <div class="tab" onclick="mpTabSwitch('court', this)">⚖️ المحكمة</div>
+            <div class="tab" onclick="mpTabSwitch('inv', this)">🔎 التحقيق</div>
         </div>
         <div id="mp-content"></div>\`;
     mpTabSwitch('members');
@@ -16050,7 +16136,8 @@ function mpTabSwitch(name, el) {
     if (name === 'log') loadMPSectorLog();
     if (name === 'promo') loadMPPromotionLog();
     if (name === 'po') loadMPPOBox();
-    if (name === 'court') courtMount('mp-content');
+    if (name === 'court') courtMount('mp-content', 'court');
+    if (name === 'inv') courtMount('mp-content', 'inv');
 }
 let mpLeaderListCache = [];
 async function loadMPMembers() {
@@ -16444,6 +16531,7 @@ function renderMPPOPanel() {
             <div class="tab active" onclick="mpPoTabSwitch('members', this)">الأعضاء</div>
             <div class="tab" onclick="mpPoTabSwitch('reports', this)">التقارير</div>
             <div class="tab" onclick="mpPoTabSwitch('court', this)">⚖️ المحكمة</div>
+            <div class="tab" onclick="mpPoTabSwitch('inv', this)">🔎 التحقيق</div>
         </div>
         <div id="mp-po-content"></div>\`;
     mpPoTabSwitch('members');
@@ -16454,7 +16542,8 @@ function mpPoTabSwitch(name, el) {
     mpPoTab = name;
     if (name === 'members') loadMPPOMembers();
     if (name === 'reports') loadMPPOReports();
-    if (name === 'court') courtMount('mp-po-content');
+    if (name === 'court') courtMount('mp-po-content', 'court');
+    if (name === 'inv') courtMount('mp-po-content', 'inv');
 }
 async function loadMPPOMembers() {
     const box = document.getElementById('mp-po-content');
@@ -16515,6 +16604,7 @@ function renderMPMemberPanel() {
         <div class="tabs">
             <div class="tab active" onclick="mpMemberTab('list', this)">👤 الأعضاء</div>
             <div class="tab" onclick="mpMemberTab('court', this)">⚖️ المحكمة</div>
+            <div class="tab" onclick="mpMemberTab('inv', this)">🔎 التحقيق</div>
         </div>
         <div id="mp-member-main"><div class="card"><input id="mp-member-search" placeholder="بحث بالاسم / اليونت / الرتبة / رقم البطاقة" onkeyup="if(event.key==='Enter') filterMPMemberList();"><button class="btn sm" onclick="filterMPMemberList()">بحث</button></div>
         <div id="mp-member-content"><div class="card">جارِ التحميل...</div></div></div>
@@ -18551,8 +18641,8 @@ function offPaintBar() {
     var micTxt = !canSpeak ? '🔇 مقفل' : (VC.micOn ? '🎙️ المايك' : '🔇 مكتوم');
     var qb = '';
     if (VC.isSenior && !VC.state.training && !VC.state.cyber && !VC.state.freq && !VC.state.court) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
-    if (VC.state.court && (offMyRole() === 'senior' || offMyRole() === 'mpl')) qb = '<button class="ov-btn" onclick="courtEndFromRoom()">⏹️ إنهاء ' + (VC.state.inv ? 'التحقيق' : 'المحكمة') + '</button>';
-    if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 نشاطه</button><button class="ov-btn" onclick="offCyEnd()">⏹️ إنهاء</button>';
+    if (VC.state.court && (offMyRole() === 'senior' || offMyRole() === 'mpl')) qb = '<button class="ov-btn" onclick="offKickedOpen()">🔓 المطرودين</button><button class="ov-btn" onclick="courtEndFromRoom()">⏹️ إنهاء ' + (VC.state.inv ? 'التحقيق' : 'المحكمة') + '</button>';
+    if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 نشاطه</button><button class="ov-btn" onclick="offKickedOpen()">🔓 المطرودين</button><button class="ov-btn" onclick="offCyEnd()">⏹️ إنهاء</button>';
     if (VC.state.freq || VC.state.court) qb += flIsIOS() ? '<button class="ov-btn" onclick="flMicHelp()">🎧 كتم/فتح من الشاشة</button>' : '<button class="ov-btn" onclick="flPipOpen()">🪟 نافذة عائمة</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
@@ -18938,6 +19028,29 @@ function offTileClick(ev, uid) {
     if (!VC || uid === VC.me) return;
     try { if (ev && ev.target && ev.target.closest && ev.target.closest('button')) return; } catch (e) {}
     offMenuOpen(uid);
+}
+function offKickedOpen() {
+    if (!VC) return;
+    var v = VC;
+    offPopOpen('<h3 style="color:var(--gold-soft);margin-bottom:10px;">🔓 المطرودين</h3><div class="ov-note">جارِ التحميل...</div>', 'kicked');
+    offFetch('/api/officers/rooms/' + v.n + '/kicked').then(function (d) {
+        if (VC !== v || VC.popup !== 'kicked') return;
+        offKickedPaint(d.list || []);
+    }).catch(function (e) { toast(e.message); offPopClose(); });
+}
+function offKickedPaint(list) {
+    var b = document.getElementById('ov-pop-box'); if (!b) return;
+    var h = '<h3 style="color:var(--gold-soft);margin-bottom:10px;">🔓 المطرودين</h3>';
+    if (!list.length) h += '<div class="ov-note">ما فيه أحد مطرود من هذا الروم.</div>';
+    list.forEach(function (x) {
+        h += '<div class="ov-rep w" style="align-items:center;justify-content:space-between;"><span>🚫 ' + spEsc(x.name) + '</span><button class="btn sm" data-u="' + x.uid + '" onclick="offUnkick(this.dataset.u)">🔓 فك الطرد</button></div>';
+    });
+    h += '<button class="btn gray" style="margin-top:10px;width:100%;" onclick="offPopClose()">إغلاق</button>';
+    b.innerHTML = h;
+}
+function offUnkick(uid) {
+    if (!VC) return;
+    offPost('/api/officers/rooms/' + VC.n + '/unkick', { uid: uid }).then(function () { toast('🔓 تم فك الطرد'); offKickedOpen(); }).catch(function (e) { toast(e.message); });
 }
 function offMenuClose() { var d = document.getElementById('ov-menu'); if (d) d.remove(); }
 function offMenuOpen(uid) {
@@ -20591,24 +20704,26 @@ async function courtSubmitMode(mode, joinId) {
         if (document.getElementById('court-body')) courtPanelLoad(true);
     } catch (e) { toast(e.message); }
 }
-function courtAdminTab() {
+function courtAdminTab(kind) {
     var box = document.getElementById('admin-content'); if (!box) return;
-    box.innerHTML = '<div class="tabs" style="margin-bottom:10px;"><div class="tab active" id="ct-sub-0" onclick="courtSubTab(0)">⚖️ المحاكم</div><div class="tab" id="ct-sub-1" onclick="courtSubTab(1)">📼 سجلات المحاكم</div></div><div id="ct-sub-body"></div>';
+    COURT.akind = kind === 'inv' ? 'inv' : 'court';
+    var inv = COURT.akind === 'inv';
+    box.innerHTML = '<div class="tabs" style="margin-bottom:10px;"><div class="tab active" id="ct-sub-0" onclick="courtSubTab(0)">' + (inv ? '🔎 التحقيقات' : '⚖️ المحاكم') + '</div><div class="tab" id="ct-sub-1" onclick="courtSubTab(1)">' + (inv ? '📼 سجلات التحقيقات' : '📼 سجلات المحاكم') + '</div></div><div id="ct-sub-body"></div>';
     courtSubTab(0);
 }
 function courtSubTab(i) {
     var a = document.getElementById('ct-sub-0'), b = document.getElementById('ct-sub-1');
     if (a) a.classList.toggle('active', i === 0);
     if (b) b.classList.toggle('active', i === 1);
-    if (i === 0) courtMount('ct-sub-body'); else courtRecordsLoad();
+    if (i === 0) courtMount('ct-sub-body', COURT.akind || 'court'); else courtRecordsLoad();
 }
 async function courtRecordsLoad() {
     var b = document.getElementById('ct-sub-body'); if (!b) return;
     b.innerHTML = '<div class="card">جارِ التحميل...</div>';
     try {
-        var d = await api('/api/court/admin/records', { noLock: true });
+        var d = await api('/api/court/admin/records?kind=' + (COURT.akind || 'court'), { noLock: true });
         b = document.getElementById('ct-sub-body'); if (!b) return;
-        b.innerHTML = d.list.length ? d.list.map(courtRecRow).join('') : '<div class="card" style="color:var(--muted);text-align:center;">ما فيه سجلات محاكم للحين</div>';
+        b.innerHTML = d.list.length ? d.list.map(courtRecRow).join('') : '<div class="card" style="color:var(--muted);text-align:center;">ما فيه سجلات للحين</div>';
     } catch (e) { if (b) b.innerHTML = '<div class="card" style="color:#f87171;">' + spEsc(e.message) + '</div>'; }
 }
 function courtRecRow(c) {
@@ -20672,9 +20787,10 @@ function courtPanelClose() {
     if (COURT.panelTimer) { clearInterval(COURT.panelTimer); COURT.panelTimer = null; }
     renderDashboard();
 }
-function courtMount(hostId) {
+function courtMount(hostId, kind) {
     var host = document.getElementById(hostId);
     if (!host) return;
+    COURT.kind = kind === 'inv' ? 'inv' : 'court';
     host.innerHTML = '<div id="court-body"><div class="card">جارِ التحميل...</div></div>';
     courtPanelLoad(false);
     if (COURT.panelTimer) clearInterval(COURT.panelTimer);
@@ -20683,19 +20799,20 @@ function courtMount(hostId) {
         else { clearInterval(COURT.panelTimer); COURT.panelTimer = null; }
     }, 8000);
 }
-function renderCourtPanel() {
+function renderInvPanel() { renderCourtPanel('inv'); }
+function renderCourtPanel(kind) {
     if (!ME || !ME.courtStaff) return renderDashboard();
     document.getElementById('app').innerHTML =
-        '<div class="card row"><h2>⚖️ المحكمة العسكرية</h2><button class="btn gray sm" onclick="courtPanelClose()">رجوع للوحتي</button></div>' +
+        '<div class="card row"><h2>' + (kind === 'inv' ? '🔎 التحقيق العسكري' : '⚖️ المحكمة العسكرية') + '</h2><button class="btn gray sm" onclick="courtPanelClose()">رجوع للوحتي</button></div>' +
         '<div id="court-host"></div>';
-    courtMount('court-host');
+    courtMount('court-host', kind);
 }
 function mpMemberTab(name, el) {
     document.querySelectorAll('.tab').forEach(function (t) { t.classList.remove('active'); });
     if (el) el.classList.add('active');
     var main = document.getElementById('mp-member-main'), ct = document.getElementById('mp-member-court');
     if (!main || !ct) return;
-    if (name === 'court') { main.style.display = 'none'; ct.style.display = 'block'; courtMount('mp-member-court'); }
+    if (name === 'court' || name === 'inv') { main.style.display = 'none'; ct.style.display = 'block'; courtMount('mp-member-court', name); }
     else { ct.style.display = 'none'; ct.innerHTML = ''; main.style.display = 'block'; }
 }
 function courtBtn(label, cls, a, id) {
@@ -20724,7 +20841,7 @@ function courtCaseHtml(c, st) {
     } else if (s === 'scheduled') {
         if (canCancel) btns = courtBtn('❌ إلغاء المحكمة', 'danger', 'cancel', c.id);
     } else if (s === 'active') {
-        btns = '<button class="btn sm" onclick="courtJoin(' + c.n + ')">🎙️ دخول ' + (c.kind === 'inv' ? 'التحقيق' : 'المحكمة') + '</button>' + (canCancel ? courtBtn('❌ إلغاء المحكمة', 'danger', 'cancel', c.id) : '');
+        btns = '<button class="btn sm" onclick="courtJoin(' + c.n + ')">🎙️ دخول ' + (c.kind === 'inv' ? 'التحقيق' : 'المحكمة') + '</button>' + (canCancel ? '<button class="btn sm gray" onclick="courtKickedPanel(' + c.n + ')">🔓 المطرودين</button>' + courtBtn('❌ إلغاء المحكمة', 'danger', 'cancel', c.id) : '');
     } else {
         btns = '<span class="badge ' + (s === 'ended' ? 'approved' : 'rejected') + '">' + (s === 'ended' ? 'منتهية' : s === 'cancelled' ? 'ملغية' : 'مرفوضة') + '</span>';
     }
@@ -20736,6 +20853,24 @@ function courtHoursOpts(hh) {
     var hours = '';
     for (var i = 0; i < 24; i++) hours += '<option value="' + i + '"' + (i === hh ? ' selected' : '') + '>' + (i % 12 === 0 ? 12 : i % 12) + ' ' + (i < 12 ? 'صباحاً' : 'مساءً') + '</option>';
     return hours;
+}
+async function courtKickedPanel(n) {
+    var box = document.getElementById('wf-box'); if (!box) return;
+    box.innerHTML = '<h3>🔓 المطرودين</h3><div style="color:var(--muted);">جارِ التحميل...</div>';
+    document.getElementById('wf-overlay').classList.add('open');
+    try {
+        var d = await api('/api/officers/rooms/' + n + '/kicked', { noLock: true });
+        var h = '<h3>🔓 المطرودين</h3>';
+        if (!(d.list || []).length) h += '<div style="color:var(--muted);margin:8px 0;">ما فيه أحد مطرود.</div>';
+        (d.list || []).forEach(function (x) {
+            h += '<div class="card row" style="padding:8px 12px;margin-top:6px;"><span>🚫 ' + spEsc(x.name) + '</span><button class="btn sm" data-n="' + n + '" data-u="' + x.uid + '" onclick="courtUnkickPanel(this.dataset.n, this.dataset.u)">🔓 فك الطرد</button></div>';
+        });
+        box.innerHTML = h + '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>';
+    } catch (e) { box.innerHTML = '<h3>🔓 المطرودين</h3><div style="color:#f87171;">' + spEsc(e.message) + '</div><div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>'; }
+}
+async function courtUnkickPanel(n, uid) {
+    try { await api('/api/officers/rooms/' + n + '/unkick', { method: 'POST', body: JSON.stringify({ uid: uid }) }); toast('🔓 تم فك الطرد'); courtKickedPanel(n); }
+    catch (e) { toast(e.message); }
 }
 function courtApproveOpen(id) {
     var c = null, st = COURT.st;
@@ -20810,24 +20945,25 @@ async function courtPanelLoad(silent) {
     var box = document.getElementById('court-body');
     if (!box) return;
     var st;
-    try { st = await api('/api/court/state', { noLock: true }); }
+    try { st = await api('/api/court/state?kind=' + (COURT.kind || 'court'), { noLock: true }); }
     catch (e) { if (!silent) box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + e.message + ')</div>'; return; }
     if (!document.getElementById('court-body')) return;
     COURT.st = st;
+    var cinv = COURT.kind === 'inv';
     var typing = document.activeElement && document.activeElement.id === 'court-q';
     var h = '';
     if (ME.isSeniorAdmin) {
-        h += '<div class="card"><h3>➕ إدخال عضو للمحكمة</h3><div style="color:var(--muted);font-size:12px;margin-bottom:8px;">كبار المسؤولين يدخلون أي عضو للمحكمة حتى لو ما عليه تحقيق، ويحددون الموعد.</div>' +
+        h += '<div class="card"><h3>➕ ' + (cinv ? 'فتح تحقيق مع عضو' : 'إدخال عضو للمحكمة') + '</h3><div style="color:var(--muted);font-size:12px;margin-bottom:8px;">كبار المسؤولين يدخلون أي عضو للمحكمة حتى لو ما عليه تحقيق، ويحددون الموعد.</div>' +
             '<input id="court-q" placeholder="🔍 ابحث عن اسم العضو..." oninput="courtSearch(this.value)"><div id="court-cand"></div></div>';
     } else {
         h += '<div class="card" style="color:var(--muted);font-size:13px;">لفتح محكمة أو تحقيق مع عضو: روح لتاب الأعضاء واضغط زر «⚖️ محكمة» أو «🔎 تحقيق» جنبه. ' + (st.leader ? 'تحقيقاتك ينحدد موعدها على طول.' : 'الطلب يروح لقيادة الشرطة العسكرية وإذا وافقوا ينحدد الموعد.') + '</div>';
     }
     if (st.pending.length) h += '<h3 style="margin:14px 0 8px;">📥 طلبات التحقيق (' + st.pending.length + ')</h3>' + st.pending.map(function (c) { return courtCaseHtml(c, st); }).join('');
-    h += '<h3 style="margin:14px 0 8px;">🕒 محاكم مجدولة (' + st.scheduled.length + ')</h3>' +
-        (st.scheduled.length ? st.scheduled.map(function (c) { return courtCaseHtml(c, st); }).join('') : '<div class="card" style="color:var(--muted);">لا يوجد محاكم مجدولة</div>');
-    h += '<h3 style="margin:14px 0 8px;">🔴 المحاكمات الجارية (' + st.active.length + ')</h3>' +
-        (st.active.length ? st.active.map(function (c) { return courtCaseHtml(c, st); }).join('') : '<div class="card" style="color:var(--muted);">لا يوجد محاكمات جارية</div>');
-    if (st.recent.length) h += '<h3 style="margin:14px 0 8px;">📜 آخر المنتهية</h3>' + st.recent.map(function (c) { return courtCaseHtml(c, st); }).join('');
+    h += '<h3 style="margin:14px 0 8px;">🕒 ' + (cinv ? 'تحقيقات مجدولة' : 'محاكم مجدولة') + ' (' + st.scheduled.length + ')</h3>' +
+        (st.scheduled.length ? st.scheduled.map(function (c) { return courtCaseHtml(c, st); }).join('') : '<div class="card" style="color:var(--muted);">' + (cinv ? 'لا يوجد تحقيقات مجدولة' : 'لا يوجد محاكم مجدولة') + '</div>');
+    h += '<h3 style="margin:14px 0 8px;">🔴 ' + (cinv ? 'التحقيقات الجارية' : 'المحاكمات الجارية') + ' (' + st.active.length + ')</h3>' +
+        (st.active.length ? st.active.map(function (c) { return courtCaseHtml(c, st); }).join('') : '<div class="card" style="color:var(--muted);">' + (cinv ? 'لا يوجد تحقيقات جارية' : 'لا يوجد محاكمات جارية') + '</div>');
+    if (st.recent.length) h += '<h3 style="margin:14px 0 8px;">📜 ' + (cinv ? 'سجل التحقيقات' : 'آخر المنتهية') + '</h3>' + st.recent.map(function (c) { return courtCaseHtml(c, st); }).join('');
     if (typing) {
         var keep = document.getElementById('court-q').value;
         box.innerHTML = h;
@@ -20835,6 +20971,11 @@ async function courtPanelLoad(silent) {
     } else box.innerHTML = h;
 }
 var courtSearchTimer = null;
+function courtCandBtns(p) {
+    var n = spEsc(p.registeredName);
+    if (COURT.kind === 'inv') return '<button class="btn sm" style="background:#0f766e;" data-u="' + p.discord + '" data-n="' + n + '" onclick="invStart(this.dataset.u, this.dataset.n)">🔎 تحقيق</button>';
+    return '<button class="btn sm" data-u="' + p.discord + '" data-n="' + n + '" onclick="courtStart(this.dataset.u, this.dataset.n)">⚖️ محكمة</button>';
+}
 function courtSearch(q) {
     clearTimeout(courtSearchTimer);
     courtSearchTimer = setTimeout(async function () {
@@ -20847,7 +20988,7 @@ function courtSearch(q) {
             if (!list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
             box.innerHTML = list.slice(0, 15).map(function (p) {
                 return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + spEsc(p.registeredName) + ' <span style="color:var(--muted);font-size:12px;">(' + spEsc(p.unit || '-') + ' • ' + spEsc(p.rank || '') + ')</span></span>' +
-                    '<button class="btn sm" data-u="' + p.discord + '" data-n="' + spEsc(p.registeredName) + '" onclick="courtStart(this.dataset.u, this.dataset.n)">⚖️ محكمة</button> <button class="btn sm" style="background:#0f766e;" data-u="' + p.discord + '" data-n="' + spEsc(p.registeredName) + '" onclick="invStart(this.dataset.u, this.dataset.n)">🔎 تحقيق</button></div></div>';
+                    courtCandBtns(p) + '</div></div>';
             }).join('');
         } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
     }, 350);
