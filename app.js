@@ -4510,9 +4510,10 @@ app.get("/api/senior/mp/leadership", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ mpLeadership: settings.mpLeadership || {} });
 });
+const MP_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد" };
 app.post("/api/senior/mp/assign", ensureSeniorAdmin, async (req, res) => {
     const { role, discordId } = req.body;
-    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
+    if (!["commander", "deputy", "personnelOfficer"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
     const person = await Personnel.findOne({ discord: discordId.trim() });
     if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
@@ -4524,7 +4525,7 @@ app.post("/api/senior/mp/assign", ensureSeniorAdmin, async (req, res) => {
     settings.markModified("mpLeadership");
     await settings.save();
     await logEvent({
-        action: "تعيين " + (role === "commander" ? "قائد" : "نائب") + " الشرطة العسكرية",
+        action: "تعيين " + MP_ROLE_LABELS[role] + " الشرطة العسكرية",
         discordId: person.discord, discordTag: person.discordTag,
         actorId: req.user.id, actorTag: req.user.username, details: displayName,
     });
@@ -4532,7 +4533,7 @@ app.post("/api/senior/mp/assign", ensureSeniorAdmin, async (req, res) => {
 });
 app.post("/api/senior/mp/remove", ensureSeniorAdmin, async (req, res) => {
     const { role } = req.body;
-    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
+    if (!["commander", "deputy", "personnelOfficer"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
     const settings = await getSettings();
     if (!settings.mpLeadership) settings.mpLeadership = {};
     const removedName = settings.mpLeadership[role + "Name"];
@@ -4540,7 +4541,7 @@ app.post("/api/senior/mp/remove", ensureSeniorAdmin, async (req, res) => {
     settings.mpLeadership[role + "Name"] = null;
     settings.markModified("mpLeadership");
     await settings.save();
-    await logEvent({ action: "إزالة " + (role === "commander" ? "قائد" : "نائب") + " الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: removedName || "-" });
+    await logEvent({ action: "إزالة " + MP_ROLE_LABELS[role] + " الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: removedName || "-" });
     res.json({ ok: true, mpLeadership: settings.mpLeadership });
 });
 
@@ -13588,7 +13589,7 @@ function buildNav() {
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) items.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) items.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
-    else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
+    else if (ME.mpPersonnelOfficer) { items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' }); items.push({ label: '👮 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' }); }
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.courtStaff) items.push({ label: '⚖️ المحكمة العسكرية', fn: 'renderCourtPanel()' });
     if (ME.courtStaff) items.push({ label: '🔎 التحقيق العسكري', fn: 'renderInvPanel()' });
@@ -13612,7 +13613,7 @@ function renderFabs() {
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) fabs.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) fabs.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
-    else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
+    else if (ME.mpPersonnelOfficer) { fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' }); fabs.push({ label: '👮 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' }); }
     else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
@@ -15107,9 +15108,17 @@ function renderSectorsBox() {
                     \${mp.deputyName ? '<button class="btn danger sm" onclick="removeMPRole(\\'deputy\\')">إزالة</button>' : ''}
                 </div>
             </div>
-            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول أفراد الشرطة العسكرية يعيّنه القائد أو النائب من داخل لوحة الشرطة العسكرية نفسها.</div>
+            <div class="row" style="margin-top:8px;">
+                <span>مسؤول الأفراد: <b style="color:\${mp.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${mp.personnelOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openMPPicker('personnelOfficer')">مسؤول أفراد الشرطة العسكرية</button>
+                    \${mp.personnelOfficerName ? '<button class="btn danger sm" onclick="removeMPRole(\\'personnelOfficer\\')">إزالة</button>' : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول أفراد الشرطة العسكرية يعيّنه كبار المسؤولين من هنا، أو القائد/النائب من لوحة الشرطة العسكرية. ياخذ نفس صلاحيات العضو + يتحكم بأفراد الشرطة العسكرية (ما عدا القائد والنائب).</div>
             <div id="picker-mp-commander"></div>
             <div id="picker-mp-deputy"></div>
+            <div id="picker-mp-personnelOfficer"></div>
         </div>
         <div class="card">
             <h3>⭐ القيادة العليا</h3>
@@ -15168,7 +15177,7 @@ async function removeHCMember(discordId) {
     catch (e) { toast(e.message); }
 }
 function openMPPicker(role) {
-    ['commander', 'deputy'].forEach(r => {
+    ['commander', 'deputy', 'personnelOfficer'].forEach(r => {
         const el = document.getElementById('picker-mp-' + r);
         if (el && r !== role) el.innerHTML = '';
     });
@@ -16637,7 +16646,7 @@ let mpPoTab = 'members';
 function renderMPPOPanel() {
     if (!ME.mpPersonnelOfficer && !ME.isSeniorAdmin) return renderDashboard();
     document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>👮 مسؤول أفراد الشرطة العسكرية</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card row"><h2>👮 مسؤول أفراد الشرطة العسكرية</h2><div class="row" style="gap:8px;">\${ME.mpPersonnelOfficer ? '<button class="btn sm" onclick="renderMPMemberPanel()">🚔 لوحة العضو</button>' : ''}<button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div></div>
         <div class="card" style="color:var(--muted);font-size:13px;">صلاحيتك تشمل أعضاء الشرطة العسكرية ما عدا القائد والنائب.</div>
         <div class="tabs">
             <div class="tab active" onclick="mpPoTabSwitch('members', this)">الأعضاء</div>
@@ -16710,6 +16719,7 @@ function renderMPMemberPanel() {
         <div class="card row"><h2>🚔 الشرطة العسكرية</h2>
             <div class="row" style="gap:8px;">
                 <button class="btn sm" onclick="openMPReportForm('renderMPMemberPanel()')">+ تسجيل تقرير جديد</button>
+                \${ME.mpPersonnelOfficer ? '<button class="btn sm gray" onclick="renderMPPOPanel()">👮 إدارة الأفراد</button>' : ''}
                 <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
             </div>
         </div>
