@@ -1974,7 +1974,7 @@ async function ensureAnyAdmin(req, res, next) {
 async function ensureSectorLeader(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
-    const realInfo = getSectorRole(req.user.id, settings);
+    const realInfo = (req.flashAs && req.flashAs.kind === "sector") ? null : getSectorRole(req.user.id, settings);
     if (realInfo) {
         req.sectorInfo = realInfo;
         req.settings = settings;
@@ -10730,7 +10730,21 @@ async function __rawFetch(url, opts, timeoutMs) {
         if (timer) clearTimeout(timer);
     }
 }
+function flFixMe(d) {
+    try {
+        if (!FLASH_AS || !d || d.blocked) return d;
+        if (FLASH_AS.kind === 'sector') {
+            var cur = d.sectorInfo;
+            if (!(cur && cur.sector === FLASH_AS.sector && cur.role === FLASH_AS.role)) d.sectorInfo = { sector: FLASH_AS.sector, sectorLabel: FL_SEC_LABELS[FLASH_AS.sector], role: FLASH_AS.role, personnelOfficerId: null, personnelOfficerName: null };
+        } else if (!(d.mpInfo && d.mpInfo.role === FLASH_AS.role)) d.mpInfo = { role: FLASH_AS.role, label: '' };
+    } catch (e) {}
+    return d;
+}
 async function api(url, opts) {
+    const d = await __apiCore(url, opts);
+    return (FLASH_AS && typeof url === 'string' && url.indexOf('/api/me') === 0) ? flFixMe(d) : d;
+}
+async function __apiCore(url, opts) {
     const noLock = !!(opts && opts.noLock);
     if (noLock) { opts = Object.assign({}, opts); delete opts.noLock; }
     const method = String((opts && opts.method) || 'GET').toUpperCase();
@@ -13090,17 +13104,19 @@ function flCmdMP() {
         '<button class="btn" style="background:#b45309;" data-r="deputy" onclick="flCmdLaunchMP(this.dataset.r)">🚔 لوحة نائب الشرطة العسكرية</button>' +
         '</div>');
 }
-async function flCmdLaunchSector(sector, role) {
+function flCmdLaunchSector(sector, role) {
     ownerModalClose();
     FLASH_AS = { kind: 'sector', sector: sector, role: role };
-    await refreshMe();
+    flFixMe(ME);
     renderSectorPanel();
+    refreshMe();
 }
-async function flCmdLaunchMP(role) {
+function flCmdLaunchMP(role) {
     ownerModalClose();
     FLASH_AS = { kind: 'mp', role: role };
-    await refreshMe();
+    flFixMe(ME);
     renderMPPanel();
+    refreshMe();
 }
 function ccStopLive() { if (CC_TIMER) { clearInterval(CC_TIMER); CC_TIMER = null; } }
 
