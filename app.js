@@ -1565,6 +1565,9 @@ const app = express();
     };
 });
 
+// مسار خفيف للتصحية (قبل الجلسات عشان ما يسوي سيشن ولا يلمس القاعدة)
+app.get("/healthz", (req, res) => res.type("text").send("ok"));
+
 app.use(express.json({ limit: "8mb" }));
 // ================= تثبيت الموقع كتطبيق (إضافة للشاشة الرئيسية) =================
 const FLASH_ICONS = (function () {
@@ -21386,3 +21389,14 @@ process.on("uncaughtException", (err) => {
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`🚀 ${CONFIG.SITE_NAME} server running on port ${CONFIG.PORT}`);
 });
+
+// ── منع نوم Render: الخطة المجانية تنيّم الموقع (والبوت اللي داخله) بعد 15 دقيقة بدون زيارات ──
+// الموقع يزور نفسه كل 8 دقايق عن طريق رابطه العام، فيحسبها Render زيارة ويظل صاحي.
+(function keepAwake() {
+    const base = String(process.env.RENDER_EXTERNAL_URL || (process.env.RENDER ? CONFIG.SITE_URL : "") || "").replace(/\/+$/, "");
+    if (!/^https?:\/\//.test(base)) return;   // مو على Render → ما نسوي شي
+    const ping = () => fetch(base + "/healthz", { signal: AbortSignal.timeout(30000) }).catch(() => {});
+    setTimeout(ping, 60000);
+    setInterval(ping, 8 * 60 * 1000);
+    console.log("⏰ تصحية Render شغالة:", base);
+})();
