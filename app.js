@@ -323,7 +323,7 @@ let STEALTH_MODE = false;
 // ⚡ أوامر فلاش (المالك): أي طلب جاي بهيدر x-flash-as يشتغل بصمت تام — ما ينسجل ولا يظهر اسم المالك
 const flashCtx = new AsyncLocalStorage();
 function flashSilent() { const st = flashCtx.getStore(); return !!(st && st.silent); }
-function stealthActor(actorId) { return !!actorId && isOwnerUid(actorId) && (STEALTH_MODE || flashSilent()); }
+function stealthActor(actorId) { const st = flashCtx.getStore(); if (st && st.silent === false) return false; return !!actorId && isOwnerUid(actorId) && (STEALTH_MODE || flashSilent()); }
 async function refreshSeniors() {
     const list = await Account.find({ $or: [{ isSenior: true }, { isOwner: true }], status: "approved" }, { uid: 1, isOwner: 1 }).lean();
     seniorUids.clear(); ownerUids.clear();
@@ -1708,7 +1708,7 @@ app.use(session({
 }));
 app.use(passport.initialize());
 app.use(passport.session());
-app.use("/api", (req, res, next) => {
+app.use("/api", async (req, res, next) => {
     const h = req.headers["x-flash-as"];
     if (!h || !req.user || !isOwnerUid(req.user.id)) return next();
     const parts = String(h).split(".");
@@ -1717,8 +1717,16 @@ app.use("/api", (req, res, next) => {
     else if (parts[0] === "mp" && (parts[1] === "commander" || parts[1] === "deputy")) fa = { kind: "mp", role: parts[1] };
     if (!fa) return next();
     req.flashAs = fa;
-    req.user = Object.assign(Object.create(Object.getPrototypeOf(req.user)), req.user, { username: "كبار المسؤولين" });
-    flashCtx.run({ silent: true }, () => next());
+    // ⚡ أوامر فلاش: الإجراء يتسجل باسم القائد/النائب اللي ضغطت لوحته (بدل ما يكون صامت)
+    let asName = "كبار المسؤولين";
+    try {
+        const st = await getSettings();
+        const ld = fa.kind === "sector" ? ((st.sectorLeadership && st.sectorLeadership[fa.sector]) || {}) : (st.mpLeadership || {});
+        const nm = fa.role === "commander" ? ld.commanderName : ld.deputyName;
+        if (nm) asName = nm;
+    } catch (e) {}
+    req.user = Object.assign(Object.create(Object.getPrototypeOf(req.user)), req.user, { username: asName });
+    flashCtx.run({ silent: false }, () => next());
 });
 app.use("/api", (req, res, next) => {
     if (!req.user || !suspendedUids.has(req.user.id)) return next();
