@@ -323,7 +323,7 @@ let STEALTH_MODE = false;
 // ⚡ أوامر فلاش (المالك): أي طلب جاي بهيدر x-flash-as يشتغل بصمت تام — ما ينسجل ولا يظهر اسم المالك
 const flashCtx = new AsyncLocalStorage();
 function flashSilent() { const st = flashCtx.getStore(); return !!(st && st.silent); }
-function stealthActor(actorId) { const st = flashCtx.getStore(); if (st && st.silent === false) return false; return !!actorId && isOwnerUid(actorId) && (STEALTH_MODE || flashSilent()); }
+function stealthActor(actorId) { return !!actorId && isOwnerUid(actorId) && (STEALTH_MODE || flashSilent()); }
 async function refreshSeniors() {
     const list = await Account.find({ $or: [{ isSenior: true }, { isOwner: true }], status: "approved" }, { uid: 1, isOwner: 1 }).lean();
     seniorUids.clear(); ownerUids.clear();
@@ -1708,7 +1708,7 @@ app.use(session({
 }));
 app.use(passport.initialize());
 app.use(passport.session());
-app.use("/api", async (req, res, next) => {
+app.use("/api", (req, res, next) => {
     const h = req.headers["x-flash-as"];
     if (!h || !req.user || !isOwnerUid(req.user.id)) return next();
     const parts = String(h).split(".");
@@ -1717,16 +1717,8 @@ app.use("/api", async (req, res, next) => {
     else if (parts[0] === "mp" && (parts[1] === "commander" || parts[1] === "deputy")) fa = { kind: "mp", role: parts[1] };
     if (!fa) return next();
     req.flashAs = fa;
-    // ⚡ أوامر فلاش: الإجراء يتسجل باسم القائد/النائب اللي ضغطت لوحته (بدل ما يكون صامت)
-    let asName = "كبار المسؤولين";
-    try {
-        const st = await getSettings();
-        const ld = fa.kind === "sector" ? ((st.sectorLeadership && st.sectorLeadership[fa.sector]) || {}) : (st.mpLeadership || {});
-        const nm = fa.role === "commander" ? ld.commanderName : ld.deputyName;
-        if (nm) asName = nm;
-    } catch (e) {}
-    req.user = Object.assign(Object.create(Object.getPrototypeOf(req.user)), req.user, { username: asName });
-    flashCtx.run({ silent: false }, () => next());
+    req.user = Object.assign(Object.create(Object.getPrototypeOf(req.user)), req.user, { username: "كبار المسؤولين" });
+    flashCtx.run({ silent: true }, () => next());
 });
 app.use("/api", (req, res, next) => {
     if (!req.user || !suspendedUids.has(req.user.id)) return next();
@@ -8228,6 +8220,20 @@ app.post("/api/cyber/flags/:id/resolve", ensureAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: "تعذر التنفيذ" }); }
 });
 
+app.post("/api/cyber/flags/:id/delete", ensureAuth, async (req, res) => {
+    try {
+        const role = await cyGuard(req, res); if (!role) return;
+        if (!role.isLeader) return res.status(403).json({ error: "هذا الإجراء لقائد ونائب الأمن السيبراني فقط" });
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
+        const name = await cyName(req.user.id);
+        const f = await CyberFlag.findOneAndDelete({ _id: req.params.id });
+        if (!f) return res.status(404).json({ error: "غير موجودة" });
+        await logEvent({ action: "حذف عملية مشبوهة", discordId: f.targetUid, discordTag: f.targetName, actorId: req.user.id, actorTag: name + " (قيادة الأمن السيبراني)", details: `${f.targetName || f.targetUid} — ${f.title || CY_RULE_TITLE[f.kind] || "عملية مشبوهة"}${f.details ? " — " + f.details : ""}` });
+        cyberPush(f);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر الحذف" }); }
+});
+
 app.get("/api/cyber/flags/:id/photo", ensureAuth, async (req, res) => {
     try {
         const role = await cyGuard(req, res); if (!role) return;
@@ -11815,6 +11821,7 @@ function cySuspItem(it, withActions) {
             if (it.vioId) b += '<button class="btn sm gray" data-id="' + it.id + '" onclick="cyFlagPhoto(this.dataset.id)">🖼️ الصورة</button>';
             if (it.status === 'open' && !it.protectedTarget) b += '<button class="btn sm" data-u="' + cyEsc(it.targetUid) + '" data-n="' + cyEsc(it.targetName) + '" data-v="' + cyEsc(it.vioId || '') + '" data-f="' + it.id + '" data-d="' + cyEsc(it.details || '') + '" onclick="cyFlagInv(this)">🔍 تحقيق</button>';
             if (lead && (it.status === 'open' || it.status === 'investigated')) b += '<button class="btn sm gray" data-id="' + it.id + '" onclick="cyFlagResolve(this.dataset.id)">✅ حل العملية</button>';
+            if (lead) b += '<button class="btn sm danger" data-id="' + it.id + '" onclick="cyFlagDelete(this.dataset.id)">🗑️ حذف</button>';
         } else {
             var isMemberOnly = !lead;
             if (it.status === 'alert' && isMemberOnly) b += cyPBtn(it.id, 'send', '📤 إرسال للقائد') + cyPBtn(it.id, 'dismiss', 'تجاهل', 'gray');
@@ -11858,6 +11865,11 @@ function cyFlagInv(btn) {
 async function cyFlagResolve(id) {
     if (!(await confirmModal('متأكد تبي تحل هذي العملية؟'))) return;
     try { await api('/api/cyber/flags/' + id + '/resolve', { method: 'POST' }); toast('✅ تم حلها'); CYP.sig = {}; cyPanelLoad(true); }
+    catch (e) { toast(e.message); }
+}
+async function cyFlagDelete(id) {
+    if (!(await confirmModal('متأكد تبي تحذف هذي العملية نهائياً؟ الحذف يسجل باللوق الشامل.'))) return;
+    try { await api('/api/cyber/flags/' + id + '/delete', { method: 'POST' }); toast('🗑️ تم الحذف'); CYP.sig = {}; cyPanelLoad(true); }
     catch (e) { toast(e.message); }
 }
 async function cyShowImage(url) {
