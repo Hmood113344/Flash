@@ -9471,10 +9471,13 @@ const underCourt = new Map();   // targetUid -> { id, n, reason, byName, at }
 const courtLite = c => ({ id: String(c._id), n: c.voiceN, reason: c.reason || "", byName: c.startedByName || "", at: c.startedAt, kind: c.kind === "inv" ? "inv" : "court" });
 async function loadCourt() {
     try {
-        underCourt.clear(); soonCourt.clear();
-        courtKindByN.clear();
-        (await CourtCase.find({ status: "active" }).lean()).forEach(c => { if (c.voiceN) courtKindByN.set(c.voiceN, c.kind === "inv" ? "inv" : "court"); courtTargetUids(c).forEach(u => underCourt.set(u, courtLite(c))); });
-        (await CourtCase.find({ status: "scheduled" }).lean()).forEach(c => courtTargetUids(c).forEach(u => soonCourt.set(u, { id: String(c._id), at: c.at, reason: c.reason || "", kind: c.kind === "inv" ? "inv" : "court" })));
+        // نبني الخرائط من القاعدة (المصدر الحقيقي) ثم نبدلها مرة وحدة، عشان لو انحذفت محكمة من القاعدة تنمسح من الذاكرة
+        const nUnder = new Map(), nSoon = new Map(), nKind = new Map();
+        (await CourtCase.find({ status: "active" }).lean()).forEach(c => { if (c.voiceN) nKind.set(c.voiceN, c.kind === "inv" ? "inv" : "court"); courtTargetUids(c).forEach(u => nUnder.set(u, courtLite(c))); });
+        (await CourtCase.find({ status: "scheduled" }).lean()).forEach(c => courtTargetUids(c).forEach(u => nSoon.set(u, { id: String(c._id), at: c.at, reason: c.reason || "", kind: c.kind === "inv" ? "inv" : "court" })));
+        underCourt.clear(); nUnder.forEach((v, k) => underCourt.set(k, v));
+        soonCourt.clear(); nSoon.forEach((v, k) => soonCourt.set(k, v));
+        courtKindByN.clear(); nKind.forEach((v, k) => courtKindByN.set(k, v));
     } catch (e) { console.error("❌ فشل تحميل المحكمة:", e.message); }
 }
 function courtCaseOf(uid) { return underCourt.get(uid) || null; }
@@ -9574,7 +9577,7 @@ app.post("/api/court/start", ensureAuth, async (req, res) => {
     const at = startNow ? new Date() : offBuildDate(b.date, b.hour, b.minute);
     if (!at) return res.status(400).json({ error: "حدد اليوم والساعة والدقيقة بشكل صحيح" });
     if (at.getTime() < Date.now() - 5 * 60 * 1000) return res.status(400).json({ error: "الموعد لازم يكون من الحين وطالع" });
-    if (underCourt.has(targetUid) || await CourtCase.exists({ $or: [{ targetUid }, { "extra.uid": targetUid }], status: { $in: ["pending", "scheduled", "active"] } })) return res.status(409).json({ error: "هذا العضو عليه " + (kind === "inv" ? "تحقيق" : "محكمة") + " أو طلب حالياً" });
+    if (await CourtCase.exists({ $or: [{ targetUid }, { "extra.uid": targetUid }], status: { $in: ["pending", "scheduled", "active"] } })) return res.status(409).json({ error: "هذا العضو عليه " + (kind === "inv" ? "تحقيق" : "محكمة") + " أو طلب حالياً" });
     {
         const dir = !!(r.senior || r.leader);
         const mode = b.mode === "join" ? "join" : (b.mode === "separate" ? "separate" : "");
@@ -9883,6 +9886,7 @@ async function courtTick() {
     if (_courtTicking) return;
     _courtTicking = true;
     try {
+        await loadCourt();   // مزامنة الذاكرة مع القاعدة (لو انحذفت محكمة يدوياً من القاعدة)
         const due = await CourtCase.find({ status: "scheduled", at: { $lte: new Date() } }).sort({ at: 1 }).limit(10);
         for (const c of due) await courtActivate(c);
     } catch (e) { console.error("❌ courtTick:", e.message); }
