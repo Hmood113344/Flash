@@ -407,6 +407,8 @@ const ViolationSchema = new mongoose.Schema({
     photo: { type: String, default: null },
     photoChannelId: { type: String, default: null },
     photoMessageId: { type: String, default: null },
+    msgChannelId: { type: String, default: null },
+    msgId: { type: String, default: null },
     status: { type: String, default: "pending" },
     rejectReason: { type: String, default: null },
     reviewedBy: String,
@@ -630,21 +632,29 @@ const SettingsSchema = new mongoose.Schema({
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
+            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
+            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
         },
         roadSecurity: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
+            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
+            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
         },
         antiDrugs: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
+            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
+            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
         },
         cyber: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
+            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
+            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
         },
     },
     mpLeadership: {
@@ -653,6 +663,7 @@ const SettingsSchema = new mongoose.Schema({
         personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
     },
     highCommand: { type: [{ id: String, name: String }], default: [] },
+    violationsOfficers: { type: [{ id: String, name: String }], default: [] },
     violationsOfficerId: { type: String, default: null },
     violationsOfficerName: { type: String, default: null },
     violationsChannelId: String,
@@ -833,6 +844,30 @@ function getPersonnelOfficerSector(userId, settings) {
     return null;
 }
 
+function getSectorAttOfficer(userId, settings) {
+    const sl = settings.sectorLeadership || {};
+    for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = sl[key];
+        if (sec && (sec.attendanceOfficers || []).some(m => m.id === userId)) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "attOfficer" };
+    }
+    return null;
+}
+function getSectorViolOfficer(userId, settings) {
+    const sl = settings.sectorLeadership || {};
+    for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = sl[key];
+        if (sec && (sec.violationsOfficers || []).some(m => m.id === userId)) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "violOfficer" };
+    }
+    return null;
+}
+// أعضاء القطاع اللي يقدر هذا المراجع يقبل مخالفاتهم (بدون نفسه وبدون قائد القطاع)
+async function sectorReviewableIds(sectorKey, reviewerUid, settings, excludeCommander) {
+    const ids = await getSectorMemberIds(sectorKey);
+    if (ids === null) return null;
+    const sec = ((settings.sectorLeadership || {})[sectorKey]) || {};
+    return ids.filter(id => id !== reviewerUid && !(excludeCommander && sec.commanderId && id === sec.commanderId));
+}
+
 function isJuniorRank(rank) {
     return rankIndex(rank) <= rankIndex("رئيس رقباء");
 }
@@ -850,8 +885,15 @@ function isMPPersonnelOfficer(userId, settings) {
 function isHighCommand(userId, settings) {
     return !!(settings.highCommand || []).find(m => m.id === userId);
 }
+function getViolationsOfficers(settings) {
+    const list = (settings.violationsOfficers || []).map(m => ({ id: m.id, name: m.name }));
+    if (settings.violationsOfficerId && !list.some(m => m.id === settings.violationsOfficerId)) {
+        list.push({ id: settings.violationsOfficerId, name: settings.violationsOfficerName || settings.violationsOfficerId });
+    }
+    return list;
+}
 function isViolationsOfficer(userId, settings) {
-    return !!(settings.violationsOfficerId && settings.violationsOfficerId === userId);
+    return getViolationsOfficers(settings).some(m => m.id === userId);
 }
 function computeSummonUnlockAt(mode, hour, minute, ampm) {
     if (mode !== "scheduled") return new Date();
@@ -1199,11 +1241,13 @@ async function postViolationToChannel(v, rawPhoto) {
         }
         const msg = await channel.send({ embeds: [embed], components, files });
         pendingMessages.set(v._id.toString(), { channelId: msg.channelId, messageId: msg.id });
+        v.msgChannelId = msg.channelId;
+        v.msgId = msg.id;
         if (rawPhoto) {
             v.photoChannelId = msg.channelId;
             v.photoMessageId = msg.id;
-            await v.save();
         }
+        await v.save();
     } catch (e) {
         console.error("❌ فشل إرسال المخالفة للقناة:", e.message);
         if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
@@ -1307,7 +1351,9 @@ async function pushNoteWithImage({ discord, text, image, actorId, actorTag }) {
 
 
 async function syncViolationMessage(v) {
-    const ref = pendingMessages.get(v._id.toString());
+    let ref = pendingMessages.get(v._id.toString());
+    if (!ref && v.msgChannelId && v.msgId) ref = { channelId: v.msgChannelId, messageId: v.msgId };
+    if (!ref && v.photoChannelId && v.photoMessageId) ref = { channelId: v.photoChannelId, messageId: v.photoMessageId };
     if (!ref) return;
     try {
         const channel = await client.channels.fetch(ref.channelId);
@@ -1320,7 +1366,7 @@ async function syncViolationMessage(v) {
         const oldEmbed = msg.embeds[0] ? EmbedBuilder.from(msg.embeds[0]) : buildViolationEmbed(v);
         const embed = oldEmbed.setColor(color).setTitle(title);
         await msg.edit({ embeds: [embed], components: [buildViolationButtons(v._id.toString(), v.status !== "pending")] });
-    } catch (e) { }
+    } catch (e) { console.error("❌ فشل تحديث رسالة المخالفة بالقناة:", e.message); }
     if (v.status !== "pending") pendingMessages.delete(v._id.toString());
 }
 
@@ -1421,20 +1467,26 @@ client.on("interactionCreate", async interaction => {
             const id = interaction.customId;
 
             if (id.startsWith("approve_") || id.startsWith("reject_")) {
-                const [action, vid] = id.split("_");
-                const allowed = isSeniorAdmin(interaction.user.id);
+                const sep = id.indexOf("_");
+                const action = id.slice(0, sep), vid = id.slice(sep + 1);
+                const settings = await getSettings();
+                const uid = interaction.user.id;
                 const isDiscordAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
-                if (!allowed && !isDiscordAdmin) {
-                    return interaction.reply({ content: "🚫 ما تملك صلاحية.", ephemeral: true });
-                }
-                const v = await Violation.findById(vid);
-                if (!v || v.status !== "pending") {
+                const v0 = await Violation.findById(vid).catch(() => null);
+                if (!v0 || v0.status !== "pending") {
                     return interaction.reply({ content: "هذه المخالفة تمت مراجعتها مسبقاً.", ephemeral: true });
                 }
-                if (action === "approve") {
-                    const ar = await approveViolation(v, interaction.user.id, interaction.user.username);
-                    if (ar && ar.blocked) return interaction.reply({ content: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون رتبة أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حالياً.", ephemeral: true });
-                    return interaction.deferUpdate();
+                let allowed = isSeniorAdmin(uid) || isDiscordAdmin || isViolationsOfficer(uid, settings);
+                if (!allowed) {
+                    // قائد القطاع يقبل مخالفات قطاعه فقط (مو مخالفاته هو)
+                    const sr = getSectorRole(uid, settings);
+                    if (sr && sr.role === "commander" && v0.reporterDiscord !== uid) {
+                        const acc = await Account.findOne({ uid: v0.reporterDiscord }, { sector: 1 }).lean();
+                        if (acc && acc.sector === sr.sector) allowed = true;
+                    }
+                }
+                if (!allowed) {
+                    return interaction.reply({ content: "🚫 ما تملك صلاحية.", ephemeral: true });
                 }
                 if (action === "reject") {
                     const modal = new ModalBuilder().setCustomId(`rejectmodal_${vid}`).setTitle("سبب الرفض");
@@ -1444,7 +1496,13 @@ client.on("interactionCreate", async interaction => {
                     modal.addComponents(new ActionRowBuilder().addComponents(input));
                     return interaction.showModal(modal);
                 }
-                return;
+                // القبول: نرد فوراً قبل أي عملية ثقيلة عشان ما ينتهي وقت التفاعل
+                await interaction.deferReply({ ephemeral: true });
+                const v = await Violation.findById(vid);
+                if (!v || v.status !== "pending") return interaction.editReply({ content: "هذه المخالفة تمت مراجعتها مسبقاً." });
+                const ar = await approveViolation(v, uid, interaction.user.username);
+                if (ar && ar.blocked) return interaction.editReply({ content: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون رتبة أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حتى ينتهي الاستدعاء." });
+                return interaction.editReply({ content: "✅ تم قبول المخالفة." });
             }
 
             if (id.startsWith("leave_")) {
@@ -1564,9 +1622,6 @@ const app = express();
         return original(path, ...wrapped);
     };
 });
-
-// مسار خفيف للتصحية (قبل الجلسات عشان ما يسوي سيشن ولا يلمس القاعدة)
-app.get("/healthz", (req, res) => res.type("text").send("ok"));
 
 app.use(express.json({ limit: "8mb" }));
 // ================= تثبيت الموقع كتطبيق (إضافة للشاشة الرئيسية) =================
@@ -1994,7 +2049,47 @@ async function ensureSectorLeader(req, res, next) {
 }
 
 function canReviewSector(sectorInfo) {
-    return !!(sectorInfo && sectorInfo.role === "senior");
+    return !!(sectorInfo && (sectorInfo.role === "senior" || sectorInfo.role === "commander"));
+}
+
+async function ensureSectorCommander(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    const real = getSectorRole(req.user.id, settings);
+    if (real && real.role === "commander") { req.sectorInfo = real; req.settings = settings; return next(); }
+    if (isSeniorAdmin(req.user.id)) {
+        const q = String(req.query.sector || req.body?.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q], role: "senior" };
+        req.settings = settings;
+        return next();
+    }
+    return res.status(403).json({ error: "هذا القسم لقادة القطاعات فقط" });
+}
+async function ensureSectorViolOfficer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    const info = getSectorViolOfficer(req.user.id, settings);
+    if (!info) return res.status(403).json({ error: "هذا القسم لمسؤول مخالفات القطاع فقط" });
+    req.sectorInfo = info; req.settings = settings;
+    next();
+}
+async function ensureAttViewer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    const scope = { all: false, sectors: [], absentTodayOnly: false };
+    if (isSeniorAdmin(req.user.id)) { scope.all = true; scope.sectors = Object.keys(CONFIG.SECTORS); }
+    else {
+        const sr = getSectorRole(req.user.id, settings);
+        if (sr && sr.role === "commander") scope.sectors.push(sr.sector);
+        const ao = getSectorAttOfficer(req.user.id, settings);
+        if (ao && !scope.sectors.includes(ao.sector)) scope.sectors.push(ao.sector);
+        const mp = !!getMPRole(req.user.id, settings) || isMPPersonnelOfficer(req.user.id, settings) || await isMilitaryPoliceMember(req.user.id);
+        if (mp) { scope.all = true; scope.absentTodayOnly = true; }
+        if (!scope.sectors.length && !mp) return res.status(403).json({ error: "هذا القسم لقادة القطاعات ومسؤولي التحضير والشرطة العسكرية فقط" });
+    }
+    req.attScope = scope; req.settings = settings;
+    next();
 }
 
 async function ensurePersonnelOfficer(req, res, next) {
@@ -2362,6 +2457,9 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         deviceLocked: meDevLocked,
         unassigned: meUnassigned,
         isViolationsOfficer: isViolationsOfficer(req.user.id, settings),
+        sectorViolOfficer: getSectorViolOfficer(req.user.id, settings),
+        sectorAttOfficer: getSectorAttOfficer(req.user.id, settings),
+        canAttView: !!(sectorInfo && sectorInfo.role === "commander") || !!getSectorAttOfficer(req.user.id, settings) || isMilitaryPolice,
         isOwner: isOwnerUid(req.user.id),
         seniorTemp,
         accountEmail,
@@ -2470,7 +2568,9 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
         if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
         const settings = await getSettings();
         const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id)
+            || settings.adminList.includes(req.user.id)
             || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
+            || !!getSectorViolOfficer(req.user.id, settings)
             || isViolationsOfficer(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
 
@@ -2497,6 +2597,73 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
     } catch (e) {
         console.error("❌ فشل تحميل صورة المخالفة:", e);
         res.status(500).json({ error: "تعذر تحميل الصورة" });
+    }
+});
+
+// ── الصورة كملف مباشر: السيرفر يجيبها من ديسكورد ويرسلها (بدون ما المتصفح يعلق على رابط ديسكورد) ──
+const photoBufCache = new Map();
+const PHOTO_BUF_MAX = 40;
+function photoBufPut(key, val) {
+    photoBufCache.set(key, val);
+    while (photoBufCache.size > PHOTO_BUF_MAX) photoBufCache.delete(photoBufCache.keys().next().value);
+}
+async function fetchDiscordAttachmentBuf(channelId, messageId, cacheKey) {
+    const hit = photoBufCache.get(cacheKey);
+    if (hit && (Date.now() - hit.at) < 30 * 60 * 1000) return hit;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const channel = client.channels.cache.get(channelId) || await withTimeout(client.channels.fetch(channelId), 8000);
+        const msg = await withTimeout(channel.messages.fetch(messageId), 8000);
+        const att = msg.attachments.first();
+        if (!att) return null;
+        photoUrlCache.set(cacheKey, { url: att.url, fetchedAt: Date.now() });
+        try {
+            const r = await fetch(att.url, { signal: AbortSignal.timeout(12000) });
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            const buf = Buffer.from(await r.arrayBuffer());
+            const val = { buf, type: att.contentType || r.headers.get("content-type") || "image/jpeg", at: Date.now() };
+            photoBufPut(cacheKey, val);
+            return val;
+        } catch (e) {
+            if (attempt === 1) throw e;
+        }
+    }
+    return null;
+}
+function sendPhotoBuf(res, val) {
+    res.set("Content-Type", val.type || "image/jpeg");
+    res.set("Cache-Control", "private, max-age=600");
+    res.send(val.buf);
+}
+app.get("/api/violations/:id/photo-file", ensureAuth, async (req, res) => {
+    try {
+        const v = await Violation.findById(req.params.id).select("photo photoChannelId photoMessageId reporterDiscord").lean();
+        if (!v) return res.status(404).send("not found");
+        const settings = await getSettings();
+        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id)
+            || settings.adminList.includes(req.user.id)
+            || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
+            || !!getSectorViolOfficer(req.user.id, settings)
+            || isViolationsOfficer(req.user.id, settings);
+        if (!allowed) return res.status(403).send("forbidden");
+        if (v.photoChannelId && v.photoMessageId) {
+            const ck = "v:" + v._id;
+            try {
+                const val = await fetchDiscordAttachmentBuf(v.photoChannelId, v.photoMessageId, ck);
+                if (val) return sendPhotoBuf(res, val);
+            } catch (e) {
+                console.error("❌ فشل جلب صورة المخالفة (ملف):", e.message);
+                const u = photoUrlCache.get(ck);
+                if (u && u.url && !v.photo) return res.redirect(302, u.url);
+            }
+        }
+        if (v.photo && v.photo.startsWith("data:image")) {
+            const m = /^data:(image\/[a-z+]+);base64,(.+)$/s.exec(v.photo);
+            if (m) return sendPhotoBuf(res, { buf: Buffer.from(m[2], "base64"), type: m[1] });
+        }
+        res.status(404).send("no photo");
+    } catch (e) {
+        console.error("❌ photo-file:", e.message);
+        res.status(500).send("error");
     }
 });
 
@@ -3903,7 +4070,7 @@ app.post("/api/owner/devices/kick-account", ensureAuth, async (req, res) => {
 
 app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
-    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null } });
+    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null }, violationsOfficers: getViolationsOfficers(settings) });
 });
 
 const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد" };
@@ -3968,8 +4135,10 @@ app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
 
 app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     try {
-        const ids = await getSectorMemberIds(req.sectorInfo.sector);
+        const settings = req.settings || await getSettings();
+        let ids = await getSectorMemberIds(req.sectorInfo.sector);
         if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+        if (req.sectorInfo.role === "commander") ids = ids.filter(id => id !== req.user.id);   // مخالفات القائد نفسه ما تجيه
         const list = ids.length ? await Violation.aggregate([
             { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
             { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
@@ -3984,22 +4153,123 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     }
 });
 
+// يتأكد إن المخالفة من قطاع القائد وإنها مو مخالفته هو
+async function sectorReviewGuard(req, res, v) {
+    if (req.sectorInfo.role === "senior") return true;
+    if (v.reporterDiscord === req.user.id) { res.status(403).json({ error: "ما تقدر تراجع مخالفاتك أنت" }); return false; }
+    const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" }); return false; }
+    if (!ids.includes(v.reporterDiscord)) { res.status(403).json({ error: "هذي المخالفة مو من قطاعك" }); return false; }
+    return true;
+}
 app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "قبول المخالفات والتقارير مخصص لمسؤول المخالفات فقط" });
+    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "قبول المخالفات والتقارير لقائد القطاع فقط (النائب ما عنده الصلاحية)" });
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    const r = await approveViolation(v, req.user.id, req.user.username);
+    if (!(await sectorReviewGuard(req, res, v))) return;
+    const r = await approveViolation(v, req.user.id, req.user.username + (req.sectorInfo.role === "commander" ? ` (قائد ${req.sectorInfo.sectorLabel})` : ""));
     if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
 app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "رفض المخالفات والتقارير مخصص لمسؤول المخالفات فقط" });
+    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "رفض المخالفات والتقارير لقائد القطاع فقط (النائب ما عنده الصلاحية)" });
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    const r = await rejectViolation(v, req.user.id, req.user.username, reason.trim());
+    if (!(await sectorReviewGuard(req, res, v))) return;
+    const r = await rejectViolation(v, req.user.id, req.user.username + (req.sectorInfo.role === "commander" ? ` (قائد ${req.sectorInfo.sectorLabel})` : ""), reason.trim());
+    if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن رفض مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
+    res.json({ ok: true });
+});
+
+// ── مسؤولو الأطراف داخل القطاع (يعيّنهم قائد القطاع فقط): مسؤول تحضير + مسؤول مخالفات ──
+function sectorOfficerKey(kind) { return kind === "att" ? "attendanceOfficers" : "violationsOfficers"; }
+app.get("/api/sector/officers", ensureSectorLeader, async (req, res) => {
+    const sec = ((req.settings.sectorLeadership || {})[req.sectorInfo.sector]) || {};
+    res.json({
+        sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel, role: req.sectorInfo.role,
+        canManage: req.sectorInfo.role === "commander" || req.sectorInfo.role === "senior",
+        attendanceOfficers: (sec.attendanceOfficers || []).map(m => ({ id: m.id, name: m.name })),
+        violationsOfficers: (sec.violationsOfficers || []).map(m => ({ id: m.id, name: m.name })),
+    });
+});
+app.post("/api/sector/officers/:kind/assign", ensureSectorCommander, async (req, res) => {
+    const kind = req.params.kind;
+    if (kind !== "att" && kind !== "viol") return res.status(400).json({ error: "نوع غير صحيح" });
+    const discordId = String(req.body.discordId || "").trim();
+    if (!discordId) return res.status(400).json({ error: "حدد الشخص" });
+    const person = await Personnel.findOne({ discord: discordId });
+    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
+    const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" });
+    if (!ids.includes(person.discord)) return res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" });
+    const settings = await getSettings();
+    if (!settings.sectorLeadership) settings.sectorLeadership = {};
+    if (!settings.sectorLeadership[req.sectorInfo.sector]) settings.sectorLeadership[req.sectorInfo.sector] = {};
+    const sec = settings.sectorLeadership[req.sectorInfo.sector];
+    const key = sectorOfficerKey(kind);
+    const cur = (sec[key] || []).map(m => ({ id: m.id, name: m.name }));
+    if (cur.some(m => m.id === person.discord)) return res.status(400).json({ error: "موجود من قبل" });
+    const name = person.registeredName || person.discordTag || person.discord;
+    sec[key] = cur.concat([{ id: person.discord, name }]);
+    settings.markModified("sectorLeadership");
+    await settings.save();
+    await logEvent({ action: kind === "att" ? "تعيين مسؤول تحضير قطاع" : "تعيين مسؤول مخالفات قطاع", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${req.sectorInfo.sectorLabel} — ${name}` });
+    res.json({ ok: true });
+});
+app.post("/api/sector/officers/:kind/remove", ensureSectorCommander, async (req, res) => {
+    const kind = req.params.kind;
+    if (kind !== "att" && kind !== "viol") return res.status(400).json({ error: "نوع غير صحيح" });
+    const discordId = String(req.body.discordId || "").trim();
+    const settings = await getSettings();
+    const sec = settings.sectorLeadership && settings.sectorLeadership[req.sectorInfo.sector];
+    if (!sec) return res.json({ ok: true });
+    const key = sectorOfficerKey(kind);
+    const cur = (sec[key] || []).map(m => ({ id: m.id, name: m.name }));
+    const gone = cur.find(m => m.id === discordId);
+    sec[key] = cur.filter(m => m.id !== discordId);
+    settings.markModified("sectorLeadership");
+    await settings.save();
+    await logEvent({ action: kind === "att" ? "إزالة مسؤول تحضير قطاع" : "إزالة مسؤول مخالفات قطاع", actorId: req.user.id, actorTag: req.user.username, details: `${req.sectorInfo.sectorLabel} — ${gone ? gone.name : discordId}` });
+    res.json({ ok: true });
+});
+
+// ── مسؤول مخالفات القطاع: يقبل ويرفض مخالفات قطاعه فقط (ما عدا مخالفاته ومخالفات القائد) ──
+app.get("/api/sector-viol-officer/pending", ensureSectorViolOfficer, async (req, res) => {
+    const ids = await sectorReviewableIds(req.sectorInfo.sector, req.user.id, req.settings, true);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" });
+    const list = ids.length ? await Violation.aggregate([
+        { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $project: { photo: 0 } },
+        { $sort: { createdAt: 1 } },
+        { $limit: 300 },
+    ]).option({ maxTimeMS: 10000 }) : [];
+    res.json({ list, sectorLabel: req.sectorInfo.sectorLabel });
+});
+async function svoGuard(req, res, v) {
+    const ids = await sectorReviewableIds(req.sectorInfo.sector, req.user.id, req.settings, true);
+    if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً" }); return false; }
+    if (!ids.includes(v.reporterDiscord)) { res.status(403).json({ error: "ما تقدر تراجع هذي المخالفة" }); return false; }
+    return true;
+}
+app.post("/api/sector-viol-officer/violations/:id/approve", ensureSectorViolOfficer, async (req, res) => {
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    if (!(await svoGuard(req, res, v))) return;
+    const r = await approveViolation(v, req.user.id, req.user.username + ` (مسؤول مخالفات ${req.sectorInfo.sectorLabel})`);
+    if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
+    res.json({ ok: true });
+});
+app.post("/api/sector-viol-officer/violations/:id/reject", ensureSectorViolOfficer, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    if (!(await svoGuard(req, res, v))) return;
+    const r = await rejectViolation(v, req.user.id, req.user.username + ` (مسؤول مخالفات ${req.sectorInfo.sectorLabel})`, reason.trim());
     if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن رفض مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
@@ -4336,20 +4606,27 @@ app.post("/api/senior/violations-officer/assign", ensureSeniorAdmin, async (req,
     const person = await Personnel.findOne({ discord: String(discordId).trim() });
     if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
     const settings = await getSettings();
-    settings.violationsOfficerId = person.discord;
-    settings.violationsOfficerName = person.registeredName || person.discordTag || person.discord;
+    const cur = getViolationsOfficers(settings);
+    if (cur.some(m => m.id === person.discord)) return res.status(400).json({ error: "هذا الشخص مسؤول مخالفات من قبل" });
+    const name = person.registeredName || person.discordTag || person.discord;
+    settings.violationsOfficers = cur.concat([{ id: person.discord, name }]);
+    settings.violationsOfficerId = null; settings.violationsOfficerName = null;   // انتقلنا للقائمة
+    settings.markModified("violationsOfficers");
     await settings.save();
-    await logEvent({ action: "تعيين مسؤول المخالفات", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: settings.violationsOfficerName });
-    res.json({ ok: true, violationsOfficer: { id: settings.violationsOfficerId, name: settings.violationsOfficerName } });
+    await logEvent({ action: "تعيين مسؤول المخالفات", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: name });
+    res.json({ ok: true, violationsOfficers: settings.violationsOfficers });
 });
 app.post("/api/senior/violations-officer/remove", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
-    const oldName = settings.violationsOfficerName;
-    settings.violationsOfficerId = null;
-    settings.violationsOfficerName = null;
+    const cur = getViolationsOfficers(settings);
+    const target = req.body && req.body.discordId ? String(req.body.discordId) : null;
+    const removed = target ? cur.find(m => m.id === target) : null;
+    settings.violationsOfficers = target ? cur.filter(m => m.id !== target) : [];
+    settings.violationsOfficerId = null; settings.violationsOfficerName = null;
+    settings.markModified("violationsOfficers");
     await settings.save();
-    await logEvent({ action: "إزالة مسؤول المخالفات", actorId: req.user.id, actorTag: req.user.username, details: oldName || "-" });
-    res.json({ ok: true });
+    await logEvent({ action: "إزالة مسؤول المخالفات", actorId: req.user.id, actorTag: req.user.username, details: removed ? removed.name : "الكل" });
+    res.json({ ok: true, violationsOfficers: settings.violationsOfficers });
 });
 
 app.get("/api/violations-officer/pending", ensureViolationsOfficer, async (req, res) => {
@@ -8657,6 +8934,47 @@ async function attPeople(uids) {
     }
     return out;
 }
+// ── عرض التحضير: قائد القطاع/مسؤول التحضير = قطاعه كامل | الشرطة العسكرية = كل القطاعات (غياب اليوم فقط) ──
+app.get("/api/att-view", ensureAttViewer, async (req, res) => {
+    try {
+        const sc = req.attScope;
+        const now = new Date(), ds = attDayStart(now);
+        const fullSectors = sc.absentTodayOnly && !req.attScope.sectors.length ? [] : sc.sectors;
+        const out = { sectors: [], absentToday: [], absentOnly: sc.absentTodayOnly && !fullSectors.length };
+        if (fullSectors.length) {
+            const accs = await Account.find({ status: "approved", sector: { $in: fullSectors } }, { uid: 1, sector: 1, fullName: 1 }).limit(3000).maxTimeMS(10000).lean();
+            const uids = accs.map(a => a.uid);
+            const [people, sts, logs] = await Promise.all([
+                attPeople(uids),
+                AttStatus.find({ uid: { $in: uids } }).limit(3000).maxTimeMS(10000).lean(),
+                AttLog.find({ uid: { $in: uids }, at: { $gte: new Date(ds.getTime() - ATT_SESSION_CAP) } }, { uid: 1, type: 1, at: 1 }).limit(60000).maxTimeMS(10000).lean(),
+            ]);
+            const sm = new Map(sts.map(x => [x.uid, x]));
+            const byUid = attGroup(logs);
+            for (const key of fullSectors) {
+                const members = accs.filter(a => a.sector === key).map(a => {
+                    const pe = people.get(a.uid) || {}, st = sm.get(a.uid), lg = byUid.get(a.uid) || [];
+                    return {
+                        uid: a.uid, name: pe.name || a.fullName || a.uid, unit: pe.unit || null, rank: pe.rank || null,
+                        status: st && st.status === "in" ? "in" : "out",
+                        lastCheckInAt: st ? st.lastCheckInAt : null, lastCheckOutAt: st ? st.lastCheckOutAt : null,
+                        todayIn: lg.filter(l => l.type === "in" && l.at >= ds).length,
+                        todayMs: attCalcMs(lg, ds.getTime(), now.getTime()),
+                    };
+                }).sort((a, b) => (a.status === b.status ? String(a.name).localeCompare(String(b.name), "ar") : a.status === "in" ? -1 : 1));
+                out.sectors.push({ key, label: CONFIG.SECTORS[key], present: members.filter(m => m.status === "in").length, members });
+            }
+        }
+        // غياب اليوم (آخر استلام اليوم): للشرطة كل القطاعات، وللقادة قطاعاتهم
+        const absKeys = sc.absentTodayOnly ? Object.keys(CONFIG.SECTORS) : fullSectors;
+        const rows = await RecRow.find({ dayKey: { $gte: ds.getTime() }, kind: "absent", removedAt: null, sectorKey: { $in: absKeys } }).sort({ sectorKey: 1, name: 1 }).limit(2000).maxTimeMS(10000).lean();
+        out.absentToday = rows.map(r => ({ uid: r.uid, name: r.name, unit: r.unit, rank: r.rank, sector: r.sector, excuseStatus: r.excuseStatus }));
+        res.json(out);
+    } catch (e) {
+        console.error("❌ att-view:", e.message);
+        res.status(500).json({ error: "تعذر تحميل التحضير، حاول مرة ثانية" });
+    }
+});
 app.get("/api/senior/att/members", ensureSeniorAdmin, async (req, res) => {
     const now = new Date(), ds = attDayStart(now);
     const sts = await AttStatus.find({}).sort({ updatedAt: -1 }).limit(500).maxTimeMS(10000).lean();
@@ -9038,6 +9356,9 @@ const AbsenceExcuseSchema = new mongoose.Schema({
     reason: String, proof: { type: String, default: null }, proofChannelId: { type: String, default: null }, proofMessageId: { type: String, default: null }, hasProof: { type: Boolean, default: false },
     status: { type: String, enum: ["pending", "deciding", "accepted", "rejected"], default: "pending" },
     rejectReason: { type: String, default: null }, absenceAt: Date,
+    oathText: { type: String, default: null },
+    audio: { type: Buffer, default: undefined }, audioChannelId: { type: String, default: null }, audioMessageId: { type: String, default: null },
+    audioMime: { type: String, default: null }, audioDuration: { type: Number, default: null }, audioWave: { type: String, default: null }, hasAudio: { type: Boolean, default: false },
     decidedBy: String, decidedByName: String, decidedAt: Date, refunded: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now },
 });
@@ -9144,7 +9465,7 @@ app.get("/api/excuse/my", ensureAuth, async (req, res) => {
     const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
     const rows = await RecRow.find({ uid: req.user.id, kind: "absent", dayKey: { $gte: since } }).sort({ dayKey: -1 }).limit(60).lean();
     const ids = rows.map(r => r.excuseId).filter(Boolean);
-    const exs = ids.length ? await AbsenceExcuse.find({ _id: { $in: ids } }, { proof: 0 }).lean() : [];
+    const exs = ids.length ? await AbsenceExcuse.find({ _id: { $in: ids } }, { proof: 0, audio: 0 }).lean() : [];
     const em = new Map(exs.map(e => [String(e._id), e]));
     res.json({
         list: rows.map(r => {
@@ -9166,16 +9487,19 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
     if (reason.length < 3) return res.status(400).json({ error: "اكتب العذر" });
     if (!type) return res.status(400).json({ error: "حدد نوع العذر (طبي أو بدون طبي)" });
     let proof = null;
-    if (b.proof) {
-        proof = String(b.proof);
-        if (!/^data:image\/(jpeg|png|webp);base64,/.test(proof) || proof.length > 2500000) return res.status(400).json({ error: "الدليل لازم يكون صورة وحجمها صغير" });
-    }
+    if (!b.proof) return res.status(400).json({ error: "لازم ترفق دليل (صورة) للعذر" });
+    proof = String(b.proof);
+    if (!/^data:image\/(jpeg|png|webp);base64,/.test(proof) || proof.length > 2500000) return res.status(400).json({ error: "الدليل لازم يكون صورة وحجمها صغير" });
+    if (b.oath !== true) return res.status(400).json({ error: "لازم توافق على القسم وتقوله" });
+    const audioIn = supportCleanAudio(b);
+    if (!audioIn) return res.status(400).json({ error: "لازم تسجّل القسم بصوتك (تسجيل صوتي صالح)" });
     let proofCh = null, proofMsg = null;
     if (proof) {
         const up = await discordSaveImage(proof, "excuse");
         if (up) { proofCh = up.channelId; proofMsg = up.messageId; proof = null; }
     }
     const hadProof = !!(proof || proofMsg);
+    const audioFields = await supportAudioFields(audioIn);
     const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
     const row = await RecRow.findOneAndUpdate(
         { _id: rowId, uid: req.user.id, kind: "absent", excuseStatus: "none", dayKey: { $gte: since } },
@@ -9186,6 +9510,8 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
         ex = await AbsenceExcuse.create({
             rowId: String(row._id), dayKey: row.dayKey, uid: row.uid, name: row.name, unit: row.unit, rank: row.rank,
             sector: row.sector, sectorKey: row.sectorKey, type, reason, proof, proofChannelId: proofCh, proofMessageId: proofMsg, hasProof: hadProof, absenceAt: row.openedAt,
+            oathText: "أُقسم بالله العظيم، أنا (" + row.name + ")، بأن العذر الذي تقدمت به بشأن غيابي وهو (" + reason + ") صحيح، وأتحمل كامل المسؤولية عن صحة ما ذكرته، وأتعهد بعدم تقديم أي عذر غير صحيح، والله على ما أقول شهيد.",
+            hasAudio: true, ...audioFields,
         });
         await RecRow.updateOne({ _id: row._id }, { $set: { excuseId: String(ex._id) } });
     } catch (e) {
@@ -9211,10 +9537,26 @@ app.get("/api/hc/excuses", ensureHighCommand, async (req, res) => {
     const f = String(req.query.filter || "pending");
     const q = f === "pending" ? { status: { $in: ["pending", "deciding"] } } : { status: { $in: ["accepted", "rejected"] } };
     const [list, pendingCount] = await Promise.all([
-        AbsenceExcuse.find(q, { proof: 0 }).sort({ createdAt: -1 }).limit(200).lean(),
+        AbsenceExcuse.find(q, { proof: 0, audio: 0 }).sort({ createdAt: -1 }).limit(200).lean(),
         AbsenceExcuse.countDocuments({ status: "pending" }),
     ]);
     res.json({ list, pendingCount });
+});
+app.get("/api/hc/excuses/:id/audio", ensureHighCommand, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).end();
+    const ex = await AbsenceExcuse.findById(req.params.id, { audio: 1, audioMime: 1, audioChannelId: 1, audioMessageId: 1 }).lean();
+    if (!ex) return res.status(404).end();
+    if (!(ex.audio && ex.audio.length) && ex.audioChannelId && ex.audioMessageId) {
+        try {
+            const u = await discordImageUrl(ex.audioChannelId, ex.audioMessageId, "exv:" + String(ex._id));
+            if (u) return res.redirect(u);
+        } catch (e) { console.error("❌ فشل جلب صوت القسم:", e.message); }
+        return res.status(503).end();
+    }
+    if (!(ex.audio && ex.audio.length)) return res.status(404).end();
+    const buf = Buffer.from(ex.audio.buffer ? ex.audio.buffer : ex.audio);
+    res.set({ "Content-Type": ex.audioMime || "audio/webm", "Cache-Control": "private, max-age=3600", "Content-Length": buf.length });
+    res.end(buf);
 });
 app.get("/api/hc/excuses/:id/proof", ensureHighCommand, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
@@ -10928,11 +11270,21 @@ window.addEventListener('popstate', () => {
 });
 async function viewViolationPhoto(id) {
     openPhotoPage();
-    try {
-        const { photo } = await api('/api/violations/' + id + '/photo');
-        if (!photo) return setPhotoPageError('لا توجد صورة');
-        setPhotoPageImage(photo);
-    } catch (e) { setPhotoPageError(e.message); }
+    const img = document.getElementById('photo-page-img');
+    const loading = document.getElementById('photo-page-loading');
+    let done = false;
+    const timer = setTimeout(function () { if (!done) { done = true; img.onload = img.onerror = null; img.src = ''; setPhotoPageError('الصورة تأخرت'); } }, 25000);
+    img.onload = function () { if (done) return; done = true; clearTimeout(timer); loading.style.display = 'none'; img.style.display = 'block'; };
+    img.onerror = async function () {
+        if (done) return;
+        img.onload = img.onerror = null;
+        try {
+            const r = await api('/api/violations/' + encodeURIComponent(id) + '/photo');
+            if (r && r.photo) { done = true; clearTimeout(timer); img.onerror = function () { setPhotoPageError('تعذر تحميل الصورة'); }; return setPhotoPageImage(r.photo); }
+        } catch (e) { done = true; clearTimeout(timer); return setPhotoPageError(e.message || 'تعذر تحميل الصورة'); }
+        done = true; clearTimeout(timer); setPhotoPageError('لا توجد صورة لهذي المخالفة');
+    };
+    img.src = '/api/violations/' + encodeURIComponent(id) + '/photo-file?t=' + Date.now();
 }
 async function viewNotePhoto(discord, noteId) {
     openPhotoPage();
@@ -13615,6 +13967,8 @@ function buildNav() {
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) items.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) items.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
+    if (ME.sectorViolOfficer) items.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
+    if (ME.canAttView) items.push({ label: '🖐️ التحضير', fn: 'renderAttViewPanel()' });
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) { items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' }); items.push({ label: '👮 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' }); }
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
@@ -13639,6 +13993,8 @@ function renderFabs() {
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) fabs.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) fabs.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
+    if (ME.sectorViolOfficer) fabs.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
+    if (ME.canAttView) fabs.push({ label: '🖐️ التحضير', fn: 'renderAttViewPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) { fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' }); fabs.push({ label: '👮 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' }); }
     else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
@@ -15078,14 +15434,16 @@ function renderSectorsBox() {
     if (!box) return;
     const keys = Object.keys(sectorsCache.sectors);
     const mp = sectorsCache.mpLeadership || {};
-    const vo = sectorsCache.violationsOfficer || {};
-    const voCard = '<div class="card">' +
-        '<h3>⚖️ مسؤول المخالفات (لكل القطاعات)</h3>' +
-        '<div class="row" style="margin-top:8px;"><span>المسؤول: <b style="color:' + (vo.name ? '#4ade80' : 'var(--muted)') + ';">' + accEsc(vo.name || 'غير معيّن') + '</b></span>' +
-        '<div class="row" style="gap:6px;"><button class="btn sm" onclick="openVOPicker()">تعيين مسؤول المخالفات</button>' +
-        (vo.name ? '<button class="btn danger sm" onclick="removeVO()">إزالة</button>' : '') + '</div></div>' +
-        '<div style="color:var(--muted);font-size:12px;margin-top:2px;">هو الوحيد اللي يقبل ويرفض مخالفات وتقارير كل القطاعات، وله سجل بالمقبولة والمرفوضة. قادة ونواب القطاعات ما يقدرون يقبلون أو يرفضون مخالفات قطاعهم.</div>' +
-        '<div id="picker-vo"></div></div>';
+    const vos = sectorsCache.violationsOfficers || [];
+    const voCard = '<div class=\"card\">' +
+        '<h3>⚖️ مسؤولو المخالفات (لكل القطاعات)</h3>' +
+        (vos.length ? vos.map(function (m) {
+            return '<div class=\"row\" style=\"margin-top:8px;\"><b style=\"color:#4ade80;\">' + accEsc(m.name || m.id) + '</b>' +
+                '<button class=\"btn danger sm\" data-id=\"' + accEsc(m.id) + '\" onclick=\"removeVO(this.dataset.id)\">إزالة</button></div>';
+        }).join('') : '<div style=\"margin-top:8px;color:var(--muted);\">ما فيه مسؤول معيّن</div>') +
+        '<div class=\"row\" style=\"gap:6px;margin-top:8px;\"><button class=\"btn sm\" onclick=\"openVOPicker()\">➕ إضافة مسؤول مخالفات</button></div>' +
+        '<div style=\"color:var(--muted);font-size:12px;margin-top:6px;\">تقدر تحط أكثر من مسؤول. يقبلون ويرفضون مخالفات وتقارير كل القطاعات. وقادة القطاعات يقبلون مخالفات قطاعهم فقط (ما عدا مخالفاتهم هم).</div>' +
+        '<div id=\"picker-vo\"></div></div>';
     box.innerHTML = voCard + keys.map(key => {
         const label = sectorsCache.sectors[key];
         const sec = (sectorsCache.leadership && sectorsCache.leadership[key]) || {};
@@ -15417,30 +15775,115 @@ async function exLoad() {
             '<div id="ex-f-' + x.rowId + '"></div></div>';
     }).join('');
 }
+function exOathText(id) {
+    var r = document.getElementById('ex-r-' + id);
+    var reason = r && r.value.trim() ? r.value.trim() : '(سبب الغياب)';
+    var nm = (ME && (ME.registeredName || ME.name)) || '(الاسم)';
+    return 'أُقسم بالله العظيم، أنا (' + nm + ')، بأن العذر الذي تقدمت به بشأن غيابي وهو (' + reason + ') صحيح، وأتحمل كامل المسؤولية عن صحة ما ذكرته، وأتعهد بعدم تقديم أي عذر غير صحيح، والله على ما أقول شهيد.';
+}
+function exOathRefresh(id) { var el = document.getElementById('ex-oath-' + id); if (el) el.textContent = exOathText(id); }
 function exOpen(id) {
     var box = document.getElementById('ex-f-' + id);
     if (!box) return;
-    if (box.innerHTML) { box.innerHTML = ''; return; }
+    if (box.innerHTML) { exVoiceReset(); box.innerHTML = ''; return; }
+    exVoiceReset();
     box.innerHTML = '<div style="margin-top:10px;display:flex;flex-direction:column;gap:8px;">' +
-        '<textarea id="ex-r-' + id + '" rows="3" maxlength="500" placeholder="اكتب عذرك هنا..." style="width:100%;"></textarea>' +
+        '<textarea id="ex-r-' + id + '" rows="3" maxlength="500" placeholder="اكتب عذرك هنا..." style="width:100%;" oninput="exOathRefresh(this.id.slice(5))"></textarea>' +
         '<select id="ex-t-' + id + '"><option value="medical">🩺 طبي</option><option value="nonmedical">📄 بدون طبي</option></select>' +
-        '<div style="font-size:12px;color:var(--muted);">دليل (اختياري) — صورة:</div>' +
+        '<div style="font-size:12px;color:#fbbf24;">دليل (إجباري) — صورة:</div>' +
         '<input type="file" id="ex-p-' + id + '" accept="image/*">' +
+        '<div style="font-size:13px;color:var(--gold-soft);margin-top:4px;">📜 القسم (إجباري — لازم تقوله بصوتك):</div>' +
+        '<div id="ex-oath-' + id + '" style="padding:10px;border:1px solid var(--border);border-radius:8px;font-size:14px;line-height:1.9;">' + accEsc(exOathText(id)) + '</div>' +
+        '<div id="ex-v-' + id + '"></div>' +
         '<div class="row" style="gap:8px;justify-content:flex-start;"><button class="btn sm" data-id="' + id + '" onclick="exSend(this.dataset.id)">إرسال</button>' +
         '<button class="btn gray sm" data-id="' + id + '" onclick="exOpen(this.dataset.id)">إلغاء</button></div></div>';
+    exVoicePaint(id);
+}
+// ---- تسجيل القسم الصوتي ----
+var EXV = { rec: null, stream: null, chunks: [], mime: '', t0: 0, timer: null, blob: null, dur: 0, id: null };
+function exVoiceReset() {
+    try { if (EXV.rec && EXV.rec.state !== 'inactive') { EXV.rec.onstop = null; EXV.rec.stop(); } } catch (e) {}
+    try { if (EXV.stream) EXV.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    if (EXV.timer) clearInterval(EXV.timer);
+    EXV = { rec: null, stream: null, chunks: [], mime: '', t0: 0, timer: null, blob: null, dur: 0, id: null };
+}
+function exVoicePaint(id) {
+    var box = document.getElementById('ex-v-' + id);
+    if (!box) return;
+    if (EXV.rec) {
+        box.innerHTML = '<div class="row" style="gap:10px;justify-content:flex-start;"><span class="sp-rec-dot"></span><b id="ex-vt-' + id + '">0:00</b>' +
+            '<button class="btn danger sm" data-id="' + id + '" onclick="exVoiceStop(this.dataset.id)">⏹️ إيقاف</button></div>';
+    } else if (EXV.blob) {
+        box.innerHTML = '<audio controls style="width:100%;" src="' + URL.createObjectURL(EXV.blob) + '"></audio>' +
+            '<div class="row" style="gap:8px;justify-content:flex-start;margin-top:6px;"><span style="color:#4ade80;font-size:13px;">✅ تم تسجيل القسم (' + EXV.dur + ' ث)</span>' +
+            '<button class="btn gray sm" data-id="' + id + '" onclick="exVoiceAgain(this.dataset.id)">🔁 إعادة التسجيل</button></div>';
+    } else {
+        box.innerHTML = '<button class="btn sm" data-id="' + id + '" onclick="exVoiceStart(this.dataset.id)">🎙️ سجّل القسم بصوتك</button>';
+    }
+}
+function exVoiceAgain(id) { exVoiceReset(); exVoicePaint(id); }
+async function exVoiceStart(id) {
+    if (!spVoiceSupported()) return toast('متصفحك ما يدعم تسجيل الصوت');
+    var stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+    catch (e) { return toast('اسمح للمايك من إعدادات المتصفح عشان تسجل القسم'); }
+    var mime = spVoicePickMime(), rec;
+    try { rec = mime ? new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 }) : new MediaRecorder(stream); }
+    catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); return toast('تعذر بدء التسجيل'); }
+    EXV.stream = stream; EXV.rec = rec; EXV.chunks = []; EXV.blob = null; EXV.id = id;
+    EXV.mime = String(rec.mimeType || mime || 'audio/webm').split(';')[0];
+    rec.ondataavailable = function (e) { if (e.data && e.data.size) EXV.chunks.push(e.data); };
+    rec.onstop = function () {
+        var dur = (Date.now() - EXV.t0) / 1000;
+        try { EXV.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+        if (EXV.timer) { clearInterval(EXV.timer); EXV.timer = null; }
+        EXV.rec = null;
+        if (dur < 3 || !EXV.chunks.length) { EXV.chunks = []; toast('التسجيل قصير، اقرأ القسم كامل'); return exVoicePaint(id); }
+        var blob = new Blob(EXV.chunks, { type: EXV.mime });
+        EXV.chunks = [];
+        if (blob.size > 3.8 * 1024 * 1024) { toast('التسجيل كبير، قصّر'); return exVoicePaint(id); }
+        EXV.blob = blob; EXV.dur = Math.max(1, Math.round(dur));
+        exVoicePaint(id);
+    };
+    EXV.t0 = Date.now();
+    rec.start(250);
+    EXV.timer = setInterval(function () {
+        var el = document.getElementById('ex-vt-' + id);
+        if (el) el.textContent = spFmtDur((Date.now() - EXV.t0) / 1000);
+        if (Date.now() - EXV.t0 > 120000) exVoiceStop(id);
+    }, 200);
+    exVoicePaint(id);
+}
+function exVoiceStop(id) { try { if (EXV.rec && EXV.rec.state !== 'inactive') EXV.rec.stop(); } catch (e) {} }
+function exBlobToB64(blob) {
+    return new Promise(function (resolve, reject) {
+        var fr = new FileReader();
+        fr.onload = function () { resolve(String(fr.result).split(',')[1] || ''); };
+        fr.onerror = function () { reject(new Error('تعذر قراءة التسجيل')); };
+        fr.readAsDataURL(blob);
+    });
 }
 async function exSend(id) {
     var r = document.getElementById('ex-r-' + id), t = document.getElementById('ex-t-' + id), p = document.getElementById('ex-p-' + id);
     if (!r || !t) return;
     var reason = r.value.trim();
     if (reason.length < 3) return toast('اكتب العذر');
-    var proof = null;
+    if (!p || !p.files || !p.files[0]) return toast('لازم ترفق دليل (صورة)');
+    if (!EXV.blob || EXV.id !== id) return toast('لازم تسجّل القسم بصوتك أول');
     try {
-        if (p && p.files && p.files[0]) proof = await exCompress(p.files[0]);
-        await api('/api/excuse/submit', { method: 'POST', body: JSON.stringify({ rowId: id, reason: reason, type: t.value, proof: proof }) });
+        var proof = await exCompress(p.files[0]);
+        var audio = await exBlobToB64(EXV.blob);
+        await api('/api/excuse/submit', { method: 'POST', body: JSON.stringify({ rowId: id, reason: reason, type: t.value, proof: proof, oath: true, audio: audio, audioMime: EXV.mime, audioDuration: EXV.dur }) });
+        exVoiceReset();
         toast('✅ انرسل عذرك للقيادة');
         exLoad();
     } catch (e) { toast(e.message); }
+}
+function exOathBlock(x) {
+    if (!x.oathText && !x.hasAudio) return '';
+    return '<div style="margin-top:8px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:13px;line-height:1.8;">' +
+        '<div style="color:var(--gold-soft);">📜 القسم</div>' + (x.oathText ? accEsc(x.oathText) : '') +
+        (x.hasAudio ? '<audio controls preload="none" style="width:100%;margin-top:6px;" src="/api/hc/excuses/' + x._id + '/audio"></audio>' : '') + '</div>';
 }
 var HCEX = { f: 'pending' };
 function hcExSetFilter(f) { HCEX.f = f; loadHCExcuses(); }
@@ -15469,7 +15912,7 @@ async function loadHCExcuses(silent) {
         return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
             '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + ' — غياب ' + exFull(x.absenceAt) + '</div>' +
             '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
-            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="hcExProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') +
+            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="hcExProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') + exOathBlock(x) +
             '<div style="font-size:11px;color:var(--muted);margin-top:4px;">قُدّم: ' + exFull(x.createdAt) + '</div>' + actions + '</div>';
     }).join('') : '<div class="card center" style="color:var(--muted);">' + (HCEX.f === 'pending' ? 'لا توجد أعذار معلّقة' : 'لا توجد أعذار منتهية') + '</div>';
     paintSilent(box, 'hex' + HCEX.f, chips + rows, silent);
@@ -15502,7 +15945,7 @@ async function loadSeniorExcuses(silent) {
         return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
             '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + '</div>' +
             '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
-            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="sexProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') +
+            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="sexProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') + exOathBlock(x) +
             '<div style="font-size:12px;margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);line-height:1.9;">' +
                 '<div>📥 <b>وقت الاستلام:</b> ' + exFull(x.absenceAt) + '</div>' +
                 '<div>📝 <b>وقت تنفيذ الطلب:</b> ' + exFull(x.createdAt) + '</div>' +
@@ -15821,6 +16264,7 @@ function renderSectorPanel() {
             <div class="tab" onclick="sectorTab('file', this)">عرض ملف عسكري</div>
             <div class="tab" onclick="sectorTab('promotions', this)">ترقيات الأفراد</div>
             <div class="tab" onclick="sectorTab('leave', this)">🌴 طلبات الإجازات</div>
+            \${ME.sectorInfo.role === 'commander' ? \`<div class="tab" onclick="sectorTab('att', this)">🖐️ التحضير</div><div class="tab" onclick="sectorTab('officers', this)">👤 مسؤول التحضير والمخالفات</div>\` : ''}
         </div>
         <div id="sector-content"></div>\`;
     sectorTab('members');
@@ -15886,6 +16330,8 @@ function sectorTab(name, el) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     if (el) el.classList.add('active');
     sectorPanelTab = name;
+    if (name === 'att') return loadSectorAtt();
+    if (name === 'officers') return loadSectorOfficers();
     if (name === 'members') loadSectorMembers();
     if (name === 'violations') loadSectorViolations();
     if (name === 'file') renderSectorFileSearch();
@@ -17415,6 +17861,145 @@ async function saveAccEdit(btn) {
     } catch (e) { toast(e.message); }
 }
 let voTab = 'pending';
+// ===== التحضير + مسؤولو القطاع (قائد القطاع / مسؤول التحضير / مسؤول المخالفات / الشرطة العسكرية) =====
+function attFmtMs(ms) {
+    var m = Math.floor((ms || 0) / 60000), h = Math.floor(m / 60);
+    return h ? (h + ' س ' + (m % 60) + ' د') : (m + ' د');
+}
+function attFmtTime(d) {
+    if (!d) return '-';
+    try { return new Date(d).toLocaleString('ar-SA', { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'numeric' }); } catch (e) { return '-'; }
+}
+function attViewHtml(d) {
+    var h = '';
+    if (!d.absentOnly) {
+        h += (d.sectors || []).map(function (sec) {
+            return '<div class="card"><div class="row"><h3>🪖 ' + accEsc(sec.label) + '</h3>' +
+                '<span style="color:#4ade80;">الحاضرين الحين: ' + sec.present + ' / ' + sec.members.length + '</span></div>' +
+                (sec.members.length ? sec.members.map(function (m) {
+                    return '<div class="row" style="padding:6px 0;border-top:1px solid var(--border);">' +
+                        '<span>' + (m.status === 'in' ? '🟢' : '⚪') + ' ' + accEsc(m.name) +
+                        ' <span style="color:var(--muted);font-size:12px;">(' + accEsc(m.rank || '-') + ' • ' + accEsc(m.unit || '-') + ')</span></span>' +
+                        '<span style="color:var(--muted);font-size:12px;">اليوم: ' + attFmtMs(m.todayMs) + ' • ' + m.todayIn + ' حضور' +
+                        (m.status === 'in' ? ' • دخل ' + attFmtTime(m.lastCheckInAt) : '') + '</span></div>';
+                }).join('') : '<div style="color:var(--muted);margin-top:8px;">ما فيه أعضاء</div>') + '</div>';
+        }).join('');
+    }
+    var abs = d.absentToday || [];
+    h += '<div class="card"><h3>❌ غياب اليوم (' + abs.length + ')</h3>' +
+        (abs.length ? abs.map(function (r) {
+            var ex = r.excuseStatus === 'accepted' ? ' ✅ عذر مقبول' : r.excuseStatus === 'pending' ? ' ⏳ عذر قيد المراجعة' : r.excuseStatus === 'rejected' ? ' ❌ عذر مرفوض' : '';
+            return '<div class="row" style="padding:6px 0;border-top:1px solid var(--border);"><span>' + accEsc(r.name) +
+                ' <span style="color:var(--muted);font-size:12px;">(' + accEsc(r.rank || '-') + ' • ' + accEsc(r.unit || '-') + ')</span></span>' +
+                '<span style="color:var(--muted);font-size:12px;">' + accEsc(r.sector || '') + ex + '</span></div>';
+        }).join('') : '<div style="color:var(--muted);margin-top:8px;">لا يوجد غياب مسجّل اليوم</div>') + '</div>';
+    return h;
+}
+async function loadAttInto(boxId) {
+    var box = document.getElementById(boxId);
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try { var d = await api('/api/att-view'); box.innerHTML = attViewHtml(d); }
+    catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; }
+}
+function renderAttViewPanel() {
+    document.getElementById('app').innerHTML =
+        '<div class="card row"><h2>🖐️ التحضير</h2><div class="row" style="gap:8px;">' +
+        '<button class="btn sm" onclick="loadAttInto(\\'att-view-box\\')">🔄 تحديث</button>' +
+        '<button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div></div>' +
+        '<div id="att-view-box"></div>';
+    loadAttInto('att-view-box');
+}
+// ---- مسؤول مخالفات القطاع ----
+function renderSectorViolOfficerPanel() {
+    var lbl = ME.sectorViolOfficer ? ME.sectorViolOfficer.sectorLabel : '';
+    document.getElementById('app').innerHTML =
+        '<div class="card row"><h2>⚖️ مخالفات ' + accEsc(lbl) + '</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>' +
+        '<div id="svo-content"></div>';
+    loadSVOPending();
+}
+async function loadSVOPending() {
+    var box = document.getElementById('svo-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var list;
+    try { list = (await api('/api/sector-viol-officer/pending')).list; }
+    catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; return; }
+    if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات معلّقة</div>'; return; }
+    box.innerHTML = list.map(function (v) {
+        return '<div class="card"><div class="row" style="align-items:flex-start;"><div class="row" style="gap:10px;align-items:flex-start;">' +
+            (v.hasPhoto ? '<button class="btn sm gray" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">📷 عرض الصورة</button>' : '') +
+            '<div>' + voDetails(v) + '</div></div><div class="row" style="gap:8px;">' +
+            '<button class="btn sm" data-id="' + v._id + '" onclick="svoApprove(this.dataset.id)">قبول</button>' +
+            '<button class="btn danger sm" data-id="' + v._id + '" onclick="svoReject(this.dataset.id)">رفض</button></div></div></div>';
+    }).join('');
+}
+async function svoApprove(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
+    lockAction(id);
+    try { await api('/api/sector-viol-officer/violations/' + id + '/approve', { method: 'POST' }); toast('تم القبول'); loadSVOPending(); }
+    catch (e) { toast(e.message); }
+}
+async function svoReject(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
+    var reason = await promptModal('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب');
+    lockAction(id);
+    api('/api/sector-viol-officer/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) })
+        .then(function () { toast('تم الرفض'); loadSVOPending(); }).catch(function (e) { toast(e.message); });
+}
+// ---- تبويبات قائد القطاع: التحضير + تعيين المسؤولين ----
+var secOfficersCache = null, secMembersCache = null;
+async function loadSectorOfficers() {
+    var box = document.getElementById('sector-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try { secOfficersCache = await api('/api/sector/officers'); }
+    catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; return; }
+    var d = secOfficersCache;
+    function card(kind, title, list, note) {
+        return '<div class="card"><h3>' + title + '</h3>' +
+            (list.length ? list.map(function (m) {
+                return '<div class="row" style="margin-top:8px;"><b style="color:#4ade80;">' + accEsc(m.name || m.id) + '</b>' +
+                    (d.canManage ? '<button class="btn danger sm" data-k="' + kind + '" data-id="' + accEsc(m.id) + '" onclick="removeSectorOfficer(this.dataset.k, this.dataset.id)">إزالة</button>' : '') + '</div>';
+            }).join('') : '<div style="margin-top:8px;color:var(--muted);">غير معيّن</div>') +
+            (d.canManage ? '<input style="margin-top:10px;" placeholder="🔍 ابحث باسم عضو من القطاع..." oninput="searchSectorOfficer(\\'' + kind + '\\', this.value)"><div id="so-cand-' + kind + '"></div>' : '') +
+            '<div style="color:var(--muted);font-size:12px;margin-top:6px;">' + note + '</div></div>';
+    }
+    box.innerHTML =
+        card('att', '🖐️ مسؤولو التحضير', d.attendanceOfficers, 'يشوفون تحضير قطاعك (الحاضرين وغياب اليوم). تقدر تحط أكثر من واحد.') +
+        card('viol', '⚖️ مسؤولو المخالفات', d.violationsOfficers, 'يقبلون ويرفضون مخالفات قطاعك فقط (ما عدا مخالفاتهم ومخالفاتك). تقدر تحط أكثر من واحد.');
+}
+async function searchSectorOfficer(kind, q) {
+    var box = document.getElementById('so-cand-' + kind);
+    if (!box) return;
+    q = (q || '').trim();
+    if (!q) { box.innerHTML = ''; return; }
+    try { if (!secMembersCache) secMembersCache = (await api('/api/sector/members', { noLock: true })).list || []; }
+    catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + accEsc(e.message) + '</p>'; return; }
+    var ok = secMembersCache.filter(function (p) { return p.registeredName && p.registeredName.indexOf(q) !== -1; }).slice(0, 8);
+    box.innerHTML = ok.length ? ok.map(function (p) {
+        return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + accEsc(p.registeredName) +
+            ' <span style="color:var(--muted);font-size:12px;">(' + accEsc(p.rank || '-') + ')</span></span>' +
+            '<button class="btn sm" data-k="' + kind + '" data-id="' + p.discord + '" onclick="addSectorOfficer(this.dataset.k, this.dataset.id)">تعيين</button></div></div>';
+    }).join('') : '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
+}
+async function addSectorOfficer(kind, id) {
+    try { await api('/api/sector/officers/' + kind + '/assign', { method: 'POST', body: JSON.stringify({ discordId: id }) }); toast('تم التعيين'); loadSectorOfficers(); }
+    catch (e) { toast(e.message); }
+}
+async function removeSectorOfficer(kind, id) {
+    if (!(await confirmModal('متأكد تبي تزيله؟'))) return;
+    try { await api('/api/sector/officers/' + kind + '/remove', { method: 'POST', body: JSON.stringify({ discordId: id }) }); toast('تم'); loadSectorOfficers(); }
+    catch (e) { toast(e.message); }
+}
+function loadSectorAtt() {
+    var box = document.getElementById('sector-content');
+    if (box) box.innerHTML = '<div id="att-view-box-sec"></div>';
+    loadAttInto('att-view-box-sec');
+}
+
 function renderViolationsOfficerPanel() {
     voTab = 'pending';
     document.getElementById('app').innerHTML =
@@ -17541,9 +18126,9 @@ async function assignVO(discordId) {
     try { await api('/api/senior/violations-officer/assign', { method: 'POST', body: JSON.stringify({ discordId: discordId }) }); toast('تم التعيين'); loadSectors(); }
     catch (e) { toast(e.message); }
 }
-async function removeVO() {
+async function removeVO(discordId) {
     if (!(await confirmModal('متأكد تبي تزيل مسؤول المخالفات؟'))) return;
-    try { await api('/api/senior/violations-officer/remove', { method: 'POST' }); toast('تم'); loadSectors(); }
+    try { await api('/api/senior/violations-officer/remove', { method: 'POST', body: JSON.stringify({ discordId: discordId }) }); toast('تم'); loadSectors(); }
     catch (e) { toast(e.message); }
 }
 async function loadHire() {
@@ -21414,13 +21999,3 @@ app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`🚀 ${CONFIG.SITE_NAME} server running on port ${CONFIG.PORT}`);
 });
 
-// ── منع نوم Render: الخطة المجانية تنيّم الموقع (والبوت اللي داخله) بعد 15 دقيقة بدون زيارات ──
-// الموقع يزور نفسه كل 8 دقايق عن طريق رابطه العام، فيحسبها Render زيارة ويظل صاحي.
-(function keepAwake() {
-    const base = String(process.env.RENDER_EXTERNAL_URL || (process.env.RENDER ? CONFIG.SITE_URL : "") || "").replace(/\/+$/, "");
-    if (!/^https?:\/\//.test(base)) return;   // مو على Render → ما نسوي شي
-    const ping = () => fetch(base + "/healthz", { signal: AbortSignal.timeout(30000) }).catch(() => {});
-    setTimeout(ping, 60000);
-    setInterval(ping, 8 * 60 * 1000);
-    console.log("⏰ تصحية Render شغالة:", base);
-})();
