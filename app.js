@@ -11703,14 +11703,11 @@ function previewNoteImage() {
     const input = document.getElementById('nf-image');
     const file = input.files[0];
     if (!file) { noteImageData = null; return; }
-    if (file.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); input.value = ''; noteImageData = null; return; }
-    const reader = new FileReader();
-    reader.onload = () => {
-        noteImageData = reader.result;
+    exCompress(file, 1600, 0.82).then(function (d) {
+        noteImageData = d;
         const img = document.getElementById('nf-preview');
         if (img) { img.src = noteImageData; img.style.display = 'block'; }
-    };
-    reader.readAsDataURL(file);
+    }).catch(function (e) { noteImageData = null; toast(e.message || 'تعذر قراءة الصورة'); });
 }
 async function submitNoteForm() {
     const text = document.getElementById('nf-text').value;
@@ -15143,14 +15140,12 @@ function pickVehicle(i) {
 function previewPhoto() {
     const f = document.getElementById('v-photo').files[0];
     if (!f) return;
-    if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
-    const reader = new FileReader();
-    reader.onload = e => {
-        photoBase64 = e.target.result;
+    toast('جارِ تجهيز الصورة...');
+    exCompress(f, 1600, 0.82).then(function (d) {
+        photoBase64 = d;
         const img = document.getElementById('v-photo-preview');
         img.src = photoBase64; img.style.display = 'block';
-    };
-    reader.readAsDataURL(f);
+    }).catch(function (e) { toast(e.message || 'تعذر قراءة الصورة'); });
 }
 let violationSubmitting = false;
 async function submitViolation() {
@@ -15293,14 +15288,12 @@ function removeSecurityAction(btn) {
 function previewReportPhoto() {
     const f = document.getElementById('rp-photo').files[0];
     if (!f) return;
-    if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
-    const reader = new FileReader();
-    reader.onload = e => {
-        reportVehiclePhoto = e.target.result;
+    toast('جارِ تجهيز الصورة...');
+    exCompress(f, 1600, 0.82).then(function (d) {
+        reportVehiclePhoto = d;
         const img = document.getElementById('rp-photo-preview');
         img.src = reportVehiclePhoto; img.style.display = 'block';
-    };
-    reader.readAsDataURL(f);
+    }).catch(function (e) { toast(e.message || 'تعذر قراءة الصورة'); });
 }
 async function submitReport(category) {
     const isDrugs = category === 'مخدرات';
@@ -16258,7 +16251,7 @@ function exFull(t) {
         return 'يوم ' + a + ' الساعة ' + b;
     } catch (e) { return '—'; }
 }
-function exCompress(file) {
+function exCompress(file, maxDim, qual) {
     return new Promise(function (resolve, reject) {
         var fr = new FileReader();
         fr.onerror = function () { reject(new Error('تعذر قراءة الصورة')); };
@@ -16266,12 +16259,12 @@ function exCompress(file) {
             var img = new Image();
             img.onerror = function () { reject(new Error('الملف مو صورة صالحة')); };
             img.onload = function () {
-                var w = img.width, h = img.height, m = 1280;
+                var w = img.width, h = img.height, m = maxDim || 1280;
                 if (w > m || h > m) { var k = m / Math.max(w, h); w = Math.round(w * k); h = Math.round(h * k); }
                 var c = document.createElement('canvas');
                 c.width = w; c.height = h;
                 c.getContext('2d').drawImage(img, 0, 0, w, h);
-                resolve(c.toDataURL('image/jpeg', 0.7));
+                resolve(c.toDataURL('image/jpeg', qual || 0.7));
             };
             img.src = fr.result;
         };
@@ -18003,14 +17996,11 @@ async function loadVehicles() {
 function previewVehiclePhoto() {
     const f = document.getElementById('veh-photo').files[0];
     if (!f) return;
-    if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
-    const reader = new FileReader();
-    reader.onload = e => {
-        newVehiclePhoto = e.target.result;
+    exCompress(f, 1200, 0.8).then(function (d) {
+        newVehiclePhoto = d;
         const img = document.getElementById('veh-photo-preview');
         img.src = newVehiclePhoto; img.style.display = 'block';
-    };
-    reader.readAsDataURL(f);
+    }).catch(function (e) { toast(e.message || 'تعذر قراءة الصورة'); });
 }
 async function addVehicle() {
     const name = document.getElementById('veh-name').value.trim();
