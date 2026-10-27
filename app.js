@@ -1224,6 +1224,7 @@ async function notifyHighCommandOfAutoPromotion(p, fromRank, toRank) {
 async function postViolationToChannel(v, rawPhoto) {
     const settings = await getSettings();
     if (!botReady || !settings.violationsChannelId) {
+        console.log("⚠️ المخالفة ما انرسلت لديسكورد:", !botReady ? "البوت غير متصل" : "آيدي قناة المخالفات غير محدد بالإعدادات");
         if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
         return;
     }
@@ -1599,11 +1600,18 @@ client.on("messageCreate", async message => {
     }
 });
 
-client.once("ready", async () => {
-    console.log(`🤖 البوت شغال: ${client.user.tag}`);
+// نسخ discord.js الجديدة غيّرت اسم الحدث من ready إلى clientReady، فنسمع للاثنين (وفحص كل 5 ثواني احتياط) عشان البوت يتعرّف عليه الموقع
+let botReadyDone = false;
+async function onBotReady() {
+    if (botReadyDone) return;
+    botReadyDone = true;
+    console.log(`🤖 البوت شغال: ${client.user ? client.user.tag : ""}`);
     botReady = true;
     await registerCommands();
-});
+}
+client.once("ready", onBotReady);
+client.once("clientReady", onBotReady);
+setInterval(() => { try { if (!botReadyDone && client.isReady && client.isReady()) onBotReady(); } catch (e) {} }, 5000);
 
 if (CONFIG.BOT_TOKEN) {
     client.login(CONFIG.BOT_TOKEN).catch(e => console.log("❌ فشل تسجيل دخول البوت:", e.message));
@@ -3733,6 +3741,32 @@ app.post("/api/senior/officers-lock", ensureSeniorAdmin, async (req, res) => {
     await Settings.updateOne({}, { $set: { officersLocked: locked } });
     await logEvent({ action: locked ? "قفل سلك الضباط" : "فتح سلك الضباط", actorId: req.user.id, actorTag: req.user.username, details: "" });
     res.json({ ok: true, locked });
+});
+
+// فحص اتصال الموقع بالبوت: التوكن، الاتصال، القنوات وصلاحياتها
+app.get("/api/senior/bot-status", ensureSeniorAdmin, async (req, res) => {
+    const s = await getSettings();
+    const ready = !!(botReady || (client.isReady && client.isReady()));
+    const out = { token: !!CONFIG.BOT_TOKEN, ready, tag: client.user ? client.user.tag : null, guild: !!CONFIG.GUILD_ID, channels: [] };
+    const need = { ViewChannel: "رؤية القناة", SendMessages: "إرسال الرسائل", AttachFiles: "إرفاق الملفات", EmbedLinks: "الروابط المضمّنة", ReadMessageHistory: "قراءة السجل" };
+    for (const [label, id] of [["قناة المخالفات", s.violationsChannelId], ["قناة الصور", s.notesChannelId]]) {
+        const r = { label, set: !!id, ok: false, note: "" };
+        if (!id) r.note = "غير محددة بالإعدادات — بدونها ما يوصل شي لديسكورد";
+        else if (!ready) r.note = "البوت غير متصل";
+        else {
+            try {
+                const ch = await client.channels.fetch(id);
+                const perms = ch && ch.guild ? ch.permissionsFor(ch.guild.members.me) : null;
+                if (!perms) r.note = "ما قدرت أفحص الصلاحيات";
+                else {
+                    const miss = Object.keys(need).filter(k => !perms.has(PermissionFlagsBits[k])).map(k => need[k]);
+                    r.ok = !miss.length; r.note = miss.length ? "ينقص البوت: " + miss.join("، ") : "تمام";
+                }
+            } catch (e) { r.note = "ما قدر يوصل للقناة (الآيدي غلط أو البوت مو بالسيرفر)"; }
+        }
+        out.channels.push(r);
+    }
+    res.json(out);
 });
 
 app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
@@ -18949,6 +18983,7 @@ async function loadSettings() {
             <label style="margin-top:10px;">آيدي قناة إرسال صور الملاحظات بديسكورد (اختياري)</label>
             <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
+            <button class="btn gray" style="margin-top:14px;" onclick="checkBotStatus()">🤖 فحص اتصال البوت</button>
         </div>\`;
     box.insertAdjacentHTML('beforeend', officersLockCardHtml(!!settings.officersLocked));
     if (ME && ME.isOwner) {
@@ -19005,6 +19040,17 @@ async function toggleSavedLock(lock) {
         const c = document.getElementById('owner-lock-card');
         if (c) c.outerHTML = ownerLockCardHtml(lock);
         toast(lock ? '🔒 تم القفل' : '🔓 تم الفتح');
+    } catch (e) { toast(e.message); }
+}
+async function checkBotStatus() {
+    try {
+        const d = await api('/api/senior/bot-status');
+        const row = (ok, t) => '<div style="margin-top:8px;">' + (ok ? '✅ ' : '❌ ') + t + '</div>';
+        let h = row(d.token, 'توكن البوت: ' + (d.token ? 'موجود' : 'غير موجود (BOT_TOKEN)'));
+        h += row(d.ready, 'اتصال البوت: ' + (d.ready ? 'متصل' + (d.tag ? ' (' + d.tag + ')' : '') : 'غير متصل'));
+        h += row(d.guild, 'آيدي السيرفر (GUILD_ID): ' + (d.guild ? 'موجود' : 'غير موجود'));
+        d.channels.forEach(function (c) { h += row(c.ok, c.label + ': ' + c.note); });
+        ownerModalOpen('🤖 فحص اتصال البوت', h);
     } catch (e) { toast(e.message); }
 }
 async function saveSettings() {
