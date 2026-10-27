@@ -1380,10 +1380,11 @@ async function approveViolation(v, actorId, actorTag) {
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_APPROVE : CONFIG.POINTS_ON_APPROVE;
     await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: pts } });
-    await checkAutoPromotion(v.reporterDiscord);
-    await syncViolationMessage(v);
+    // الخطوات الجانبية كل وحدة لحالها: لو وحدة فشلت ما توقف القبول ولا تعلّق رد البوت
+    try { await checkAutoPromotion(v.reporterDiscord); } catch (e) { console.error("❌ checkAutoPromotion:", e.message); }
+    try { await syncViolationMessage(v); } catch (e) { console.error("❌ syncViolationMessage:", e.message); }
     const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
-    await logEvent({ action: v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${label} — ${v.reporterName}` });
+    try { await logEvent({ action: v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${label} — ${v.reporterName}` }); } catch (e) { console.error("❌ logEvent:", e.message); }
     return { blocked: false };
 }
 
@@ -1397,9 +1398,9 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_REJECT : CONFIG.POINTS_ON_REJECT;
     await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: -pts } });
     await Personnel.updateOne({ discord: v.reporterDiscord, points: { $lt: 0 } }, { $set: { points: 0 } });
-    await syncViolationMessage(v);
+    try { await syncViolationMessage(v); } catch (e) { console.error("❌ syncViolationMessage:", e.message); }
     const rlabel = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
-    await logEvent({ action: v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${rlabel} — ${v.reporterName} — السبب: ${reason}` });
+    try { await logEvent({ action: v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${rlabel} — ${v.reporterName} — السبب: ${reason}` }); } catch (e) { console.error("❌ logEvent:", e.message); }
     return { blocked: false };
 }
 
@@ -1424,6 +1425,22 @@ async function registerCommands() {
     } catch (e) {
         console.log("❌ خطأ بتسجيل الأوامر:", e);
     }
+}
+
+// من يقدر يقبل/يرفض مخالفة من ديسكورد: الكبار / مسؤول المخالفات العام / قائد القطاع أو مسؤول مخالفات القطاع (قطاعه فقط، وبدون مخالفاته)
+async function discordCanReviewViolation(interaction, v, settings) {
+    const uid = interaction.user.id;
+    if (isSeniorAdmin(uid) || interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || isViolationsOfficer(uid, settings)) return true;
+    if (v.reporterDiscord === uid) return false;
+    const sr = getSectorRole(uid, settings);
+    const vo = getSectorViolOfficer(uid, settings);
+    const isCmd = !!(sr && sr.role === "commander");
+    const sector = isCmd ? sr.sector : (vo ? vo.sector : null);
+    if (!sector) return false;
+    const acc = await Account.findOne({ uid: v.reporterDiscord }, { sector: 1 }).lean();
+    if (!acc || acc.sector !== sector) return false;
+    if (!isCmd) { const sec = (settings.sectorLeadership || {})[sector] || {}; if (sec.commanderId && sec.commanderId === v.reporterDiscord) return false; }
+    return true;
 }
 
 client.on("interactionCreate", async interaction => {
@@ -1469,26 +1486,9 @@ client.on("interactionCreate", async interaction => {
             if (id.startsWith("approve_") || id.startsWith("reject_")) {
                 const sep = id.indexOf("_");
                 const action = id.slice(0, sep), vid = id.slice(sep + 1);
-                const settings = await getSettings();
-                const uid = interaction.user.id;
-                const isDiscordAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
-                const v0 = await Violation.findById(vid).catch(() => null);
-                if (!v0 || v0.status !== "pending") {
-                    return interaction.reply({ content: "هذه المخالفة تمت مراجعتها مسبقاً.", ephemeral: true });
-                }
-                let allowed = isSeniorAdmin(uid) || isDiscordAdmin || isViolationsOfficer(uid, settings);
-                if (!allowed) {
-                    // قائد القطاع يقبل مخالفات قطاعه فقط (مو مخالفاته هو)
-                    const sr = getSectorRole(uid, settings);
-                    if (sr && sr.role === "commander" && v0.reporterDiscord !== uid) {
-                        const acc = await Account.findOne({ uid: v0.reporterDiscord }, { sector: 1 }).lean();
-                        if (acc && acc.sector === sr.sector) allowed = true;
-                    }
-                }
-                if (!allowed) {
-                    return interaction.reply({ content: "🚫 ما تملك صلاحية.", ephemeral: true });
-                }
-                if (action === "reject") {
+                const isApprove = action === "approve";
+                // أول شي نرد على ديسكورد (عنده 3 ثواني بس)، وبعدها نسوي الفحوصات والاستعلامات
+                if (!isApprove) {
                     const modal = new ModalBuilder().setCustomId(`rejectmodal_${vid}`).setTitle("سبب الرفض");
                     const input = new TextInputBuilder()
                         .setCustomId("reason").setLabel("اكتب سبب رفض المخالفة")
@@ -1496,11 +1496,12 @@ client.on("interactionCreate", async interaction => {
                     modal.addComponents(new ActionRowBuilder().addComponents(input));
                     return interaction.showModal(modal);
                 }
-                // القبول: نرد فوراً قبل أي عملية ثقيلة عشان ما ينتهي وقت التفاعل
                 await interaction.deferReply({ ephemeral: true });
-                const v = await Violation.findById(vid);
+                const settings = await getSettings();
+                const v = await Violation.findById(vid).catch(() => null);
                 if (!v || v.status !== "pending") return interaction.editReply({ content: "هذه المخالفة تمت مراجعتها مسبقاً." });
-                const ar = await approveViolation(v, uid, interaction.user.username);
+                if (!(await discordCanReviewViolation(interaction, v, settings))) return interaction.editReply({ content: "🚫 ما تملك صلاحية." });
+                const ar = await approveViolation(v, interaction.user.id, interaction.user.username);
                 if (ar && ar.blocked) return interaction.editReply({ content: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون رتبة أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حتى ينتهي الاستدعاء." });
                 return interaction.editReply({ content: "✅ تم قبول المخالفة." });
             }
@@ -1526,19 +1527,26 @@ client.on("interactionCreate", async interaction => {
 
         if (interaction.isModalSubmit()) {
             if (interaction.customId.startsWith("rejectmodal_")) {
+                await interaction.deferReply({ ephemeral: true });
                 const vid = interaction.customId.split("_")[1];
                 const reason = interaction.fields.getTextInputValue("reason");
-                const v = await Violation.findById(vid);
-                if (!v || v.status !== "pending") {
-                    return interaction.reply({ content: "هذه المخالفة تمت مراجعتها مسبقاً.", ephemeral: true });
-                }
+                const v = await Violation.findById(vid).catch(() => null);
+                if (!v || v.status !== "pending") return interaction.editReply({ content: "هذه المخالفة تمت مراجعتها مسبقاً." });
+                const settings = await getSettings();
+                if (!(await discordCanReviewViolation(interaction, v, settings))) return interaction.editReply({ content: "🚫 ما تملك صلاحية." });
                 const rr = await rejectViolation(v, interaction.user.id, interaction.user.username, reason);
-                if (rr && rr.blocked) return interaction.reply({ content: rr.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنرفض مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنرفض مخالفاته حالياً.", ephemeral: true });
-                return interaction.reply({ content: "✅ تم رفض المخالفة وحفظ السبب.", ephemeral: true });
+                if (rr && rr.blocked) return interaction.editReply({ content: rr.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنرفض مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنرفض مخالفاته حالياً." });
+                return interaction.editReply({ content: "✅ تم رفض المخالفة وحفظ السبب." });
             }
         }
     } catch (e) {
         console.error("❌ خطأ بالتفاعل:", e);
+        // ما نخلي الزر يعلق: نرد بالخطأ بدل ما يبقى "يفكر"
+        try {
+            const msg = "⚠️ صار خطأ أثناء التنفيذ، حاول مرة ثانية.";
+            if (interaction.deferred || interaction.replied) await interaction.editReply({ content: msg });
+            else if (interaction.isRepliable && interaction.isRepliable()) await interaction.reply({ content: msg, ephemeral: true });
+        } catch (e2) {}
     }
 });
 
@@ -1702,7 +1710,12 @@ self.addEventListener("notificationclick", function (e) {
   n.close();
   var url = (n.data && n.data.url) || "/";
   e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
-    for (var i = 0; i < list.length; i++) { if ("focus" in list[i]) return list[i].focus(); }
+    for (var i = 0; i < list.length; i++) {
+      if ("focus" in list[i]) {
+        try { list[i].postMessage({ t: "nav", url: url }); } catch (er) {}
+        return list[i].focus();
+      }
+    }
     return self.clients.openWindow(url);
   }));
 });
@@ -2610,24 +2623,17 @@ function photoBufPut(key, val) {
 async function fetchDiscordAttachmentBuf(channelId, messageId, cacheKey) {
     const hit = photoBufCache.get(cacheKey);
     if (hit && (Date.now() - hit.at) < 30 * 60 * 1000) return hit;
-    for (let attempt = 0; attempt < 2; attempt++) {
-        const channel = client.channels.cache.get(channelId) || await withTimeout(client.channels.fetch(channelId), 8000);
-        const msg = await withTimeout(channel.messages.fetch(messageId), 8000);
-        const att = msg.attachments.first();
-        if (!att) return null;
-        photoUrlCache.set(cacheKey, { url: att.url, fetchedAt: Date.now() });
-        try {
-            const r = await fetch(att.url, { signal: AbortSignal.timeout(12000) });
-            if (!r.ok) throw new Error("HTTP " + r.status);
-            const buf = Buffer.from(await r.arrayBuffer());
-            const val = { buf, type: att.contentType || r.headers.get("content-type") || "image/jpeg", at: Date.now() };
-            photoBufPut(cacheKey, val);
-            return val;
-        } catch (e) {
-            if (attempt === 1) throw e;
-        }
-    }
-    return null;
+    const channel = client.channels.cache.get(channelId) || await withTimeout(client.channels.fetch(channelId), 6000);
+    const msg = await withTimeout(channel.messages.fetch(messageId), 6000);
+    const att = msg.attachments.first();
+    if (!att) return null;
+    photoUrlCache.set(cacheKey, { url: att.url, fetchedAt: Date.now() });
+    const r = await fetch(att.url, { signal: AbortSignal.timeout(9000) });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const val = { buf, type: att.contentType || r.headers.get("content-type") || "image/jpeg", at: Date.now() };
+    photoBufPut(cacheKey, val);
+    return val;
 }
 function sendPhotoBuf(res, val) {
     res.set("Content-Type", val.type || "image/jpeg");
@@ -5412,8 +5418,16 @@ const SupportTicket = mongoose.model("SupportTicket", new mongoose.Schema({
         audioMime: { type: String, default: null }, audioDuration: { type: Number, default: null }, audioWave: { type: String, default: null },
         suggest: Boolean,
         role: String,
+        senderUid: { type: String, default: null },
+        replyTo: { type: Number, default: null },
+        edited: { type: Boolean, default: false }, editedAt: { type: Date, default: null },
+        edits: { type: [{ _id: false, text: String, at: Date }], default: [] },
+        deleted: { type: Boolean, default: false }, deletedAt: { type: Date, default: null },
+        deletedByUid: { type: String, default: null }, deletedByName: { type: String, default: null },
+        revealed: { type: Boolean, default: false },
         createdAt: { type: Date, default: Date.now },
     }],
+    mver: { type: Number, default: 0 },
 }, { timestamps: true }));
 
 const SupportRating = mongoose.model("SupportRating", new mongoose.Schema({
@@ -5499,7 +5513,7 @@ async function supportAudioFields(c) {
 function supportLastPreview(t, forUser) {
     let m = {};
     const arr = t.messages || [];
-    for (let i = arr.length - 1; i >= 0; i--) { if (!(forUser && arr[i].sender === "note")) { m = arr[i]; break; } }
+    for (let i = arr.length - 1; i >= 0; i--) { if (!arr[i].deleted && !(forUser && arr[i].sender === "note")) { m = arr[i]; break; } }
     return (m.text || ((m.audioDuration || m.audioChannelId) ? "🎙️ رسالة صوتية" : "")).slice(0, 60);
 }
 async function supportLoad(req, res, full) {
@@ -5519,8 +5533,31 @@ async function supportLoad(req, res, full) {
     if (!role) { res.status(403).json({ error: "ما عندك صلاحية على هذا التكت" }); return null; }
     return { t, role, uid };
 }
-function supportPubMsg(m, i) {
-    return { i, sender: m.sender, name: m.name, text: m.text || "", img: !!(m.image || m.imageChannelId), aud: !!(m.audio || m.audioChannelId || m.audioDuration), dur: m.audioDuration || 0, wf: m.audioWave || "", suggest: !!m.suggest, role: m.role || null, at: m.createdAt };
+// هل الرسالة لهذا المشاهد؟ (العضو: رسايله | الإداري: رسايله هو)
+function supportIsOwnMsg(m, role, uid, username) {
+    if (role === "owner") return m.sender === "user";
+    return m.sender === "admin" && (m.senderUid ? m.senderUid === uid : (!!username && m.name === username));
+}
+// المحذوف: يشوفه الكبار (أحمر) والعضو فقط إذا الكبار عرضوها له
+function supportCanSeeDeleted(m, ctx) { return !!(ctx.senior || (ctx.role === "owner" && m.revealed)); }
+function supportPubMsg(m, i, ctx) {
+    ctx = ctx || { role: "owner", senior: false, uid: null, username: null, msgs: null };
+    if (m.deleted && !supportCanSeeDeleted(m, ctx)) return { i, sender: m.sender, name: m.name, hid: true, at: m.createdAt };
+    const o = { i, sender: m.sender, name: m.name, text: m.text || "", img: !!(m.image || m.imageChannelId), aud: !!(m.audio || m.audioChannelId || m.audioDuration), dur: m.audioDuration || 0, wf: m.audioWave || "", suggest: !!m.suggest, role: m.role || null, at: m.createdAt,
+        own: supportIsOwnMsg(m, ctx.role, ctx.uid, ctx.username), ed: !!m.edited, edAt: m.editedAt || null };
+    if (m.deleted) { o.del = true; o.delBy = m.deletedByName || ""; o.delAt = m.deletedAt || null; o.rev = !!m.revealed; }
+    if (typeof m.replyTo === "number" && m.replyTo >= 0 && ctx.msgs && ctx.msgs[m.replyTo]) {
+        const q = ctx.msgs[m.replyTo];
+        const hidden = (q.sender === "note" && ctx.role !== "admin") || (q.deleted && !supportCanSeeDeleted(q, ctx));
+        o.rp = m.replyTo;
+        o.rpn = hidden ? "" : (q.name || "");
+        o.rpt = hidden ? "رسالة محذوفة" : (q.text ? String(q.text).slice(0, 80) : ((q.audioDuration || q.audioChannelId) ? "🎙️ رسالة صوتية" : ((q.image || q.imageChannelId) ? "📷 صورة" : "")));
+    }
+    if (ctx.senior && m.edits && m.edits.length) o.edits = m.edits.map(e => ({ text: e.text, at: e.at }));
+    return o;
+}
+function supportCtx(x, req) {
+    return { role: x.role, senior: x.role === "admin" && isSeniorAdmin(x.uid), uid: x.uid, username: req.user ? req.user.username : null, msgs: x.t.messages };
 }
 function supportPubTicket(t) {
     return { id: String(t._id), no: t.no, name: t.name, category: t.category, place: t.place, subject: t.subject, status: t.status, adminName: t.adminName, guest: !t.uid, updatedAt: t.updatedAt, createdAt: t.createdAt, rating: t.rating == null ? null : t.rating, needRate: !!(t.status === "closed" && t.ratingRequired && t.rating == null) };
@@ -5538,7 +5575,7 @@ function supportAddMsg(t, m) {
 
 async function supportAskAi(t) {
     if (!CONFIG.ANTHROPIC_API_KEY || typeof fetch !== "function") return null;
-    const convo = t.messages.filter(m => m.sender === "user" || m.sender === "ai").slice(-14);
+    const convo = t.messages.filter(m => !m.deleted && (m.sender === "user" || m.sender === "ai")).slice(-14);
     let lastImgDataUrl = null;
     {
         const lm = convo[convo.length - 1];
@@ -5845,16 +5882,18 @@ app.get("/api/support/tickets/:id", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const after = Math.max(0, parseInt(req.query.after, 10) || 0);
     const { t, role } = x;
-    const msgs = t.messages.map((m, i) => supportPubMsg(m, i)).slice(after).filter(m => role === "admin" || m.sender !== "note");
+    const sctx = supportCtx(x, req);
+    const msgs = t.messages.map((m, i) => supportPubMsg(m, i, sctx)).slice(after).filter(m => role === "admin" || m.sender !== "note");
     if (role === "owner" && t.unreadUser) { t.unreadUser = 0; await t.save(); }
     if (role === "admin" && t.unreadAdmin) { t.unreadAdmin = 0; await t.save(); }
     const canInspect = role === "admin" && supportCanInspect(t, x.uid);
-    res.json({ ticket: supportPubTicket(t), role, msgs, n: t.messages.length, shared: (role === "owner" || canInspect) ? (t.shared || []) : [], canInspect });
+    res.json({ ticket: supportPubTicket(t), role, msgs, n: t.messages.length, mver: t.mver || 0, shared: (role === "owner" || canInspect) ? (t.shared || []) : [], canInspect });
 });
 
 app.get("/api/support/tickets/:id/img/:i", async (req, res) => {
     const x = await supportLoad(req, res); if (!x) return;
     const m = x.t.messages[parseInt(req.params.i, 10)];
+    if (m && m.deleted && !supportCanSeeDeleted(m, supportCtx(x, req))) return res.status(404).end();
     if (m && m.imageChannelId && m.imageMessageId && !m.image) {
         try {
             const u = await discordImageUrl(m.imageChannelId, m.imageMessageId, "tk:" + String(m._id));
@@ -5872,6 +5911,7 @@ app.get("/api/support/tickets/:id/audio/:i", async (req, res) => {
     const x = await supportLoad(req, res, true); if (!x) return;
     const m = x.t.messages[parseInt(req.params.i, 10)];
     if (!m) return res.status(404).end();
+    if (m.deleted && !supportCanSeeDeleted(m, supportCtx(x, req))) return res.status(404).end();
     const hasDb = !!(m.audio && m.audio.length);
     if (!hasDb && m.audioChannelId && m.audioMessageId) {
         try {
@@ -5926,10 +5966,19 @@ app.post("/api/support/tickets/:id/messages", async (req, res) => {
     if (audioIn && t.messages.filter(m => m.audioDuration || m.audioChannelId).length >= 25) return res.status(400).json({ error: "وصلت الحد الأقصى للرسائل الصوتية بهذا التكت" });
     if (t.messages.length >= 300) return res.status(400).json({ error: "وصل التكت للحد الأقصى من الرسائل، افتح تكت جديد" });
     if (image && t.messages.filter(m => m.image || m.imageChannelId).length >= 10) return res.status(400).json({ error: "وصلت الحد الأقصى للصور بهذا التكت" });
+    // رد على رسالة (اقتباس): لازم الرسالة موجودة وما تكون محذوفة أو ملاحظة داخلية للعضو
+    let replyTo = null;
+    const rpIn = (req.body || {}).replyTo;
+    if (rpIn !== undefined && rpIn !== null && rpIn !== "") {
+        const k = parseInt(rpIn, 10), q = t.messages[k];
+        const qOk = q && !q.deleted && q.sender !== "system" && !(q.sender === "note" && role !== "admin");
+        if (!(k >= 0 && qOk)) return res.status(400).json({ error: "الرسالة اللي تبي ترد عليها غير موجودة" });
+        replyTo = k;
+    }
 
     if (role === "owner") {
         if (await supportBanned(uid, supportGuestToken(req))) return res.status(403).json({ error: SUPPORT_BANNED_MSG });
-        supportAddMsg(t, Object.assign({ sender: "user", name: t.name, text }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
+        supportAddMsg(t, Object.assign({ sender: "user", name: t.name, text, senderUid: uid || null, replyTo }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
         if (t.status !== "ai") t.unreadAdmin += 1;
         await t.save();
         res.json({ ok: true });
@@ -5940,12 +5989,69 @@ app.post("/api/support/tickets/:id/messages", async (req, res) => {
         if (!senior && t.status !== "active") return res.status(400).json({ error: "استلم التكت أول عشان تقدر ترد" });
         if (!senior && t.adminUid !== uid) return res.status(403).json({ error: "هذا التكت مستلمه " + (t.adminName || "إداري ثاني") });
         if (senior && t.status === "ai") t.status = "waiting";
-        supportAddMsg(t, Object.assign({ sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
+        supportAddMsg(t, Object.assign({ sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text, senderUid: uid, replyTo }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
         t.unreadUser += 1;
         await t.save();
         res.json({ ok: true });
         supportEvent(t, "admin");
     }
+});
+
+// ── خيارات الرسالة: تعديل (صاحبها) / حذف (صاحبها أو الكبار) / عرض المحذوف للعضو (الكبار) ──
+async function supportMsgLoad(req, res) {
+    const x = await supportLoad(req, res); if (!x) return null;
+    const i = parseInt(req.params.i, 10);
+    const m = x.t.messages[i];
+    if (!(i >= 0) || !m) { res.status(404).json({ error: "الرسالة غير موجودة" }); return null; }
+    x.i = i; x.m = m; x.senior = x.role === "admin" && isSeniorAdmin(x.uid);
+    return x;
+}
+app.post("/api/support/tickets/:id/messages/:i/edit", async (req, res) => {
+    const x = await supportMsgLoad(req, res); if (!x) return;
+    const { t, m } = x;
+    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
+    if (m.deleted) return res.status(400).json({ error: "الرسالة محذوفة" });
+    if (m.sender !== "user" && m.sender !== "admin") return res.status(400).json({ error: "هذي الرسالة ما تنعدل" });
+    if (!supportIsOwnMsg(m, x.role, x.uid, req.user ? req.user.username : null)) return res.status(403).json({ error: "تعدّل رسايلك أنت بس" });
+    if (m.audio || m.audioChannelId || m.audioDuration) return res.status(400).json({ error: "الرسالة الصوتية ما تنعدل" });
+    const text = String((req.body || {}).text || "").trim().slice(0, 1500);
+    if (!text) return res.status(400).json({ error: "اكتب النص الجديد" });
+    if (text === (m.text || "")) return res.json({ ok: true });
+    if (!m.edits) m.edits = [];
+    m.edits.push({ text: m.text || "", at: new Date() });
+    if (m.edits.length > 20) m.edits = m.edits.slice(-20);
+    m.text = text; m.edited = true; m.editedAt = new Date();
+    t.mver = (t.mver || 0) + 1;
+    await t.save();
+    res.json({ ok: true });
+    supportEvent(t, x.role === "owner" ? "user" : "admin");
+});
+app.post("/api/support/tickets/:id/messages/:i/delete", async (req, res) => {
+    const x = await supportMsgLoad(req, res); if (!x) return;
+    const { t, m } = x;
+    if (m.deleted) return res.status(400).json({ error: "الرسالة محذوفة من قبل" });
+    if (m.sender === "system" || m.sender === "note") return res.status(400).json({ error: "هذي الرسالة ما تنحذف" });
+    const own = supportIsOwnMsg(m, x.role, x.uid, req.user ? req.user.username : null);
+    if (!own && !x.senior) return res.status(403).json({ error: "تحذف رسايلك أنت بس" });
+    if (t.status === "closed" && !x.senior) return res.status(400).json({ error: "التكت مغلق" });
+    const dn = x.role === "owner" ? (t.name || "العضو") : (stealthActor(x.uid) ? "كبار المسؤولين" : req.user.username);
+    m.deleted = true; m.deletedAt = new Date(); m.deletedByUid = x.uid || null; m.deletedByName = dn; m.revealed = false;
+    supportAddMsg(t, { sender: "system", name: dn, text: own ? (dn + " حذف رسالة") : (dn + " حذف رسالة " + (m.name || "")).trim() });
+    t.mver = (t.mver || 0) + 1;
+    await t.save();
+    res.json({ ok: true });
+    supportEvent(t, x.role === "owner" ? "user" : "admin");
+});
+app.post("/api/support/tickets/:id/messages/:i/reveal", async (req, res) => {
+    const x = await supportMsgLoad(req, res); if (!x) return;
+    const { t, m } = x;
+    if (!x.senior) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
+    if (!m.deleted) return res.status(400).json({ error: "هذي الرسالة مو محذوفة" });
+    m.revealed = !!(req.body || {}).show;
+    t.mver = (t.mver || 0) + 1;
+    await t.save();
+    res.json({ ok: true, revealed: m.revealed });
+    supportEvent(t, "admin");
 });
 
 app.post("/api/support/tickets/:id/human", async (req, res) => {
@@ -6011,6 +6117,11 @@ app.post("/api/support/tickets/:id/rate", async (req, res) => {
     supportEvent(t, "user", { kind: "rate" });
 });
 
+app.get("/api/support/admin/ratings/:uid", async (req, res) => {
+    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
+    const list = await SupportRating.find({ adminUid: String(req.params.uid) }).sort({ at: -1 }).limit(200).lean();
+    res.json({ list: list.map(r => ({ ticketId: r.ticketId, no: r.no, name: r.name, category: r.category, stars: r.stars, comment: r.comment || "", at: r.at })) });
+});
 app.get("/api/support/admin/ratings", async (req, res) => {
     if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
     const cnt = n => ({ $sum: { $cond: [{ $eq: ["$stars", n] }, 1, 0] } });
@@ -8086,7 +8197,10 @@ async function cyOpsOf(uid, from, to) {
     const sess = await DeviceSession.find({ uid, loginAt: range }, { ip: 1, ua: 1, loginAt: 1 }).sort({ loginAt: -1 }).limit(100).maxTimeMS(8000).lean();
     const flags = await CyberFlag.find({ targetUid: uid, kind: { $in: CY_FLAG_KINDS }, $or: [{ lastAt: range }, { createdAt: range }] }).sort({ lastAt: -1 }).limit(100).maxTimeMS(8000).lean();
     const devs = await CyberCase.find({ targetUid: uid, kind: { $ne: "manual" }, createdAt: range }, { targetName: 1, relatedName: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(100).maxTimeMS(8000).lean();
+    const vios = await Violation.find({ reporterDiscord: uid, createdAt: range }, { violationType: 1, kind: 1, reportCategory: 1, status: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(100).maxTimeMS(8000).lean();
     const out = [];
+    const VST = { pending: "قيد المراجعة", approved: "مقبولة", rejected: "مرفوضة" };
+    vios.forEach(v => out.push({ id: "vio:" + v._id, kind: "vio", title: v.kind === "report" ? "تسجيل تقرير مكافحة مخدرات" : "تسجيل مخالفة", details: (v.kind === "report" ? (v.reportCategory || "-") : (v.violationType || "-")) + " — " + (VST[v.status] || v.status), at: v.createdAt }));
     flags.forEach(f => out.push({ id: "flag:" + f._id, kind: "flag", title: f.title || CY_RULE_TITLE[f.kind] || "عملية مشبوهة", details: f.details || "", at: f.lastAt || f.createdAt }));
     devs.forEach(c => out.push({ id: "case:" + c._id, kind: "case", title: "دخول جهاز على حساب عضو ثاني", details: "جهاز " + (c.targetName || "") + " دخل حساب " + (c.relatedName || ""), at: c.createdAt }));
     logs.forEach(l => out.push({ id: "log:" + l._id, kind: "log", title: l.action, details: l.details || "", at: l.createdAt }));
@@ -8095,8 +8209,15 @@ async function cyOpsOf(uid, from, to) {
     return out.slice(0, 150);
 }
 async function cyResolveOp(ref, targetUid) {
-    const m = /^(log|ses|flag|case):([a-f0-9]{24})$/.exec(String(ref || ""));
+    const m = /^(log|ses|flag|case|vio):([a-f0-9]{24})$/.exec(String(ref || ""));
     if (!m) return null;
+    if (m[1] === "vio") {
+        const v = await Violation.findById(m[2], { photo: 0 }).lean();
+        if (!v || v.reporterDiscord !== targetUid) return null;
+        const lines = [(v.kind === "report" ? "تقرير مكافحة مخدرات: " + (v.reportCategory || "-") : "المخالفة: " + (v.violationType || "-")), "الحالة: " + ({ pending: "قيد المراجعة", approved: "مقبولة", rejected: "مرفوضة" }[v.status] || v.status)];
+        if (v.rejectReason) lines.push("سبب الرفض: " + v.rejectReason);
+        return { ref, title: v.kind === "report" ? "تسجيل تقرير" : "تسجيل مخالفة", lines, opAt: v.createdAt, hasPhoto: false };
+    }
     if (m[1] === "flag") {
         const f = await CyberFlag.findById(m[2]).lean();
         if (!f || f.targetUid !== targetUid) return null;
@@ -8689,13 +8810,24 @@ function ensureVapid() {
     })().catch(e => { vapidPromise = null; console.error("❌ VAPID:", e.message); return null; });
     return vapidPromise;
 }
+// صفحة الإشعار: لما يضغط عليه يدخله على موضوعه (التحضير / الغياب بعذر / التكت / المحكمة)، والباقي (إعلانات الكبار) للصفحة الرئيسية
+function pushUrlFor(tag) {
+    const t = String(tag || "");
+    if (!t) return "/";
+    if (t === "reception" || t === "att-note") return "/?go=att";
+    if (t.startsWith("att-over-")) return "/?go=hcatt";
+    if (t === "recabs" || t.startsWith("rmabs-") || t.startsWith("excuse-res-")) return "/?go=excuse";
+    if (t.startsWith("excuse-hc-")) return "/?go=hcexcuse";
+    if (t === "court" || t === "court-soon" || t === "court-req" || t === "unkick") return "/?go=court";
+    return "/";
+}
 async function sendPushTo(devs, opts) {
     const key = await ensureVapid();
     if (!key) return { sent: 0, failed: [], unavailable: true };
     const payload = JSON.stringify({
         title: String(opts.title || CONFIG.SITE_NAME).slice(0, 80),
         body: String(opts.body || "").slice(0, 200),
-        url: opts.url || "/",
+        url: opts.url || pushUrlFor(opts.tag),
         tag: opts.tag || undefined,
     });
     const list = (devs || []).filter(d => d && d.sub && d.sub.endpoint);
@@ -8817,7 +8949,7 @@ app.post("/api/support/admin/tickets/:id/notify", async (req, res) => {
     if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر بدون حساب، ما نقدر نرسل له إشعار" });
     const k = String(t._id);
     if (Date.now() - (ticketNotifyThrottle.get(k) || 0) < 15000) return res.status(429).json({ error: "تم إرسال إشعار قبل شوي" });
-    const r = await pushUid(t.uid, { title: CONFIG.SITE_NAME, body: "رد عليك الإداري على تكتك ⚡", tag: "ticket-" + t.no });
+    const r = await pushUid(t.uid, { title: CONFIG.SITE_NAME, body: "رد عليك الإداري على تكتك ⚡", tag: "ticket-" + t.no, url: "/?ticket=" + String(t._id) });
     if (!r.sent) return res.status(404).json({ error: "العضو ما فعّل الإشعارات على أي جهاز" });
     ticketNotifyThrottle.set(k, Date.now());
     res.json({ ok: true, sent: r.sent });
@@ -10657,6 +10789,28 @@ app.get("/", (req, res) => {
     #sp-in.note-mode { border-color: #f59e0b; background: #2a2310; }
     .sp-msg.note { align-self: center; max-width: 94%; }
     .sp-msg.note .sp-b { background: #2a2310; border: 1px dashed #f59e0b; color: #fde68a; }
+    .sp-msg[data-i] .sp-b { -webkit-touch-callout: none; }
+    .sp-msg[data-i] img { -webkit-touch-callout: none; }
+    .sp-msg.del .sp-b { background: rgba(127,29,29,0.55) !important; border: 1px solid #ef4444 !important; color: #fecaca !important; }
+    .sp-del-tag { font-size: 11px; color: #fca5a5; font-weight: 800; margin-bottom: 4px; }
+    .sp-quote { border-right: 3px solid #60a5fa; background: rgba(255,255,255,0.08); border-radius: 6px; padding: 4px 8px; margin-bottom: 6px; font-size: 12px; color: #cbd5e1; cursor: pointer; white-space: normal; overflow: hidden; max-height: 48px; }
+    .sp-quote b { display: block; color: #93c5fd; font-size: 11px; }
+    .sp-ed { font-size: 10px; color: var(--muted); margin-inline-start: 5px; }
+    .sp-msg.sp-flash .sp-b { outline: 2px solid #60a5fa; transition: outline 0.2s; }
+    .sp-ctxbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: rgba(59,130,246,0.14); border-right: 3px solid #60a5fa; border-radius: 8px; padding: 6px 10px; margin: 0 2px 6px; font-size: 12.5px; color: #cbd5e1; }
+    .sp-ctxbar span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #sp-mm-ov { position: fixed; inset: 0; z-index: 7200; background: rgba(2,6,15,0.62); display: flex; align-items: flex-end; justify-content: center; }
+    #sp-mm-sheet { width: 100%; background: #0d1f3c; border-top: 1px solid rgba(59,130,246,0.45); border-radius: 20px 20px 0 0; padding: 8px 14px calc(14px + env(safe-area-inset-bottom, 0px)); box-shadow: 0 -12px 40px rgba(0,0,0,0.6); animation: spMmUp 0.18s ease-out; max-height: 78%; overflow-y: auto; }
+    @keyframes spMmUp { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .sp-mm-grip { width: 44px; height: 4px; border-radius: 4px; background: rgba(255,255,255,0.25); margin: 4px auto 10px; }
+    .sp-mm-prev { font-size: 12.5px; color: var(--muted); background: rgba(255,255,255,0.05); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; white-space: pre-wrap; word-break: break-word; max-height: 64px; overflow: hidden; }
+    .sp-mm-it { display: flex; align-items: center; gap: 12px; width: 100%; background: transparent; border: none; border-top: 1px solid rgba(255,255,255,0.07); color: #e5edff; font-family: inherit; font-size: 15px; padding: 13px 6px; cursor: pointer; text-align: right; }
+    .sp-mm-it span { font-size: 19px; width: 26px; text-align: center; }
+    .sp-mm-it.danger { color: #fca5a5; }
+    .sp-mm-it.cancel { justify-content: center; color: var(--muted); }
+    .sp-mm-info { font-size: 13px; line-height: 1.9; color: #cbd5e1; }
+    .sp-mm-info b { color: #e5edff; }
+    .sp-mm-info .ed { background: rgba(255,255,255,0.05); border-radius: 8px; padding: 5px 8px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
     .sp-canned { background: #0f1a30; border: 1px solid var(--border); border-radius: 10px; margin-top: 8px; max-height: 40vh; overflow-y: auto; }
     .sp-canned-h { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; }
     .sp-canned-r { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px dashed var(--border); cursor: pointer; }
@@ -11256,8 +11410,18 @@ function setPhotoPageImage(src) {
     img.src = src;
     img.style.display = 'block';
 }
-function setPhotoPageError(msg) {
-    document.getElementById('photo-page-loading').textContent = msg + ' — اضغط رجوع وحاول مرة ثانية';
+function setPhotoPageError(msg, retry) {
+    var el = document.getElementById('photo-page-loading');
+    el.style.display = 'block';
+    el.textContent = msg + ' — ';
+    if (retry) {
+        window.__photoRetry = retry;
+        var b = document.createElement('button');
+        b.className = 'btn sm';
+        b.textContent = '🔄 إعادة المحاولة';
+        b.onclick = function () { var f = window.__photoRetry; if (f) f(); };
+        el.appendChild(b);
+    } else el.appendChild(document.createTextNode('اضغط رجوع وحاول مرة ثانية'));
 }
 function closePhotoPage(skipHistory) {
     document.getElementById('photo-page').classList.remove('open');
@@ -11270,20 +11434,34 @@ window.addEventListener('popstate', () => {
 });
 async function viewViolationPhoto(id) {
     openPhotoPage();
-    const img = document.getElementById('photo-page-img');
-    const loading = document.getElementById('photo-page-loading');
-    let done = false;
-    const timer = setTimeout(function () { if (!done) { done = true; img.onload = img.onerror = null; img.src = ''; setPhotoPageError('الصورة تأخرت'); } }, 25000);
-    img.onload = function () { if (done) return; done = true; clearTimeout(timer); loading.style.display = 'none'; img.style.display = 'block'; };
-    img.onerror = async function () {
-        if (done) return;
-        img.onload = img.onerror = null;
-        try {
-            const r = await api('/api/violations/' + encodeURIComponent(id) + '/photo');
-            if (r && r.photo) { done = true; clearTimeout(timer); img.onerror = function () { setPhotoPageError('تعذر تحميل الصورة'); }; return setPhotoPageImage(r.photo); }
-        } catch (e) { done = true; clearTimeout(timer); return setPhotoPageError(e.message || 'تعذر تحميل الصورة'); }
-        done = true; clearTimeout(timer); setPhotoPageError('لا توجد صورة لهذي المخالفة');
-    };
+    runViolationPhoto(id);
+}
+// المرحلة 1: الصورة كملف من السيرفر | المرحلة 2: رابط الصورة/المحفوظة من السيرفر | وإذا فشلت الاثنتين يطلع زر إعادة محاولة
+function runViolationPhoto(id) {
+    var img = document.getElementById('photo-page-img');
+    var loading = document.getElementById('photo-page-loading');
+    var tok = (window.__photoTok = (window.__photoTok || 0) + 1);
+    var finished = false, t1 = null, t2 = null;
+    loading.textContent = 'جارِ تحميل الصورة...';
+    loading.style.display = 'block';
+    img.style.display = 'none';
+    function dead() { return finished || tok !== window.__photoTok; }
+    function ok() { if (dead()) return; finished = true; clearTimeout(t1); clearTimeout(t2); loading.style.display = 'none'; img.style.display = 'block'; }
+    function fail(msg) { if (dead()) return; finished = true; clearTimeout(t1); clearTimeout(t2); img.onload = img.onerror = null; img.src = ''; setPhotoPageError(msg, function () { runViolationPhoto(id); }); }
+    function fallback() {
+        if (dead()) return;
+        api('/api/violations/' + encodeURIComponent(id) + '/photo').then(function (r) {
+            if (dead()) return;
+            if (!r || !r.photo) return fail('لا توجد صورة لهذي المخالفة');
+            img.onload = ok;
+            img.onerror = function () { fail('تعذر تحميل الصورة'); };
+            t2 = setTimeout(function () { fail('الصورة تأخرت'); }, 20000);
+            img.src = r.photo;
+        }).catch(function (e) { fail((e && e.message) || 'تعذر تحميل الصورة'); });
+    }
+    t1 = setTimeout(function () { if (dead()) return; img.onload = img.onerror = null; fallback(); }, 12000);
+    img.onload = ok;
+    img.onerror = function () { clearTimeout(t1); img.onload = img.onerror = null; fallback(); };
     img.src = '/api/violations/' + encodeURIComponent(id) + '/photo-file?t=' + Date.now();
 }
 async function viewNotePhoto(discord, noteId) {
@@ -12022,8 +12200,8 @@ function cyOpsHtml(list, clickable) {
     return list.map(function (o) {
         var meta = (typeof LOG_META !== 'undefined' && LOG_META[o.title]) || null;
         var ses = o.kind === 'ses', sus = o.kind === 'flag' || o.kind === 'case';
-        var ic = ses ? '🖥️' : (sus ? '🚨' : (meta ? meta.icon : 'ℹ️'));
-        var col = ses ? '#22c55e' : (sus ? '#f59e0b' : (meta ? meta.border : '#64748b'));
+        var ic = ses ? '🖥️' : (sus ? '🚨' : (o.kind === 'vio' ? '📋' : (meta ? meta.icon : 'ℹ️')));
+        var col = ses ? '#22c55e' : (sus ? '#f59e0b' : (o.kind === 'vio' ? '#3b82f6' : (meta ? meta.border : '#64748b')));
         var tc = ses ? '#86efac' : (sus ? '#fcd34d' : (meta ? meta.color : '#e2e8f0'));
         var attrs = clickable ? ' data-ref="' + cyEsc(o.id) + '" onclick="cyShowOp(this.dataset.ref)" style="display:block;cursor:pointer;border-color:' + col + ';"' : ' style="display:block;border-color:' + col + ';"';
         return '<div class="log-item"' + attrs + '><div style="color:' + tc + ';font-weight:bold;">' + ic + ' ' + cyEsc((meta && meta.label) || o.title) + '</div>' + (o.details ? '<div style="color:#93c5fd;font-size:13px;">' + cyEsc(o.details) + '</div>' : '') + '<div style="font-size:12px;color:#64748b;">' + cyEsc(cyFmt(o.at)) + '</div></div>';
@@ -12645,7 +12823,7 @@ function spViewImg(src) {
 async function spOpenTicket(id, mode, box) {
     spVoiceReset(); spVmStopAll(); SP.noteMode = false;
     SP.cur = { id: id, mode: mode, box: box, n: 0, t: null, role: null, typing: false };
-    SP.img = null;
+    SP.img = null; SP.edit = null; SP.reply = null; spMmClose();
     var el = document.getElementById(box);
     el.innerHTML =
         '<div class="sp-chat">' +
@@ -12655,6 +12833,7 @@ async function spOpenTicket(id, mode, box) {
         '<div class="sp-msgs" id="sp-msgs"></div>' +
         '<div id="sp-rate" class="sp-rate" style="display:none;"></div>' +
         '<div id="sp-prev" class="sp-prev"></div>' +
+        '<div id="sp-ctxbar" class="sp-ctxbar" style="display:none;"></div>' +
         '<div class="sp-compose" id="sp-compose">' +
             '<div class="sp-cin" id="sp-cin">' +
                 '<label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label>' +
@@ -12668,11 +12847,12 @@ async function spOpenTicket(id, mode, box) {
     var ta = document.getElementById('sp-in');
     ta.onkeydown = function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); spSend(); } };
     ta.oninput = function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; spTypingPing(); };
+    spWireMsgs();
     await spLoadNew(true);
 }
 function spBack() {
     spVoiceReset(); spVmStopAll(); SP.noteMode = false;
-    SP.cur = null; SP.img = null;
+    SP.cur = null; SP.img = null; SP.edit = null; SP.reply = null; spMmClose();
     if (document.getElementById('spa-body')) spaShowList(); else spShowList();
 }
 async function spLoadNew(first) {
@@ -12687,6 +12867,13 @@ async function spLoadNew(first) {
         c.sharedKey = skNew; c.shared = d.shared || [];
         var box = document.getElementById('sp-msgs');
         if (!box) return;
+        if (c.mver === undefined) c.mver = d.mver;
+        else if (d.mver !== undefined && d.mver !== c.mver) {
+            // انعدلت أو انحذفت رسالة قديمة: نعيد رسم الرسايل كلها من الأول
+            c.mver = d.mver; c.n = 0; c.mm = {}; c.keepScroll = box.scrollTop; box.innerHTML = '';
+            SP.again = true;
+            return;
+        }
         var near = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
         var tp = document.getElementById('sp-typing'); if (tp) tp.remove();
         var pp = document.getElementById('sp-peers'); if (pp) pp.remove();
@@ -12702,6 +12889,7 @@ async function spLoadNew(first) {
         spPaintState();
         if (skChanged) spLoadInfo();
         if (first || near || d.msgs.some(function (m) { return m.sender === (c.mode === 'admin' ? 'admin' : 'user'); })) box.scrollTop = box.scrollHeight;
+        if (c.keepScroll != null) { box.scrollTop = c.keepScroll; c.keepScroll = null; }
         if (d.msgs.length) spBadges();
     } catch (e) {
         if (first) { var el = document.getElementById(c.box); if (el) el.innerHTML = '<div style="color:#fca5a5;padding:14px;">' + spEsc(e.message) + '</div>'; }
@@ -12712,19 +12900,162 @@ async function spLoadNew(first) {
     }
 }
 function spMsgHtml(m) {
+    if (m.hid) return '';
+    var c = SP.cur;
+    if (c) { if (!c.mm) c.mm = {}; c.mm[m.i] = m; }
     if (m.sender === 'note') {
         var rt = m.role === 'senior' ? '<span class="sp-role senior">كبار المسؤولين</span>' : '<span class="sp-role admin">إداري</span>';
-        return '<div class="sp-msg note"><div class="sp-who">📝 ملاحظة داخلية (ما تظهر للعضو) — ' + spEsc(m.name || '') + rt + '</div><div class="sp-b">' + spEsc(m.text || '') + '</div><div class="sp-time">' + spTime(m.at) + '</div></div>';
+        return '<div class="sp-msg note" data-i="' + m.i + '"><div class="sp-who">📝 ملاحظة داخلية (ما تظهر للعضو) — ' + spEsc(m.name || '') + rt + '</div><div class="sp-b">' + spEsc(m.text || '') + '</div><div class="sp-time">' + spTime(m.at) + '</div></div>';
     }
-    var c = SP.cur, mine = c.mode === 'admin' ? m.sender === 'admin' : m.sender === 'user';
-    var cls = m.sender === 'system' ? 'sys' : (mine ? 'me' : 'other') + (m.sender === 'ai' ? ' ai' : '') + (m.sender === 'admin' && !mine ? ' admin' : '');
+    var mine = c.mode === 'admin' ? m.sender === 'admin' : m.sender === 'user';
+    var cls = m.sender === 'system' ? 'sys' : (mine ? 'me' : 'other') + (m.sender === 'ai' ? ' ai' : '') + (m.sender === 'admin' && !mine ? ' admin' : '') + (m.del ? ' del' : '');
     var gt = spGuestToken();
     var roleTag = m.sender === 'admin' ? (m.role === 'senior' ? '<span class="sp-role senior">كبار المسؤولين</span>' : '<span class="sp-role admin">إداري</span>') : '';
     var who = m.sender === 'system' ? '' : '<div class="sp-who">' + (m.sender === 'ai' ? '🤖 ' : m.sender === 'admin' ? '🛡️ ' : '') + spEsc(m.name || '') + roleTag + '</div>';
     var img = m.img ? '<img class="sp-img" loading="lazy" src="/api/support/tickets/' + c.id + '/img/' + m.i + '?gt=' + gt + '" onclick="spViewImg(this.src)">' : '';
-    var body = (m.text ? spEsc(m.text) : '') ;
+    var body = (m.text ? spEsc(m.text) : '');
     if (m.aud) body += spVoiceHtml(m, c);
-    return '<div class="sp-msg ' + cls + '">' + who + '<div class="sp-b">' + body + img + '</div>' + (m.sender === 'system' ? '' : '<div class="sp-time">' + spTime(m.at) + '</div>') + '</div>';
+    var quote = m.rp != null ? '<div class="sp-quote" onclick="spJumpTo(' + m.rp + ')"><b>' + spEsc(m.rpn || '') + '</b>' + spEsc(m.rpt || '') + '</div>' : '';
+    var delTag = m.del ? '<div class="sp-del-tag">🗑️ ' + (c.mode === 'admin' ? 'محذوفة — حذفها ' + spEsc(m.delBy || '') + (m.rev ? ' • معروضة للعضو' : ' • مخفية عن العضو') : 'رسالة محذوفة (عرضتها لك الإدارة)') + '</div>' : '';
+    var data = m.sender === 'system' ? '' : ' data-i="' + m.i + '"';
+    return '<div class="sp-msg ' + cls + '"' + data + '>' + who + '<div class="sp-b">' + delTag + quote + body + img + '</div>' + (m.sender === 'system' ? '' : '<div class="sp-time">' + spTime(m.at) + (m.ed ? '<span class="sp-ed">• معدّلة</span>' : '') + '</div>') + '</div>';
+}
+// ===== قائمة خيارات الرسالة (تطلع من تحت بعرض الشاشة) =====
+function spIsSenior() { return !!(ME && ME.isSeniorAdmin && SP.cur && SP.cur.mode === 'admin'); }
+function spMmClose() { var e = document.getElementById('sp-mm-ov'); if (e) e.remove(); }
+function spMsgMenuOpen(i) {
+    var c = SP.cur; if (!c || !c.mm || !c.mm[i]) return;
+    var m = c.mm[i], t = c.t || {}, closed = t.status === 'closed', senior = spIsSenior();
+    var isMsg = m.sender !== 'note' && m.sender !== 'system';
+    var items = [];
+    if (m.text) items.push(['copy', '📋', 'نسخ الرسالة']);
+    if (isMsg && !m.del && !closed) items.push(['reply', '↩️', 'رد على الرسالة']);
+    if (isMsg && m.own && !m.del && !closed && !m.aud) items.push(['edit', '✏️', 'تعديل الرسالة']);
+    if (isMsg && !m.del && (m.own || senior) && (!closed || senior)) items.push(['del', '🗑️', 'حذف الرسالة', 'danger']);
+    if (senior && m.del) items.push(['reveal', m.rev ? '🙈' : '👁️', m.rev ? 'إخفاء الرسالة عن العضو' : 'عرض الرسالة للعضو']);
+    if (senior && isMsg) items.push(['info', 'ℹ️', 'تفاصيل الرسالة']);
+    if (!items.length) return;
+    spMmRender(m, items);
+}
+function spMmRender(m, items) {
+    spMmClose();
+    var ov = document.createElement('div');
+    ov.id = 'sp-mm-ov';
+    ov.onclick = function (e) { if (e.target === ov) spMmClose(); };
+    var prev = (m.text || (m.aud ? '🎙️ رسالة صوتية' : (m.img ? '📷 صورة' : ''))).slice(0, 90);
+    var h = '<div id="sp-mm-sheet"><div class="sp-mm-grip"></div><div class="sp-mm-prev">' + spEsc(prev) + '</div>';
+    items.forEach(function (it) { h += '<button class="sp-mm-it ' + (it[3] || '') + '" data-a="' + it[0] + '"><span>' + it[1] + '</span>' + it[2] + '</button>'; });
+    h += '<button class="sp-mm-it cancel" data-a="x">إغلاق</button></div>';
+    ov.innerHTML = h;
+    ov.addEventListener('click', function (e) { var b = e.target.closest ? e.target.closest('.sp-mm-it') : null; if (b) spMsgAct(b.getAttribute('data-a'), m.i); });
+    document.body.appendChild(ov);
+}
+function spMmInfo(m) {
+    var sh = document.getElementById('sp-mm-sheet'); if (!sh) return;
+    var h = '<div class="sp-mm-grip"></div><div class="sp-mm-info">';
+    h += '<div>👤 المرسل: <b>' + spEsc(m.name || '-') + '</b>' + (m.sender === 'admin' ? (m.role === 'senior' ? ' (كبار المسؤولين)' : ' (إداري)') : m.sender === 'ai' ? ' (المساعد الآلي)' : m.sender === 'user' ? ' (العضو)' : '') + '</div>';
+    h += '<div>🕒 أُرسلت: <b>' + exFull(m.at) + '</b></div>';
+    if (m.ed) { h += '<div>✏️ آخر تعديل: <b>' + exFull(m.edAt) + '</b></div>'; (m.edits || []).forEach(function (e, k) { h += '<div class="ed">النسخة ' + (k + 1) + ' (قبل التعديل — ' + spTime(e.at) + '): ' + spEsc(e.text || '') + '</div>'; }); }
+    if (m.del) { h += '<div style="color:#fca5a5;">🗑️ حذفها: <b>' + spEsc(m.delBy || '-') + '</b> — ' + exFull(m.delAt) + '</div><div>👁️ معروضة للعضو: <b>' + (m.rev ? 'نعم' : 'لا') + '</b></div>'; }
+    h += '</div><button class="sp-mm-it cancel" data-a="x">إغلاق</button>';
+    sh.innerHTML = h;
+}
+async function spMsgAct(a, i) {
+    var c = SP.cur;
+    if (a === 'x' || !c || !c.mm || !c.mm[i]) return spMmClose();
+    var m = c.mm[i];
+    if (a === 'info') return spMmInfo(m);
+    spMmClose();
+    var ta = document.getElementById('sp-in');
+    if (a === 'copy') return spCopyText(m.text);
+    if (a === 'reply') {
+        SP.edit = null;
+        SP.reply = { i: i, name: m.name || '', text: m.text || (m.aud ? '🎙️ رسالة صوتية' : (m.img ? '📷 صورة' : '')) };
+        spPaintCtx(); if (ta) ta.focus(); return;
+    }
+    if (a === 'edit') {
+        SP.reply = null; SP.edit = { i: i };
+        if (ta) { ta.value = m.text || ''; ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; ta.focus(); }
+        spPaintCtx(); return;
+    }
+    if (a === 'del') {
+        if (!(await confirmModal('متأكد تبي تحذف هذي الرسالة؟'))) return;
+        try { await spApi('/api/support/tickets/' + c.id + '/messages/' + i + '/delete', { method: 'POST', body: '{}' }); toast('تم حذف الرسالة'); await spLoadNew(); } catch (e) { toast(e.message); }
+        return;
+    }
+    if (a === 'reveal') return spRevealAsk(i);
+}
+async function spRevealAsk(i) {
+    var c = SP.cur; if (!c || !c.mm || !c.mm[i]) return;
+    var m = c.mm[i];
+    if (!(await confirmModal(m.rev ? 'تبي تخفي هذي الرسالة المحذوفة عن العضو؟' : 'تبي تعرض هذي الرسالة المحذوفة للعضو؟'))) return;
+    try {
+        await spApi('/api/support/tickets/' + c.id + '/messages/' + i + '/reveal', { method: 'POST', body: JSON.stringify({ show: !m.rev }) });
+        toast(m.rev ? 'تم إخفاؤها عن العضو' : 'تم عرضها للعضو');
+        await spLoadNew();
+    } catch (e) { toast(e.message); }
+}
+function spCopyText(txt) {
+    txt = String(txt || '');
+    function fb() {
+        var ta = document.createElement('textarea');
+        ta.value = txt; ta.style.cssText = 'position:fixed;top:-100px;opacity:0;';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); toast('تم نسخ الرسالة'); } catch (e) { toast('تعذر النسخ'); }
+        ta.remove();
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(function () { toast('تم نسخ الرسالة'); }).catch(fb); else fb();
+}
+function spJumpTo(i) {
+    var el = document.querySelector('#sp-msgs .sp-msg[data-i="' + i + '"]');
+    if (!el) { toast('الرسالة غير موجودة'); return; }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('sp-flash');
+    setTimeout(function () { el.classList.remove('sp-flash'); }, 1400);
+}
+function spPaintCtx() {
+    var b = document.getElementById('sp-ctxbar'); if (!b) return;
+    if (SP.edit) { b.style.display = 'flex'; b.innerHTML = '<span>✏️ تعديل الرسالة</span><button class="sp-link" onclick="spCtxCancel()">✕ إلغاء</button>'; }
+    else if (SP.reply) { b.style.display = 'flex'; b.innerHTML = '<span>↩️ رد على <b>' + spEsc(SP.reply.name) + '</b>: ' + spEsc(String(SP.reply.text).slice(0, 50)) + '</span><button class="sp-link" onclick="spCtxCancel()">✕</button>'; }
+    else { b.style.display = 'none'; b.innerHTML = ''; }
+}
+function spCtxCancel() {
+    var wasEdit = !!SP.edit;
+    SP.edit = null; SP.reply = null; spPaintCtx();
+    if (wasEdit) { var ta = document.getElementById('sp-in'); if (ta) { ta.value = ''; ta.style.height = 'auto'; } }
+}
+function spMsgClick(e) {
+    if (SP.lpFired) { SP.lpFired = false; return; }
+    var t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest('.sp-img, .sp-vm, .sp-quote, button, a, audio, input, textarea')) return;
+    try { var sel = window.getSelection && window.getSelection().toString(); if (sel) return; } catch (x) {}
+    var el = t.closest('.sp-msg[data-i]'); if (!el) return;
+    var i = parseInt(el.getAttribute('data-i'), 10), c = SP.cur;
+    if (!c || !c.mm || !c.mm[i]) return;
+    if (c.mm[i].del && spIsSenior()) return spRevealAsk(i);
+    spMsgMenuOpen(i);
+}
+function spLpStart(e) {
+    var el = e.target && e.target.closest ? e.target.closest('.sp-msg[data-i]') : null;
+    clearTimeout(SP.lpT); SP.lpFired = false;
+    if (!el) return;
+    SP.lpT = setTimeout(function () { SP.lpFired = true; spMsgMenuOpen(parseInt(el.getAttribute('data-i'), 10)); }, 520);
+}
+function spLpCancel() { clearTimeout(SP.lpT); }
+function spWireMsgs() {
+    var mb = document.getElementById('sp-msgs'); if (!mb) return;
+    mb.onclick = spMsgClick;
+    mb.oncontextmenu = function (e) {
+        var el = e.target && e.target.closest ? e.target.closest('.sp-msg[data-i]') : null;
+        if (!el) return;
+        e.preventDefault();
+        spMsgMenuOpen(parseInt(el.getAttribute('data-i'), 10));
+    };
+    mb.addEventListener('touchstart', spLpStart, { passive: true });
+    mb.addEventListener('touchend', spLpCancel, { passive: true });
+    mb.addEventListener('touchmove', spLpCancel, { passive: true });
+    mb.addEventListener('touchcancel', spLpCancel, { passive: true });
 }
 function spShowTyping() {
     var c = SP.cur, box = document.getElementById('sp-msgs'); if (!c || !box) return;
@@ -12779,12 +13110,25 @@ async function spSend() {
     var c = SP.cur; if (!c) return;
     var ta = document.getElementById('sp-in'), btn = document.getElementById('sp-send');
     var text = ta.value.trim();
+    if (SP.edit) {
+        if (!text) { toast('اكتب النص الجديد'); return; }
+        btn.disabled = true;
+        try {
+            await spApi('/api/support/tickets/' + c.id + '/messages/' + SP.edit.i + '/edit', { method: 'POST', body: JSON.stringify({ text: text }) });
+            SP.edit = null; ta.value = ''; ta.style.height = 'auto'; spPaintCtx();
+            toast('تم تعديل الرسالة');
+            await spLoadNew();
+        } catch (e) { toast(e.message); }
+        btn.disabled = false; ta.focus();
+        return;
+    }
     if (!text && !SP.img) return;
     btn.disabled = true;
     try {
         if (SP.noteMode && SP.img) { toast('الملاحظة الداخلية نص فقط'); btn.disabled = false; return; }
-        await spApi('/api/support/tickets/' + c.id + (SP.noteMode ? '/note' : '/messages'), { method: 'POST', body: JSON.stringify(SP.noteMode ? { text: text } : { text: text, image: SP.img }) });
-        ta.value = ''; ta.style.height = 'auto'; SP.img = null; spPaintPrev();
+        var rpl = (!SP.noteMode && SP.reply) ? SP.reply.i : undefined;
+        await spApi('/api/support/tickets/' + c.id + (SP.noteMode ? '/note' : '/messages'), { method: 'POST', body: JSON.stringify(SP.noteMode ? { text: text } : { text: text, image: SP.img, replyTo: rpl }) });
+        ta.value = ''; ta.style.height = 'auto'; SP.img = null; spPaintPrev(); SP.reply = null; spPaintCtx();
         await spLoadNew();
         if (!SP.noteMode && c.mode === 'user' && c.t && c.t.status === 'ai') {
             c.typing = true; spShowTyping();
@@ -13050,6 +13394,18 @@ async function spRateSend() {
         await spLoadNew();
     } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
 }
+async function spRatingAdmin(uid, name) {
+    var box = document.getElementById('spa-list'); if (!box) return;
+    box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">جارِ التحميل...</div>';
+    try {
+        var d = await spApi('/api/support/admin/ratings/' + encodeURIComponent(uid));
+        var h = '<div class="sp-row" style="cursor:default;"><div class="t1"><span>🛡️ تقييمات ' + spEsc(name) + '</span><button class="sp-link" onclick="spLoadRatings()">‹ رجوع</button></div></div>';
+        h += d.list.length ? d.list.map(function (r) {
+            return '<div class="sp-row" style="cursor:pointer;" data-id="' + spEsc(r.ticketId) + '" onclick="spOpenTicket(this.dataset.id, \\'admin\\', \\'spa-body\\')"><div class="t1"><span>#' + r.no + ' — ' + spEsc(r.name || '-') + '</span><span>' + '★'.repeat(r.stars) + '</span></div>' + (r.comment ? '<div class="t2">' + spEsc(r.comment) + '</div>' : '') + '<div class="t2">' + spEsc(r.category || '') + ' • ' + exFull(r.at) + ' • اضغط لفتح التكت</div></div>';
+        }).join('') : '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه تقييمات</div>';
+        box.innerHTML = h;
+    } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
+}
 async function spLoadRatings() {
     var box = document.getElementById('spa-list'); if (!box) return;
     try {
@@ -13058,7 +13414,7 @@ async function spLoadRatings() {
         var html = '<div class="sp-row" style="cursor:default;"><div class="t1"><span>📊 الإجمالي</span><span>⭐ ' + d.avg.toFixed(2) + ' (' + d.total + ' تقييم)</span></div></div>';
         html += d.admins.map(function (a) {
             var dist = [5, 4, 3, 2, 1].map(function (n) { return n + '★ ' + a.dist[n - 1]; }).join(' • ');
-            return '<div class="sp-row" style="cursor:default;"><div class="t1"><span>🛡️ ' + spEsc(a.name) + '</span><span>⭐ ' + a.avg.toFixed(2) + ' (' + a.count + ')</span></div><div class="t2">' + dist + '</div></div>';
+            return '<div class="sp-row" style="cursor:pointer;" data-u="' + spEsc(a.uid) + '" data-n="' + spEsc(a.name) + '" onclick="spRatingAdmin(this.dataset.u, this.dataset.n)"><div class="t1"><span>🛡️ ' + spEsc(a.name) + '</span><span>⭐ ' + a.avg.toFixed(2) + ' (' + a.count + ')</span></div><div class="t2">' + dist + '</div></div>';
         }).join('');
         if (d.recent.length) {
             html += '<div style="margin:12px 4px 6px;font-weight:bold;">💬 آخر التعليقات</div>' + d.recent.map(function (r) {
@@ -13402,6 +13758,53 @@ function spPendingTicket() {
     } catch (e) { id = null; }
     if (id) return id;
     try { var v = sessionStorage.getItem('sp_pending_ticket'); return v && /^[a-f0-9]{24}$/.test(v) ? v : null; } catch (e) { return null; }
+}
+// ===== تنقّل الإشعارات: ?go=att|excuse|hcexcuse|hcatt|court  و ?ticket=ID =====
+function flGoTo(code) {
+    if (!ME) return false;
+    try {
+        if (code === 'att') { if (ME.att && ME.att.status === 'in') renderDashboard(); else renderFingerprint('checkin'); return true; }
+        if (code === 'excuse') { renderExcusePage(); return true; }
+        if (code === 'hcexcuse') {
+            if (ME.isHighCommand) { renderHighCommandPanel(); hcTabSwitch('exc', document.querySelectorAll('.tabs .tab')[3]); return true; }
+            if (ME.isSeniorAdmin) { renderAdmin('excuses'); return true; }
+        }
+        if (code === 'hcatt' && ME.isHighCommand) { renderHighCommandPanel(); hcTabSwitch('att', document.querySelectorAll('.tabs .tab')[2]); return true; }
+        if (code === 'court' && ME.courtStaff) { renderCourtPanel(); return true; }
+    } catch (e) {}
+    renderDashboard();
+    return true;
+}
+function flPendingGo() {
+    var g = null;
+    try {
+        g = new URLSearchParams(location.search).get('go');
+        if (g && /^[a-z]{2,12}$/.test(g)) { sessionStorage.setItem('fl_pending_go', g); history.replaceState(null, '', location.pathname); }
+        else g = null;
+    } catch (e) { g = null; }
+    if (g) return g;
+    try { var v = sessionStorage.getItem('fl_pending_go'); return v && /^[a-z]{2,12}$/.test(v) ? v : null; } catch (e) { return null; }
+}
+function flDeepLink() {
+    try {
+        var g = flPendingGo();
+        if (!g) return;
+        try { sessionStorage.removeItem('fl_pending_go'); } catch (e) {}
+        flGoTo(g);
+    } catch (e) {}
+}
+// الموقع مفتوح وضغط على الإشعار: ننتقل بدون إعادة تحميل
+function flNavUrl(url) {
+    if (!ME) return;
+    var q = new URL(url, location.origin).searchParams;
+    var t = q.get('ticket'), g = q.get('go');
+    if (t && /^[a-f0-9]{24}$/.test(t)) {
+        if (ME.isAdmin) { renderAdmin('support'); spOpenTicket(t, 'admin', 'spa-body'); } else spOpen(t);
+        return;
+    }
+    if (g && /^[a-z]{2,12}$/.test(g)) { flGoTo(g); return; }
+    try { if (typeof spClose === 'function') spClose(); } catch (e) {}
+    renderDashboard();
 }
 function spDeepLink() {
     try {
@@ -13881,6 +14284,7 @@ function updateLockBtn(on) {
 }
 
 async function init() {
+    try { flPendingGo(); } catch (e) {}
     spConnect();
     var lockLoad = loadSavedLock();
     try { ME = await api('/api/me'); odFix(); } catch (e) {
@@ -13926,6 +14330,7 @@ async function init() {
     cyberCheck();
     startPolling();
     spDeepLink();
+    flDeepLink();
     flPushInit();
     try { fetch('/api/pwa/ping?sa=' + (flStandalone() ? 1 : 0)); } catch (e) {}
 }
@@ -21183,6 +21588,7 @@ document.addEventListener('visibilitychange', function () { if (!document.hidden
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('message', function (e) {
         if (e.data && e.data.t === 'mic-toggle' && typeof VC !== 'undefined' && VC && (VC.freq || VC.court)) offToggleMic();
+        if (e.data && e.data.t === 'nav' && e.data.url) { try { flNavUrl(e.data.url); } catch (x) {} }
     });
 }
 
