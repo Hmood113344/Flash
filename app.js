@@ -28,7 +28,7 @@ const CONFIG = {
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || "",
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",
-    BOT_TOKEN: process.env.BOT_TOKEN || "",
+    BOT_TOKEN: String(process.env.BOT_TOKEN || "").trim().replace(/^["']+|["']+$/g, ""),
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
@@ -1613,8 +1613,11 @@ client.once("ready", onBotReady);
 client.once("clientReady", onBotReady);
 setInterval(() => { try { if (!botReadyDone && client.isReady && client.isReady()) onBotReady(); } catch (e) {} }, 5000);
 
+let botLoginError = null, botLoginStartedAt = 0;
+client.on("error", e => { botLoginError = e && e.message ? e.message : String(e); console.log("❌ خطأ البوت:", botLoginError); });
 if (CONFIG.BOT_TOKEN) {
-    client.login(CONFIG.BOT_TOKEN).catch(e => console.log("❌ فشل تسجيل دخول البوت:", e.message));
+    botLoginStartedAt = Date.now();
+    client.login(CONFIG.BOT_TOKEN).catch(e => { botLoginError = e && e.message ? e.message : String(e); console.log("❌ فشل تسجيل دخول البوت:", botLoginError); });
 } else {
     console.log("⚠️ BOT_TOKEN غير موجود — البوت لن يعمل، تحقق من متغيرات البيئة");
 }
@@ -3747,7 +3750,7 @@ app.post("/api/senior/officers-lock", ensureSeniorAdmin, async (req, res) => {
 app.get("/api/senior/bot-status", ensureSeniorAdmin, async (req, res) => {
     const s = await getSettings();
     const ready = !!(botReady || (client.isReady && client.isReady()));
-    const out = { token: !!CONFIG.BOT_TOKEN, ready, tag: client.user ? client.user.tag : null, guild: !!CONFIG.GUILD_ID, channels: [] };
+    const out = { token: !!CONFIG.BOT_TOKEN, ready, tag: client.user ? client.user.tag : null, guild: !!CONFIG.GUILD_ID, channels: [], error: ready ? null : (botLoginError || (botLoginStartedAt && Date.now() - botLoginStartedAt > 60000 ? "ديسكورد ما رد على البوت من أكثر من دقيقة (غالباً الاستضافة تمنع الاتصال بديسكورد)" : null)) };
     const need = { ViewChannel: "رؤية القناة", SendMessages: "إرسال الرسائل", AttachFiles: "إرفاق الملفات", EmbedLinks: "الروابط المضمّنة", ReadMessageHistory: "قراءة السجل" };
     for (const [label, id] of [["قناة المخالفات", s.violationsChannelId], ["قناة الصور", s.notesChannelId]]) {
         const r = { label, set: !!id, ok: false, note: "" };
@@ -19048,6 +19051,7 @@ async function checkBotStatus() {
         const row = (ok, t) => '<div style="margin-top:8px;">' + (ok ? '✅ ' : '❌ ') + t + '</div>';
         let h = row(d.token, 'توكن البوت: ' + (d.token ? 'موجود' : 'غير موجود (BOT_TOKEN)'));
         h += row(d.ready, 'اتصال البوت: ' + (d.ready ? 'متصل' + (d.tag ? ' (' + d.tag + ')' : '') : 'غير متصل'));
+        if (d.error) h += '<div style="margin-top:8px;color:#fca5a5;direction:ltr;text-align:left;font-size:13px;">' + d.error + '</div>';
         h += row(d.guild, 'آيدي السيرفر (GUILD_ID): ' + (d.guild ? 'موجود' : 'غير موجود'));
         d.channels.forEach(function (c) { h += row(c.ok, c.label + ': ' + c.note); });
         ownerModalOpen('🤖 فحص اتصال البوت', h);
