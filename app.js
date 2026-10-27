@@ -129,6 +129,71 @@ mongoose.connect(CONFIG.MONGO_URI)
     .then(async () => { console.log("✅ MongoDB connected"); await copyOldMainDb().catch(e => console.error("❌ فشل نسخ القاعدة القديمة:", e.message)); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
+// ── قاعدة بيانات منفصلة لصور المخالفات (base64): حط عنوانها في PHOTOS_MONGO_URI ──
+const PHOTOS_URI = String(process.env.PHOTOS_MONGO_URI || "").trim();
+let photosDb = null, ViolationPhoto = null;
+if (PHOTOS_URI) {
+    photosDb = mongoose.createConnection(PHOTOS_URI);
+    photosDb.on("connected", () => console.log("✅ قاعدة صور المخالفات متصلة"));
+    photosDb.on("error", e => console.log("❌ قاعدة صور المخالفات:", e.message));
+    ViolationPhoto = photosDb.model("ViolationPhoto", new mongoose.Schema({
+        violationId: { type: String, unique: true, index: true },
+        full: String, thumb: { type: String, default: null },
+        createdAt: { type: Date, default: Date.now },
+    }));
+} else console.log("ℹ️ PHOTOS_MONGO_URI غير محدد — صور المخالفات تنحفظ بالطريقة القديمة");
+let sharpLib = null;
+try { sharpLib = require("sharp"); } catch (e) {}
+async function makeThumb(dataUrl) {
+    if (!sharpLib) return null;
+    try {
+        const m = /^data:image\/[a-z+]+;base64,(.+)$/s.exec(dataUrl);
+        if (!m) return null;
+        const buf = await sharpLib(Buffer.from(m[1], "base64")).rotate().resize(260, 260, { fit: "inside" }).jpeg({ quality: 70 }).toBuffer();
+        return "data:image/jpeg;base64," + buf.toString("base64");
+    } catch (e) { return null; }
+}
+async function savePhotoDb(v, rawPhoto) {
+    if (!ViolationPhoto || typeof rawPhoto !== "string" || !rawPhoto.startsWith("data:image")) return false;
+    try {
+        const thumb = await makeThumb(rawPhoto);
+        await ViolationPhoto.findOneAndUpdate({ violationId: String(v._id) }, { $set: { full: rawPhoto, thumb } }, { upsert: true });
+        v.photoDb = true; await v.save();
+        return true;
+    } catch (e) { console.error("❌ فشل حفظ الصورة بقاعدة الصور:", e.message); return false; }
+}
+
+// نقل صور المخالفات/التقارير "قيد المراجعة" الحالية لقاعدة الصور (المقبولة والمرفوضة القديمة تبقى مكانها)
+let migrating = false;
+async function migratePendingPhotos() {
+    if (!ViolationPhoto || migrating) return;
+    migrating = true;
+    try {
+        const list = await Violation.find({ status: "pending", photoDb: { $ne: true }, $or: [{ photo: { $ne: null } }, { photoMessageId: { $ne: null } }] }).limit(30);
+        for (const v of list) {
+            try {
+                let data = null;
+                if (v.photo && v.photo.startsWith("data:image")) data = v.photo;
+                else if (v.photoChannelId && v.photoMessageId && botReady) {
+                    const val = await fetchDiscordAttachmentBuf(v.photoChannelId, v.photoMessageId, "mig:" + v._id);
+                    if (val && val.buf) data = "data:" + (val.type || "image/jpeg") + ";base64," + val.buf.toString("base64");
+                }
+                if (!data) continue;
+                const thumb = await makeThumb(data);
+                await ViolationPhoto.findOneAndUpdate({ violationId: String(v._id) }, { $set: { full: data, thumb } }, { upsert: true });
+                v.photoDb = true; v.photo = null;
+                await v.save();
+                console.log("✅ اننقلت صورة مخالفة قيد المراجعة لقاعدة الصور:", String(v._id));
+            } catch (e) { console.error("❌ فشل نقل صورة مخالفة:", e.message); }
+        }
+    } catch (e) { console.error("❌ migratePendingPhotos:", e.message); }
+    migrating = false;
+}
+if (ViolationPhoto) {
+    setTimeout(() => { migratePendingPhotos().catch(() => {}); }, 25000);
+    setInterval(() => { migratePendingPhotos().catch(() => {}); }, 5 * 60 * 1000);
+}
+
 const PersonnelSchema = new mongoose.Schema({
     discord: { type: String, required: true, unique: true },
     discordTag: String,
@@ -405,6 +470,7 @@ const ViolationSchema = new mongoose.Schema({
     vehiclePhoto: { type: String, default: null },
     plateNumber: String,
     photo: { type: String, default: null },
+    photoDb: { type: Boolean, default: false },
     photoChannelId: { type: String, default: null },
     photoMessageId: { type: String, default: null },
     msgChannelId: { type: String, default: null },
@@ -1223,9 +1289,10 @@ async function notifyHighCommandOfAutoPromotion(p, fromRank, toRank) {
 
 async function postViolationToChannel(v, rawPhoto) {
     const settings = await getSettings();
+    const savedDb = await savePhotoDb(v, rawPhoto);   // الصورة بقاعدة الصور المنفصلة (إذا مفعّلة)
     if (!botReady || !settings.violationsChannelId) {
         console.log("⚠️ المخالفة ما انرسلت لديسكورد:", !botReady ? "البوت غير متصل" : "آيدي قناة المخالفات غير محدد بالإعدادات");
-        if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
+        if (rawPhoto && !savedDb) { v.photo = rawPhoto; await v.save().catch(() => {}); }
         return;
     }
     try {
@@ -1251,7 +1318,7 @@ async function postViolationToChannel(v, rawPhoto) {
         await v.save();
     } catch (e) {
         console.error("❌ فشل إرسال المخالفة للقناة:", e.message);
-        if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
+        if (rawPhoto && !savedDb) { v.photo = rawPhoto; await v.save().catch(() => {}); }
     }
 }
 
@@ -2566,7 +2633,7 @@ app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
     try {
         const list = await Violation.aggregate([
             { $match: { reporterDiscord: req.user.id } },
-            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
             { $project: { photo: 0 } },
             { $sort: { createdAt: -1 } },
             { $limit: 500 }
@@ -2588,7 +2655,7 @@ function withTimeout(promise, ms) {
 }
 app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
     try {
-        const v = await Violation.findById(req.params.id).select("photo photoChannelId photoMessageId reporterDiscord");
+        const v = await Violation.findById(req.params.id).select("photo photoDb photoChannelId photoMessageId reporterDiscord");
         if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
         const settings = await getSettings();
         const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id)
@@ -2597,6 +2664,7 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
             || !!getSectorViolOfficer(req.user.id, settings)
             || isViolationsOfficer(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
+        { const d = await violationPhotoDoc(v); if (d && d.full) return res.json({ photo: d.full }); }
 
         if (v.photoChannelId && v.photoMessageId) {
             const cacheKey = v._id.toString();
@@ -2651,9 +2719,37 @@ function sendPhotoBuf(res, val) {
     res.set("Cache-Control", "private, max-age=600");
     res.send(val.buf);
 }
+async function violationPhotoAllowed(req, v) {
+    const settings = await getSettings();
+    return v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id)
+        || settings.adminList.includes(req.user.id)
+        || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
+        || !!getSectorViolOfficer(req.user.id, settings)
+        || isViolationsOfficer(req.user.id, settings);
+}
+async function violationPhotoDoc(v) {
+    if (!(v && v.photoDb && ViolationPhoto)) return null;
+    try { return await ViolationPhoto.findOne({ violationId: String(v._id) }).lean(); } catch (e) { return null; }
+}
+function sendDataUrl(res, dataUrl) {
+    const m = /^data:(image\/[a-z+]+);base64,(.+)$/s.exec(String(dataUrl || ""));
+    if (!m) return false;
+    sendPhotoBuf(res, { buf: Buffer.from(m[2], "base64"), type: m[1] });
+    return true;
+}
+app.get("/api/violations/:id/thumb", ensureAuth, async (req, res) => {
+    try {
+        const v = await Violation.findById(req.params.id).select("photoDb reporterDiscord").lean();
+        if (!v) return res.status(404).send("not found");
+        if (!(await violationPhotoAllowed(req, v))) return res.status(403).send("forbidden");
+        const d = await violationPhotoDoc(v);
+        if (d && sendDataUrl(res, d.thumb || d.full)) return;
+        return res.redirect(302, "/api/violations/" + encodeURIComponent(req.params.id) + "/photo-file");
+    } catch (e) { res.status(500).send("error"); }
+});
 app.get("/api/violations/:id/photo-file", ensureAuth, async (req, res) => {
     try {
-        const v = await Violation.findById(req.params.id).select("photo photoChannelId photoMessageId reporterDiscord").lean();
+        const v = await Violation.findById(req.params.id).select("photo photoDb photoChannelId photoMessageId reporterDiscord").lean();
         if (!v) return res.status(404).send("not found");
         const settings = await getSettings();
         const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id)
@@ -2662,6 +2758,7 @@ app.get("/api/violations/:id/photo-file", ensureAuth, async (req, res) => {
             || !!getSectorViolOfficer(req.user.id, settings)
             || isViolationsOfficer(req.user.id, settings);
         if (!allowed) return res.status(403).send("forbidden");
+        { const d = await violationPhotoDoc(v); if (d && sendDataUrl(res, d.full)) return; }
         if (v.photoChannelId && v.photoMessageId) {
             const ck = "v:" + v._id;
             try {
@@ -2817,7 +2914,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
 app.get("/api/admin/pending", ensureSeniorAdmin, async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: "pending" } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
         { $project: { photo: 0 } },
         { $sort: { createdAt: 1 } }
     ]);
@@ -3365,7 +3462,7 @@ app.post("/api/points/edit/:discord", ensurePointsEditor, async (req, res) => {
 app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: { $in: ["approved", "rejected"] } } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
         { $project: { photo: 0 } },
         { $sort: { reviewedAt: -1 } },
         { $limit: 300 },
@@ -4184,7 +4281,7 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
         if (req.sectorInfo.role === "commander") ids = ids.filter(id => id !== req.user.id);   // مخالفات القائد نفسه ما تجيه
         const list = ids.length ? await Violation.aggregate([
             { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
-            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
             { $project: { photo: 0 } },
             { $sort: { createdAt: -1 } },
             { $limit: 300 }
@@ -4285,7 +4382,7 @@ app.get("/api/sector-viol-officer/pending", ensureSectorViolOfficer, async (req,
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" });
     const list = ids.length ? await Violation.aggregate([
         { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
         { $project: { photo: 0 } },
         { $sort: { createdAt: 1 } },
         { $limit: 300 },
@@ -4675,7 +4772,7 @@ app.post("/api/senior/violations-officer/remove", ensureSeniorAdmin, async (req,
 app.get("/api/violations-officer/pending", ensureViolationsOfficer, async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: "pending" } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
         { $project: { photo: 0 } },
         { $sort: { createdAt: 1 } },
         { $limit: 300 },
@@ -4685,7 +4782,7 @@ app.get("/api/violations-officer/pending", ensureViolationsOfficer, async (req, 
 app.get("/api/violations-officer/log", ensureViolationsOfficer, async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: { $in: ["approved", "rejected"] } } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
         { $project: { photo: 0 } },
         { $sort: { reviewedAt: -1 } },
         { $limit: 300 },
@@ -4800,7 +4897,7 @@ app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req,
     const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
     const list = juniorIds.length ? await Violation.aggregate([
         { $match: { reporterDiscord: { $in: juniorIds }, status: "pending" } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
         { $project: { photo: 0 } },
         { $sort: { createdAt: -1 } },
         { $limit: 300 }
@@ -10633,6 +10730,7 @@ app.get("/", (req, res) => {
     .acc-check input { width: auto; margin: 0; }
     .login-screen h1 { font-size: 3rem; color: #3b82f6; text-shadow: 0 0 20px rgba(59,130,246,0.5); margin-bottom: 10px; }
     footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); font-size: 0.9rem; }
+    .vthumb { width: 86px; height: 66px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); cursor: pointer; background: #0a1628; flex-shrink: 0; }
     #photo-page { display: none; position: fixed; inset: 0; z-index: 5000; background: #000; flex-direction: column; }
     #photo-page.open { display: flex; }
     #photo-page .pp-bar { display: flex; align-items: center; padding: env(safe-area-inset-top,14px) 8px 10px; background: rgba(0,0,0,0.55); flex-shrink: 0; }
@@ -14976,7 +15074,7 @@ async function loadMine(silent) {
         if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);">لا توجد مخالفات مسجلة بعد</p>'; return; }
         box.innerHTML = \`<table><tr><th></th><th>النوع</th><th>المركبة</th><th>اللوحة</th><th>الحالة</th></tr>\` +
             list.map(v => \`<tr>
-                <td>\${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض</button>\` : '—'}</td>
+                <td>\${v.hasPhoto ? \`<img class="vthumb" loading="lazy" src="/api/violations/\${v._id}/thumb" onclick="viewViolationPhoto('\${v._id}')">\` : '—'}</td>
                 <td>\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</td><td>\${v.vehicle}</td><td>\${v.plateNumber}</td>
                 <td><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}</td>
             </tr>\`).join('') + '</table>';
@@ -15679,7 +15777,7 @@ async function loadReviewedViolations() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<img class="vthumb" loading="lazy" src="/api/violations/\${v._id}/thumb" onclick="viewViolationPhoto('\${v._id}')">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة — ' + v.reportCategory) : v.violationType}</div>
@@ -15793,7 +15891,7 @@ async function loadPending() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<img class="vthumb" loading="lazy" src="/api/violations/\${v._id}/thumb" onclick="viewViolationPhoto('\${v._id}')">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
@@ -15815,7 +15913,7 @@ async function loadPending() {
         <div class="card">
             <div class="row">
                 <div class="row" style="gap:10px;">
-                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<img class="vthumb" loading="lazy" src="/api/violations/\${v._id}/thumb" onclick="viewViolationPhoto('\${v._id}')">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.violationType}</div>
@@ -16896,7 +16994,7 @@ async function loadSectorViolations() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<img class="vthumb" loading="lazy" src="/api/violations/\${v._id}/thumb" onclick="viewViolationPhoto('\${v._id}')">\` : ''}
                     <div>
                         <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
@@ -17063,7 +17161,7 @@ async function loadPoViolations() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<img class="vthumb" loading="lazy" src="/api/violations/\${v._id}/thumb" onclick="viewViolationPhoto('\${v._id}')">\` : ''}
                     <div>
                         <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
@@ -18370,7 +18468,7 @@ async function loadSVOPending() {
     if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات معلّقة</div>'; return; }
     box.innerHTML = list.map(function (v) {
         return '<div class="card"><div class="row" style="align-items:flex-start;"><div class="row" style="gap:10px;align-items:flex-start;">' +
-            (v.hasPhoto ? '<button class="btn sm gray" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">📷 عرض الصورة</button>' : '') +
+            (v.hasPhoto ? '<img class="vthumb" loading="lazy" src="/api/violations/' + v._id + '/thumb" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">' : '') +
             '<div>' + voDetails(v) + '</div></div><div class="row" style="gap:8px;">' +
             '<button class="btn sm" data-id="' + v._id + '" onclick="svoApprove(this.dataset.id)">قبول</button>' +
             '<button class="btn danger sm" data-id="' + v._id + '" onclick="svoReject(this.dataset.id)">رفض</button></div></div></div>';
@@ -18490,7 +18588,7 @@ async function loadVOPending() {
     box.innerHTML = list.map(function (v) {
         return '<div class="card"><div class="row" style="align-items:flex-start;">' +
             '<div class="row" style="gap:10px;align-items:flex-start;">' +
-                (v.hasPhoto ? '<button class="btn sm gray" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">📷 عرض الصورة</button>' : '') +
+                (v.hasPhoto ? '<img class="vthumb" loading="lazy" src="/api/violations/' + v._id + '/thumb" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">' : '') +
                 '<div>' + voDetails(v) + '</div>' +
             '</div>' +
             '<div class="row" style="gap:8px;">' +
@@ -18526,7 +18624,7 @@ async function loadVOLog() {
     box.innerHTML = list.map(function (v) {
         return '<div class="card"><div class="row" style="align-items:flex-start;">' +
             '<div class="row" style="gap:10px;align-items:flex-start;">' +
-                (v.hasPhoto ? '<button class="btn sm gray" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">📷 عرض الصورة</button>' : '') +
+                (v.hasPhoto ? '<img class="vthumb" loading="lazy" src="/api/violations/' + v._id + '/thumb" data-id="' + v._id + '" onclick="viewViolationPhoto(this.dataset.id)">' : '') +
                 '<div>' + voDetails(v) +
                     '<div style="margin-top:4px;"><span class="badge ' + v.status + '">' + (v.status === 'approved' ? 'مقبولة' : 'مرفوضة') + '</span></div>' +
                     (v.status === 'rejected' && v.rejectReason ? '<div style="font-size:11px;color:var(--muted);margin-top:3px;">السبب: ' + accEsc(v.rejectReason) + '</div>' : '') +
