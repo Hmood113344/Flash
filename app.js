@@ -2506,7 +2506,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         unlockAt: p.summon.unlockAt, enteredAt: p.summon.enteredAt,
     } : null;
 
-    const recState = isReceptionOfficer(req.user.id, settings) ? await getReceptionState() : { open: null };
+    const recState = (isReceptionOfficer(req.user.id, settings) || senior) ? await getReceptionState() : { open: null };
     const [meAtt, mePwaDoc, meCourt, meCyber, meDevLocked, meUnassigned, meAcc] = await Promise.all([
         getAttState(req.user.id),
         PwaInstall.exists({ uid: req.user.id }),
@@ -2521,7 +2521,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     res.json({
         blocked: false,
         att: meAtt, attRequired: attRequired(req.user.id), pwaInstalled: mePwa,
-        isReceptionOfficer: isReceptionOfficer(req.user.id, settings),
+        isReceptionOfficer: isReceptionOfficer(req.user.id, settings) || senior,
         receptionOpen: recState.open,
         courtStaff: meCourt.staff, courtLeader: meCourt.leader, courtLocked: !!courtCaseOf(req.user.id), courtCase: courtCaseOf(req.user.id), courtSoon: courtSoonOf(req.user.id),
         discordId: req.user.id,
@@ -9992,11 +9992,12 @@ function riyadhHour() {
 let lastReceptionAt = 0;
 app.post("/api/reception/open", ensureAuth, async (req, res) => {
     const settings = await getSettings();
-    if (!isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
+    const isSr = isSeniorAdmin(req.user.id); // الكبار: يفتحون الاستلام بأي وقت وبدون بصمة
+    if (!isSr && !isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
     const att = await getAttState(req.user.id);
-    if (att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
+    if (!isSr && att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
     const h = riyadhHour();
-    if (h < CONFIG.RECEPTION_START_HOUR || h >= CONFIG.RECEPTION_END_HOUR) return res.status(400).json({ error: "⏰ مو وقت الاستلام — الاستلام من الساعة 2 العصر إلى 9 الليل" });
+    if (!isSr && (h < CONFIG.RECEPTION_START_HOUR || h >= CONFIG.RECEPTION_END_HOUR)) return res.status(400).json({ error: "⏰ مو وقت الاستلام — الاستلام من الساعة 2 العصر إلى 9 الليل" });
     const state = await getReceptionState();
     if (state.open) return res.status(409).json({ error: "الاستلام مفتوح الحين", receptionOpen: state.open });
     const opened = await openReceptionDay(req.user.id, await cyName(req.user.id));
@@ -10015,9 +10016,10 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
 });
 app.post("/api/reception/close", ensureAuth, async (req, res) => {
     const settings = await getSettings();
-    if (!isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
+    const isSr = isSeniorAdmin(req.user.id);
+    if (!isSr && !isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
     const att = await getAttState(req.user.id);
-    if (att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
+    if (!isSr && att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
     const state = await getReceptionState();
     if (!state.open) return res.status(409).json({ error: "الاستلام مو مفتوح الحين", receptionOpen: null });
     let rec = null;
@@ -21654,7 +21656,8 @@ function flAttCardHtml() {
 // ملاحظة: هنا التردد — زر التردد محذوف من الصفحة الرئيسية، والكود باقي ما انحذف
 function flFreqBtnHtml() { return '<button class="btn sm" onclick="flFreqOpen()">📻 تردد القطاعات المشتركة</button>'; }
 function flRcBtnHtml() {
-    if (!ME || !ME.isReceptionOfficer || !(ME.att && ME.att.status === 'in')) return '';
+    if (!ME || !ME.isReceptionOfficer) return '';
+    if (!ME.isSeniorAdmin && !(ME.att && ME.att.status === 'in')) return '';
     if (ME.receptionOpen) return '<button class=\"btn sm danger\" onclick=\"flReceptionClose()\">🔒 إغلاق الاستلام</button>';
     return '<button class=\"btn sm\" onclick=\"flReceptionOpen()\">🎤 فتح استلام</button>';
 }
