@@ -9729,7 +9729,7 @@ async function closeReceptionDay(closerId, closerName) {
             rows.push({ ...base, kind: "leave" });
             leave++;
         } else {
-            const ded = Math.min(2, Math.max(0, p.points || 0));
+            const ded = 2; // خصم ثابت نقطتين حتى لو رصيده 0 أو 1 (يصير بالسالب)
             rows.push({ ...base, kind: "absent", deducted: ded, excuseStatus: "none" });
             if (ded) ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: -ded } } } });
             absent++;
