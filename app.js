@@ -87,6 +87,7 @@ const CONFIG = {
         roadSecurity: "أمن الطرق",
         antiDrugs: "مكافحة المخدرات",
         cyber: "الأمن السيبراني",
+        mp: "الشرطة العسكرية",
     },
 
     MILITARY_POLICE_ROLE_ID: process.env.MILITARY_POLICE_ROLE_ID || "1545415273438249010",
@@ -126,7 +127,7 @@ const CONFIG = {
 };
 
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(async () => { console.log("✅ MongoDB connected"); await copyOldMainDb().catch(e => console.error("❌ فشل نسخ القاعدة القديمة:", e.message)); await ensureSeniorAccount(); await ensureCardNumbers(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); })
+    .then(async () => { console.log("✅ MongoDB connected"); await copyOldMainDb().catch(e => console.error("❌ فشل نسخ القاعدة القديمة:", e.message)); await ensureSeniorAccount(); await ensureCardNumbers(); await migrateMpSector(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 // ── قاعدة بيانات منفصلة لصور المخالفات (base64): حط عنوانها في PHOTOS_MONGO_URI ──
@@ -319,6 +320,25 @@ async function copyOldMainDb() {
     } finally {
         await src.close().catch(() => {});
     }
+}
+
+// الشرطة العسكرية صارت قطاع: كل عضو له قطاع واحد فقط (isMP = قطاعه mp)
+async function migrateMpSector() {
+    try {
+        const toMp = await Account.find({ isMP: true, sector: { $ne: "mp" } }, { uid: 1, sector: 1 }).lean();
+        for (const a of toMp) {
+            if (a.sector) console.log("ℹ️ نقل للشرطة العسكرية (كان في قطاع " + a.sector + "):", a.uid);
+            const p = await Personnel.findOne({ discord: a.uid }, { unit: 1 }).lean();
+            const oldLabel = a.sector ? CONFIG.SECTORS[a.sector] : null;
+            const upd = { sector: "mp" };
+            if (p && (!p.unit || p.unit === "غير محدد" || (oldLabel && p.unit === oldLabel))) upd.unit = CONFIG.SECTORS.mp;
+            await Account.updateOne({ uid: a.uid }, { $set: { sector: "mp", isMP: true } });
+            await Personnel.updateOne({ discord: a.uid }, { $set: upd });
+        }
+        await Account.updateMany({ sector: "mp", isMP: { $ne: true } }, { $set: { isMP: true } });
+        await Account.updateMany({ isMP: true, sector: { $ne: "mp" } }, { $set: { sector: "mp" } });
+        if (toMp.length) console.log("✅ تم ربط الشرطة العسكرية بالقطاعات (" + toMp.length + " عضو)");
+    } catch (e) { console.error("❌ فشل ترحيل الشرطة العسكرية:", e.message); }
 }
 
 async function ensureSectorFields() {
@@ -732,6 +752,8 @@ const SettingsSchema = new mongoose.Schema({
         commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
         deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
         personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
+        attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
+        violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
     },
     highCommand: { type: [{ id: String, name: String }], default: [] },
     violationsOfficers: { type: [{ id: String, name: String }], default: [] },
@@ -814,7 +836,7 @@ async function rankProgress(p, settings) {
 const agingNoteCheckThrottle = new Map();
 const AGING_CHECK_COOLDOWN_MS = 60 * 60 * 1000;
 async function checkAgingNotesForSector(sectorKey, sectorLabel, settings) {
-    const sl = (settings.sectorLeadership || {})[sectorKey] || {};
+    const sl = secLead(settings, sectorKey) || {};
     const notifyIds = [sl.commanderId, sl.deputyId].filter(Boolean);
     if (!notifyIds.length) return;
     const ids = await getSectorMemberIds(sectorKey);
@@ -895,10 +917,30 @@ async function endLeaveOnAttendance(uid) {
     await finalizeLeave(leave, "تلقائي (سجّل حضور أثناء الإجازة)");
 }
 
+// قيادة القطاع: الشرطة العسكرية قطاع مثل غيرها، وبياناتها محفوظة في mpLeadership
+function secLead(settings, key) {
+    if (!settings) return null;
+    if (key === "mp") return settings.mpLeadership || null;
+    return (settings.sectorLeadership || {})[key] || null;
+}
+function secLeadW(settings, key) {
+    if (key === "mp") { if (!settings.mpLeadership) settings.mpLeadership = {}; return settings.mpLeadership; }
+    if (!settings.sectorLeadership) settings.sectorLeadership = {};
+    if (!settings.sectorLeadership[key]) settings.sectorLeadership[key] = {};
+    return settings.sectorLeadership[key];
+}
+function markSecLead(settings, key) { settings.markModified(key === "mp" ? "mpLeadership" : "sectorLeadership"); }
+function leadershipView(settings) {
+    let o = settings;
+    try { if (settings && typeof settings.toObject === "function") o = settings.toObject(); } catch (e) { o = settings; }
+    const base = Object.assign({}, (o && o.sectorLeadership) || {});
+    base.mp = Object.assign({}, (o && o.mpLeadership) || {});
+    return base;
+}
+
 function getSectorRole(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
+        for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = secLead(settings, key);
         if (!sec) continue;
         if (sec.commanderId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "commander" };
         if (sec.deputyId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "deputy" };
@@ -907,26 +949,23 @@ function getSectorRole(userId, settings) {
 }
 
 function getPersonnelOfficerSector(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
+        for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = secLead(settings, key);
         if (sec && sec.personnelOfficerId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key] };
     }
     return null;
 }
 
 function getSectorAttOfficer(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
+        for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = secLead(settings, key);
         if (sec && (sec.attendanceOfficers || []).some(m => m.id === userId)) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "attOfficer" };
     }
     return null;
 }
 function getSectorViolOfficer(userId, settings) {
-    const sl = settings.sectorLeadership || {};
-    for (const key of Object.keys(CONFIG.SECTORS)) {
-        const sec = sl[key];
+        for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = secLead(settings, key);
         if (sec && (sec.violationsOfficers || []).some(m => m.id === userId)) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "violOfficer" };
     }
     return null;
@@ -935,7 +974,7 @@ function getSectorViolOfficer(userId, settings) {
 async function sectorReviewableIds(sectorKey, reviewerUid, settings, excludeCommander) {
     const ids = await getSectorMemberIds(sectorKey);
     if (ids === null) return null;
-    const sec = ((settings.sectorLeadership || {})[sectorKey]) || {};
+    const sec = secLead(settings, sectorKey) || {};
     return ids.filter(id => id !== reviewerUid && !(excludeCommander && sec.commanderId && id === sec.commanderId));
 }
 
@@ -984,6 +1023,7 @@ function sectorRoleId(sectorKey) {
     if (sectorKey === "patrol") return CONFIG.PATROL_ROLE_ID;
     if (sectorKey === "roadSecurity") return CONFIG.ROAD_SECURITY_ROLE_ID;
     if (sectorKey === "antiDrugs") return CONFIG.ANTI_DRUGS_ROLE_ID;
+    if (sectorKey === "mp") return CONFIG.MILITARY_POLICE_ROLE_ID;
     return null;
 }
 
@@ -1512,7 +1552,7 @@ async function discordCanReviewViolation(interaction, v, settings) {
     if (!sector) return false;
     const acc = await Account.findOne({ uid: v.reporterDiscord }, { sector: 1 }).lean();
     if (!acc || acc.sector !== sector) return false;
-    if (!isCmd) { const sec = (settings.sectorLeadership || {})[sector] || {}; if (sec.commanderId && sec.commanderId === v.reporterDiscord) return false; }
+    if (!isCmd) { const sec = secLead(settings, sector) || {}; if (sec.commanderId && sec.commanderId === v.reporterDiscord) return false; }
     return true;
 }
 
@@ -1917,7 +1957,7 @@ app.get("/api/me", async (req, res, next) => {
         try {
             const st = await getSettings();
             if (req.flashAs.kind === "sector") {
-                const sec = (st.sectorLeadership && st.sectorLeadership[req.flashAs.sector]) || {};
+                const sec = secLead(st, req.flashAs.sector) || {};
                 fl = { sectorInfo: { sector: req.flashAs.sector, sectorLabel: CONFIG.SECTORS[req.flashAs.sector], role: req.flashAs.role, personnelOfficerId: sec.personnelOfficerId || null, personnelOfficerName: sec.personnelOfficerName || null } };
             } else {
                 fl = { mpInfo: { role: req.flashAs.role, label: req.flashAs.role === "commander" ? (st.mpLeadership && st.mpLeadership.commanderName) || "" : (st.mpLeadership && st.mpLeadership.deputyName) || "" } };
@@ -2346,7 +2386,7 @@ app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res)
     }
     const oldSector = a.sector;
     a.fullName = fullName; a.age = age; a.nationality = nationality; a.email = email;
-    a.sector = sector; a.isMP = !!b.isMP;
+    a.sector = sector; a.isMP = (sector === "mp");
     let pwChanged = false;
     if (password && !verifyPassword(password, a.passwordHash)) {
         a.passwordHash = hashPassword(password); a.passwordEnc = encryptText(password); pwChanged = true;
@@ -2480,7 +2520,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     const progress = await rankProgress(p, settings);
     const sectorInfo = getSectorRole(req.user.id, settings);
     if (sectorInfo) {
-        const sec = (settings.sectorLeadership && settings.sectorLeadership[sectorInfo.sector]) || {};
+        const sec = secLead(settings, sectorInfo.sector) || {};
         sectorInfo.personnelOfficerId = sec.personnelOfficerId || null;
         sectorInfo.personnelOfficerName = sec.personnelOfficerName || null;
         if (sectorInfo.role === "commander" || sectorInfo.role === "deputy") {
@@ -3399,6 +3439,7 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
     if (sectorChanged && secAcc) {
         const oldSec = secAcc.sector || null;
         secAcc.sector = newSector;
+        secAcc.isMP = (newSector === "mp");
         await secAcc.save();
         await logEvent({ action: "تغيير قطاع", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${p.registeredName || p.discord}: ${oldSec ? CONFIG.SECTORS[oldSec] : "بدون قطاع"} ← ${newSector ? CONFIG.SECTORS[newSector] : "بدون قطاع"}` });
     }
@@ -4029,7 +4070,7 @@ app.get("/api/owner/command-center", ensureAuth, async (req, res) => {
         Violation.countDocuments({ status: "pending" }).catch(() => 0),
     ]);
     const sectors = Object.keys(CONFIG.SECTORS).map(k => {
-        const lead = (settings.sectorLeadership || {})[k] || {};
+        const lead = secLead(settings, k) || {};
         return { key: k, label: CONFIG.SECTORS[k], commanderName: lead.commanderName || null, deputyName: lead.deputyName || null };
     });
     res.json({
@@ -4230,7 +4271,7 @@ app.post("/api/owner/devices/kick-account", ensureAuth, async (req, res) => {
 
 app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
-    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null }, violationsOfficers: getViolationsOfficers(settings) });
+    res.json({ sectors: CONFIG.SECTORS, leadership: leadershipView(settings), mpLeadership: settings.mpLeadership || {}, violationsOfficer: { id: settings.violationsOfficerId || null, name: settings.violationsOfficerName || null }, violationsOfficers: getViolationsOfficers(settings) });
 });
 
 const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد" };
@@ -4249,19 +4290,18 @@ app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, re
     }
 
     const settings = await getSettings();
-    if (!settings.sectorLeadership) settings.sectorLeadership = {};
-    if (!settings.sectorLeadership[sector]) settings.sectorLeadership[sector] = {};
+    const slObj = secLeadW(settings, sector);
     const displayName = person.registeredName || person.discordTag || person.discord;
-    settings.sectorLeadership[sector][`${role}Id`] = person.discord;
-    settings.sectorLeadership[sector][`${role}Name`] = displayName;
-    settings.markModified("sectorLeadership");
+    slObj[`${role}Id`] = person.discord;
+    slObj[`${role}Name`] = displayName;
+    markSecLead(settings, sector);
     await settings.save();
     await logEvent({
         action: "تعيين قيادة قطاع", discordId: person.discord, discordTag: person.discordTag,
         actorId: req.user.id, actorTag: req.user.username,
         details: `${CONFIG.SECTORS[sector]} — ${SECTOR_ROLE_LABELS[role]} — ${displayName}`,
     });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
+    res.json({ ok: true, sectorLeadership: leadershipView(settings) });
 });
 
 app.post("/api/senior/sectors/:sector/remove", ensureSeniorAdmin, async (req, res) => {
@@ -4271,18 +4311,18 @@ app.post("/api/senior/sectors/:sector/remove", ensureSeniorAdmin, async (req, re
     if (!SECTOR_ROLE_LABELS[role]) return res.status(400).json({ error: "دور غير معروف" });
 
     const settings = await getSettings();
-    if (!settings.sectorLeadership || !settings.sectorLeadership[sector]) return res.json({ ok: true });
-    const sec = settings.sectorLeadership[sector];
+    const sec = secLead(settings, sector);
+    if (!sec) return res.json({ ok: true });
     const removedName = sec[`${role}Name`];
     sec[`${role}Id`] = null;
     sec[`${role}Name`] = null;
-    settings.markModified("sectorLeadership");
+    markSecLead(settings, sector);
     await settings.save();
     await logEvent({
         action: "إزالة قيادة قطاع", actorId: req.user.id, actorTag: req.user.username,
         details: `${CONFIG.SECTORS[sector]} — ${SECTOR_ROLE_LABELS[role]} — ${removedName || "-"}`,
     });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
+    res.json({ ok: true, sectorLeadership: leadershipView(settings) });
 });
 
 app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
@@ -4347,7 +4387,7 @@ app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, re
 // ── مسؤولو الأطراف داخل القطاع (يعيّنهم قائد القطاع فقط): مسؤول تحضير + مسؤول مخالفات ──
 function sectorOfficerKey(kind) { return kind === "att" ? "attendanceOfficers" : "violationsOfficers"; }
 app.get("/api/sector/officers", ensureSectorLeader, async (req, res) => {
-    const sec = ((req.settings.sectorLeadership || {})[req.sectorInfo.sector]) || {};
+    const sec = secLead(req.settings, req.sectorInfo.sector) || {};
     res.json({
         sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel, role: req.sectorInfo.role,
         canManage: req.sectorInfo.role === "commander" || req.sectorInfo.role === "senior",
@@ -4366,15 +4406,13 @@ app.post("/api/sector/officers/:kind/assign", ensureSectorCommander, async (req,
     if (ids === null) return res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" });
     if (!ids.includes(person.discord)) return res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" });
     const settings = await getSettings();
-    if (!settings.sectorLeadership) settings.sectorLeadership = {};
-    if (!settings.sectorLeadership[req.sectorInfo.sector]) settings.sectorLeadership[req.sectorInfo.sector] = {};
-    const sec = settings.sectorLeadership[req.sectorInfo.sector];
+    const sec = secLeadW(settings, req.sectorInfo.sector);
     const key = sectorOfficerKey(kind);
     const cur = (sec[key] || []).map(m => ({ id: m.id, name: m.name }));
     if (cur.some(m => m.id === person.discord)) return res.status(400).json({ error: "موجود من قبل" });
     const name = person.registeredName || person.discordTag || person.discord;
     sec[key] = cur.concat([{ id: person.discord, name }]);
-    settings.markModified("sectorLeadership");
+    markSecLead(settings, req.sectorInfo.sector);
     await settings.save();
     await logEvent({ action: kind === "att" ? "تعيين مسؤول تحضير قطاع" : "تعيين مسؤول مخالفات قطاع", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${req.sectorInfo.sectorLabel} — ${name}` });
     res.json({ ok: true });
@@ -4384,13 +4422,13 @@ app.post("/api/sector/officers/:kind/remove", ensureSectorCommander, async (req,
     if (kind !== "att" && kind !== "viol") return res.status(400).json({ error: "نوع غير صحيح" });
     const discordId = String(req.body.discordId || "").trim();
     const settings = await getSettings();
-    const sec = settings.sectorLeadership && settings.sectorLeadership[req.sectorInfo.sector];
+    const sec = secLead(settings, req.sectorInfo.sector);
     if (!sec) return res.json({ ok: true });
     const key = sectorOfficerKey(kind);
     const cur = (sec[key] || []).map(m => ({ id: m.id, name: m.name }));
     const gone = cur.find(m => m.id === discordId);
     sec[key] = cur.filter(m => m.id !== discordId);
-    settings.markModified("sectorLeadership");
+    markSecLead(settings, req.sectorInfo.sector);
     await settings.save();
     await logEvent({ action: kind === "att" ? "إزالة مسؤول تحضير قطاع" : "إزالة مسؤول مخالفات قطاع", actorId: req.user.id, actorTag: req.user.username, details: `${req.sectorInfo.sectorLabel} — ${gone ? gone.name : discordId}` });
     res.json({ ok: true });
@@ -4551,40 +4589,121 @@ app.post("/api/sector/personnel-officer/assign", ensureSectorLeader, async (req,
     if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
 
     const settings = await getSettings();
-    if (!settings.sectorLeadership) settings.sectorLeadership = {};
-    if (!settings.sectorLeadership[req.sectorInfo.sector]) settings.sectorLeadership[req.sectorInfo.sector] = {};
+    const poSec = secLeadW(settings, req.sectorInfo.sector);
     const displayName = person.registeredName || person.discordTag || person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].personnelOfficerId = person.discord;
-    settings.sectorLeadership[req.sectorInfo.sector].personnelOfficerName = displayName;
-    settings.markModified("sectorLeadership");
+    poSec.personnelOfficerId = person.discord;
+    poSec.personnelOfficerName = displayName;
+    markSecLead(settings, req.sectorInfo.sector);
     await settings.save();
     await logEvent({
         action: "تعيين مسؤول أفراد", discordId: person.discord, discordTag: person.discordTag,
         actorId: req.user.id, actorTag: req.user.username,
         details: `${req.sectorInfo.sectorLabel} — ${displayName} (بواسطة ${req.sectorInfo.role === "senior" ? "كبار المسؤولين" : "قيادة القطاع"})`,
     });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
+    res.json({ ok: true, sectorLeadership: leadershipView(settings) });
 });
 
 app.post("/api/sector/personnel-officer/remove", ensureSectorLeader, async (req, res) => {
     const settings = await getSettings();
-    const sec = settings.sectorLeadership && settings.sectorLeadership[req.sectorInfo.sector];
+    const sec = secLead(settings, req.sectorInfo.sector);
     if (!sec || !sec.personnelOfficerId) return res.json({ ok: true });
     const removedName = sec.personnelOfficerName;
     sec.personnelOfficerId = null;
     sec.personnelOfficerName = null;
-    settings.markModified("sectorLeadership");
+    markSecLead(settings, req.sectorInfo.sector);
     await settings.save();
     await logEvent({
         action: "إزالة مسؤول أفراد", actorId: req.user.id, actorTag: req.user.username,
         details: `${req.sectorInfo.sectorLabel} — ${removedName || "-"}`,
     });
-    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
+    res.json({ ok: true, sectorLeadership: leadershipView(settings) });
 });
 
 app.get("/api/sector/promotion-requests", ensureSectorLeader, async (req, res) => {
     const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }, { noteImage: 0 }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
+});
+
+// ── سجل الأفراد: لقائد القطاع فقط (النائب ومسؤول الأفراد وبقية المسؤولين ما يشوفونه) ──
+async function ensureSectorLogViewer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (req.flashAs && req.flashAs.kind === "sector") {
+        if (req.flashAs.role !== "commander" || !CONFIG.SECTORS[req.flashAs.sector]) return res.status(403).json({ error: "سجل الأفراد لقائد القطاع فقط" });
+        req.sectorInfo = { sector: req.flashAs.sector, sectorLabel: CONFIG.SECTORS[req.flashAs.sector], role: "senior" };
+        req.settings = settings;
+        return next();
+    }
+    const real = getSectorRole(req.user.id, settings);
+    if (real && real.role === "commander") { req.sectorInfo = real; req.settings = settings; return next(); }
+    if (isSeniorAdmin(req.user.id)) {
+        const q = String(req.query.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q], role: "senior" };
+        req.settings = settings;
+        return next();
+    }
+    return res.status(403).json({ error: "سجل الأفراد لقائد القطاع فقط" });
+}
+const SECTOR_LOG_HIDE = /سيبراني|مشبوه|الدعم الفني|تكت|اللوق الشامل|تسجيل دخول/;
+function sectorLogCat(action, details) {
+    const a = String(action || "");
+    if (a === "تعديل ملف عسكري") {
+        const d = String(details || "");
+        if (d.indexOf('"rank"') !== -1) return "rank";
+        if (d.indexOf('"points"') !== -1) return "points";
+        return "other";
+    }
+    if (/ترقية|تنزيل|رتبة/.test(a)) return "rank";
+    if (/نقاط/.test(a)) return "points";
+    if (/ملاحظ/.test(a)) return "note";
+    if (/تحذير|إنذار|إشعار|عقوبة|فصل|حظر|إيقاف|استدعاء|تحقيق/.test(a)) return "penalty";
+    if (/مخالف/.test(a)) return "viol";
+    if (/إجازة|غياب|حضور|انصراف|استلام/.test(a)) return "att";
+    return "other";
+}
+function sectorLogDetails(action, details) {
+    const raw = String(details || "");
+    if (action !== "تعديل ملف عسكري") return raw;
+    const parts = raw.split(" — ");
+    try {
+        const o = JSON.parse(parts[0]);
+        const names = { registeredName: "الاسم", unit: "اليونت", rank: "الرتبة", points: "النقاط", sector: "القطاع" };
+        const txt = Object.keys(o).map(k => (names[k] || k) + ": " + (k === "sector" ? (CONFIG.SECTORS[o[k]] || "بدون قطاع") : o[k])).join(" • ");
+        return [txt].concat(parts.slice(1)).join(" — ");
+    } catch (e) { return raw; }
+}
+app.get("/api/sector/personnel-log", ensureSectorLogViewer, async (req, res) => {
+    try {
+        let ids = await getSectorMemberIds(req.sectorInfo.sector);
+        if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" });
+        if (req.sectorInfo.role === "commander") ids = ids.filter(id => id !== req.user.id);   // سجل القائد نفسه ما يطلع له
+        const only = String(req.query.discord || "").trim();
+        let target = ids;
+        if (only) {
+            if (!ids.includes(only)) return res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" });
+            target = [only];
+        }
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 400, 1), 800);
+        const logs = target.length ? await Log.find({ discordId: { $in: target }, action: { $not: SECTOR_LOG_HIDE } }).sort({ createdAt: -1 }).limit(limit).lean() : [];
+        const people = ids.length ? await Personnel.find({ discord: { $in: ids } }, { registeredName: 1, discordTag: 1, rank: 1 }).lean() : [];
+        const byId = {};
+        people.forEach(p => { byId[p.discord] = p; });
+        const members = people.filter(p => p.registeredName).map(p => ({ id: p.discord, name: p.registeredName })).sort((a, b) => a.name.localeCompare(b.name, "ar"));
+        const list = logs.map(l => {
+            const p = byId[l.discordId] || {};
+            return {
+                id: String(l._id), at: l.createdAt, action: l.action,
+                details: sectorLogDetails(l.action, l.details), cat: sectorLogCat(l.action, l.details),
+                actor: l.actorTag || null,
+                targetId: l.discordId, targetName: p.registeredName || l.discordTag || l.discordId, targetRank: p.rank || null,
+            };
+        });
+        res.json({ sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel, members, list });
+    } catch (e) {
+        console.error("❌ personnel-log:", e.message);
+        res.status(500).json({ error: "تعذر تحميل السجل" });
+    }
 });
 
 app.get("/api/high-command/promotion-requests", ensureHighCommand, async (req, res) => {
@@ -4624,7 +4743,7 @@ async function approveExtraRequest(r0, req, res) {
     const revert = async (msg, code = 404) => { await PromotionRequest.updateOne({ _id: r._id }, { $set: { status: "pending" }, $unset: { reviewedBy: "", reviewedByTag: "", reviewedAt: "" } }); return res.status(code).json({ error: msg }); };
     const settings = await getSettings();
     const name = r.targetName || r.targetTag;
-    const sl = (settings.sectorLeadership || {})[r.sector];
+    const sl = secLead(settings, r.sector);
     const commanderId = sl && sl.commanderId && sl.commanderId !== r.requestedBy ? sl.commanderId : null;
 
     if (kind === "points") {
@@ -4694,7 +4813,7 @@ app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, 
             issuedBy: req.user.id, issuedByTag: req.user.username,
         } } });
     }
-    const sl = (settings.sectorLeadership || {})[r.sector];
+    const sl = secLead(settings, r.sector);
     if (sl && sl.commanderId && sl.commanderId !== r.requestedBy) {
         await Personnel.findOneAndUpdate({ discord: sl.commanderId }, { $push: { warnings: {
             kind: "notice", reason: `🎖️ تمت ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من ${oldRank} إلى ${r.toRank} بأمر القيادة العليا.`,
@@ -6580,6 +6699,7 @@ app.post("/api/support/admin/tickets/:id/person", async (req, res) => {
     if (sectorChanged && secAcc) {
         const oldSec = secAcc.sector || null;
         secAcc.sector = newSector;
+        secAcc.isMP = (newSector === "mp");
         await secAcc.save();
         await logEvent({ action: "تغيير قطاع", discordId: np.discord, discordTag: np.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${np.registeredName || np.discord}: ${oldSec ? CONFIG.SECTORS[oldSec] : "بدون قطاع"} ← ${newSector ? CONFIG.SECTORS[newSector] : "بدون قطاع"} — من تكت خدمة العملاء #${t.no}` });
     }
@@ -9805,7 +9925,7 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
         return res.status(500).json({ error: "تعذر إرسال العذر، حاول مرة ثانية" });
     }
     const settings = await getSettings();
-    const sec = (settings.sectorLeadership && row.sectorKey && settings.sectorLeadership[row.sectorKey]) || {};
+    const sec = (row.sectorKey && secLead(settings, row.sectorKey)) || {};
     const targets = Array.from(new Set([sec.commanderId, sec.deputyId, sec.personnelOfficerId].filter(x => x && x !== req.user.id)));
     const text = "🩺 تنبيه: العضو " + row.name + " (" + (row.rank || "-") + " • " + (row.unit || "-") + ") قدّم عذر غياب عن الاستلام — النوع: " + EXCUSE_TYPE_LABEL[type] + " — السبب: " + reason.slice(0, 150) + " — القرار عند القيادة العليا.";
     for (const t of targets) {
@@ -16823,7 +16943,7 @@ function renderSectorPanel() {
             <div class="tab" onclick="sectorTab('file', this)">عرض ملف عسكري</div>
             <div class="tab" onclick="sectorTab('promotions', this)">ترقيات الأفراد</div>
             <div class="tab" onclick="sectorTab('leave', this)">🌴 طلبات الإجازات</div>
-            \${ME.sectorInfo.role === 'commander' ? \`<div class="tab" onclick="sectorTab('att', this)">🖐️ التحضير</div><div class="tab" onclick="sectorTab('officers', this)">👤 مسؤول التحضير والمخالفات</div>\` : ''}
+            \${ME.sectorInfo.role === 'commander' ? \`<div class="tab" onclick="sectorTab('att', this)">🖐️ التحضير</div><div class="tab" onclick="sectorTab('officers', this)">👤 مسؤول التحضير والمخالفات</div><div class="tab" onclick="sectorTab('plog', this)">📜 سجل الأفراد</div>\` : ''}
         </div>
         <div id="sector-content"></div>\`;
     sectorTab('members');
@@ -16885,12 +17005,60 @@ async function removePersonnelOfficer() {
         renderSectorPanel();
     } catch (e) { toast(e.message); }
 }
+var secLogState = { discord: '', cat: '' };
+var secLogCache = null;
+var SEC_LOG_CATS = [['', 'الكل'], ['rank', '🎖️ ترقيات وتنزيلات'], ['penalty', '⚠️ عقوبات وإنذارات'], ['note', '📝 ملاحظات'], ['points', '⭐ نقاط'], ['viol', '🚨 مخالفات'], ['att', '🌴 حضور وإجازات'], ['other', 'أخرى']];
+async function loadSectorPersonnelLog(keep) {
+    var box = document.getElementById('sector-content');
+    if (!box) return;
+    if (!keep) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try { secLogCache = await api('/api/sector/personnel-log' + (secLogState.discord ? '?discord=' + encodeURIComponent(secLogState.discord) : '')); }
+    catch (e) {
+        if (sectorPanelTab !== 'plog') return;
+        box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>';
+        return;
+    }
+    if (sectorPanelTab !== 'plog') return;
+    renderSectorPersonnelLog();
+}
+function setSecLogMember(v) { secLogState.discord = v || ''; loadSectorPersonnelLog(true); }
+function setSecLogCat(v) { secLogState.cat = v || ''; renderSectorPersonnelLog(); }
+function secLogFmt(t) {
+    try { return new Date(t).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '-'; }
+}
+function renderSectorPersonnelLog() {
+    var box = document.getElementById('sector-content');
+    var d = secLogCache;
+    if (!box || !d) return;
+    var all = d.list || [];
+    var list = all.filter(function (r) { return !secLogState.cat || r.cat === secLogState.cat; });
+    var opts = '<option value="">كل أفراد القطاع</option>' + (d.members || []).map(function (m) {
+        return '<option value="' + accEsc(m.id) + '"' + (m.id === secLogState.discord ? ' selected' : '') + '>' + accEsc(m.name) + '</option>';
+    }).join('');
+    var chips = SEC_LOG_CATS.map(function (c) {
+        return '<button class="btn sm ' + (secLogState.cat === c[0] ? '' : 'gray') + '" data-c="' + c[0] + '" onclick="setSecLogCat(this.dataset.c)">' + c[1] + '</button>';
+    }).join('');
+    var head = '<div class="card"><h3>📜 سجل أفراد ' + accEsc(d.sectorLabel || '') + '</h3>' +
+        '<div style="color:var(--muted);font-size:12px;margin:4px 0 8px;">كل شي صار على أفراد قطاعك: الترقيات والتنزيلات (ومن رقّاهم من القيادة العليا والرتبة الجديدة)، العقوبات، الملاحظات، النقاط وغيرها. هذا التبويب لك أنت بس كقائد، النائب وباقي المسؤولين ما يشوفونه.</div>' +
+        '<select onchange="setSecLogMember(this.value)">' + opts + '</select>' +
+        '<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px;justify-content:flex-start;">' + chips + '</div>' +
+        '<div style="color:var(--muted);font-size:12px;margin-top:6px;">عدد السجلات: ' + list.length + '</div></div>';
+    if (!list.length) { box.innerHTML = head + '<div class="card center" style="color:var(--muted);">لا يوجد سجل</div>'; return; }
+    box.innerHTML = head + list.map(function (r) {
+        return '<div class="card"><div class="row"><b>' + accEsc(r.targetName || '-') + (r.targetRank ? ' <span style="color:var(--muted);font-size:12px;font-weight:normal;">(' + accEsc(r.targetRank) + ')</span>' : '') + '</b>' +
+            '<span style="color:var(--muted);font-size:12px;">' + accEsc(secLogFmt(r.at)) + '</span></div>' +
+            '<div style="color:var(--gold-soft);margin-top:4px;">' + accEsc(r.action || '-') + '</div>' +
+            (r.details ? '<div style="color:var(--muted);font-size:13px;margin-top:2px;">' + accEsc(r.details) + '</div>' : '') +
+            '<div style="color:var(--muted);font-size:12px;margin-top:2px;">بواسطة: ' + accEsc(r.actor || 'النظام (تلقائي)') + '</div></div>';
+    }).join('');
+}
 function sectorTab(name, el) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     if (el) el.classList.add('active');
     sectorPanelTab = name;
     if (name === 'att') return loadSectorAtt();
     if (name === 'officers') return loadSectorOfficers();
+    if (name === 'plog') return loadSectorPersonnelLog();
     if (name === 'members') loadSectorMembers();
     if (name === 'violations') loadSectorViolations();
     if (name === 'file') renderSectorFileSearch();
@@ -18245,7 +18413,7 @@ async function clearAllLogs() {
 }
 let accView_ = 'approved';
 let ACC_LIST = [];
-const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات'], ['cyber', 'الأمن السيبراني']];
+const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات'], ['cyber', 'الأمن السيبراني'], ['mp', 'الشرطة العسكرية']];
 function accEsc(t) {
     return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -18386,7 +18554,7 @@ function openAccEdit(uid) {
         '<label>البريد الإلكتروني</label><input id="ae-email" type="email" dir="ltr">' +
         '<label>كلمة المرور</label><input id="ae-pw" type="text" dir="ltr">' +
         '<label>القطاع</label>' + sec +
-        '<label class="acc-check"><input type="checkbox" id="ae-mp"> من الشرطة العسكرية</label>' +
+        '<label class="acc-check" style="display:none;"><input type="checkbox" id="ae-mp"> من الشرطة العسكرية</label>' +
         '<div class="row" style="gap:8px;margin-top:14px;"><button class="btn gray" onclick="closeAccEdit()">إلغاء</button>' +
         '<button class="btn" data-uid="' + a.uid + '" onclick="saveAccEdit(this)">💾 حفظ</button></div></div>';
     document.body.appendChild(ov);
