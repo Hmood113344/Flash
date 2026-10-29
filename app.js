@@ -10956,6 +10956,7 @@ app.get("/", (req, res) => {
     #wf-overlay.open { display: flex; }
     .wf-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 380px; width: 100%; text-align: center; max-height: 85vh; overflow-y: auto; margin: auto; }
     .wf-box h3 { margin-bottom: 14px; color: var(--gold-soft); }
+    .wf-box.wf-big { max-width: 520px; padding: 28px 24px; }
     .wf-choice-row { display: flex; gap: 10px; margin-top: 6px; }
     .wf-choice-row button { flex: 1; padding: 14px 8px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: #fff; }
     .wf-choice-row button.wf-warning:hover { border-color: #f87171; background: rgba(248,113,113,0.12); }
@@ -11815,6 +11816,7 @@ async function warnFormReason(discord, apiBase, kind) {
 function closeWarnForm() {
     document.getElementById('wf-overlay').classList.remove('open');
     document.getElementById('wf-box').innerHTML = '';
+    document.getElementById('wf-box').classList.remove('wf-big');
 }
 async function submitWarnForm(discord, apiBase, kind) {
     const reason = document.getElementById('wf-reason').value;
@@ -11909,59 +11911,25 @@ async function submitSectorNoteForm(hasEvidence) {
     } catch (e) { toast(e.message); }
 }
 
-let summonFormCtx = null;
-function openSummonForm(discord, apiPath, reloadCall) {
-    summonFormCtx = { discord, apiPath, reloadCall };
-    const box = document.getElementById('wf-box');
-    box.innerHTML = \`
-        <h3>📣 استدعاء عسكري</h3>
-        <div class="wf-choice-row">
-            <button class="wf-warning" onclick="summonPickMode('now')">⏱️ الآن</button>
-            <button class="wf-notice" onclick="summonPickMode('scheduled')">🕒 وقت محدد</button>
-        </div>
-        <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
+var summonChoiceCtx = null;
+function openSummonChoice(discord) {
+    summonChoiceCtx = { discord: discord };
+    var box = document.getElementById('wf-box');
+    box.classList.add('wf-big');
+    box.innerHTML = '<h3>📣 استدعاء</h3>' +
+        '<div style="color:var(--muted);font-size:14px;margin-bottom:14px;">وش نوع الاستدعاء؟</div>' +
+        '<div class="wf-choice-row" style="gap:14px;">' +
+        '<button class="wf-notice" style="padding:38px 10px;font-size:20px;font-weight:bold;" data-k="inv" onclick="summonChoiceGo(this.dataset.k)"><div style="font-size:38px;margin-bottom:8px;">🔎</div>تحقيق</button>' +
+        '<button class="wf-warning" style="padding:38px 10px;font-size:20px;font-weight:bold;" data-k="court" onclick="summonChoiceGo(this.dataset.k)"><div style="font-size:38px;margin-bottom:8px;">⚖️</div>محكمة</button>' +
+        '</div>' +
+        '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>';
     document.getElementById('wf-overlay').classList.add('open');
 }
-function summonPickMode(mode) {
-    const box = document.getElementById('wf-box');
-    if (mode === 'now') {
-        box.innerHTML = \`
-            <h3>⏱️ استدعاء فوري</h3>
-            <p style="font-size:13px;color:var(--muted);margin-top:6px;">بيوصل للعضو إشعار "لديك استدعاء" فوراً.</p>
-            <div class="wf-actions">
-                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
-                <button class="btn sm" onclick="submitSummonForm('now')">إرسال</button>
-            </div>\`;
-        return;
-    }
-    box.innerHTML = \`
-        <h3>🕒 حدد وقت الاستدعاء</h3>
-        <div class="row" style="gap:8px;">
-            <input type="number" id="sf-hour" placeholder="الساعة (1-12)" min="1" max="12" style="width:33%;">
-            <input type="number" id="sf-minute" placeholder="الدقيقة" min="0" max="59" style="width:33%;">
-            \${csHtml('sf-ampm', [['صباح', 'صباح'], ['مساء', 'مساء']], 'صباح', { style: 'width:33%;margin-bottom:0;' })}
-        </div>
-        <div class="wf-actions">
-            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
-            <button class="btn sm" onclick="submitSummonForm('scheduled')">إرسال</button>
-        </div>\`;
+function summonChoiceGo(kind) {
+    var c = summonChoiceCtx; if (!c) return;
+    var box = document.getElementById('wf-box'); if (box) box.classList.remove('wf-big');
+    if (kind === 'inv') invStartBtn(c.discord); else courtStartBtn(c.discord);
 }
-async function submitSummonForm(mode) {
-    const body = { mode };
-    if (mode === 'scheduled') {
-        body.hour = document.getElementById('sf-hour').value;
-        body.minute = document.getElementById('sf-minute').value;
-        body.ampm = document.getElementById('sf-ampm').value;
-        if (!body.hour || !body.minute) return toast('حدد الوقت كاملاً');
-    }
-    try {
-        const r = await api(summonFormCtx.apiPath + summonFormCtx.discord + '/summon', { method: 'POST', body: JSON.stringify(body) });
-        toast(r.pending ? '✅ تم إرسال طلب الاستدعاء لقيادة الشرطة العسكرية' : '✅ تم إرسال الاستدعاء');
-        closeWarnForm();
-        if (summonFormCtx.reloadCall) { try { Function(summonFormCtx.reloadCall)(); } catch (e) {} }
-    } catch (e) { toast(e.message); }
-}
-
 function openWarnAllForm() {
     const box = document.getElementById('wf-box');
     box.innerHTML = \`
@@ -17390,7 +17358,6 @@ function renderMPPanel() {
             <div class="tab active" onclick="mpTabSwitch('members', this)">👤 العساكر</div>
             <div class="tab" onclick="mpTabSwitch('force', this)">🚔 أفراد الشرطة العسكرية</div>
             <div class="tab" onclick="mpTabSwitch('file', this)">📇 عرض ملف عسكري</div>
-            <div class="tab" onclick="mpTabSwitch('requests', this)">📣 طلبات الاستدعاء</div>
             <div class="tab" onclick="mpTabSwitch('points', this)">⭐ طلبات النقاط</div>
             <div class="tab" onclick="mpTabSwitch('reports', this)">📄 التقارير</div>
             <div class="tab" onclick="mpTabSwitch('log', this)">📜 لوق القطاعات</div>
@@ -17451,7 +17418,6 @@ function mpTabSwitch(name, el) {
     if (name === 'members') loadMPMembers();
     if (name === 'force') loadMPForceMembers();
     if (name === 'file') renderMPFileSearch();
-    if (name === 'requests') loadMPSummonRequests();
     if (name === 'points') loadMPPointsRequests();
     if (name === 'reports') loadMPReports();
     if (name === 'log') loadMPSectorLog();
@@ -17498,25 +17464,16 @@ function renderMPLeaderMembersList(list) {
             <div class="row">
                 <div>
                     <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
-                    \${p.summon && p.summon.status === 'approved' ? \`<div style="color:#f59e0b;font-size:12px;margin-top:3px;">📣 عليه استدعاء نشط — \${p.summon.timeLabel || ''}\${p.summon.enteredAt ? ' (دخل الاستدعاء)' : ''}</div>\` : ''}
-                    \${p.summon && p.summon.status === 'pending' ? '<div style="color:#fbbf24;font-size:12px;margin-top:3px;">⏳ طلب استدعاء بانتظار قبولك</div>' : ''}
                 </div>
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📝 ملاحظة</button>
                     <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/mp/personnel/')">⚠️ تحذير</button>
                     <button class="btn sm gray" onclick="openMPPointsForm('\${p.discord}')">⭐ نقاط</button>
-                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ محكمة</button>
-                    <button class="btn sm" style="background:#0f766e;color:#fff;" onclick="invStartBtn('\${p.discord}')">🔎 تحقيق</button>
-                    \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📣 استدعاء</button>\` : ''}
-                    \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">✅ إنهاء الاستدعاء</button>\` : ''}
+                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="openSummonChoice('\${p.discord}')">📣 استدعاء</button>
                 </div>
             </div>
         </div>\`).join('');
-}
-function mpStopSummon(discord) {
-    api('/api/mp/personnel/' + discord + '/summon/stop', { method: 'POST' })
-        .then(() => { toast('✅ تم إنهاء الاستدعاء'); loadMPMembers(); }).catch(e => toast(e.message));
 }
 function renderMPFileSearch() {
     const box = document.getElementById('mp-content');
@@ -17560,40 +17517,11 @@ async function viewMPFile(discord) {
                     <tr><td>النقاط</td><td>\${p.points}</td></tr>
                     <tr><td>متبقي للترقية</td><td>\${progress.nextRank ? (progress.remaining + ' نقطة (' + progress.nextRank + ')') : 'وصل لأعلى رتبة'}</td></tr>
                     <tr><td>الحالة</td><td>\${p.isBlocked ? 'موقوف' : 'فعّال'}</td></tr>
-                    \${p.summon && p.summon.status !== 'none' ? \`<tr><td>الاستدعاء</td><td>\${p.summon.status === 'approved' ? '📣 نشط — ' + (p.summon.timeLabel || '') : '⏳ طلب معلّق'}</td></tr>\` : ''}
                 </table>
                 \${p.notes && p.notes.length ? '<div style="margin-top:10px;font-size:13px;color:var(--gold-soft);">الملاحظات:</div>' +
                     p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}\${(n.image || (n.imageChannelId && n.imageMessageId)) ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${p.discord}','\${n._id}')">📷 عرض الصورة</button>\` : ''}</div>\`).join('') : ''}
             </div>\`;
     } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
-}
-async function loadMPSummonRequests() {
-    const box = document.getElementById('mp-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let data;
-    try { data = await api('/api/mp/summon-requests'); }
-    catch (e) { if (mpTab !== 'requests') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
-    if (mpTab !== 'requests') return;
-    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات استدعاء معلّقة</div>'; return; }
-    box.innerHTML = data.list.map(p => \`
-        <div class="card">
-            <div class="row">
-                <div>
-                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.rank}</span>
-                    <div style="color:var(--gold-soft);margin-top:4px;">🕒 \${p.summon.timeLabel}</div>
-                </div>
-                <div class="row" style="gap:8px;">
-                    <button class="btn sm" onclick="mpSummonReqDecide('\${p.discord}','approve')">قبول</button>
-                    <button class="btn danger sm" onclick="mpSummonReqDecide('\${p.discord}','reject')">رفض</button>
-                </div>
-            </div>
-        </div>\`).join('');
-}
-function mpSummonReqDecide(discord, action) {
-    api('/api/mp/summon-requests/' + discord + '/' + action, { method: 'POST' })
-        .then(() => { toast(action === 'approve' ? '✅ تم قبول الاستدعاء' : 'تم رفض الطلب'); loadMPSummonRequests(); })
-        .catch(e => toast(e.message));
 }
 let mpPoListCache = [];
 let mpPtsCtx = null;
@@ -17882,8 +17810,7 @@ async function loadMPPOMembers() {
                 <div><b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span></div>
                 <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/po/personnel/','loadMPPOMembers()')">📝 ملاحظة</button>
                 <button class="btn sm gray" onclick="openMPPointsForm('\${p.discord}')">⭐ نقاط</button>
-                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ محكمة</button>
-                    <button class="btn sm" style="background:#0f766e;color:#fff;" onclick="invStartBtn('\${p.discord}')">🔎 تحقيق</button>
+                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="openSummonChoice('\${p.discord}')">📣 استدعاء</button>
             </div>
         </div>\`).join('');
 }
@@ -17964,16 +17891,12 @@ function renderMPMemberList(list) {
             <div class="row">
                 <div>
                     <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
-                    \${p.summon && p.summon.status === 'approved' ? '<div style="color:#f59e0b;font-size:12px;margin-top:3px;">📣 عليه استدعاء نشط</div>' : ''}
-                    \${p.summon && p.summon.status === 'pending' ? '<div style="color:#fbbf24;font-size:12px;margin-top:3px;">⏳ في طلب استدعاء بانتظار القيادة</div>' : ''}
                 </div>
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📝 ملاحظة</button>
                     <button class="btn sm gray" onclick="openMPPointsForm('\${p.discord}')">⭐ نقاط</button>
-                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="courtStartBtn('\${p.discord}')">⚖️ محكمة</button>
-                    <button class="btn sm" style="background:#0f766e;color:#fff;" onclick="invStartBtn('\${p.discord}')">🔎 تحقيق</button>
-                    \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📣 طلب استدعاء</button>\` : ''}
+                    <button class="btn sm" style="background:#92400e;color:#fff;" onclick="openSummonChoice('\${p.discord}')">📣 استدعاء</button>
                 </div>
             </div>
         </div>\`).join('');
