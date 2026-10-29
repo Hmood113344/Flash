@@ -1,3 +1,45 @@
+// ===================== نظام النشر من فلاش المطورين (Release Loader) =====================
+// فلاش الرسمي: لو وصله إصدار من فلاش المطورين (محفوظ بالداتابيس) يشغله بدل هذا الملف. أي خطأ => يكمل بهذا الملف عادي.
+const __DEV_MODE__ = /^(1|true|yes)$/i.test(String(process.env.DEV_MODE || ""));
+(function () {
+    try {
+        const fs = require("fs"), path = require("path"), zlib = require("zlib"), cr = require("crypto");
+        if (global.__FLASH_RELEASE__) return;
+        const baseCode = fs.readFileSync(__filename);
+        global.__FLASH_BASE_HASH__ = cr.createHash("sha256").update(baseCode).digest("hex");
+        global.__FLASH_BASE_FILE__ = __filename;
+        if (__DEV_MODE__ || !process.env.MONGO_URI || !process.env.DEPLOY_SECRET) return;
+        const fetchScript = 'const M=require("mongoose").mongo.MongoClient;(async()=>{const c=new M(process.env.MONGO_URI,{serverSelectionTimeoutMS:15000});await c.connect();' +
+            'const d=await c.db().collection("flash_releases").find({bad:{$ne:true},baseHash:process.env.FLASH_BASE_HASH}).sort({at:-1}).limit(1).toArray();await c.close();' +
+            'process.stdout.write(JSON.stringify(d[0]?{hash:d[0].hash,code:d[0].code}:null));})().catch(()=>process.stdout.write("null"));';
+        let out = "null";
+        try {
+            out = require("child_process").execFileSync(process.execPath, ["-e", fetchScript], {
+                cwd: __dirname, timeout: 30000, maxBuffer: 64 * 1024 * 1024,
+                env: Object.assign({}, process.env, { FLASH_BASE_HASH: global.__FLASH_BASE_HASH__ }), stdio: ["ignore", "pipe", "ignore"],
+            }).toString("utf8");
+        } catch (e) { return; }
+        const rel = JSON.parse(out || "null");
+        if (!rel || !rel.code || !rel.hash) return;
+        const code = zlib.gunzipSync(Buffer.from(rel.code, "base64"));
+        if (cr.createHash("sha256").update(code).digest("hex") !== rel.hash) return;
+        // حماية من حلقة الانهيار: لو الإصدار فشل يقوم 3 مرات ورا بعض، نرجع لهذا الملف
+        const markerFile = path.join(__dirname, "flash_boot.json");
+        let mk = {}; try { mk = JSON.parse(fs.readFileSync(markerFile, "utf8")); } catch (e) {}
+        const tries = mk.hash === rel.hash ? (mk.tries || 0) : 0;
+        if (tries >= 3) { console.log("⚠️ الإصدار المنشور ما اشتغل 3 مرات، نكمل بالملف الأصلي"); return; }
+        fs.writeFileSync(markerFile, JSON.stringify({ hash: rel.hash, tries: tries + 1 }));
+        const relPath = path.join(__dirname, "flash_release.js");
+        fs.writeFileSync(relPath, code);
+        global.__FLASH_RELEASE__ = rel.hash;
+        console.log("📦 تشغيل الإصدار المنشور " + rel.hash.slice(0, 12));
+        try { require(relPath); }
+        catch (e) { console.error("❌ الإصدار المنشور فشل عند التشغيل:", e && e.stack || e); process.exit(1); }
+        global.__FLASH_RELEASE_LOADED__ = true;
+    } catch (e) { console.log("⚠️ Release loader:", e && e.message); }
+})();
+if (global.__FLASH_RELEASE_LOADED__) return;
+// ==========================================================================================
 
 const express = require("express");
 const session = require("express-session");
@@ -32,7 +74,7 @@ const CONFIG = {
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
-    SITE_NAME: "فلاش",
+    SITE_NAME: __DEV_MODE__ ? "فلاش المطورين" : "فلاش",
     SITE_URL: process.env.SITE_URL || (process.env.DISCORD_CALLBACK_URL ? process.env.DISCORD_CALLBACK_URL.replace(/\/auth\/discord\/callback.*$/, "") : "https://flash1-gtsp.onrender.com"),
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7700,
@@ -1755,6 +1797,78 @@ const app = express();
 });
 
 app.use(express.json({ limit: "8mb" }));
+// ================= النشر من فلاش المطورين إلى فلاش الرسمي =================
+// المتغيرات: DEPLOY_SECRET (نفس القيمة على الموقعين) — وعلى المطورين بس: DEV_MODE=1 و DEPLOY_TARGET_URL (رابط الرسمي)
+const DEPLOY_SETTINGS_KEYS = ["rankThresholds", "warningPenalties", "leaveBalanceDefault", "notifTitle", "notifBody", "supportCanned", "attConfig"];
+const deploySha = (x) => crypto.createHash("sha256").update(x).digest("hex");
+const deploySign = (secret, ts, action, hash, setHash) => crypto.createHmac("sha256", secret).update([ts, action, hash || "", setHash || ""].join(".")).digest("hex");
+function deployRunningHash() { return global.__FLASH_RELEASE__ || global.__FLASH_BASE_HASH__ || ""; }
+function deployRestartSoon() { setTimeout(() => { console.log("🔄 إعادة تشغيل بعد النشر..."); process.exit(0); }, 1500); }
+
+// ---- الاستقبال (فلاش الرسمي فقط) ----
+app.post("/deploy/receive", async (req, res) => {
+    if (__DEV_MODE__) return res.status(404).json({ error: "غير متاح" });
+    const secret = String(process.env.DEPLOY_SECRET || "");
+    if (!secret) return res.status(503).json({ error: "DEPLOY_SECRET غير مضبوط على الرسمي" });
+    const b = req.body || {};
+    const ts = Number(b.ts || 0), action = String(b.action || "");
+    if (!ts || Math.abs(Date.now() - ts) > 5 * 60 * 1000) return res.status(401).json({ error: "الوقت غير متطابق بين الموقعين (فرق أكثر من 5 دقايق)" });
+    const settingsJson = typeof b.settingsJson === "string" ? b.settingsJson : "";
+    const expect = deploySign(secret, ts, action, String(b.hash || ""), settingsJson ? deploySha(settingsJson) : "");
+    const got = String(b.sig || "");
+    if (got.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expect))) return res.status(401).json({ error: "التوقيع غلط — تأكد DEPLOY_SECRET نفسه على الموقعين" });
+    const col = mongoose.connection.db.collection("flash_releases");
+    const baseHash = global.__FLASH_BASE_HASH__ || "";
+
+    if (action === "status") {
+        const rels = await col.find({ baseHash }, { projection: { code: 0 } }).sort({ at: -1 }).limit(6).toArray();
+        return res.json({ ok: true, ver: APP_VER, running: deployRunningHash().slice(0, 12), fromRelease: !!global.__FLASH_RELEASE__, releases: rels.map(r => ({ hash: String(r.hash).slice(0, 12), at: +r.at, by: r.by || "", bad: !!r.bad })) });
+    }
+
+    if (action === "rollback") {
+        const last = await col.find({ baseHash, bad: { $ne: true } }).sort({ at: -1 }).limit(1).toArray();
+        if (!last.length) return res.status(400).json({ error: "ما فيه إصدار منشور للرجوع منه (الرسمي يشتغل على ملفه الأصلي)" });
+        await col.updateOne({ _id: last[0]._id }, { $set: { bad: true, badAt: new Date() } });
+        await logEvent({ action: "رجوع للنسخة السابقة (نشر)", actorId: "deploy", actorTag: String(b.by || "المطورين").slice(0, 60), details: String(last[0].hash).slice(0, 12) });
+        res.json({ ok: true, restart: true });
+        return deployRestartSoon();
+    }
+
+    if (action === "publish") {
+        let restart = false, codeNote = "";
+        if (b.code) {
+            if (typeof b.code !== "string" || b.code.length > 30 * 1024 * 1024) return res.status(400).json({ error: "الكود كبير أو غير صالح" });
+            let code;
+            try { code = require("zlib").gunzipSync(Buffer.from(b.code, "base64")); } catch (e) { return res.status(400).json({ error: "فشل فك ضغط الكود" }); }
+            if (deploySha(code) !== String(b.hash || "")) return res.status(400).json({ error: "الكود وصل ناقص (الهاش ما يطابق)" });
+            try { new (require("vm").Script)(require("module").wrap(code.toString("utf8")), { filename: "release.js" }); }
+            catch (e) { return res.status(400).json({ error: "الكود فيه خطأ كتابة ورفضه الرسمي: " + e.message }); }
+            const lastRel = await col.find({ baseHash, bad: { $ne: true } }, { projection: { hash: 1 } }).sort({ at: -1 }).limit(1).toArray();
+            if (b.hash === deployRunningHash() || (lastRel.length && lastRel[0].hash === b.hash)) { codeNote = "نفس النسخة اللي شغالة، ما تغير الكود"; }
+            else {
+                await col.insertOne({ hash: b.hash, baseHash, at: new Date(), by: String(b.by || "").slice(0, 60), code: b.code, bad: false });
+                const old = await col.find({ baseHash }, { projection: { _id: 1 } }).sort({ at: -1 }).skip(5).toArray();
+                if (old.length) await col.deleteMany({ _id: { $in: old.map(o => o._id) } });
+                restart = true; codeNote = "تم حفظ النسخة الجديدة";
+            }
+        }
+        let setNote = "";
+        if (settingsJson) {
+            let o; try { o = JSON.parse(settingsJson); } catch (e) { return res.status(400).json({ error: "الإعدادات غير صالحة" }); }
+            const s = await getSettings();
+            let n = 0;
+            for (const k of DEPLOY_SETTINGS_KEYS) if (Object.prototype.hasOwnProperty.call(o, k) && o[k] !== undefined) { s[k] = o[k]; s.markModified(k); n++; }
+            await s.save();
+            setNote = "انتقلت " + n + " إعدادات";
+        }
+        await logEvent({ action: "نشر من فلاش المطورين", actorId: "deploy", actorTag: String(b.by || "المطورين").slice(0, 60), details: [codeNote, setNote].filter(Boolean).join(" | ") });
+        res.json({ ok: true, restart, codeNote, setNote });
+        if (restart) deployRestartSoon();
+        return;
+    }
+    res.status(400).json({ error: "أمر غير معروف" });
+});
+
 // ================= تثبيت الموقع كتطبيق (إضافة للشاشة الرئيسية) =================
 const FLASH_ICONS = (function () {
     const zlib = require("zlib");
@@ -1802,7 +1916,7 @@ function makeIcon(size) {
     return { 180: makeIcon(180), 192: makeIcon(192), 512: makeIcon(512) };
 })();
 const FLASH_MANIFEST = JSON.stringify({
-    id: "/", name: "فلاش", short_name: "فلاش",
+    id: "/", name: __DEV_MODE__ ? "فلاش المطورين" : "فلاش", short_name: __DEV_MODE__ ? "فلاش DEV" : "فلاش",
     start_url: "/", scope: "/", display: "standalone",
     background_color: "#0a1628", theme_color: "#0a1628", lang: "ar", dir: "rtl",
     icons: [
@@ -4175,6 +4289,59 @@ app.post("/api/owner/officer-requests/:id/reject", ensureAuth, async (req, res) 
     a.stage = "rejected"; a.rejectedAt = "application";
     await a.save();
     res.json({ ok: true });
+});
+
+// ---- الإرسال (فلاش المطورين فقط، للمالك) ----
+async function deployCall(action, extra) {
+    const secret = String(process.env.DEPLOY_SECRET || "");
+    const target = String(process.env.DEPLOY_TARGET_URL || "").replace(/\/+$/, "");
+    if (!secret || !target) throw new Error("ضبط DEPLOY_SECRET و DEPLOY_TARGET_URL على فلاش المطورين أول");
+    const ts = Date.now();
+    const x = extra || {};
+    const sig = deploySign(secret, ts, action, x.hash || "", x.settingsJson ? deploySha(x.settingsJson) : "");
+    let r;
+    try { r = await fetch(target + "/deploy/receive", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ ts, action, sig }, x)), signal: AbortSignal.timeout(90000) }); }
+    catch (e) { throw new Error("ما قدرت أوصل للرسمي: " + (e && e.message ? e.message : e)); }
+    let j = null; try { j = await r.json(); } catch (e) {}
+    if (!r.ok || !j || j.ok === false) throw new Error((j && j.error) || ("الرسمي رد بخطأ " + r.status));
+    return j;
+}
+function devOwnerOnly(req, res) {
+    if (!__DEV_MODE__) { res.status(404).json({ error: "متاح فقط في فلاش المطورين" }); return false; }
+    if (!isOwnerUid(req.user.id)) { res.status(403).json({ error: "غير مصرح" }); return false; }
+    return true;
+}
+app.get("/api/dev/publish/info", ensureAuth, async (req, res) => {
+    if (!devOwnerOnly(req, res)) return;
+    const code = require("fs").readFileSync(__filename);
+    const out = { devHash: deploySha(code).slice(0, 12), target: String(process.env.DEPLOY_TARGET_URL || ""), configured: !!(process.env.DEPLOY_SECRET && process.env.DEPLOY_TARGET_URL), official: null, officialError: "" };
+    if (out.configured) { try { out.official = await deployCall("status"); } catch (e) { out.officialError = e.message; } }
+    res.json(out);
+});
+app.post("/api/dev/publish", ensureAuth, async (req, res) => {
+    if (!devOwnerOnly(req, res)) return;
+    const wantCode = !!(req.body || {}).code, wantSettings = !!(req.body || {}).settings;
+    if (!wantCode && !wantSettings) return res.status(400).json({ error: "اختار شي تنشره (الكود أو الإعدادات)" });
+    const extra = { by: req.user.username || "المطورين" };
+    if (wantCode) {
+        const code = require("fs").readFileSync(__filename);
+        extra.hash = deploySha(code);
+        extra.code = require("zlib").gzipSync(code).toString("base64");
+    }
+    if (wantSettings) {
+        const s = await getSettings();
+        const o = s.toObject({ flattenMaps: true }), pick = {};
+        for (const k of DEPLOY_SETTINGS_KEYS) if (o[k] !== undefined) pick[k] = o[k];
+        extra.settingsJson = JSON.stringify(pick);
+    }
+    const j = await deployCall("publish", extra);
+    await logEvent({ action: "نشر لفلاش الرسمي", actorId: req.user.id, actorTag: req.user.username, details: [j.codeNote, j.setNote].filter(Boolean).join(" | ") });
+    res.json(j);
+});
+app.post("/api/dev/rollback", ensureAuth, async (req, res) => {
+    if (!devOwnerOnly(req, res)) return;
+    const j = await deployCall("rollback", { by: req.user.username || "المطورين" });
+    res.json(j);
 });
 
 app.get("/api/owner/updates", ensureAuth, async (req, res) => {
@@ -10674,10 +10841,10 @@ app.get("/", (req, res) => {
 <link rel="apple-touch-icon" href="/icon-180.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="فلاش">
+<meta name="apple-mobile-web-app-title" content="${__DEV_MODE__ ? 'فلاش DEV' : 'فلاش'}">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="theme-color" content="#0a1628">
-<script>window.APP_VER = "${APP_VER}";</script>
+<script>window.APP_VER = "${APP_VER}"; window.IS_DEV = ${__DEV_MODE__ ? "true" : "false"};</script>
 <script>if ('serviceWorker' in navigator) { window.addEventListener('load', function () { navigator.serviceWorker.register('/sw.js').catch(function () {}); }); }</script>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
@@ -11325,6 +11492,7 @@ app.get("/", (req, res) => {
 </div>
 </head>
 <body>
+${__DEV_MODE__ ? '<div style="position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:99999;background:#16a34a;color:#fff;font-size:11px;font-weight:700;padding:1px 14px;border-radius:0 0 10px 10px;pointer-events:none;">🧪 نسخة المطورين</div>' : ''}
 <div id="fl-splash">
     <svg viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="flSplashG" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs><path pathLength="1" d="M58 8 L26 55 L46 55 L40 92 L74 42 L54 42 L64 8 Z"/></svg>
     <div class="fl-name">${CONFIG.SITE_NAME}</div>
@@ -11390,6 +11558,7 @@ app.get("/", (req, res) => {
     <button class="btn sm" style="background:#0e7490;" onclick="offaOpenCommandCenter()">🖥️ غرفة التحكم</button>
     <button class="btn sm" style="background:#be123c;" onclick="offaOpenLive()">📡 العمليات الحية</button>
     <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenUpdates()">🛠️ تحديثات المطور</button>
+    ${__DEV_MODE__ ? '<button class="btn sm" style="background:#16a34a;" onclick="devOpenPublish()">🚀 نشر للرسمي</button>' : ''}
     <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
     <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
     <button id="owner-lock-btn" class="btn sm danger" onclick="offaToggleLockdown()">🚨 إغلاق الموقع</button>
@@ -14482,6 +14651,50 @@ async function offaDeleteUpdate(id) {
         await api('/api/owner/updates/' + id, { method: 'DELETE', noLock: true });
         toast('🗑️ تم الحذف');
         offaOpenUpdates();
+    } catch (e) { toast(e.message); }
+}
+
+function devRelRow(r) {
+    return '<div style="font-size:12px;display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);"><span>' + spEsc(r.hash) + (r.bad ? ' ↩️ (مرجّع)' : '') + '</span><span style="color:var(--muted);">' + new Date(r.at).toLocaleString('ar-SA') + '</span></div>';
+}
+async function devOpenPublish() {
+    ccStopLive();
+    ownerModalOpen('🚀 النشر لفلاش الرسمي', '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/dev/publish/info', { noLock: true });
+        var h = '<div class="card" style="margin-bottom:10px;font-size:12px;">' +
+            '<div>🧪 نسخة المطورين الحالية: <b>' + spEsc(d.devHash) + '</b></div>';
+        if (!d.configured) h += '<div style="color:#f87171;margin-top:6px;">ضبط DEPLOY_SECRET و DEPLOY_TARGET_URL على هذا الموقع أول.</div>';
+        else if (d.officialError) h += '<div style="color:#f87171;margin-top:6px;">ما قدرت أوصل للرسمي: ' + spEsc(d.officialError) + '</div>';
+        else if (d.official) {
+            h += '<div style="margin-top:4px;">⚡ الرسمي شغال على: <b>' + spEsc(d.official.running) + '</b>' + (d.official.running === d.devHash ? ' ✅ نفس نسختك' : ' (يختلف عن نسختك)') + '</div>';
+            if (d.official.releases && d.official.releases.length) h += '<div style="margin-top:8px;"><b>آخر النسخ المنشورة:</b>' + d.official.releases.map(devRelRow).join('') + '</div>';
+        }
+        h += '</div>';
+        h += '<div class="card" style="margin-bottom:10px;">' +
+            '<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;margin-bottom:8px;"><input id="dp-code" type="checkbox" checked style="width:auto;margin-top:3px;"><span><b>نشر الكود</b><br><span style="color:var(--muted);font-size:11px;">الرسمي يحفظ النسخة ويعيد تشغيل نفسه، والأعضاء يتحدثون تلقائي بدون ما يسوون شي.</span></span></label>' +
+            '<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;"><input id="dp-set" type="checkbox" style="width:auto;margin-top:3px;"><span><b>نقل الإعدادات</b><br><span style="color:var(--muted);font-size:11px;">حدود الرتب، قائمة العقوبات، رصيد الإجازات، نص الإشعار، الردود الجاهزة، إعدادات الحضور. الحسابات والمناصب والبيانات ما تنتقل أبداً.</span></span></label>' +
+            '<button class="btn" style="margin-top:12px;width:100%;" onclick="devDoPublish()">🚀 نشر للرسمي</button>' +
+            '<button class="btn sm danger" style="margin-top:8px;width:100%;" onclick="devDoRollback()">↩️ رجوع للنسخة السابقة</button></div>';
+        ownerModalOpen('🚀 النشر لفلاش الرسمي', h);
+    } catch (e) { toast(e.message); }
+}
+async function devDoPublish() {
+    var c = !!(document.getElementById('dp-code') || {}).checked, s = !!(document.getElementById('dp-set') || {}).checked;
+    if (!c && !s) { toast('اختار شي تنشره'); return; }
+    if (!(await confirmModal('🚀 بينزل للرسمي الحين' + (c ? ' وبيعيد تشغيله ثواني والأعضاء يتحدثون تلقائي' : '') + '. متأكد؟'))) return;
+    try {
+        var j = await api('/api/dev/publish', { method: 'POST', body: JSON.stringify({ code: c, settings: s }), noLock: true });
+        toast('✅ ' + [j.codeNote, j.setNote].filter(Boolean).join(' - '));
+        setTimeout(devOpenPublish, 6000);
+    } catch (e) { toast(e.message); }
+}
+async function devDoRollback() {
+    if (!(await confirmModal('↩️ الرسمي بيرجع للنسخة اللي قبل آخر نشر (أو لملفه الأصلي) ويعيد تشغيله. متأكد؟'))) return;
+    try {
+        await api('/api/dev/rollback', { method: 'POST', noLock: true });
+        toast('↩️ تم الرجوع');
+        setTimeout(devOpenPublish, 6000);
     } catch (e) { toast(e.message); }
 }
 
@@ -22684,5 +22897,6 @@ process.on("uncaughtException", (err) => {
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`🚀 ${CONFIG.SITE_NAME} server running on port ${CONFIG.PORT}`);
+    if (global.__FLASH_RELEASE__) setTimeout(() => { try { require("fs").unlinkSync(require("path").join(__dirname, "flash_boot.json")); } catch (e) {} }, 90000).unref();
 });
 
