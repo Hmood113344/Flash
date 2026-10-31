@@ -19540,7 +19540,8 @@ const MC_LAYOUT = {
     antiDrugs:    { rows: [35.6, 45.4, 55.4, 65.6], gx: 24.7, gw: 24.0, photo: [77.5, 26.5, 18.1, 36.6], bc: [20.5, 75.4, 53.4, 12.5], adm: [23.5, 70.6] },
     roadSecurity: { rows: [35.0, 45.2, 55.4, 65.4], gx: 24.2, gw: 24.3, photo: [77.6, 25.6, 18.6, 37.3], bc: [20.5, 74.4, 55.0, 13.4], adm: [23.5, 69.6] },
     cyber:        { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
-    senior:       { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
+    // بطاقة كبار المسؤولين (الخلفية 1376×768): ثلاث خانات فقط (الاسم / الرتبة / الوحدة-اليونت في خانة «الكود العسكري») بدون رقم البطاقة وبدون القطاع، والنص أبيض لأن الخانات داكنة
+    senior:       { rows: [44.3, 51.3, 51.3, 58.2], unitRow: true, tc: '#ffffff', gx: 71.9, gw: 17.6, photo: [82.9, 9.4, 12.6, 23.4], bc: [25.6, 83.6, 48.5, 7.2], adm: [23.5, 71.3] },
     highCommand:  { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
     default:      { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] }
 };
@@ -19561,7 +19562,7 @@ function mcFace(f) {
     const L = MC_LAYOUT[f.key] || MC_LAYOUT['default'];
     const box = function (a) { return 'left:' + a[0] + '%;top:' + a[1] + '%;width:' + a[2] + '%;height:' + a[3] + '%;'; };
     const t = function (k, y, txt, cls) {
-        return '<div class="mc-t ' + cls + '" data-k="' + k + '" style="left:' + L.gx + '%;width:' + L.gw + '%;top:' + y + '%;font-size:' + mcFs(txt, k === 'num') + ';">' + cardEsc(txt) + '</div>';
+        return '<div class="mc-t ' + cls + '" data-k="' + k + '" style="left:' + L.gx + '%;width:' + L.gw + '%;top:' + y + '%;font-size:' + mcFs(txt, k === 'num') + ';' + (L.tc ? 'color:' + L.tc + ';text-shadow:0 1px 3px rgba(0,0,0,0.85);' : '') + '">' + cardEsc(txt) + '</div>';
     };
     const photo = f.avatar ? '<img class="mc-photo" src="' + cardEsc(f.avatar) + '" alt="" onerror="this.remove()" style="' + box(L.photo) + '">' : '';
     const bc = /^[0-9]{8}$/.test(String(f.num))
@@ -19570,8 +19571,8 @@ function mcFace(f) {
     return '<div class="mc-face" style="background: url(/card-bg/' + f.key + '?v=' + MC_BG_V + ') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3);">' +
         t('name', L.rows[0], f.name, 'name') +
         t('rank', L.rows[1], f.rank, 'rank') +
-        t('division', L.rows[2], f.division, 'sector') +
-        t('num', L.rows[3], f.num, 'num') +
+        (L.unitRow ? '' : t('division', L.rows[2], f.division, 'sector')) +
+        (L.unitRow ? t('unit', L.rows[3], f.unit, 'sector') : t('num', L.rows[3], f.num, 'num')) +
         photo + bc +
         (f.admin ? '<div class="mc-adm-in" style="right:' + L.adm[0] + '%;top:' + L.adm[1] + '%;">إداري</div>' : '') +
         (f.revoked ? '<div class="mc-revoked">ملغاة</div>' : '') +
