@@ -1845,6 +1845,21 @@ const app = express();
 });
 
 app.use(express.json({ limit: "8mb" }));
+// 🏦 أي أحد يفتح موقع فلاش (صفحة، مو API) → نصحّي البنك معه بالخلفية، بدون ما ننتظره ولا نبطّئ الصفحة
+var __bankWakeAt = 0;
+function bankWakeSoft() {
+    try {
+        var now = Date.now();
+        if (now - __bankWakeAt < 2 * 60 * 1000) return; // مرة كل دقيقتين كحد أقصى
+        __bankWakeAt = now;
+        var u = String(process.env.BANK_URL || "https://bank2-9d45.onrender.com").replace(/\/+$/, "");
+        fetch(u + "/healthz", { signal: AbortSignal.timeout(60000), headers: { "User-Agent": "flash-wake-bank" } }).catch(function () {});
+    } catch (e) {}
+}
+app.use(function (req, res, next) {
+    if (req.method === "GET" && !/^\/(api|bank|healthz|static|assets)\b/.test(req.path) && String(req.headers.accept || "").indexOf("text/html") !== -1) bankWakeSoft();
+    next();
+});
 // ================= النشر من فلاش المطورين إلى فلاش الرسمي =================
 // المتغيرات: DEPLOY_SECRET (نفس القيمة على الموقعين) — وعلى المطورين بس: DEV_MODE=1 و DEPLOY_TARGET_URL (رابط الرسمي)
 const DEPLOY_SETTINGS_KEYS = ["rankThresholds", "warningPenalties", "leaveBalanceDefault", "notifTitle", "notifBody", "supportCanned", "attConfig"];
@@ -2782,10 +2797,11 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         cardPhotoStatus: meCpReq ? meCpReq.status : null,
         cardPhotoReason: meCpReq ? meCpReq.rejectReason : null,
         cardKey: (() => {
+            if (senior) return "senior";
             const s = (meAcc && meAcc.sector) || p.sector || null;
             if (s && CONFIG.SECTORS[s]) return s;
             if (isHighCommand(req.user.id, settings)) return "highCommand";
-            return senior ? "senior" : "default";
+            return "default";
         })(),
         sector: (meAcc && meAcc.sector) || p.sector || null,
         unit: p.unit,
@@ -3197,9 +3213,14 @@ async function ensureCertIssuer(req, res, next) {
     req.certRole = role; req.settings = settings;
     next();
 }
+function certIssuerLabel(c) {
+    const n = String(c.issuedByName || "").trim(), r = String(c.issuedByRole || "").trim();
+    if (n && n !== "كبار المسؤولين") return r ? n + " — " + r : n;
+    return r || n || "-";
+}
 function certPublic(c) {
     return { code: c.code, kind: c.kind, kindLabel: CERT_LABEL[c.kind] || c.kind, targetDiscord: c.targetDiscord, name: (c.data || {}).name, rank: (c.data || {}).rank,
-        issuedByName: c.issuedByName, issuedByRole: c.issuedByRole, status: c.status, createdAt: c.createdAt, revokedByName: c.revokedByName, revokedAt: c.revokedAt };
+        issuedByName: c.issuedByName, issuedByRole: c.issuedByRole, issuedByLabel: certIssuerLabel(c), status: c.status, createdAt: c.createdAt, revokedByName: c.revokedByName, revokedAt: c.revokedAt };
 }
 async function certListFor(discord) {
     const list = await Certificate.find({ targetDiscord: discord }).sort({ createdAt: -1 }).limit(100).lean();
@@ -3251,7 +3272,7 @@ app.post("/api/certs/issue", ensureCertIssuer, async (req, res) => {
     const settings = req.settings;
     const data = await certBuildData(p, settings, note);
     const me = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1 }).lean();
-    const issuedByName = isSeniorAdmin(req.user.id) ? "كبار المسؤولين" : ((me && me.registeredName) || req.user.username);
+    const issuedByName = (me && me.registeredName) || req.user.username;
     let c = null;
     for (let i = 0; i < 5 && !c; i++) {
         try { c = await Certificate.create({ code: genCertCode(), kind, targetDiscord: discord, data, issuedBy: req.user.id, issuedByName, issuedByRole: req.certRole }); }
@@ -3269,7 +3290,7 @@ app.post("/api/certs/:code/revoke", ensureCertIssuer, async (req, res) => {
     if (c.status === "revoked") return res.json({ ok: true });
     const me = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1 }).lean();
     c.status = "revoked"; c.revokedBy = req.user.id; c.revokedAt = new Date();
-    c.revokedByName = isSeniorAdmin(req.user.id) ? "كبار المسؤولين" : ((me && me.registeredName) || req.user.username);
+    c.revokedByName = (me && me.registeredName) || req.user.username;
     await c.save();
     await logEvent({ action: "سحب شهادة", discordId: c.targetDiscord, actorId: req.user.id, actorTag: req.user.username, details: (CERT_LABEL[c.kind] || "") + " (" + c.code + ") — " + ((c.data || {}).name || "") });
     res.json({ ok: true });
@@ -3353,7 +3374,7 @@ function certPageHtml(c, assets, forPrint, baseUrl) {
         '.meta{margin-top:12px;border-top:1px dashed #c9a227;padding-top:8px;font-size:12px;color:#4b5563;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}' +
         '.wm{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:150px;font-weight:800;color:rgba(220,38,38,.18);transform:rotate(-25deg);pointer-events:none}' +
         '@media print{html,body{background:#fff}.bar{display:none}.page{margin:0;box-shadow:none}}@media(max-width:820px){.page{width:100%;min-height:0;padding:6px;margin:0}.frame{padding:14px}.title{font-size:28px}table{font-size:14px}.sigs{flex-wrap:wrap}.sig,.qr{width:48%}}</style></head><body>' +
-        (forPrint === false ? "" : '<div class="bar"><button class="back" onclick="if(history.length>1){history.back()}else{location.href=\'/?go=certs\'}">↩️ رجوع</button><span>📜 ' + certEsc(kindLbl) + '</span><button onclick="window.print()">🖨️ طباعة / حفظ PDF</button></div>') +
+        (forPrint === false ? "" : '<div class="bar"><button class="back" onclick="var h=location.href;if(history.length>1){history.back();setTimeout(function(){if(location.href===h){location.href=\'/?go=certs\'}},450)}else{location.href=\'/?go=certs\'}">↩️ رجوع</button><span>📜 ' + certEsc(kindLbl) + '</span><button onclick="window.print()">🖨️ طباعة / حفظ PDF</button></div>') +
         '<div class="page"><div class="frame">' + (revoked ? '<div class="wm">ملغاة</div>' : '') +
         '<div class="hd"><div class="org">' + certEsc(CONFIG.SITE_NAME) + '</div><div class="sub">الإدارة العامة للسيرفر — وثيقة رسمية</div></div>' +
         '<div class="title">' + certEsc(kindLbl) + '</div><div class="no">رقم الوثيقة: <b dir="ltr">' + certEsc(c.code) + '</b></div>' + (revoked ? '<div style="text-align:center;margin:10px 0 0;"><span style="display:inline-block;background:#fee2e2;color:#b91c1c;border:1.5px solid #b91c1c;border-radius:10px;padding:5px 18px;font-weight:800;font-size:16px;">⚠️ هذي الوثيقة ملغاة ولا يُعتدّ بها</span></div>' : '') + body +
@@ -3361,7 +3382,7 @@ function certPageHtml(c, assets, forPrint, baseUrl) {
         '<div class="sig"><div class="box"><div class="st">' + (assets.vpStamp ? certAssetImg(assets.vpStamp, 100) : certStampSvg(CERT_DEFAULTS.vpTitle, "#b91c1c")) + '</div>' + (assets.vpSig ? certAssetImg(assets.vpSig, 70) : certSigSvg(2)) + '</div><div class="nm">' + certEsc(vpName) + '</div><div class="tt">' + certEsc(CERT_DEFAULTS.vpTitle) + '</div></div>' +
         '<div class="qr"><a href="' + certEsc(url) + '" target="_blank" rel="noopener" style="display:block;color:inherit;text-decoration:none;">' + qr + '<div class="cap">امسح الرمز أو اضغط عليه للتحقق من صحة الوثيقة</div></a></div>' +
         '<div class="sig"><div class="box"><div class="st">' + (assets.presStamp ? certAssetImg(assets.presStamp, 100) : certStampSvg(CERT_DEFAULTS.presTitle, "#1d3a8a")) + '</div>' + (assets.presSig ? certAssetImg(assets.presSig, 70) : certSigSvg(1)) + '</div><div class="nm">' + certEsc(presName) + '</div><div class="tt">' + certEsc(CERT_DEFAULTS.presTitle) + '</div></div>' +
-        '</div><div class="meta"><span>تاريخ الإصدار: ' + certDate(c.createdAt) + '</span><span>أصدرها: ' + certEsc(c.issuedByRole || "") + '</span><span dir="ltr">' + certEsc(url) + '</span></div>' +
+        '</div><div class="meta"><span>تاريخ الإصدار: ' + certDate(c.createdAt) + '</span><span>أصدرها: ' + certEsc(certIssuerLabel(c)) + '</span><span dir="ltr">' + certEsc(url) + '</span></div>' +
         '</div></div></body></html>';
 }
 // رابط الموقع الحقيقي من الطلب نفسه (عشان الباركود دايم يفتح موقع فلاش اللي انفتحت منه الشهادة)
@@ -3399,7 +3420,7 @@ app.get("/verify/:code", async (req, res) => {
     else { status = "سارية وصحيحة"; color = "#15803d"; icon = "✅"; msg = "هذي الوثيقة صادرة رسمياً من " + CONFIG.SITE_NAME + " ومسجّلة في ملف العسكري."; }
     const row = (k, v) => '<div class="r"><span>' + k + '</span><b>' + certEsc(v) + '</b></div>';
     const details = c ? row("نوع الوثيقة", CERT_LABEL[c.kind] || "-") + row("اسم العسكري", d.name || "-") + row("الرتبة وقت الإصدار", d.rank || "-") + row("اليونت", d.unit || "-") +
-        row("تاريخ الإصدار", certDate(c.createdAt)) + row("جهة الإصدار", c.issuedByRole || "-") + row("رقم الوثيقة", c.code) + (c.status === "revoked" ? row("تاريخ السحب", certDate(c.revokedAt)) : "") : "";
+        row("تاريخ الإصدار", certDate(c.createdAt)) + row("أصدرها", certIssuerLabel(c)) + row("رقم الوثيقة", c.code) + (c.status === "revoked" ? row("تاريخ السحب", certDate(c.revokedAt)) : "") : "";
     res.set("Cache-Control", "no-store").type("html").send('<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>التحقق من الوثيقة</title>' +
         '<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet"><style>*{box-sizing:border-box}body{margin:0;background:#0b1f4a;font-family:Tajawal,Cairo,"Segoe UI",Tahoma,Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}' +
         '.c{background:#fffdf7;border-radius:16px;max-width:460px;width:100%;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.4)}.h{background:' + color + ';color:#fff;text-align:center;padding:22px 14px}.h .i{font-size:46px}.h .s{font-size:24px;font-weight:800;margin-top:4px}' +
@@ -3409,7 +3430,7 @@ app.get("/verify/:code", async (req, res) => {
 
 // ===================== 🪪 التحقق من البطاقة العسكرية (يفتحها أي أحد يمسح باركود البطاقة أو يضغط عليه) =====================
 // زر الرجوع بصفحات التحقق (باركود البطاقة والشهادة): يرجع للصفحة اللي قبل، وإذا انفتحت بتبويب جديد يودّي للموقع
-const VERIFY_BACK_BTN = '<div style="padding:14px 18px;text-align:center;"><a href="/" onclick="if(history.length>1){history.back();return false;}" style="display:inline-block;background:#0b1f4a;color:#fff;text-decoration:none;font-weight:800;padding:10px 30px;border-radius:10px;font-size:15px;">🔙 رجوع</a></div>';
+const VERIFY_BACK_BTN = '<div style="padding:14px 18px;text-align:center;"><a href="/" onclick="var h=location.href;if(history.length>1){history.back();setTimeout(function(){if(location.href===h){location.href=\'/\'}},450);return false;}" style="display:inline-block;background:#0b1f4a;color:#fff;text-decoration:none;font-weight:800;padding:10px 30px;border-radius:10px;font-size:15px;">🔙 رجوع</a></div>';
 const CARD_NUM_RE = /^[0-9]{8}$/;
 app.get("/card-qr/:num", (req, res) => {
     const n = String(req.params.num || "");
@@ -3996,7 +4017,7 @@ app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
         const hc = isHighCommand(o.discord, cardSt);
         const adm = !!(isSeniorAdmin(o.discord) || (cardSt.adminList || []).includes(o.discord) || hc);
         o.cardAdmin = adm;
-        o.cardKey = (o.sector && CONFIG.SECTORS[o.sector]) ? o.sector : (hc ? "highCommand" : (isSeniorAdmin(o.discord) ? "senior" : "default"));
+        o.cardKey = isSeniorAdmin(o.discord) ? "senior" : ((o.sector && CONFIG.SECTORS[o.sector]) ? o.sector : (hc ? "highCommand" : "default"));
         return o;
     }) });
 });
@@ -6690,14 +6711,89 @@ app.post("/api/mp/po/reports/:id/reject", ensureMPPersonnelOfficer, async (req, 
 });
 
 
-app.get("/api/bank/ranks", async (req, res) => {
+// ===================== 🏦 بنك فلاش: ربط بتطبيق ويب واحد =====================
+// فلاش يوصل للبنك بزر واحد (دخول تلقائي برابط موقّع فيه الاسم والرتبة)، والبنك يرسل إشعاراته عبر فلاش (Push) فما تحتاج تحمّل تطبيقين.
+// لازم تحط نفس المتغير INTERNAL_API_KEY (نص عشوائي طويل) على موقع فلاش وعلى موقع البنك في Render، وإلا الربط يتوقف.
+const BANK_URL = String(process.env.BANK_URL || "https://bank2-9d45.onrender.com").replace(/\/+$/, "");
+function bankKey() { return String(process.env.INTERNAL_API_KEY || "").trim(); }
+function ensureBankKey(req, res, next) {
+    const k = bankKey();
+    if (!k) return res.status(503).json({ success: false, msg: "INTERNAL_API_KEY غير مضبوط على موقع فلاش" });
+    const got = Buffer.from(String(req.get("x-internal-key") || "")), want = Buffer.from(k);
+    if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return res.status(403).json({ success: false, msg: "غير مصرح" });
+    next();
+}
+function bankSignToken(payload) {
+    const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    return body + "." + crypto.createHmac("sha256", bankKey()).update(body).digest("base64url");
+}
+// زر «بنك فلاش»: يرجّع رابط دخول موقّع (يعيش دقيقة وينستخدم مرة وحدة)
+app.get("/api/bank/sso", ensureAuth, async (req, res) => {
+    try {
+        if (!bankKey()) return res.status(503).json({ error: "البنك غير مربوط بعد — لازم تضبط INTERNAL_API_KEY على فلاش والبنك" });
+        const p = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1, rank: 1, unit: 1 }).lean();
+        if (!p || !p.registeredName) return res.status(400).json({ error: "أكمل تسجيل بياناتك أولاً" });
+        const token = bankSignToken({ uid: req.user.id, name: p.registeredName, rank: p.rank || "", unit: p.unit || "", senior: isSeniorAdmin(req.user.id), exp: Date.now() + 60 * 1000, n: crypto.randomBytes(9).toString("hex") });
+        res.json({ ok: true, url: "/bank/sso?t=" + encodeURIComponent(token) });
+    } catch (e) { console.error("❌ bank sso:", e.message); res.status(500).json({ error: "تعذر فتح البنك" }); }
+});
+// ---- البنك يظهر داخل فلاش نفسه على المسار /bank (نفس الدومين = يبقى داخل تطبيق الويب بدون شريط متصفح) ----
+// فلاش يمرّر الطلبات لخدمة البنك من السيرفر، ولا يمرّر للبنك غير كوكي البنك (كوكي فلاش ما يطلع له أبداً).
+function bankProxyToken() { return crypto.createHmac("sha256", bankKey()).update("flash-proxy-v1").digest("hex"); }
+app.all(/^\/bank(?:\/(.*))?$/, async (req, res) => {
+    try {
+        const isApi = /^\/bank\/api\//.test(req.path);
+        if (!req.isAuthenticated || !req.isAuthenticated()) return isApi ? res.status(401).json({ success: false, msg: "سجّل دخولك في فلاش أولاً" }) : res.redirect("/");
+        if (!bankKey()) return res.status(503).send("البنك غير مربوط بعد (INTERNAL_API_KEY ناقص)");
+        const sub = "/" + String(req.params[0] || "");
+        if (/^\/(api\/flash|auth)(\/|$)/.test(sub)) return res.status(403).json({ success: false, msg: "غير مصرح" });
+        const qi = req.originalUrl.indexOf("?");
+        const qs = qi >= 0 ? req.originalUrl.slice(qi) : "";
+        const headers = { "x-flash-proxy": bankProxyToken(), "x-forwarded-prefix": "/bank", "accept": req.get("accept") || "*/*", "accept-language": req.get("accept-language") || "ar", "user-agent": req.get("user-agent") || "flash" };
+        const m = /(?:^|;\s*)bank_session=([^;]*)/.exec(req.headers.cookie || "");
+        if (m) headers.cookie = "bank_session=" + m[1];
+        let body;
+        if (req.method !== "GET" && req.method !== "HEAD" && /json/i.test(req.get("content-type") || "")) { body = JSON.stringify(req.body || {}); headers["content-type"] = "application/json"; }
+        const r = await fetch(BANK_URL + sub + qs, { method: req.method, headers, body, redirect: "manual", signal: AbortSignal.timeout(25000) });
+        if ((r.status === 502 || r.status === 503 || r.status === 504) && !isApi && req.method === "GET") { return res.status(200).set("Cache-Control", "no-store").type("html").send(bankWakePage()); }
+        res.status(r.status);
+        const ct = r.headers.get("content-type"); if (ct) res.set("Content-Type", ct);
+        res.set("Cache-Control", "no-store");
+        const loc = r.headers.get("location");
+        if (loc) res.set("Location", loc.indexOf(BANK_URL) === 0 ? "/bank" + loc.slice(BANK_URL.length) : (loc.charAt(0) === "/" && loc.indexOf("/bank") !== 0 ? "/bank" + loc : loc));
+        const sc = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : (r.headers.get("set-cookie") ? [r.headers.get("set-cookie")] : []);
+        if (sc.length) res.append("Set-Cookie", sc.map(c => c.replace(/;\s*Path=[^;]*/i, "").replace(/;\s*Domain=[^;]*/i, "") + "; Path=/bank"));
+        res.send(Buffer.from(await r.arrayBuffer()));
+    } catch (e) {
+        console.error("❌ bank proxy:", e.message);
+        if (!res.headersSent) {
+            const isApi2 = /^\/bank\/api\//.test(req.path);
+            if (isApi2) return res.status(502).json({ success: false, msg: "البنك يشتغل الحين، جرّب بعد ثواني" });
+            if (req.method === "GET") return res.status(200).set("Cache-Control", "no-store").type("html").send(bankWakePage());
+            res.status(502).send("البنك يشتغل الحين، جرّب بعد ثواني");
+        }
+    }
+});
+app.get("/healthz", (req, res) => res.type("text").send("ok"));
+app.get("/api/bank/status", ensureAuth, async (req, res) => {
+    try {
+        const r = await fetch(BANK_URL + "/healthz", { signal: AbortSignal.timeout(9000) });
+        res.json({ up: r.status < 500 });
+    } catch (e) { res.json({ up: false }); }
+});
+var BANK_WAIT_PHRASES = ["⚡ جاري تشغيل الاستضافة...", "🤍 صلِّ على النبي ﷺ", "🔧 نجهّز الخوادم لك", "🌿 استغفر ربك", "🔐 نأمّن الاتصال بحسابك", "📿 سبحان الله وبحمده", "💳 نحمّل بياناتك البنكية", "☝️ لا إله إلا الله", "🚀 على وشك الانتهاء", "🤲 لا حول ولا قوة إلا بالله", "⏳ ثواني ويفتح تلقائياً", "🌙 الحمد لله"];
+function bankWakePage() {
+    return '<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>بنك فلاش</title><style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a1628;color:#e2e8f0;font-family:Tahoma,Arial,sans-serif;text-align:center;padding:20px}.sp{width:54px;height:54px;border:5px solid #1e3a5f;border-top-color:#3b82f6;border-radius:50%;animation:r 1s linear infinite;margin:0 auto 18px}@keyframes r{to{transform:rotate(360deg)}}p{font-size:18px;line-height:1.9;margin:0}small{color:#94a3b8;display:block;margin-top:10px;font-size:15px;min-height:24px;transition:opacity .35s}</style></head><body><div><div class="sp"></div><p>🏦 جاري تشغيل البنك...</p><small id="m">ثواني ويفتح تلقائياً</small></div><script>var P=' + JSON.stringify(BANK_WAIT_PHRASES) + ',pi=0,pm=document.getElementById("m");pm.textContent=P[0];var T=setInterval(function(){pi=(pi+1)%P.length;pm.style.opacity=0;setTimeout(function(){pm.textContent=P[pi];pm.style.opacity=1},350)},3500);var t0=Date.now();function chk(){fetch("/api/bank/status",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){if(d&&d.up){location.reload()}else{nx()}}).catch(nx)}function nx(){if(Date.now()-t0>180000){clearInterval(T);document.getElementById("m").textContent="البنك تأخر، حدّث الصفحة بعد شوي";return}setTimeout(chk,2500)}chk();</script></body></html>';
+}
+// البنك يسأل عن الرتب (جدول الرواتب) ورتبة كل عسكري — بمفتاح سرّي بين الموقعين
+app.get("/api/bank/ranks", ensureBankKey, async (req, res) => {
     res.json({ success: true, ranks: CONFIG.MILITARY_RANKS });
 });
-
-app.get("/api/bank/personnel-ranks", async (req, res) => {
+app.get("/api/bank/personnel-ranks", ensureBankKey, async (req, res) => {
     try {
         const regUidsB = await getFlashRegisteredUids();
-        const list = await Personnel.find({ isBlocked: false, discord: { $in: regUidsB, $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
+        // إصلاح: كان يستثني ownerUids فكبار المسؤولين/المالك ما ينزل لهم راتب مع إن معهم رتبة — الحين يدخلون مع الباقي
+        const list = await Personnel.find({ isBlocked: false, discord: { $in: regUidsB } }, "discord discordTag rank registeredName");
         const personnel = list.map(p => ({
             discord: p.discord,
             discordTag: p.discordTag,
@@ -6708,6 +6804,37 @@ app.get("/api/bank/personnel-ranks", async (req, res) => {
     } catch (e) {
         res.json({ success: false, msg: e.message });
     }
+});
+// البنك يتحقق من البطاقة العسكرية للعضو (رقم البطاقة + الرتبة + القطاع + اليونت) عند طلب بطاقة بنكية
+app.get("/api/bank/member-card", ensureBankKey, async (req, res) => {
+    try {
+        const uid = String(req.query.uid || "");
+        if (!CARD_UID_RE.test(uid)) return res.json({ success: false, msg: "معرّف غير صالح" });
+        const [p, acc] = await Promise.all([
+            Personnel.findOne({ discord: uid }, { registeredName: 1, rank: 1, unit: 1, sector: 1, cardNumber: 1, cardRevoked: 1, isBlocked: 1 }).lean(),
+            Account.findOne({ uid }, { sector: 1 }).lean(),
+        ]);
+        if (!p || !p.registeredName || !p.cardNumber) return res.json({ success: true, found: false });
+        const sec = (acc && acc.sector) || p.sector || null;
+        res.json({
+            success: true, found: true,
+            name: p.registeredName, rank: p.rank || "", unit: p.unit || "",
+            sector: sec ? (CONFIG.SECTORS[sec] || sec) : "",
+            cardNumber: String(p.cardNumber), revoked: !!p.cardRevoked, blocked: !!p.isBlocked,
+        });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+// البنك يرسل إشعاراته (راتب، تحويل، قرض...) عبر فلاش كـ Push على أجهزة العضو
+app.post("/api/bank/notify", ensureBankKey, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const uid = String(b.uid || "");
+        const body = String(b.body || "").trim().slice(0, 300);
+        if (!CARD_UID_RE.test(uid) || !body) return res.json({ success: false, msg: "بيانات ناقصة" });
+        const title = String(b.title || "🏦 بنك فلاش").slice(0, 80);
+        await pushUid(uid, { title, body, tag: "bank-" + Date.now(), url: "/?go=bank" });
+        res.json({ success: true });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
 });
 
 const SUPPORT_CATEGORIES = ["مشكلة في الموقع", "مشكلة في حسابي", "مخالفة / نقاط / رتبة", "إجازة", "البطاقة العسكرية", "اقتراح", "أخرى"];
@@ -11889,6 +12016,7 @@ app.get("/", (req, res) => {
     .mc-bc { position: absolute; display: flex; align-items: center; justify-content: flex-start; cursor: pointer; z-index: 1; -webkit-tap-highlight-color: transparent; text-decoration: none; }
     .mc-bc img { height: 100%; aspect-ratio: 1; background: #fff; padding: 0.3cqw; border-radius: 0.6cqw; box-shadow: 0 0 0 0.25cqw rgba(15,23,42,0.35); }
     .mc-adm-in { position: absolute; z-index: 1; font-size: 2.1cqw; font-weight: 800; line-height: 1.2; color: #dc2626; background: rgba(255,255,255,0.88); border: 0.2cqw solid #dc2626; border-radius: 99px; padding: 0.15cqw 1.2cqw; pointer-events: none; }
+    .mc-warn { margin-top: 8px; padding: 7px 10px; border-radius: 10px; background: rgba(220,38,38,0.14); border: 1px solid rgba(248,113,113,0.55); color: #fca5a5; font-size: 12.5px; font-weight: 700; line-height: 1.7; text-align: center; }
     .mc-adm { text-align: center; margin-top: 8px; font-weight: 800; font-size: 14px; color: #ef4444; }
     .mcard.dbg .mc-t, .mcard.dbg .mc-photo, .mcard.dbg .mc-bc { outline: 1px dashed #d946ef; }
     .mc-cover { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2cqw; background: rgba(15,30,60,0.28); cursor: pointer; z-index: 2; }
@@ -15088,9 +15216,48 @@ function flGoTo(code) {
         if (code === 'court' && ME.courtStaff) { renderCourtPanel(); return true; }
         if (code === 'fraud' && ME.canFraud) { renderFraudPanel(); return true; }
         if (code === 'certs') { renderCertPage(); return true; }
+        if (code === 'bank') { flBankOpen(); return true; }
     } catch (e) {}
     renderDashboard();
     return true;
+}
+async function flBankOpen() {
+    var ov = document.getElementById('fl-bank-wake');
+    if (!ov) {
+        ov = document.createElement('div');
+        ov.id = 'fl-bank-wake';
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(10,22,40,0.97);display:flex;align-items:center;justify-content:center;text-align:center;color:#e2e8f0;font-family:Tahoma,Arial,sans-serif;padding:20px';
+        ov.innerHTML = '<style>@keyframes flbw{to{transform:rotate(360deg)}}</style><div><div style="width:54px;height:54px;border:5px solid #1e3a5f;border-top-color:#3b82f6;border-radius:50%;animation:flbw 1s linear infinite;margin:0 auto 18px"></div><p style="font-size:18px;margin:0">🏦 جاري تشغيل البنك...</p><small id="fl-bank-phrase" style="color:#94a3b8;display:block;margin-top:10px;font-size:15px;min-height:24px;transition:opacity .35s">ثواني ويفتح تلقائياً</small></div>';
+        document.body.appendChild(ov);
+    }
+    ov.style.display = 'flex';
+    var phraseTimer = null, ph = document.getElementById('fl-bank-phrase'), pi = 0;
+    var PH = ["⚡ جاري تشغيل الاستضافة...", "🤍 صلِّ على النبي ﷺ", "🔧 نجهّز الخوادم لك", "🌿 استغفر ربك", "🔐 نأمّن الاتصال بحسابك", "📿 سبحان الله وبحمده", "💳 نحمّل بياناتك البنكية", "☝️ لا إله إلا الله", "🚀 على وشك الانتهاء", "🤲 لا حول ولا قوة إلا بالله", "⏳ ثواني ويفتح تلقائياً", "🌙 الحمد لله"];
+    if (ph) {
+        ph.textContent = PH[0];
+        phraseTimer = setInterval(function () {
+            pi = (pi + 1) % PH.length;
+            ph.style.opacity = 0;
+            setTimeout(function () { ph.textContent = PH[pi]; ph.style.opacity = 1; }, 350);
+        }, 3500);
+    }
+    try {
+        var up = false, t0 = Date.now();
+        while (Date.now() - t0 < 150000) {
+            var s = null;
+            try { s = await api('/api/bank/status', { noLock: true }); } catch (e) {}
+            if (s && s.up) { up = true; break; }
+            await new Promise(function (res) { setTimeout(res, 2500); });
+        }
+        if (!up) throw new Error('البنك تأخر في التشغيل، جرّب بعد شوي');
+        var r = await api('/api/bank/sso', { noLock: true });
+        if (!r || !r.url) throw new Error('تعذر فتح البنك');
+        location.href = r.url;
+    } catch (e) {
+        if (phraseTimer) clearInterval(phraseTimer);
+        ov.style.display = 'none';
+        toast(e.message || 'تعذر فتح البنك');
+    }
 }
 function flPendingGo() {
     var g = null;
@@ -16290,6 +16457,7 @@ function renderDashboard() {
                 <div><h2 style="margin-bottom:2px;">\${ME.registeredName}</h2><div style="color:var(--muted);font-size:13px;">\${ME.unit} • \${ME.rank}</div></div>
             </div>
             <div class="row" style="gap:8px;">
+                <button class="btn sm btn-checkout" onclick="flBankOpen()">🏦 بنك فلاش</button>
                 \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
                 \${(ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
@@ -18118,7 +18286,7 @@ function certKindLbl(k) {
 function certRowHtml(c, canRevoke) {
     var dt = new Date(c.createdAt).toLocaleDateString('ar-SA');
     return '<div style="background:rgba(5,15,10,0.6);padding:10px;border-radius:8px;margin-top:6px;font-size:13px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
-        '<div><b>' + accEsc(c.kindLabel || certKindLbl(c.kind)) + '</b>' + (c.name ? ' — ' + accEsc(c.name) : '') + '<div style="color:var(--muted);font-size:12px;">' + dt + ' • ' + accEsc(c.issuedByRole || '') + ' • <span dir="ltr">' + accEsc(c.code) + '</span>' +
+        '<div><b>' + accEsc(c.kindLabel || certKindLbl(c.kind)) + '</b>' + (c.name ? ' — ' + accEsc(c.name) : '') + '<div style="color:var(--muted);font-size:12px;">' + dt + ' • ' + accEsc(c.issuedByLabel || c.issuedByRole || '') + ' • <span dir="ltr">' + accEsc(c.code) + '</span>' +
         (c.status === 'revoked' ? ' • <span style="color:#f87171;">ملغاة</span>' : '') + '</div></div>' +
         '<div style="display:flex;gap:6px;">' + ('<a class="btn sm" target="_blank" href="/cert/' + accEsc(c.code) + '">📄 عرض / PDF</a>') +
         (canRevoke && c.status !== 'revoked' ? '<button class="btn danger sm" data-c="' + accEsc(c.code) + '" onclick="certRevoke(this.dataset.c)">🗑️ سحب</button>' : '') + '</div></div>';
@@ -19556,6 +19724,7 @@ function mcFs(txt, isNum) {
     return (n <= 10 ? 2.9 : n <= 14 ? 2.5 : n <= 18 ? 2.1 : n <= 24 ? 1.7 : 1.4) + 'cqw';
 }
 function mcFit(node) { node.style.fontSize = mcFs(node.textContent, node.classList.contains('num')); }
+function mcWarn() { return '<div class="mc-warn">⚠️ تنبيه: هذي البطاقة مخصصة للمحاكاة واللعب فقط، وليست بطاقة حقيقية ولا تمت للواقع بصلة.</div>'; }
 function mcAdminTag(f) { return f.admin ? '<div class="mc-adm">🔴 إداري</div>' : ''; }
 function mcDebug(on) { document.querySelectorAll('.mcard').forEach(function (c) { c.classList.toggle('dbg', on !== false); }); }
 function mcFace(f) {
@@ -19591,7 +19760,7 @@ function cardBlock(p, o) {
         '<div class="mcard locked" onclick="mcTap(this)">' +
             mcFace(f) +
             '<div class="mc-cover">' + eye + '<span>عرض البطاقة</span></div>' +
-        '</div>' + mcAdminTag(f) + remain +
+        '</div>' + mcWarn() + mcAdminTag(f) + remain +
         '<div class="mc-hint">اضغط على البطاقة لعرضها كاملة ⤢</div>' +
     '</div>';
 }
@@ -19768,7 +19937,7 @@ function mcInfoHtml(id) {
     if (id === 'me-card' || id === 'home-card') info += cpSectionHtml();
     const remain = o.hasProgress ? '<div class="mc-remain">' + remainText(o.nextRank, o.remaining) + '</div>' : '';
     return '<div class="mc-wrap unlocked" data-mc="' + id + '">' +
-        '<div class="mcard" onclick="mcTap(this)">' + mcFace(f) + '</div>' + mcAdminTag(f) +
+        '<div class="mcard" onclick="mcTap(this)">' + mcFace(f) + '</div>' + mcWarn() + mcAdminTag(f) +
         '<div class="mc-hint">اضغط على البطاقة لعرضها كاملة ⤢</div>' + remain +
         '<div class="mc-info open">' + info +
             '<div class="row" style="gap:8px;margin-top:4px;">' +
@@ -21616,7 +21785,6 @@ function offPaintBar() {
     if (VC.isSenior && !VC.state.training && !VC.state.cyber && !VC.state.freq && !VC.state.court) qb = '<button class="ov-btn' + (VC.ivHidden ? '' : ' on') + '" onclick="offIvToggle()">' + (VC.ivHidden ? '❓ الأسئلة' : '🙈 إخفاء الأسئلة') + '</button>';
     if (VC.state.court && (offMyRole() === 'senior' || offMyRole() === 'mpl')) qb = '<button class="ov-btn" onclick="offKickedOpen()">🔓 المطرودين</button><button class="ov-btn" onclick="courtEndFromRoom()">⏹️ إنهاء ' + (VC.state.inv ? 'التحقيق' : 'المحكمة') + '</button>';
     if (VC.state.cyber && offMyRole() === 'leader') qb = '<button class="ov-btn" onclick="cyOpsOpen()">📋 نشاطه</button><button class="ov-btn" onclick="offKickedOpen()">🔓 المطرودين</button><button class="ov-btn" onclick="offCyEnd()">⏹️ إنهاء</button>';
-    if (VC.state.freq || VC.state.court) qb += flIsIOS() ? '<button class="ov-btn" onclick="flMicHelp()">🎧 كتم/فتح من الشاشة</button>' : '<button class="ov-btn" onclick="flPipOpen()">🪟 نافذة عائمة</button>';
     box.innerHTML = '<button class="' + micCls + '" onclick="offToggleMic()">' + micTxt + '</button>' + qb +
         '<button class="ov-btn leave" onclick="offLeaveVoice(false)">📞 خروج</button>';
 }
@@ -23372,16 +23540,16 @@ function flSilentWavUrl() {
     return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
 async function flWake() { try { if ('wakeLock' in navigator && FLMIC.active) FLMIC.wake = await navigator.wakeLock.request('screen'); } catch (e) {} }
-function flMicSet(on) { if (VC && (VC.freq || VC.court) && VC.micOn !== on) offToggleMic(); }
+function flMicSet(on) { if (VC && VC.micOn !== on) offToggleMic(); }
 function flMicStart() {
     if (FLMIC.active) return;
     FLMIC.active = true;
     try {
         if ('mediaSession' in navigator) {
             var ms = navigator.mediaSession;
-            ms.metadata = new MediaMetadata({ title: (VC && VC.court) ? 'المحكمة العسكرية' : 'تردد القطاعات المشتركة', artist: 'فلاش', album: 'الراديو', artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }] });
+            ms.metadata = new MediaMetadata({ title: !VC ? 'روم صوتي' : (VC.court ? (VC.state && VC.state.inv ? 'التحقيق العسكري' : 'المحكمة العسكرية') : VC.freq ? 'تردد القطاعات المشتركة' : VC.cyber ? 'تحقيق سيبراني' : VC.training ? 'روم التدريب' : 'مقابلة'), artist: 'فلاش', album: 'الراديو', artwork: [{ src: '/icon-512.png', sizes: '512x512', type: 'image/png' }] });
             ms.playbackState = 'playing';
-            try { ms.setActionHandler('togglemicrophone', function () { if (VC && (VC.freq || VC.court)) offToggleMic(); }); } catch (e) {}
+            try { ms.setActionHandler('togglemicrophone', function () { if (VC) offToggleMic(); }); } catch (e) {}
             try { ms.setActionHandler('pause', function () { flMicSet(false); }); } catch (e) {}
             try { ms.setActionHandler('play', function () { flMicSet(true); }); } catch (e) {}
             try { ms.setActionHandler('stop', function () { flMicSet(false); }); } catch (e) {}
@@ -23422,7 +23590,7 @@ function flMicStop() {
 document.addEventListener('visibilitychange', function () { if (!document.hidden && FLMIC.active) flWake(); });
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('message', function (e) {
-        if (e.data && e.data.t === 'mic-toggle' && typeof VC !== 'undefined' && VC && (VC.freq || VC.court)) offToggleMic();
+        if (e.data && e.data.t === 'mic-toggle' && typeof VC !== 'undefined' && VC) offToggleMic();
         if (e.data && e.data.t === 'nav' && e.data.url) { try { flNavUrl(e.data.url); } catch (x) {} }
     });
 }
@@ -23445,15 +23613,15 @@ function flMicHelp() {
     cyOverlay('<div style="text-align:center;line-height:1.9;"><div style="font-size:40px;">🎧</div><h3 style="margin:6px 0 10px;">كتم وفتح المايك وانت داخل اللعبة</h3>' +
         '<div style="text-align:right;font-size:14px;">' +
         'آيفون ما يسمح بنافذة عائمة للتطبيقات، فاستخدم أزرار التشغيل:<br>' +
-        '1️⃣ ادخل اللعبة والتردد شغّال.<br>' +
-        '2️⃣ اسحب <b>مركز التحكم</b> (أو افتح <b>شاشة القفل</b>) وبتلقى «فلاش — تردد القطاعات المشتركة».<br>' +
+        '1️⃣ ادخل اللعبة والروم شغّال.<br>' +
+        '2️⃣ اسحب <b>مركز التحكم</b> (أو افتح <b>شاشة القفل</b>) وبتلقى «فلاش» مع اسم الروم اللي أنت فيه.<br>' +
         '3️⃣ <b>⏸ إيقاف مؤقت = كتم المايك</b> 🔇<br>' +
         '4️⃣ <b>▶️ تشغيل = فتح المايك</b> 🎙️<br>' +
         '5️⃣ نفس الشي بالضغط على <b>سماعة AirPods</b> أو زر السماعة.' +
         '</div><button class="btn" style="width:100%;margin-top:12px;" onclick="cyOverlayClose()">فهمت</button></div>');
 }
 function flPipToggle() {
-    if (VC && (VC.freq || VC.court)) offToggleMic();
+    if (VC) offToggleMic();
     FLPIP.self = true;
     try { if (FLPIP.vid) FLPIP.vid.play().catch(function () {}); } catch (e) {}
     setTimeout(function () { FLPIP.self = false; }, 400);
@@ -23950,11 +24118,14 @@ async function courtPanelLoad(silent) {
     h += '<h3 style="margin:14px 0 8px;">🔴 ' + (cinv ? 'التحقيقات الجارية' : 'المحاكمات الجارية') + ' (' + st.active.length + ')</h3>' +
         (st.active.length ? st.active.map(function (c) { return courtCaseHtml(c, st); }).join('') : '<div class="card" style="color:var(--muted);">' + (cinv ? 'لا يوجد تحقيقات جارية' : 'لا يوجد محاكمات جارية') + '</div>');
     if (st.recent.length) h += '<h3 style="margin:14px 0 8px;">📜 ' + (cinv ? 'سجل التحقيقات' : 'آخر المنتهية') + '</h3>' + st.recent.map(function (c) { return courtCaseHtml(c, st); }).join('');
-    if (typing) {
-        var keep = document.getElementById('court-q').value;
-        box.innerHTML = h;
-        var qi = document.getElementById('court-q'); if (qi) { qi.value = keep; qi.focus(); }
-    } else box.innerHTML = h;
+    // التحديث الدوري يعيد رسم الصفحة كاملة، فنحفظ كلمة البحث ونتائجه ونرجعها بعد الرسم (عشان ما تختفي الأسامي)
+    var oldQ = document.getElementById('court-q'), keepQ = oldQ ? oldQ.value : '';
+    var oldCand = document.getElementById('court-cand'), keepCand = oldCand ? oldCand.innerHTML : '';
+    box.innerHTML = h;
+    var qi = document.getElementById('court-q'), ci = document.getElementById('court-cand');
+    if (qi && keepQ) qi.value = keepQ;
+    if (ci && keepCand) ci.innerHTML = keepCand;
+    if (typing && qi) { try { qi.focus(); qi.setSelectionRange(qi.value.length, qi.value.length); } catch (e) {} }
 }
 var courtSearchTimer = null;
 function courtCandBtns(p) {
@@ -23962,14 +24133,18 @@ function courtCandBtns(p) {
     if (COURT.kind === 'inv') return '<button class="btn sm" style="background:#0f766e;" data-u="' + p.discord + '" data-n="' + n + '" onclick="invStart(this.dataset.u, this.dataset.n)">🔎 تحقيق</button>';
     return '<button class="btn sm" data-u="' + p.discord + '" data-n="' + n + '" onclick="courtStart(this.dataset.u, this.dataset.n)">⚖️ محكمة</button>';
 }
+var courtSearchTok = 0;
 function courtSearch(q) {
     clearTimeout(courtSearchTimer);
+    var tok = ++courtSearchTok;
     courtSearchTimer = setTimeout(async function () {
         var box = document.getElementById('court-cand'); if (!box) return;
         if (!q || !q.trim()) { box.innerHTML = ''; return; }
         box.innerHTML = 'جارِ البحث...';
         try {
             var r = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
+            if (tok !== courtSearchTok) return;
+            box = document.getElementById('court-cand'); if (!box) return;
             var list = (r.list || []).filter(function (p) { return p.registeredName; });
             if (!list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
             box.innerHTML = list.slice(0, 15).map(function (p) {
@@ -24238,6 +24413,7 @@ process.on("uncaughtException", (err) => {
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`🚀 ${CONFIG.SITE_NAME} server running on port ${CONFIG.PORT}`);
+    bankWakeSoft(); // فلاش قام → صحّي البنك معه
     if (global.__FLASH_RELEASE__) setTimeout(() => { try { require("fs").unlinkSync(require("path").join(__dirname, "flash_boot.json")); } catch (e) {} }, 90000).unref();
 });
 
