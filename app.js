@@ -1997,7 +1997,10 @@ self.addEventListener("push", function (e) {
   var opt = { body: d.body || "", icon: "/icon-192.png", badge: "/icon-192.png", lang: "ar", dir: "rtl", data: { url: d.url || "/" } };
   if (d.tag) { opt.tag = d.tag; opt.renotify = true; }
   if (d.urgent) { opt.requireInteraction = true; opt.silent = false; opt.vibrate = [700, 150, 700, 150, 600, 150, 400]; }
-  e.waitUntil(self.registration.showNotification(d.title || "فلاش", opt));
+  e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
+    if (d.inapp && list.some(function (c) { return c.visibilityState === "visible"; })) return;
+    return self.registration.showNotification(d.title || "فلاش", opt);
+  }));
 });
 self.addEventListener("notificationclick", function (e) {
   var n = e.notification;
@@ -4176,6 +4179,16 @@ async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag, po
 
     p.warnings.push(entry);
     await p.save();
+    try {
+        const wEntry = p.warnings[p.warnings.length - 1];
+        const numLbl = { 1: "تحذير أول", 2: "تحذير ثاني", 3: "تحذير ثالث" };
+        pushUid(p.discord, {
+            title: CONFIG.SITE_NAME,
+            body: (kind === "warning" ? "🚨 صدر عليك " + (numLbl[entry.warningNumber] || "تحذير") : "📌 صدر لك إشعار إداري") + " — " + entry.reason.slice(0, 90),
+            tag: "warn-" + String(wEntry._id), level: kind === "warning" ? "danger" : "warning",
+            label: kind === "warning" ? "🚨 إنذار" : "📌 إشعار إداري", urgent: kind === "warning", ttl: 86400,
+        }).catch(() => {});
+    } catch (e) {}
 
     await logEvent({
         action: dismissed ? "فصل تلقائي (تجاوز التحذيرات)" : (kind === "warning" ? "إصدار تحذير" : "إصدار إشعار"),
@@ -6837,7 +6850,8 @@ app.post("/api/bank/notify", ensureBankKey, async (req, res) => {
         const body = String(b.body || "").trim().slice(0, 300);
         if (!CARD_UID_RE.test(uid) || !body) return res.json({ success: false, msg: "بيانات ناقصة" });
         const title = String(b.title || "🏦 بنك فلاش").slice(0, 80);
-        await pushUid(uid, { title, body, tag: "bank-" + Date.now(), url: "/?go=bank", urgent: String(b.type || "") === "danger" });
+        const bt = ["danger", "warning", "success"].includes(String(b.type || "")) ? String(b.type) : "info";
+        await pushUid(uid, { title, body, tag: "bank-" + Date.now(), url: "/?go=bank", urgent: bt === "danger", level: bt, label: title });
         res.json({ success: true });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -10280,6 +10294,8 @@ function pushUrlFor(tag) {
     if (t === "recabs" || t.startsWith("rmabs-") || t.startsWith("excuse-res-")) return "/?go=excuse";
     if (t.startsWith("excuse-hc-")) return "/?go=hcexcuse";
     if (t === "court" || t === "court-soon" || t === "court-req" || t === "unkick") return "/?go=court";
+    if (t.startsWith("warn-")) return "/?go=warn";
+    if (t.startsWith("fraud-")) return "/?go=fraud";
     return "/";
 }
 async function sendPushTo(devs, opts) {
@@ -10291,6 +10307,7 @@ async function sendPushTo(devs, opts) {
         url: opts.url || pushUrlFor(opts.tag),
         tag: opts.tag || undefined,
         urgent: opts.urgent ? true : undefined,
+        inapp: opts.inapp ? true : undefined,
     });
     const list = (devs || []).filter(d => d && d.sub && d.sub.endpoint);
     let sent = 0; const failed = [];
@@ -10307,8 +10324,76 @@ async function sendPushTo(devs, opts) {
     return { sent, failed };
 }
 // يرسل للمتصل وغير المتصل (كل جهاز مفعّل الإشعارات)
+// ═══════════ 🔔 نظام الإشعارات (نفس نظام البنك) ═══════════
+// كل إشعار لعضو يتسجّل هنا: داخل التطبيق يطلع توست تحت يمين (أزرق معلومة / أخضر نجاح / برتقالي تنبيه)،
+// والإنذار يطلع نافذة حمراء منبثقة بصوت لين تضغط «فهمت». لو العضو برّا التطبيق يوصله Push عادي، وأول ما يدخل يطلع له.
+const FlNotif = mongoose.model("FlNotif", new mongoose.Schema({
+    uid: { type: String, index: true },
+    kind: String,                                  // بادئة الـ tag (att-over- / court / warn- ...)
+    label: String,                                 // اسم النوع اللي يظهر بعنوان الإشعار
+    type: { type: String, default: "info" },       // info / success / warning / danger
+    body: String,
+    url: { type: String, default: "/" },           // وين يودّيك الضغط على الإشعار (?go=...)
+    read: { type: Boolean, default: false },
+    createdAt: { type: Date, default: Date.now, index: true },
+}));
+// كل نوع إشعار له لونه واسمه ووجهته (يتحدد بالـ tag): [بادئة الـ tag, النوع, العنوان]
+const FL_NOTIF_KINDS = [
+    ["att-over-",   "warning", "🚨 تجاوز الحضور"],        // برتقالي → يودّي لتجاوز الحضور
+    ["att-note",    "warning", "⏱️ نسيت الانصراف"],
+    ["recabs",      "warning", "❌ غياب عن الاستلام"],
+    ["rmabs-",      "warning", "❌ غياب عن الاستلام"],
+    ["excuse-res-", "info",    "🩺 قرار العذر"],
+    ["excuse-hc-",  "info",    "🩺 عذر ينتظر قرارك"],
+    ["excuse-",     "info",    "🩺 عذر غياب جديد"],
+    ["court-soon",  "warning", "⚖️ موعد تحقيق"],
+    ["court-req",   "info",    "⚖️ طلب تحقيق"],
+    ["court",       "danger",  "⚖️ مطلوب للتحقيق الحين"],  // أحمر منبثق
+    ["unkick",      "success", "🔓 فك الطرد"],
+    ["fraud-",      "danger",  "🛡️ تلاعب محتمل"],         // أحمر منبثق
+    ["cert-",       "success", "📜 شهادة جديدة"],
+    ["ticket-",     "info",    "💬 رد على تكتك"],
+    ["warn-",       "danger",  "🚨 إنذار"],               // التحذير أحمر (والإشعار الإداري برتقالي)
+    ["bank-",       "info",    "🏦 بنك فلاش"],
+];
+function flNotifMeta(opts) {
+    const tag = String(opts.tag || "");
+    const m = FL_NOTIF_KINDS.find(k => tag.startsWith(k[0]));
+    const type = ["info", "success", "warning", "danger"].includes(opts.level) ? opts.level : (m ? m[1] : "info");
+    return { type, label: String(opts.label || (m ? m[2] : "🔔 إشعار")).slice(0, 60), kind: m ? m[0] : "gen" };
+}
+async function flRecordNotif(uid, opts) {
+    try {
+        if (!uid || !opts || opts.noRecord || !opts.body) return;
+        const meta = flNotifMeta(opts);
+        const doc = await FlNotif.create({ uid: String(uid), kind: meta.kind, label: meta.label, type: meta.type, body: String(opts.body).slice(0, 300), url: opts.url || pushUrlFor(opts.tag) });
+        sseBroadcast("fnotif", { id: String(doc._id) }, c => c.uid === String(uid));
+    } catch (e) { console.error("❌ fnotif:", e.message); }
+}
+setInterval(() => { FlNotif.deleteMany({ createdAt: { $lt: new Date(Date.now() - 30 * 86400000) } }).catch(() => {}); }, 6 * 3600 * 1000).unref();
+app.get("/api/fnotif", async (req, res) => {
+    if (!req.isAuthenticated()) return res.json({ list: [] });
+    try {
+        const list = await FlNotif.find({ uid: req.user.id, read: false }).sort({ createdAt: -1 }).limit(20).lean();
+        res.json({ list: list.map(n => ({ id: String(n._id), type: n.type, kind: n.kind, label: n.label, body: n.body, url: n.url, createdAt: n.createdAt })) });
+    } catch (e) { res.json({ list: [] }); }
+});
+app.put("/api/fnotif/read", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    try {
+        const ids = (Array.isArray((req.body || {}).ids) ? req.body.ids : []).map(String).filter(x => /^[a-f0-9]{24}$/.test(x)).slice(0, 50);
+        if (ids.length) await FlNotif.updateMany({ _id: { $in: ids }, uid: req.user.id }, { read: true });
+        res.json({ ok: true });
+    } catch (e) { res.json({ ok: false }); }
+});
 const pushAll = opts => pushableDevs().then(d => sendPushTo(d, opts));
-const pushUid = (uid, opts) => pushableDevs({ uid }).then(d => sendPushTo(d, opts));
+const pushUidRaw = (uid, opts) => pushableDevs({ uid }).then(d => sendPushTo(d, opts));
+// أي Push لعضو يتسجّل تلقائياً كإشعار داخل التطبيق (يطلع له توست/نافذة أول ما يدخل)
+const pushUid = (uid, opts) => {
+    const o = Object.assign({}, opts, { inapp: !!(opts && opts.body) && !(opts && opts.noRecord) });
+    flRecordNotif(uid, o);
+    return pushUidRaw(uid, o);
+};
 
 app.get("/api/push/vapid", async (req, res) => {
     const key = await ensureVapid();
@@ -11965,6 +12050,34 @@ app.get("/", (req, res) => {
     .rank-line { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 15px; color: var(--gold-soft); margin: 10px 0; font-weight: bold; }
     .hidden { display: none !important; }
     #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0d1f3c; padding: 10px 20px; border-radius: 10px; border: 1px solid var(--gold); z-index: 7500; display: none; }
+    /* 🔔 إشعارات فلاش (نفس نمط البنك): توست تحت يمين + نافذة إنذار حمراء */
+    #fn-wrap { position: fixed; right: 14px; bottom: calc(14px + env(safe-area-inset-bottom, 0px)); z-index: 7600; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; pointer-events: none; }
+    .fn-toast { --c: #3b82f6; pointer-events: auto; cursor: pointer; position: relative; overflow: hidden; width: min(310px, calc(100vw - 28px)); background: #07162b; border: 1px solid var(--c); border-right-width: 4px; border-radius: 12px; padding: 10px 12px 13px; box-shadow: 0 10px 30px rgba(0,0,0,0.55); animation: fnIn 0.3s cubic-bezier(.2,.9,.3,1.2); transition: opacity 0.25s, transform 0.25s; direction: rtl; }
+    .fn-toast.out { opacity: 0; transform: translateX(40px); }
+    .fn-info { --c: #3b82f6; background: linear-gradient(135deg, #07162b, #0b2447); }
+    .fn-success { --c: #22c55e; background: linear-gradient(135deg, #07162b, #0a2a1c); }
+    .fn-warning { --c: #f97316; background: linear-gradient(135deg, #07162b, #2e1606); }
+    .fn-title { font-size: 0.78rem; font-weight: 800; color: var(--c); margin-bottom: 3px; }
+    .fn-text { font-size: 0.84rem; color: #e2e8f0; line-height: 1.6; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+    .fn-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,0.08); }
+    .fn-bar i { display: block; height: 100%; width: 100%; background: var(--c); transform-origin: right center; animation-name: fnBar; animation-timing-function: linear; animation-fill-mode: forwards; }
+    @keyframes fnBar { to { transform: scaleX(0); } }
+    @keyframes fnIn { from { opacity: 0; transform: translateX(60px); } to { opacity: 1; transform: none; } }
+    .fn-dg-ov { position: fixed; inset: 0; z-index: 7800; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(60,0,0,0.38); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); animation: fnFade 0.2s ease; touch-action: none; }
+    .fn-dg-box { width: 100%; max-width: 400px; max-height: 85vh; overflow-y: auto; text-align: center; direction: rtl; background: linear-gradient(160deg, #1a0709, #07162b); border: 2px solid #ef4444; border-radius: 16px; padding: 22px 20px 20px; box-shadow: 0 0 0 0 rgba(239,68,68,0.6), 0 20px 60px rgba(0,0,0,0.7); animation: fnPop 0.25s cubic-bezier(.2,.9,.3,1.2), fnPulse 1.1s ease-in-out infinite 0.25s; }
+    .fn-dg-icon { font-size: 3rem; line-height: 1; margin-bottom: 6px; animation: fnShake 0.6s ease-in-out infinite; }
+    .fn-dg-title { font-size: 1.15rem; font-weight: 800; color: #fca5a5; margin-bottom: 12px; }
+    .fn-dg-msg { font-size: 1rem; color: #f1f5f9; line-height: 1.8; word-break: break-word; padding: 8px 4px; }
+    .fn-dg-msg + .fn-dg-msg { border-top: 1px solid rgba(239,68,68,0.3); margin-top: 6px; }
+    .fn-dg-msg b { display: block; font-size: 0.8rem; color: #fca5a5; margin-bottom: 2px; }
+    .fn-dg-hint { font-size: 0.82rem; color: #fbbf24; margin-top: 8px; display: none; }
+    .fn-dg-btn { width: 100%; margin-top: 10px; padding: 12px; font-size: 1rem; border: none; border-radius: 10px; font-weight: 800; cursor: pointer; font-family: inherit; }
+    .fn-dg-ok { background: #ef4444; color: #fff; margin-top: 14px; }
+    .fn-dg-go { background: #1e293b; color: #e2e8f0; border: 1px solid #475569; }
+    @keyframes fnFade { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes fnPop { from { opacity: 0; transform: scale(0.8); } to { opacity: 1; transform: none; } }
+    @keyframes fnPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55), 0 20px 60px rgba(0,0,0,0.7); } 50% { box-shadow: 0 0 0 14px rgba(239,68,68,0), 0 20px 60px rgba(0,0,0,0.7); } }
+    @keyframes fnShake { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-9deg); } 75% { transform: rotate(9deg); } }
     .fab { position: fixed; bottom: 25px; right: 25px; z-index: 998; background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; border: 2px solid rgba(255,255,255,0.2); padding: 14px 24px; border-radius: 50px; font-weight: bold; font-family: inherit; font-size: 14px; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.4); transition: 0.3s; }
     .fab:hover { transform: scale(1.05); }
     .vgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -14077,6 +14190,7 @@ function spConnect() {
         es.addEventListener('vsig', function (e) { try { offOnVsig(JSON.parse(e.data)); } catch (x) {} });
         es.addEventListener('court', function () { try { if (ME && ME.courtLocked) courtCheck(); if (document.getElementById('court-body')) courtPanelLoad(true); } catch (x) {} });
         es.addEventListener('courtlock', function () { try { courtCheck(); } catch (x) {} });
+        es.addEventListener('fnotif', function () { try { fnCheck(); } catch (x) {} });
         es.addEventListener('pushtext', function (e) { try { flOnPushText(JSON.parse(e.data)); } catch (x) {} });
         es.addEventListener('pwakick', function () { try { if (!flStandalone() && ME) { ME.pwaInstalled = true; PWA.mode = 'open'; pwaGate(); } } catch (x) {} });
         es.addEventListener('sessionkick', function () { try { flSessionKicked(); } catch (x) {} });
@@ -15209,7 +15323,114 @@ function spPendingTicket() {
     if (id) return id;
     try { var v = sessionStorage.getItem('sp_pending_ticket'); return v && /^[a-f0-9]{24}$/.test(v) ? v : null; } catch (e) { return null; }
 }
-// ===== تنقّل الإشعارات: ?go=att|excuse|hcexcuse|hcatt|court  و ?ticket=ID =====
+/* ═══════════ 🔔 نظام الإشعارات (نفس نظام البنك) ═══════════
+   توست تحت يمين: أزرق معلومة / أخضر نجاح / برتقالي تنبيه (مثل: تجاوز الحضور) — الضغط عليه يودّيك لصفحته.
+   الإنذار (أحمر): نافذة منبثقة بصوت واهتزاز لين تضغط «فهمت». لو وصلك وأنت برّا التطبيق جاك Push عادي، وأول ما تدخل يطلع لك. */
+var FN = { busy: false, shown: {}, t: null, ctx: null, loop: null, dg: null, dgItems: [] };
+var FN_MS = 8000;
+function fnCtx() { try { var AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; if (!FN.ctx) FN.ctx = new AC(); return FN.ctx; } catch (e) { return null; } }
+['click', 'touchend', 'pointerdown', 'keydown'].forEach(function (ev) {
+    document.addEventListener(ev, function () { var c = fnCtx(); if (c && c.state !== 'running') c.resume().catch(function () {}); }, { passive: true, capture: true });
+});
+function fnVib(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+function fnBeep() {
+    try {
+        var c = fnCtx(); if (!c) return false;
+        if (c.state !== 'running') { c.resume().catch(function () {}); return false; }
+        var now = c.currentTime, g = c.createGain();
+        g.gain.setValueAtTime(0.0001, now); g.gain.exponentialRampToValueAtTime(0.4, now + 0.03);
+        g.gain.setValueAtTime(0.4, now + 1.9); g.gain.exponentialRampToValueAtTime(0.0001, now + 2.0);
+        g.connect(c.destination);
+        var o = c.createOscillator(); o.type = 'square';
+        for (var i = 0; i < 4; i++) { o.frequency.setValueAtTime(880, now + i * 0.5); o.frequency.setValueAtTime(660, now + i * 0.5 + 0.25); }
+        o.connect(g); o.start(now); o.stop(now + 2.0);
+        return true;
+    } catch (e) { return false; }
+}
+function fnStopSound() { if (FN.loop) { clearInterval(FN.loop.timer); clearTimeout(FN.loop.cap); FN.loop = null; } fnVib(0); }
+function fnStartSound(hint) {
+    if (FN.loop) return;
+    var n = 0;
+    function tick() { var ok = fnBeep(); if (hint) hint.style.display = ok ? 'none' : 'block'; if (n++ % 3 === 0) fnVib([1000, 120, 1000, 120, 900, 120, 800, 120, 500]); }
+    FN.loop = { timer: setInterval(tick, 2300), cap: setTimeout(fnStopSound, 120000) };
+    tick();
+}
+function fnRead(ids) { if (!ids || !ids.length) return; api('/api/fnotif/read', { method: 'PUT', body: JSON.stringify({ ids: ids }), noLock: true }).catch(function () {}); }
+function fnGo(n) { try { flNavUrl(n.url || '/'); } catch (e) {} }
+function fnEl(tag, cls, txt) { var e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; }
+function fnToast(n) {
+    var wrap = document.getElementById('fn-wrap');
+    if (!wrap) { wrap = fnEl('div'); wrap.id = 'fn-wrap'; document.body.appendChild(wrap); }
+    var type = (n.type === 'success' || n.type === 'warning') ? n.type : 'info';
+    var t = fnEl('div', 'fn-toast fn-' + type);
+    t.appendChild(fnEl('div', 'fn-title', n.label || 'إشعار جديد'));
+    t.appendChild(fnEl('div', 'fn-text', n.body || ''));
+    var bar = fnEl('div', 'fn-bar'), f = document.createElement('i'); f.style.animationDuration = FN_MS + 'ms'; bar.appendChild(f); t.appendChild(bar);
+    wrap.appendChild(t);
+    var closed = false;
+    function close() { if (closed) return; closed = true; t.classList.add('out'); setTimeout(function () { t.remove(); }, 280); }
+    setTimeout(close, FN_MS);
+    t.onclick = function () { close(); fnGo(n); };
+    if (type === 'warning') fnVib([300, 100, 300, 100, 200]); else if (type === 'success') fnVib([30, 60, 30]); else fnVib([40]);
+}
+function fnDanger(n) {
+    FN.dgItems.push(n);
+    if (FN.dg) {
+        var m2 = fnEl('div', 'fn-dg-msg'); m2.appendChild(fnEl('b', null, n.label || 'إنذار')); m2.appendChild(document.createTextNode(n.body || ''));
+        FN.dg.querySelector('.fn-dg-list').appendChild(m2);
+        return;
+    }
+    var ov = fnEl('div', 'fn-dg-ov'), box = fnEl('div', 'fn-dg-box');
+    box.appendChild(fnEl('div', 'fn-dg-icon', '🚨'));
+    box.appendChild(fnEl('div', 'fn-dg-title', 'إنذار'));
+    var list = fnEl('div', 'fn-dg-list'), m = fnEl('div', 'fn-dg-msg');
+    m.appendChild(fnEl('b', null, n.label || 'إنذار')); m.appendChild(document.createTextNode(n.body || ''));
+    list.appendChild(m); box.appendChild(list);
+    var hint = fnEl('div', 'fn-dg-hint', '🔊 المس الشاشة لتشغيل صوت الإنذار');
+    box.appendChild(hint);
+    var go = null;
+    if (n.url && n.url.indexOf('go=') > -1) { go = fnEl('button', 'fn-dg-btn fn-dg-go', 'الذهاب للصفحة'); box.appendChild(go); }
+    var ok = fnEl('button', 'fn-dg-btn fn-dg-ok', 'فهمت'); box.appendChild(ok);
+    ov.appendChild(box); document.body.appendChild(ov); FN.dg = ov;
+    document.body.style.overflow = 'hidden';
+    function close(goAfter) {
+        fnStopSound(); ov.remove(); FN.dg = null; document.body.style.overflow = '';
+        var ids = FN.dgItems.map(function (x) { return x.id; }); FN.dgItems = [];
+        fnRead(ids);
+        if (goAfter) fnGo(n);
+    }
+    ok.onclick = function () { close(false); };
+    if (go) go.onclick = function () { close(true); };
+    fnStartSound(hint);
+    try { ok.focus(); } catch (e) {}
+}
+async function fnCheck() {
+    if (!ME || FN.busy || document.hidden) return;
+    FN.busy = true;
+    try {
+        var d = await api('/api/fnotif', { noLock: true });
+        var list = ((d && d.list) || []).slice().reverse();
+        var markRead = [], toasts = [];
+        list.forEach(function (n) {
+            if (FN.shown[n.id]) return;
+            FN.shown[n.id] = 1;
+            if (n.kind === 'warn-') { checkPendingWarning(); markRead.push(n.id); return; }
+            if (n.type === 'danger') { fnDanger(n); return; }
+            markRead.push(n.id);
+            if (Date.now() - new Date(n.createdAt).getTime() < 86400000) toasts.push(n);
+        });
+        toasts.slice(-3).forEach(fnToast);
+        fnRead(markRead);
+    } catch (e) {} finally { FN.busy = false; }
+}
+function fnStart() {
+    if (FN.t) return;
+    FN.t = setInterval(fnCheck, 40000);
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) fnCheck(); });
+    fnCheck();
+}
+
+// ===== تنقّل الإشعارات: ?go=att|excuse|hcexcuse|hcatt|court|warn  و ?ticket=ID =====
 function flGoTo(code) {
     if (!ME) return false;
     try {
@@ -15224,6 +15445,7 @@ function flGoTo(code) {
         if (code === 'fraud' && ME.canFraud) { renderFraudPanel(); return true; }
         if (code === 'certs') { renderCertPage(); return true; }
         if (code === 'bank') { flBankOpen(); return true; }
+        if (code === 'warn') { checkPendingWarning(); return true; }
     } catch (e) {}
     renderDashboard();
     return true;
@@ -15901,6 +16123,7 @@ async function init() {
     if (!ME.unit) ME.unit = 'غير محدد';
     if (!navRestore()) renderDashboard();
     checkPendingWarning();
+    fnStart();
     checkPromotionAlert();
     cyberCheck();
     startPolling();
