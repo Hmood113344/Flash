@@ -10215,11 +10215,9 @@ async function pushDupSet() {
     }
     return new Set(all.filter(d => best.get(d.uid).id !== d.id).map(d => d.id));
 }
-// includeDup = true: يشمل الأجهزة المكررة (نستخدمها لإشعار الكل وإشعار الاستلام)
-async function pushableDevs(filter, includeDup) {
-    const list = await PushDevice.find(Object.assign({ sub: { $ne: null } }, filter || {})).lean();
-    if (includeDup) return list;
+async function pushableDevs(filter) {
     const dup = await pushDupSet();
+    const list = await PushDevice.find(Object.assign({ sub: { $ne: null } }, filter || {})).lean();
     return list.filter(d => !dup.has(d.id));
 }
 // حساب دخل مرة من "تطبيق الويب" => المتصفح يتقفل عليه ويقوله ادخل من التطبيق
@@ -10410,7 +10408,7 @@ app.put("/api/fnotif/read", async (req, res) => {
         res.json({ ok: true });
     } catch (e) { res.json({ ok: false }); }
 });
-const pushAll = opts => pushableDevs(null, true).then(d => sendPushTo(d, opts));   // للكل (الاستلام وغيره): يوصل حتى للأجهزة المكررة
+const pushAll = opts => pushableDevs().then(d => sendPushTo(d, opts));
 const pushUidRaw = (uid, opts) => pushableDevs({ uid }).then(d => sendPushTo(d, opts));
 // أي Push لعضو يتسجّل تلقائياً كإشعار داخل التطبيق (يطلع له توست/نافذة أول ما يدخل)
 const pushUid = (uid, opts) => {
@@ -10530,7 +10528,7 @@ app.post("/api/senior/push/send", ensureSeniorAdmin, async (req, res) => {
     const body = String(b.body || "").trim().slice(0, 160) || CONFIG.PUSH_DEFAULT_BODY;
     if (!webpush) return res.status(503).json({ error: "مكتبة web-push غير مثبتة على السيرفر" });
     let devs = [];
-    if (b.all) devs = await pushableDevs(null, true);   // للجميع: يشمل الأجهزة المكررة بعد
+    if (b.all) devs = await pushableDevs();
     else if (validDevId(b.id)) {
         const d = await PushDevice.findOne({ id: b.id }).lean();
         if (!d || !d.sub) return res.status(404).json({ error: "هذا الجهاز ما فعّل الإشعارات" });
@@ -11087,8 +11085,11 @@ const RecRowSchema = new mongoose.Schema({
     gained: { type: Number, default: 0 }, deducted: { type: Number, default: 0 }, refunded: { type: Number, default: 0 },
     excuseStatus: { type: String, default: "none" }, excuseId: { type: String, default: null }, openedAt: Date,
     removedAt: Date, removedBy: String, removedByName: String,
+    // حماية الاستلام: watch = ينتظر مؤقت الـ 8 ساعات • ok = سجّل مخالفة صالحة • absent = انقلب غياب • exempt = معفى (موقوف/مفصول/بطاقة ملغاة)
+    protStatus: { type: String, default: null }, protDeadline: Date, protCheckedAt: Date,
 });
 RecRowSchema.index({ dayKey: 1, uid: 1 }, { unique: true });
+RecRowSchema.index({ protStatus: 1, protDeadline: 1 });
 const RecRow = mongoose.model("RecRow", RecRowSchema);
 const AbsenceExcuseSchema = new mongoose.Schema({
     rowId: String, dayKey: Number, uid: String, name: String, unit: String, rank: String, sector: String, sectorKey: String,
@@ -11165,8 +11166,18 @@ async function closeReceptionDay(closerId, closerName) {
             }
         }
     } catch (e) { console.error("❌ فشل حساب مدة بقاء الاستلام:", e.message); }
+    // الاستلام مرة وحدة باليوم: اللي حضر استلام سابق اليوم ما ينحسب عليه غياب بهذا الاستلام (ولو حضر ياخذ نقطته عادي)
+    const attendedEarlier = new Set();
+    try {
+        const earlier = await RecDay.find({ dayKey: { $ne: dayKey }, openedAt: { $gte: attDayStart(rd.openedAt), $lt: rd.openedAt } }, { dayKey: 1 }).lean();
+        if (earlier.length) {
+            const prev = await RecRow.find({ dayKey: { $in: earlier.map(e => e.dayKey) }, kind: "attended", removedAt: null }, { uid: 1 }).limit(20000).maxTimeMS(10000).lean();
+            prev.forEach(r => attendedEarlier.add(r.uid));
+        }
+    } catch (e) { console.error("❌ فشل جلب حضور الاستلامات السابقة:", e.message); }
+    const protDeadline = new Date(now.getTime() + REC_PROT_MS);
     const rows = [], ops = [];
-    let attended = 0, absent = 0, leave = 0;
+    let attended = 0, absent = 0, leave = 0, skippedEarlier = 0;
     for (const a of accs) {
         if (a.isSenior || a.isOwner || a.tempSenior || isSeniorAdmin(a.uid) || isHighCommand(a.uid, settings)) continue;
         const p = pm.get(a.uid);
@@ -11176,9 +11187,13 @@ async function closeReceptionDay(closerId, closerName) {
         const st = sm.get(a.uid);
         const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: rd.openedAt };
         if ((st && st.status === "in") || stayed.has(a.uid)) {
-            rows.push({ ...base, kind: "attended", gained: 1 });
+            // اللي مسجّل حضور وقت انتهاء الاستلام يبدأ له مؤقت 8 ساعات (حماية: لازم يسجّل مخالفة صالحة)
+            const watch = !!(st && st.status === "in");
+            rows.push({ ...base, kind: "attended", gained: 1, ...(watch ? { protStatus: "watch", protDeadline } : {}) });
             ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
             attended++;
+        } else if (attendedEarlier.has(a.uid)) {
+            skippedEarlier++;   // حضر استلام سابق اليوم: هذا الاستلام ما يحسب عليه
         } else if (lv.has(a.uid)) {
             rows.push({ ...base, kind: "leave" });
             leave++;
@@ -11197,9 +11212,70 @@ async function closeReceptionDay(closerId, closerName) {
             await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "غبت عن الاستلام" + (r.deducted ? " وانخصم عليك " + r.deducted + " نقطة" : "") + " — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
         }
     })();
-    await logEvent({ action: "إغلاق استلام وحساب الغيابات", actorId: closerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-5) • إجازة " + leave });
+    await logEvent({ action: "إغلاق استلام وحساب الغيابات", actorId: closerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-5) • إجازة " + leave + (skippedEarlier ? " • ما انحسب عليهم (حضروا استلام سابق اليوم) " + skippedEarlier : "") });
     return { attended, absent, leave };
 }
+
+// ═══ حماية الاستلام ═══
+// اللي انحسب حاضر وهو مسجّل حضور وقت انتهاء الاستلام: يبدأ له مؤقت 8 ساعات.
+// لو ما سجّل ولا مخالفة صالحة خلالها => ينقلب حضوره غياب (تنسحب نقطة الحضور وينخصم 5).
+// المخالفة المرفوضة تعتبر كأنها ما انسجلت، والمعلّقة ننتظر قرارها.
+const REC_PROT_MS = 8 * 60 * 60 * 1000;
+let recProtBusy = false;
+async function runRecProtection() {
+    if (recProtBusy) return;
+    recProtBusy = true;
+    try {
+        const now = new Date();
+        const due = await RecRow.find({ kind: "attended", protStatus: "watch", protDeadline: { $lte: now }, removedAt: null }).limit(300).maxTimeMS(10000).lean();
+        if (!due.length) return;
+        const settings = await getSettings();
+        if (settings.disableViolations) {   // تسجيل المخالفات مقفل: ما نظلم أحد، نأجّل ساعة
+            await RecRow.updateMany({ _id: { $in: due.map(r => r._id) } }, { $set: { protDeadline: new Date(now.getTime() + 60 * 60 * 1000) } });
+            return;
+        }
+        const uids = [...new Set(due.map(r => r.uid))];
+        const since = new Date(Math.min(...due.map(r => new Date(r.openedAt).getTime())));
+        const [vs, ps] = await Promise.all([
+            Violation.find({ reporterDiscord: { $in: uids }, createdAt: { $gte: since } }, { reporterDiscord: 1, createdAt: 1, status: 1 }).limit(20000).maxTimeMS(10000).lean(),
+            Personnel.find({ discord: { $in: uids } }, { discord: 1, isBlocked: 1, isDismissed: 1, cardRevoked: 1 }).maxTimeMS(10000).lean(),
+        ]);
+        const pm = new Map(ps.map(p => [p.discord, p]));
+        const ops = [], flipped = [];
+        for (const row of due) {
+            const from = new Date(row.openedAt).getTime(), to = new Date(row.protDeadline).getTime();
+            const mine = vs.filter(v => v.reporterDiscord === row.uid && new Date(v.createdAt).getTime() >= from && new Date(v.createdAt).getTime() <= to);
+            if (mine.some(v => v.status !== "pending" && v.status !== "rejected")) {
+                await RecRow.updateOne({ _id: row._id, protStatus: "watch" }, { $set: { protStatus: "ok", protCheckedAt: now } });
+                continue;
+            }
+            if (mine.some(v => v.status === "pending")) {   // لسا ما انقرر عليها: ننتظر
+                await RecRow.updateOne({ _id: row._id }, { $set: { protCheckedAt: now } });
+                continue;
+            }
+            const p = pm.get(row.uid);
+            if (!p || p.isBlocked || p.isDismissed || p.cardRevoked) {   // ما يقدر يسجّل مخالفات أصلاً: معفى
+                await RecRow.updateOne({ _id: row._id, protStatus: "watch" }, { $set: { protStatus: "exempt", protCheckedAt: now } });
+                continue;
+            }
+            const r0 = await RecRow.findOneAndUpdate(
+                { _id: row._id, kind: "attended", protStatus: "watch", removedAt: null },
+                { $set: { kind: "absent", gained: 0, deducted: 5, excuseStatus: "none", protStatus: "absent", protCheckedAt: now } }
+            );
+            if (!r0) continue;
+            ops.push({ updateOne: { filter: { discord: row.uid }, update: { $inc: { points: -6 } } } });   // سحب نقطة الحضور + خصم 5
+            flipped.push(row);
+        }
+        if (ops.length) await Personnel.bulkWrite(ops, { ordered: false }).catch(e => console.error("❌ فشل خصم حماية الاستلام:", e.message));
+        for (const r of flipped) {
+            await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "انحسب عليك غياب عن الاستلام: ما سجّلت أي مخالفة صالحة خلال 8 ساعات من انتهاءه (المرفوضة ما تنحسب). انسحبت نقطة الحضور وانخصم عليك 5 نقاط — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
+        }
+        if (flipped.length) await logEvent({ action: "حماية الاستلام: تحويل حضور لغياب", actorId: "auto", actorTag: "🤖 نظام حماية الاستلام", details: "انقلب غياب لعدم تسجيل مخالفة صالحة خلال 8 ساعات: " + flipped.map(r => r.name).join("، ") });
+    } catch (e) { console.error("❌ حماية الاستلام:", e.message); }
+    finally { recProtBusy = false; }
+}
+setInterval(() => { runRecProtection(); }, 5 * 60 * 1000).unref();
+setTimeout(() => { runRecProtection(); }, 90 * 1000).unref();
 
 app.get("/api/excuse/my", ensureAuth, async (req, res) => {
     const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
