@@ -10215,9 +10215,11 @@ async function pushDupSet() {
     }
     return new Set(all.filter(d => best.get(d.uid).id !== d.id).map(d => d.id));
 }
-async function pushableDevs(filter) {
-    const dup = await pushDupSet();
+// includeDup = true: يشمل الأجهزة المكررة (نستخدمها لإشعار الكل وإشعار الاستلام)
+async function pushableDevs(filter, includeDup) {
     const list = await PushDevice.find(Object.assign({ sub: { $ne: null } }, filter || {})).lean();
+    if (includeDup) return list;
+    const dup = await pushDupSet();
     return list.filter(d => !dup.has(d.id));
 }
 // حساب دخل مرة من "تطبيق الويب" => المتصفح يتقفل عليه ويقوله ادخل من التطبيق
@@ -10408,7 +10410,7 @@ app.put("/api/fnotif/read", async (req, res) => {
         res.json({ ok: true });
     } catch (e) { res.json({ ok: false }); }
 });
-const pushAll = opts => pushableDevs().then(d => sendPushTo(d, opts));
+const pushAll = opts => pushableDevs(null, true).then(d => sendPushTo(d, opts));   // للكل (الاستلام وغيره): يوصل حتى للأجهزة المكررة
 const pushUidRaw = (uid, opts) => pushableDevs({ uid }).then(d => sendPushTo(d, opts));
 // أي Push لعضو يتسجّل تلقائياً كإشعار داخل التطبيق (يطلع له توست/نافذة أول ما يدخل)
 const pushUid = (uid, opts) => {
@@ -10528,7 +10530,7 @@ app.post("/api/senior/push/send", ensureSeniorAdmin, async (req, res) => {
     const body = String(b.body || "").trim().slice(0, 160) || CONFIG.PUSH_DEFAULT_BODY;
     if (!webpush) return res.status(503).json({ error: "مكتبة web-push غير مثبتة على السيرفر" });
     let devs = [];
-    if (b.all) devs = await pushableDevs();
+    if (b.all) devs = await pushableDevs(null, true);   // للجميع: يشمل الأجهزة المكررة بعد
     else if (validDevId(b.id)) {
         const d = await PushDevice.findOne({ id: b.id }).lean();
         if (!d || !d.sub) return res.status(404).json({ error: "هذا الجهاز ما فعّل الإشعارات" });
