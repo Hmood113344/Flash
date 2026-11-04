@@ -1185,6 +1185,29 @@ const client = new Client({
     ],
     partials: [Partials.Channel],
 });
+// مهلة لأي جلب قناة / إرسال رسالة لديسكورد: لو علق ما يعلّق معه زر الإرسال عند العضو
+function __discordTimeout(promise, ms, label) {
+    let timer;
+    return Promise.race([
+        Promise.resolve(promise),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("انتهت مهلة ديسكورد (" + label + ")")), ms); }),
+    ]).finally(() => clearTimeout(timer));
+}
+(function () {
+    try {
+        const origFetch = client.channels.fetch.bind(client.channels);
+        client.channels.fetch = function () {
+            return __discordTimeout(origFetch.apply(null, arguments).then(ch => {
+                if (ch && typeof ch.send === "function" && !ch.__flSendWrapped) {
+                    const origSend = ch.send.bind(ch);
+                    ch.send = function () { return __discordTimeout(origSend.apply(null, arguments), 25000, "send"); };
+                    ch.__flSendWrapped = true;
+                }
+                return ch;
+            }), 15000, "fetch");
+        };
+    } catch (e) { console.error("⚠️ تعذر ضبط مهلة ديسكورد:", e.message); }
+})();
 
 const pendingMessages = new Map();
 let botReady = false;
@@ -3629,7 +3652,16 @@ app.post("/api/card-photos/:uid/reject", ensureAnyAdmin, async (req, res) => {
 });
 
 const VIOLATION_COOLDOWN_MS = 5 * 1000;
-const violationLocks = new Set();
+// قفل بمدة صلاحية: لو الطلب علق (مثلاً ديسكورد تأخر) ما يبقى الحساب مقفول، ينفك لحاله بعد 30 ثانية
+const violationLocks = (function () {
+    const m = new Map();
+    const TTL = 30 * 1000;
+    return {
+        has(k) { const t = m.get(k); if (t && Date.now() - t > TTL) { m.delete(k); return false; } return !!t; },
+        add(k) { m.set(k, Date.now()); return this; },
+        delete(k) { return m.delete(k); },
+    };
+})();
 
 app.post("/api/violations/submit", ensureAuth, async (req, res) => {
     if (violationLocks.has(req.user.id)) {
@@ -6733,7 +6765,7 @@ app.get("/api/bank/sso", ensureAuth, async (req, res) => {
         if (!bankKey()) return res.status(503).json({ error: "البنك غير مربوط بعد — لازم تضبط INTERNAL_API_KEY على فلاش والبنك" });
         const p = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1, rank: 1, unit: 1 }).lean();
         if (!p || !p.registeredName) return res.status(400).json({ error: "أكمل تسجيل بياناتك أولاً" });
-        const token = bankSignToken({ uid: req.user.id, name: p.registeredName, rank: p.rank || "", unit: p.unit || "", senior: isSeniorAdmin(req.user.id), exp: Date.now() + 60 * 1000, n: crypto.randomBytes(9).toString("hex") });
+        const token = bankSignToken({ uid: req.user.id, name: p.registeredName, rank: p.rank || "", unit: p.unit || "", senior: isSeniorAdmin(req.user.id), owner: isOwnerUid(req.user.id), exp: Date.now() + 60 * 1000, n: crypto.randomBytes(9).toString("hex") });
         res.json({ ok: true, url: "/bank/sso?t=" + encodeURIComponent(token) });
     } catch (e) { console.error("❌ bank sso:", e.message); res.status(500).json({ error: "تعذر فتح البنك" }); }
 });
@@ -6789,11 +6821,30 @@ function bankWakePage() {
 app.get("/api/bank/ranks", ensureBankKey, async (req, res) => {
     res.json({ success: true, ranks: CONFIG.MILITARY_RANKS });
 });
+// البنك يسأل عن البطاقة العسكرية لعضو (للتحقق من طلب بطاقة بنكية + ملف العضو عند كبار البنك)
+app.get("/api/bank/member-card", ensureBankKey, async (req, res) => {
+    try {
+        const uid = String(req.query.uid || "").trim();
+        if (!uid) return res.json({ success: false, msg: "uid مطلوب" });
+        const p = await Personnel.findOne({ discord: uid }).lean();
+        if (!p || !p.registeredName) return res.json({ success: true, found: false });
+        const a = await Account.findOne({ uid }, { sector: 1, isSenior: 1, status: 1 }).lean();
+        const secKey = p.sector || (a && a.sector) || null;
+        res.json({
+            success: true, found: true,
+            name: p.registeredName || "", cardNumber: p.cardNumber || "",
+            rank: p.rank || "", unit: p.unit || "", sector: (secKey && CONFIG.SECTORS[secKey]) || "",
+            points: p.points || 0, leaveBalance: p.leaveBalance == null ? 0 : p.leaveBalance,
+            warnings: (p.warnings || []).length,
+            revoked: !!p.cardRevoked, blocked: !!(p.isBlocked || p.isDismissed),
+            senior: !!(a && a.isSenior),
+        });
+    } catch (e) { res.status(500).json({ success: false, msg: e.message }); }
+});
 app.get("/api/bank/personnel-ranks", ensureBankKey, async (req, res) => {
     try {
         const regUidsB = await getFlashRegisteredUids();
-        // إصلاح: كان يستثني ownerUids فكبار المسؤولين/المالك ما ينزل لهم راتب مع إن معهم رتبة — الحين يدخلون مع الباقي
-        const list = await Personnel.find({ isBlocked: false, discord: { $in: regUidsB } }, "discord discordTag rank registeredName");
+        const list = await Personnel.find({ isBlocked: false, discord: { $in: regUidsB, $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
         const personnel = list.map(p => ({
             discord: p.discord,
             discordTag: p.discordTag,
@@ -6804,25 +6855,6 @@ app.get("/api/bank/personnel-ranks", ensureBankKey, async (req, res) => {
     } catch (e) {
         res.json({ success: false, msg: e.message });
     }
-});
-// البنك يتحقق من البطاقة العسكرية للعضو (رقم البطاقة + الرتبة + القطاع + اليونت) عند طلب بطاقة بنكية
-app.get("/api/bank/member-card", ensureBankKey, async (req, res) => {
-    try {
-        const uid = String(req.query.uid || "");
-        if (!CARD_UID_RE.test(uid)) return res.json({ success: false, msg: "معرّف غير صالح" });
-        const [p, acc] = await Promise.all([
-            Personnel.findOne({ discord: uid }, { registeredName: 1, rank: 1, unit: 1, sector: 1, cardNumber: 1, cardRevoked: 1, isBlocked: 1 }).lean(),
-            Account.findOne({ uid }, { sector: 1 }).lean(),
-        ]);
-        if (!p || !p.registeredName || !p.cardNumber) return res.json({ success: true, found: false });
-        const sec = (acc && acc.sector) || p.sector || null;
-        res.json({
-            success: true, found: true,
-            name: p.registeredName, rank: p.rank || "", unit: p.unit || "",
-            sector: sec ? (CONFIG.SECTORS[sec] || sec) : "",
-            cardNumber: String(p.cardNumber), revoked: !!p.cardRevoked, blocked: !!p.isBlocked,
-        });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
 });
 // البنك يرسل إشعاراته (راتب، تحويل، قرض...) عبر فلاش كـ Push على أجهزة العضو
 app.post("/api/bank/notify", ensureBankKey, async (req, res) => {
@@ -11032,7 +11064,7 @@ async function closeReceptionDay(closerId, closerName) {
             rows.push({ ...base, kind: "leave" });
             leave++;
         } else {
-            const ded = 2; // خصم ثابت نقطتين حتى لو رصيده 0 أو 1 (يصير بالسالب)
+            const ded = 5; // خصم ثابت خمس نقاط حتى لو رصيده 0 أو 1 (يصير بالسالب)
             rows.push({ ...base, kind: "absent", deducted: ded, excuseStatus: "none" });
             if (ded) ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: -ded } } } });
             absent++;
@@ -11046,7 +11078,7 @@ async function closeReceptionDay(closerId, closerName) {
             await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "غبت عن الاستلام" + (r.deducted ? " وانخصم عليك " + r.deducted + " نقطة" : "") + " — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
         }
     })();
-    await logEvent({ action: "إغلاق استلام وحساب الغيابات", actorId: closerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-2) • إجازة " + leave });
+    await logEvent({ action: "إغلاق استلام وحساب الغيابات", actorId: closerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-5) • إجازة " + leave });
     return { attended, absent, leave };
 }
 
@@ -12767,7 +12799,7 @@ async function __apiCore(url, opts) {
         btn.style.cursor = 'wait';
     }
     try {
-        return await __rawFetch(url, opts, 0);
+        return await __rawFetch(url, opts, 40000);
     } finally {
         if (btn) {
             btn.dataset.busy = '0';
