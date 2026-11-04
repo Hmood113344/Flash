@@ -272,6 +272,7 @@ const PersonnelSchema = new mongoose.Schema({
         issuedBy: String, issuedByTag: String,
         acknowledged: { type: Boolean, default: false },
         acknowledgedAt: Date,
+        broadcast: { type: Boolean, default: false },   // إشعار للجميع: الوحيد اللي يطلع برتقالي بنص الشاشة، باقي الإشعارات توست
         warningNumber: { type: Number, default: null },
         pointsDeducted: { type: Number, default: 0 },
         penaltyType: { type: String, default: null },
@@ -4146,6 +4147,7 @@ async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag, po
     if (!p) throw new Error("غير موجود");
 
     const entry = { kind, reason: reason.trim(), issuedBy: actorId, issuedByTag: actorTag };
+    if (kind === "notice") { entry.acknowledged = true; entry.acknowledgedAt = new Date(); }   // الإشعار العادي يوصل توست (مو نافذة برتقالية)
     let dismissed = false;
     let logDetails = `على ${p.registeredName || p.discord}: ${reason.trim()}`;
 
@@ -4185,7 +4187,7 @@ async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag, po
         pushUid(p.discord, {
             title: CONFIG.SITE_NAME,
             body: (kind === "warning" ? "🚨 صدر عليك " + (numLbl[entry.warningNumber] || "تحذير") : "📌 صدر لك إشعار إداري") + " — " + entry.reason.slice(0, 90),
-            tag: "warn-" + String(wEntry._id), level: kind === "warning" ? "danger" : "warning",
+            tag: (kind === "warning" ? "warn-" : "notice-") + String(wEntry._id), level: kind === "warning" ? "danger" : "warning",
             label: kind === "warning" ? "🚨 إنذار" : "📌 إشعار إداري", urgent: kind === "warning", ttl: 86400,
         }).catch(() => {});
     } catch (e) {}
@@ -4276,7 +4278,7 @@ app.post("/api/senior/personnel/:discord/warn", ensureSeniorAdmin, async (req, r
 app.post("/api/senior/personnel/warn-all", ensureSeniorAdmin, async (req, res) => {
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
-    const entry = { kind: "notice", reason: reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username };
+    const entry = { kind: "notice", broadcast: true, reason: reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username };   // للجميع = نافذة برتقالية
     const result = await Personnel.updateMany(
         { registeredName: { $ne: null }, discord: { $nin: hiddenOwnerIds(req) } },
         { $push: { warnings: entry } }
@@ -4291,11 +4293,13 @@ app.post("/api/sector/notice-all", ensureSectorLeader, async (req, res) => {
     const memberIds = await getSectorMemberIds(req.sectorInfo.sector);
     if (memberIds === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية" });
     const fullReason = `📢 إشعار لقطاع ${req.sectorInfo.sectorLabel}: ${reason.trim()}`;
-    const entry = { kind: "notice", reason: fullReason, issuedBy: req.user.id, issuedByTag: req.user.username };
+    const entry = { kind: "notice", reason: fullReason, issuedBy: req.user.id, issuedByTag: req.user.username, acknowledged: true, acknowledgedAt: new Date() };
     const result = await Personnel.updateMany(
         { discord: { $in: memberIds }, registeredName: { $ne: null } },
         { $push: { warnings: entry } }
     );
+    Personnel.find({ discord: { $in: memberIds }, registeredName: { $ne: null } }, { discord: 1 }).lean()
+        .then(rows => flNotifyMany(rows.map(r => r.discord), { title: CONFIG.SITE_NAME, body: fullReason, tag: "notice-sec-" + Date.now().toString(36), level: "warning", label: "📢 إشعار قطاع " + req.sectorInfo.sectorLabel, ttl: 86400 })).catch(() => {});
     await logEvent({
         action: "إصدار إشعار قطاع", actorId: req.user.id, actorTag: req.user.username,
         details: `📢 إشعار لقطاع ${req.sectorInfo.sectorLabel} (${result.modifiedCount}): ${reason.trim()}`,
@@ -4305,6 +4309,7 @@ app.post("/api/sector/notice-all", ensureSectorLeader, async (req, res) => {
 
 app.get("/api/warnings/pending", async (req, res) => {
     if (!req.isAuthenticated()) return res.json({ warning: null });
+    await flConvertNotices(req.user.id);   // أي إشعار عادي معلّق يتحوّل توست؛ يبقى بالنافذة البرتقالية بس «للجميع» ومراجعة الملاحظات
     const p = await Personnel.findOne({ discord: req.user.id }, { warnings: 1 });
     if (!p || !p.warnings || !p.warnings.length) return res.json({ warning: null });
     const pending = p.warnings.filter(w => !w.acknowledged).sort((a, b) => a.createdAt - b.createdAt)[0];
@@ -6277,11 +6282,13 @@ app.post("/api/mp/notice-all", ensureMPLeader, async (req, res) => {
     const ids = await getMilitaryPoliceMemberIds();
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية" });
     const fullReason = `📢 إشعار للشرطة العسكرية: ${reason.trim()}`;
-    const entry = { kind: "notice", reason: fullReason, issuedBy: req.user.id, issuedByTag: req.user.username };
+    const entry = { kind: "notice", reason: fullReason, issuedBy: req.user.id, issuedByTag: req.user.username, acknowledged: true, acknowledgedAt: new Date() };
     const result = await Personnel.updateMany(
         { discord: { $in: ids }, registeredName: { $ne: null } },
         { $push: { warnings: entry } }
     );
+    Personnel.find({ discord: { $in: ids }, registeredName: { $ne: null } }, { discord: 1 }).lean()
+        .then(rows => flNotifyMany(rows.map(r => r.discord), { title: CONFIG.SITE_NAME, body: fullReason, tag: "notice-mp-" + Date.now().toString(36), level: "warning", label: "📢 إشعار الشرطة العسكرية", ttl: 86400 })).catch(() => {});
     await logEvent({ action: "إصدار إشعار الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: `📢 (${result.modifiedCount}): ${reason.trim()}` });
     res.json({ ok: true, count: result.modifiedCount });
 });
@@ -10353,7 +10360,9 @@ const FL_NOTIF_KINDS = [
     ["fraud-",      "danger",  "🛡️ تلاعب محتمل"],         // أحمر منبثق
     ["cert-",       "success", "📜 شهادة جديدة"],
     ["ticket-",     "info",    "💬 رد على تكتك"],
-    ["warn-",       "danger",  "🚨 إنذار"],               // التحذير أحمر (والإشعار الإداري برتقالي)
+    ["warn-",       "danger",  "🚨 إنذار"],               // التحذير الرسمي أحمر (نافذة)
+    ["notice-",     "warning", "📌 إشعار إداري"],          // الإشعار الإداري توست برتقالي
+    ["adm-",        "info",    "📢 رسالة من الإدارة"],     // إشعار مخصص من الكبار (النوع يتحدد من level)
     ["bank-",       "info",    "🏦 بنك فلاش"],
 ];
 function flNotifMeta(opts) {
@@ -10374,8 +10383,19 @@ setInterval(() => { FlNotif.deleteMany({ createdAt: { $lt: new Date(Date.now() -
 app.get("/api/fnotif", async (req, res) => {
     if (!req.isAuthenticated()) return res.json({ list: [] });
     try {
+        await flConvertNotices(req.user.id);
         const list = await FlNotif.find({ uid: req.user.id, read: false }).sort({ createdAt: -1 }).limit(20).lean();
-        res.json({ list: list.map(n => ({ id: String(n._id), type: n.type, kind: n.kind, label: n.label, body: n.body, url: n.url, createdAt: n.createdAt })) });
+        const since = parseInt(req.query.since, 10);
+        const unseen = since > 0 ? await FlNotif.countDocuments({ uid: req.user.id, createdAt: { $gt: new Date(since) } }) : 0;
+        res.json({ unseen, list: list.map(n => ({ id: String(n._id), type: n.type, kind: n.kind, label: n.label, body: n.body, url: n.url, createdAt: n.createdAt })) });
+    } catch (e) { res.json({ list: [] }); }
+});
+// سجل الإشعارات (آخر 30 يوم) لمركز الإشعارات
+app.get("/api/fnotif/all", async (req, res) => {
+    if (!req.isAuthenticated()) return res.json({ list: [] });
+    try {
+        const list = await FlNotif.find({ uid: req.user.id }).sort({ createdAt: -1 }).limit(50).lean();
+        res.json({ list: list.map(n => ({ id: String(n._id), type: n.type, label: n.label, body: n.body, url: n.url, createdAt: n.createdAt })) });
     } catch (e) { res.json({ list: [] }); }
 });
 app.put("/api/fnotif/read", async (req, res) => {
@@ -10394,6 +10414,42 @@ const pushUid = (uid, opts) => {
     flRecordNotif(uid, o);
     return pushUidRaw(uid, o);
 };
+// إشعار لمجموعة أعضاء (توست داخل التطبيق + Push) على دفعات عشان ما نخنق السيرفر
+async function flNotifyMany(uids, opts) {
+    const list = [...new Set((uids || []).map(String))];
+    for (let i = 0; i < list.length; i += 25) {
+        await Promise.all(list.slice(i, i + 25).map(u => pushUid(u, opts).catch(() => {})));
+    }
+}
+// أي إشعار إداري عادي معلّق (من أي مكان بالنظام) يتحوّل لتوست ويتعلّم مقروء. الوحيد اللي يبقى نافذة برتقالية: «إشعار للجميع».
+async function flConvertNotices(uid) {
+    try {
+        const cond = { kind: "notice", acknowledged: false, broadcast: { $ne: true } };
+        const old = await Personnel.findOneAndUpdate(
+            { discord: uid, warnings: { $elemMatch: cond } },
+            { $set: { "warnings.$[w].acknowledged": true, "warnings.$[w].acknowledgedAt": new Date() } },
+            { arrayFilters: [{ "w.kind": "notice", "w.acknowledged": false, "w.broadcast": { $ne: true } }], projection: { warnings: 1 } }
+        ).lean();
+        if (!old) return;
+        const conv = (old.warnings || []).filter(w => w.kind === "notice" && !w.acknowledged && !w.broadcast).slice(-5);
+        for (const w of conv) await flRecordNotif(uid, { tag: "notice-" + String(w._id), level: "warning", label: "📌 إشعار إداري", body: String(w.reason || ""), url: "/" });
+    } catch (e) { console.error("❌ flConvertNotices:", e.message); }
+}
+// إشعار مخصص من كبار المسؤولين لعضو: معلومة / نجاح / تنبيه / إنذار (الإنذار نافذة حمراء بصوت لين يضغط «فهمت»)
+const FL_ADM_LABELS = { info: "📢 رسالة من الإدارة", success: "✅ رسالة من الإدارة", warning: "⚠️ تنبيه من الإدارة", danger: "🚨 إنذار من الإدارة" };
+app.post("/api/senior/personnel/:discord/notify", ensureSeniorAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const msg = String(b.message || "").trim().slice(0, 300);
+        if (!msg) return res.status(400).json({ error: "اكتب نص الإشعار" });
+        const type = ["info", "success", "warning", "danger"].includes(b.type) ? b.type : "info";
+        const p = await Personnel.findOne({ discord: req.params.discord }, { discord: 1, discordTag: 1, registeredName: 1 }).lean();
+        if (!p) return res.status(404).json({ error: "غير موجود" });
+        pushUid(p.discord, { title: CONFIG.SITE_NAME, body: msg, tag: "adm-" + Date.now().toString(36), level: type, label: FL_ADM_LABELS[type], urgent: type === "danger", ttl: 86400 }).catch(() => {});
+        await logEvent({ action: type === "danger" ? "إرسال إنذار" : "إرسال إشعار", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: "(" + type + ") " + msg });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get("/api/push/vapid", async (req, res) => {
     const key = await ensureVapid();
@@ -12078,6 +12134,21 @@ app.get("/", (req, res) => {
     @keyframes fnPop { from { opacity: 0; transform: scale(0.8); } to { opacity: 1; transform: none; } }
     @keyframes fnPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55), 0 20px 60px rgba(0,0,0,0.7); } 50% { box-shadow: 0 0 0 14px rgba(239,68,68,0), 0 20px 60px rgba(0,0,0,0.7); } }
     @keyframes fnShake { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-9deg); } 75% { transform: rotate(9deg); } }
+    #fn-bell { position: fixed; bottom: calc(86px + env(safe-area-inset-bottom, 0px)); left: 22px; z-index: 5290; width: 44px; height: 44px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.2); background: linear-gradient(135deg, #0f172a, #1e3a8a); color: #fff; font-size: 20px; cursor: pointer; box-shadow: 0 6px 18px rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    #fn-bell:active { transform: scale(0.94); }
+    #fn-bell-badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 9px; background: #ef4444; color: #fff; font-size: 11px; font-weight: 800; align-items: center; justify-content: center; font-family: inherit; }
+    body.cy-frozen #fn-bell, body.ua-frozen #fn-bell, body.sus-frozen #fn-bell, body.pwa-frozen #fn-bell, html.sp-lock #fn-bell { display: none !important; }
+    .fn-ct-ov { position: fixed; inset: 0; z-index: 7700; background: rgba(2,6,23,0.7); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; padding: 14px; }
+    .fn-ct-box { width: 100%; max-width: 440px; max-height: 82vh; display: flex; flex-direction: column; background: #0b1730; border: 1px solid #334155; border-radius: 14px; direction: rtl; color: #e2e8f0; overflow: hidden; }
+    .fn-ct-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #1e293b; font-size: 1rem; }
+    .fn-ct-x { background: none; border: none; color: #94a3b8; font-size: 1.1rem; cursor: pointer; }
+    .fn-ct-body { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+    .fn-ct-empty { text-align: center; color: #64748b; padding: 20px 0; }
+    .fn-ct-item { --c: #3b82f6; border: 1px solid var(--c); border-right-width: 4px; border-radius: 10px; padding: 8px 10px; background: rgba(255,255,255,0.03); }
+    .fn-ct-success { --c: #22c55e; } .fn-ct-warning { --c: #f97316; } .fn-ct-danger { --c: #ef4444; }
+    .fn-ct-t { font-size: 0.78rem; font-weight: 800; color: var(--c); margin-bottom: 2px; }
+    .fn-ct-m { font-size: 0.86rem; line-height: 1.6; word-break: break-word; }
+    .fn-ct-d { font-size: 0.7rem; color: #64748b; margin-top: 3px; }
     .fab { position: fixed; bottom: 25px; right: 25px; z-index: 998; background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; border: 2px solid rgba(255,255,255,0.2); padding: 14px 24px; border-radius: 50px; font-weight: bold; font-family: inherit; font-size: 14px; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.4); transition: 0.3s; }
     .fab:hover { transform: scale(1.05); }
     .vgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -13085,9 +13156,19 @@ function openWarnForm(discord, apiBase) {
 async function warnFormReason(discord, apiBase, kind) {
     const box = document.getElementById('wf-box');
     if (kind === 'notice') {
+        var typeSel = '';
+        if (apiBase === '/api/senior/personnel/') {
+            typeSel = '<select id="wf-ntype" style="width:100%;margin-top:8px;padding:10px;border-radius:8px;background:#0a1730;color:#fff;border:1px solid #334155;font-family:inherit;font-size:14px;">'
+                + '<option value="warning">🟠 تنبيه (برتقالي) — يُسجّل بسجل العضو</option>'
+                + '<option value="info">🔵 معلومة (أزرق)</option>'
+                + '<option value="success">🟢 نجاح (أخضر)</option>'
+                + '<option value="danger">🔴 إنذار (نافذة حمراء + صوت لين يضغط فهمت)</option>'
+                + '</select>';
+        }
         box.innerHTML = \`
             <h3>🔔 ضع سبب الإشعار</h3>
             <textarea id="wf-reason" placeholder="اكتب السبب هنا..."></textarea>
+            \${typeSel}
             <div class="wf-actions">
                 <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
                 <button class="btn sm" onclick="submitWarnForm('\${discord}','\${apiBase}','notice')">إرسال</button>
@@ -13138,6 +13219,15 @@ async function submitWarnForm(discord, apiBase, kind) {
     const reason = document.getElementById('wf-reason').value;
     if (!reason || !reason.trim()) return toast('لازم تكتب السبب');
     const body = { kind, reason };
+    const nt = document.getElementById('wf-ntype');
+    if (kind === 'notice' && nt && nt.value && nt.value !== 'warning') {
+        try {
+            await api(apiBase + discord + '/notify', { method: 'POST', body: JSON.stringify({ message: reason, type: nt.value }) });
+            toast(nt.value === 'danger' ? '🚨 تم إرسال الإنذار' : '✅ تم إرسال الإشعار');
+            closeWarnForm();
+        } catch (e) { toast(e.message); }
+        return;
+    }
     try {
         const result = await api(apiBase + discord + '/warn', { method: 'POST', body: JSON.stringify(body) });
         toast(kind === 'warning' ? (result.dismissed ? '🚫 تم فصل العضو تلقائيًا' : '✅ تم إرسال التحذير') : '✅ تم إرسال الإشعار');
@@ -15408,7 +15498,8 @@ async function fnCheck() {
     if (!ME || FN.busy || document.hidden) return;
     FN.busy = true;
     try {
-        var d = await api('/api/fnotif', { noLock: true });
+        var d = await api('/api/fnotif?since=' + fnSeenTs(), { noLock: true });
+        fnBadge(d && d.unseen);
         var list = ((d && d.list) || []).slice().reverse();
         var markRead = [], toasts = [];
         list.forEach(function (n) {
@@ -15423,7 +15514,51 @@ async function fnCheck() {
         fnRead(markRead);
     } catch (e) {} finally { FN.busy = false; }
 }
+/* ── مركز الإشعارات: زر الجرس + سجل آخر 30 يوم + عدّاد الجديد ── */
+function fnSeenTs() { try { return parseInt(localStorage.getItem('fn_seen_ts') || '0', 10) || (Date.now() - 86400000); } catch (e) { return Date.now() - 86400000; } }
+function fnSetSeen() { try { localStorage.setItem('fn_seen_ts', String(Date.now())); } catch (e) {} fnBadge(0); }
+function fnBadge(n) {
+    var b = document.getElementById('fn-bell-badge'); if (!b) return;
+    n = parseInt(n, 10) || 0;
+    b.textContent = n > 9 ? '9+' : String(n);
+    b.style.display = n > 0 ? 'flex' : 'none';
+}
+function fnEnsureBell() {
+    if (document.getElementById('fn-bell')) return;
+    var bell = fnEl('button', null, '🔔'); bell.id = 'fn-bell'; bell.setAttribute('aria-label', 'الإشعارات');
+    var bd = fnEl('span', null, '0'); bd.id = 'fn-bell-badge'; bd.style.display = 'none'; bell.appendChild(bd);
+    bell.onclick = fnOpenCenter;
+    document.body.appendChild(bell);
+}
+var FN_ICONS = { info: '🔵', success: '🟢', warning: '🟠', danger: '🔴' };
+async function fnOpenCenter() {
+    if (document.getElementById('fn-center')) return;
+    var ov = fnEl('div', 'fn-ct-ov'); ov.id = 'fn-center';
+    var box = fnEl('div', 'fn-ct-box');
+    var head = fnEl('div', 'fn-ct-head'); head.appendChild(fnEl('b', null, '🔔 الإشعارات'));
+    var x = fnEl('button', 'fn-ct-x', '✕'); head.appendChild(x); box.appendChild(head);
+    var body = fnEl('div', 'fn-ct-body', 'جارِ التحميل...'); box.appendChild(body);
+    ov.appendChild(box); document.body.appendChild(ov);
+    function close() { ov.remove(); }
+    x.onclick = close; ov.addEventListener('mousedown', function (e) { if (e.target === ov) close(); });
+    fnSetSeen();
+    try {
+        var d = await api('/api/fnotif/all', { noLock: true });
+        var list = (d && d.list) || [];
+        body.textContent = '';
+        if (!list.length) { body.appendChild(fnEl('div', 'fn-ct-empty', 'لا توجد إشعارات.')); return; }
+        list.forEach(function (n) {
+            var it = fnEl('div', 'fn-ct-item fn-ct-' + (FN_ICONS[n.type] ? n.type : 'info'));
+            it.appendChild(fnEl('div', 'fn-ct-t', (FN_ICONS[n.type] || '🔵') + ' ' + (n.label || 'إشعار')));
+            it.appendChild(fnEl('div', 'fn-ct-m', n.body || ''));
+            it.appendChild(fnEl('div', 'fn-ct-d', new Date(n.createdAt).toLocaleString('ar-SA')));
+            if (n.url && n.url.indexOf('go=') > -1) it.onclick = function () { close(); fnGo(n); };
+            body.appendChild(it);
+        });
+    } catch (e) { body.textContent = 'تعذر تحميل الإشعارات.'; }
+}
 function fnStart() {
+    fnEnsureBell();
     if (FN.t) return;
     FN.t = setInterval(fnCheck, 40000);
     document.addEventListener('visibilitychange', function () { if (!document.hidden) fnCheck(); });
