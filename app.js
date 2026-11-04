@@ -2518,6 +2518,8 @@ const fsCard = require("fs");
 const CARD_KEYS = ["patrol", "roadSecurity", "antiDrugs", "mp", "cyber", "senior", "highCommand", "default"];
 function cardBgFile(key) {
     const names = [];
+    // بطاقة كبار الشخصيات: الملف card.jpg (أو png/webp) بجانب app.js له الأولوية على card-senior.*
+    if (key === "senior") for (const ext of ["jpg", "jpeg", "png", "webp"]) names.push("card." + ext);
     for (const k of [key, key.toLowerCase()]) for (const ext of ["jpg", "jpeg", "png", "webp"]) names.push("card-" + k + "." + ext);
     if (key === "default") names.push("card-bg.jpg", "card-bg2.jpg");
     return names.find(n => fsCard.existsSync(nodePath.join(__dirname, n))) || null;
@@ -20079,7 +20081,7 @@ const MC_LAYOUT = {
     highCommand:  { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
     default:      { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] }
 };
-const MC_BG_V = '1';
+const MC_BG_V = '2';
 function cardKeyOf(p) {
     if (p && p.cardKey && MC_LAYOUT[p.cardKey]) return p.cardKey;
     return (p && p.sector && MC_LAYOUT[p.sector]) ? p.sector : 'default';
