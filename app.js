@@ -1185,29 +1185,6 @@ const client = new Client({
     ],
     partials: [Partials.Channel],
 });
-// مهلة لأي جلب قناة / إرسال رسالة لديسكورد: لو علق ما يعلّق معه زر الإرسال عند العضو
-function __discordTimeout(promise, ms, label) {
-    let timer;
-    return Promise.race([
-        Promise.resolve(promise),
-        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("انتهت مهلة ديسكورد (" + label + ")")), ms); }),
-    ]).finally(() => clearTimeout(timer));
-}
-(function () {
-    try {
-        const origFetch = client.channels.fetch.bind(client.channels);
-        client.channels.fetch = function () {
-            return __discordTimeout(origFetch.apply(null, arguments).then(ch => {
-                if (ch && typeof ch.send === "function" && !ch.__flSendWrapped) {
-                    const origSend = ch.send.bind(ch);
-                    ch.send = function () { return __discordTimeout(origSend.apply(null, arguments), 25000, "send"); };
-                    ch.__flSendWrapped = true;
-                }
-                return ch;
-            }), 15000, "fetch");
-        };
-    } catch (e) { console.error("⚠️ تعذر ضبط مهلة ديسكورد:", e.message); }
-})();
 
 const pendingMessages = new Map();
 let botReady = false;
@@ -3652,22 +3629,24 @@ app.post("/api/card-photos/:uid/reject", ensureAnyAdmin, async (req, res) => {
 });
 
 const VIOLATION_COOLDOWN_MS = 5 * 1000;
-// قفل بمدة صلاحية: لو الطلب علق (مثلاً ديسكورد تأخر) ما يبقى الحساب مقفول، ينفك لحاله بعد 30 ثانية
-const violationLocks = (function () {
-    const m = new Map();
-    const TTL = 30 * 1000;
-    return {
-        has(k) { const t = m.get(k); if (t && Date.now() - t > TTL) { m.delete(k); return false; } return !!t; },
-        add(k) { m.set(k, Date.now()); return this; },
-        delete(k) { return m.delete(k); },
-    };
-})();
+// قفل بمهلة تلقائية: لو طلب علق ما يبقى الحساب مقفول (كانت تطلع «في مخالفة قيد الإرسال» وهو ما عنده شي)
+function lockTake(map, id, ms) { const e = map.get(id); if (e && e > Date.now()) return false; map.set(id, Date.now() + ms); return true; }
+const violationLocks = new Map();
+async function safePostViolation(v, photo) {
+    try { await withTimeout(postViolationToChannel(v, photo), 20000); }
+    catch (e) {
+        console.error("⚠️ رفع المخالفة لديسكورد تأخر/فشل:", e.message);
+        try {
+            const fresh = await Violation.findById(v._id).select("photo photoDb photoMessageId");
+            if (fresh && photo && !fresh.photo && !fresh.photoDb && !fresh.photoMessageId) { fresh.photo = photo; await fresh.save(); }
+        } catch (e2) {}
+    }
+}
 
 app.post("/api/violations/submit", ensureAuth, async (req, res) => {
-    if (violationLocks.has(req.user.id)) {
-        return res.status(429).json({ error: "في مخالفة قيد الإرسال حالياً على حسابك، انتظر لحظة." });
+    if (!lockTake(violationLocks, req.user.id, 40000)) {
+        return res.status(429).json({ error: "طلبك السابق لسا يرسل، انتظر ثواني وجرّب." });
     }
-    violationLocks.add(req.user.id);
     try {
         const settings = await getSettings();
         if (settings.disableViolations) return res.status(403).json({ error: "تسجيل المخالفات مغلق حالياً" });
@@ -3708,7 +3687,7 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
             plateNumber: plate, status: "pending",
             photoHash: fr.hash, photoPHash: fr.phash, fraudFlags: fr.flags,
         });
-        await postViolationToChannel(v, photo);
+        await safePostViolation(v, photo);
         raiseFraudAlert(v, fr.flags).catch(() => {});
         res.json({ ok: true, violation: { _id: v._id, status: v.status, plateNumber: v.plateNumber, violationType: v.violationType, vehicle: v.vehicle, createdAt: v.createdAt } });
     } finally {
@@ -3928,12 +3907,11 @@ app.post("/api/notes/:discord/:noteId/extend-review", ensureAuth, async (req, re
     res.json({ ok: true });
 });
 
-const reportLocks = new Set();
+const reportLocks = new Map();
 app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
-    if (reportLocks.has(req.user.id)) {
-        return res.status(429).json({ error: "في تقرير قيد الإرسال حالياً على حسابك، انتظر لحظة." });
+    if (!lockTake(reportLocks, req.user.id, 40000)) {
+        return res.status(429).json({ error: "طلبك السابق لسا يرسل، انتظر ثواني وجرّب." });
     }
-    reportLocks.add(req.user.id);
     try {
         const settings = await getSettings();
         if (settings.disableViolations) return res.status(403).json({ error: "تسجيل التقارير مغلق حالياً" });
@@ -3992,7 +3970,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
                 concealMethod: category === "مخدرات" ? it.concealMethod : null,
                 plateNumber: generatePlate(), status: "pending",
             });
-            await postViolationToChannel(v, photo);
+            await safePostViolation(v, photo);
             created.push(v);
         }
         if (created.length) raiseFraudAlert(created[0], fr.flags).catch(() => {});
@@ -6821,25 +6799,19 @@ function bankWakePage() {
 app.get("/api/bank/ranks", ensureBankKey, async (req, res) => {
     res.json({ success: true, ranks: CONFIG.MILITARY_RANKS });
 });
-// البنك يسأل عن البطاقة العسكرية لعضو (للتحقق من طلب بطاقة بنكية + ملف العضو عند كبار البنك)
+// البنك يتحقق من البطاقة العسكرية للعضو (طلب بطاقة بنكية + ملف العضو للكبار)
 app.get("/api/bank/member-card", ensureBankKey, async (req, res) => {
     try {
-        const uid = String(req.query.uid || "").trim();
-        if (!uid) return res.json({ success: false, msg: "uid مطلوب" });
-        const p = await Personnel.findOne({ discord: uid }).lean();
+        const uid = String(req.query.uid || "");
+        if (!CARD_UID_RE.test(uid)) return res.json({ success: false, msg: "آيدي غير صالح" });
+        const [p, a] = await Promise.all([
+            Personnel.findOne({ discord: uid }, { registeredName: 1, rank: 1, unit: 1, sector: 1, cardNumber: 1, cardRevoked: 1, isBlocked: 1, points: 1, isDismissed: 1 }).lean(),
+            Account.findOne({ uid }, { sector: 1, isSenior: 1 }).lean(),
+        ]);
         if (!p || !p.registeredName) return res.json({ success: true, found: false });
-        const a = await Account.findOne({ uid }, { sector: 1, isSenior: 1, status: 1 }).lean();
-        const secKey = p.sector || (a && a.sector) || null;
-        res.json({
-            success: true, found: true,
-            name: p.registeredName || "", cardNumber: p.cardNumber || "",
-            rank: p.rank || "", unit: p.unit || "", sector: (secKey && CONFIG.SECTORS[secKey]) || "",
-            points: p.points || 0, leaveBalance: p.leaveBalance == null ? 0 : p.leaveBalance,
-            warnings: (p.warnings || []).length,
-            revoked: !!p.cardRevoked, blocked: !!(p.isBlocked || p.isDismissed),
-            senior: !!(a && a.isSenior),
-        });
-    } catch (e) { res.status(500).json({ success: false, msg: e.message }); }
+        const key = p.sector || (a && a.sector) || null;
+        res.json({ success: true, found: true, name: p.registeredName, cardNumber: p.cardNumber || "", rank: p.rank || "", unit: p.unit || "", sector: (key && CONFIG.SECTORS[key]) || "", points: p.points || 0, revoked: !!p.cardRevoked, blocked: !!(p.isBlocked || p.isDismissed), senior: !!(a && a.isSenior) });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
 });
 app.get("/api/bank/personnel-ranks", ensureBankKey, async (req, res) => {
     try {
@@ -12799,7 +12771,8 @@ async function __apiCore(url, opts) {
         btn.style.cursor = 'wait';
     }
     try {
-        return await __rawFetch(url, opts, 40000);
+        const bodyLen = (opts && typeof opts.body === 'string') ? opts.body.length : 0;
+        return await __rawFetch(url, opts, bodyLen > 300000 ? 90000 : 35000);
     } finally {
         if (btn) {
             btn.dataset.busy = '0';
