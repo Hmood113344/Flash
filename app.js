@@ -20073,8 +20073,9 @@ const MC_LAYOUT = {
     antiDrugs:    { rows: [35.6, 45.4, 55.4, 65.6], gx: 24.7, gw: 24.0, photo: [77.5, 26.5, 18.1, 36.6], bc: [20.5, 75.4, 53.4, 12.5], adm: [23.5, 70.6] },
     roadSecurity: { rows: [35.0, 45.2, 55.4, 65.4], gx: 24.2, gw: 24.3, photo: [77.6, 25.6, 18.6, 37.3], bc: [20.5, 74.4, 55.0, 13.4], adm: [23.5, 69.6] },
     cyber:        { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
-    // بطاقة كبار المسؤولين (الخلفية 1376×768): ثلاث خانات فقط (الاسم / الرتبة / الوحدة-اليونت في خانة «الكود العسكري») بدون رقم البطاقة وبدون القطاع، والنص أبيض لأن الخانات داكنة
-    senior:       { rows: [44.3, 51.3, 51.3, 58.2], unitRow: true, tc: '#ffffff', gx: 71.9, gw: 17.6, photo: [82.9, 9.4, 12.6, 23.4], bc: [25.6, 83.6, 48.5, 7.2], adm: [23.5, 71.3] },
+    // بطاقة كبار المسؤولين / كبار الشخصيات «عدم التعرض» (الخلفية الجديدة 1679×937): ثلاث خانات فقط (الاسم / الرتبة / الوحدة-اليونت في خانة «الكود العسكري») بدون رقم البطاقة وبدون القطاع، والنص أبيض لأن الخانات داكنة
+    // cols = [يسار، عرض] لكل صف: القيمة تبدأ بعد الفاصل الذهبي وتنتهي ملاصقة للكلمة (الاسم: / الرتبة: / الكود العسكري:) — خانة الكود أضيق لأن كلمتها أطول
+    senior:       { rows: [35.6, 44.9, 54.0, 54.0], unitRow: true, tc: '#ffffff', gx: 69.7, gw: 21.2, cols: [[69.7, 21.2], [69.7, 21.3], null, [69.7, 12.8]], photo: [83.2, 5.3, 13.9, 19.1], bc: [23.8, 80.6, 49.2, 7.2], adm: [23.5, 71.3] },
     highCommand:  { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
     default:      { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] }
 };
@@ -20083,30 +20084,35 @@ function cardKeyOf(p) {
     if (p && p.cardKey && MC_LAYOUT[p.cardKey]) return p.cardKey;
     return (p && p.sector && MC_LAYOUT[p.sector]) ? p.sector : 'default';
 }
-function mcFs(txt, isNum) {
+function mcFs(txt, isNum, gw) {
     const n = String(txt == null ? '' : txt).length;
     if (isNum) return '2.7cqw';
-    return (n <= 10 ? 2.9 : n <= 14 ? 2.5 : n <= 18 ? 2.1 : n <= 24 ? 1.7 : 1.4) + 'cqw';
+    let fs = n <= 10 ? 2.9 : n <= 14 ? 2.5 : n <= 18 ? 2.1 : n <= 24 ? 1.7 : 1.4;
+    // خانة ضيقة (مثل خانة «الكود العسكري» بجنب الكلمة الطويلة): نصغّر الخط على قد عرض الخانة عشان ما ينقص النص
+    if (gw > 0) fs = Math.max(1.1, Math.min(fs, Math.round(((gw - 0.9) / (0.52 * Math.max(n, 1))) * 100) / 100));
+    return fs + 'cqw';
 }
-function mcFit(node) { node.style.fontSize = mcFs(node.textContent, node.classList.contains('num')); }
+function mcFit(node) { node.style.fontSize = mcFs(node.textContent, node.classList.contains('num'), parseFloat(node.getAttribute('data-gw')) || 0); }
 function mcWarn() { return '<div class="mc-warn">⚠️ تنبيه: هذي البطاقة مخصصة للمحاكاة واللعب فقط، وليست بطاقة حقيقية ولا تمت للواقع بصلة.</div>'; }
 function mcAdminTag(f) { return f.admin ? '<div class="mc-adm">🔴 إداري</div>' : ''; }
 function mcDebug(on) { document.querySelectorAll('.mcard').forEach(function (c) { c.classList.toggle('dbg', on !== false); }); }
 function mcFace(f) {
     const L = MC_LAYOUT[f.key] || MC_LAYOUT['default'];
     const box = function (a) { return 'left:' + a[0] + '%;top:' + a[1] + '%;width:' + a[2] + '%;height:' + a[3] + '%;'; };
-    const t = function (k, y, txt, cls) {
-        return '<div class="mc-t ' + cls + '" data-k="' + k + '" style="left:' + L.gx + '%;width:' + L.gw + '%;top:' + y + '%;font-size:' + mcFs(txt, k === 'num') + ';' + (L.tc ? 'color:' + L.tc + ';text-shadow:0 1px 3px rgba(0,0,0,0.85);' : '') + '">' + cardEsc(txt) + '</div>';
+    // idx = رقم الصف (0 الاسم، 1 الرتبة، 2 القطاع، 3 الأخير). L.cols[idx] = [يسار، عرض] خاص بكل صف (لو ما انحطت يستخدم gx/gw)
+    const t = function (k, y, txt, cls, idx) {
+        const c = (L.cols && L.cols[idx]) || [L.gx, L.gw];
+        return '<div class="mc-t ' + cls + '" data-k="' + k + '" data-gw="' + c[1] + '" style="left:' + c[0] + '%;width:' + c[1] + '%;top:' + y + '%;font-size:' + mcFs(txt, k === 'num', c[1]) + ';' + (L.tc ? 'color:' + L.tc + ';text-shadow:0 1px 3px rgba(0,0,0,0.85);' : '') + '">' + cardEsc(txt) + '</div>';
     };
     const photo = f.avatar ? '<img class="mc-photo" src="' + cardEsc(f.avatar) + '" alt="" onerror="this.remove()" style="' + box(L.photo) + '">' : '';
     const bc = /^[0-9]{8}$/.test(String(f.num))
         ? '<a class="mc-bc" href="/verify-card/' + f.num + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="' + box(L.bc) + '" aria-label="التحقق من البطاقة"></a>'
         : '';
     return '<div class="mc-face" style="background: url(/card-bg/' + f.key + '?v=' + MC_BG_V + ') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3);">' +
-        t('name', L.rows[0], f.name, 'name') +
-        t('rank', L.rows[1], f.rank, 'rank') +
-        (L.unitRow ? '' : t('division', L.rows[2], f.division, 'sector')) +
-        (L.unitRow ? t('unit', L.rows[3], f.unit, 'sector') : t('num', L.rows[3], f.num, 'num')) +
+        t('name', L.rows[0], f.name, 'name', 0) +
+        t('rank', L.rows[1], f.rank, 'rank', 1) +
+        (L.unitRow ? '' : t('division', L.rows[2], f.division, 'sector', 2)) +
+        (L.unitRow ? t('unit', L.rows[3], f.unit, 'sector', 3) : t('num', L.rows[3], f.num, 'num', 3)) +
         photo + bc +
         (f.admin ? '<div class="mc-adm-in" style="right:' + L.adm[0] + '%;top:' + L.adm[1] + '%;">إداري</div>' : '') +
         (f.revoked ? '<div class="mc-revoked">ملغاة</div>' : '') +
