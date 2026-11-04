@@ -1996,6 +1996,7 @@ self.addEventListener("push", function (e) {
   try { d = e.data ? e.data.json() : {}; } catch (err) { d = { body: e.data ? e.data.text() : "" }; }
   var opt = { body: d.body || "", icon: "/icon-192.png", badge: "/icon-192.png", lang: "ar", dir: "rtl", data: { url: d.url || "/" } };
   if (d.tag) { opt.tag = d.tag; opt.renotify = true; }
+  if (d.urgent) { opt.requireInteraction = true; opt.silent = false; opt.vibrate = [700, 150, 700, 150, 600, 150, 400]; }
   e.waitUntil(self.registration.showNotification(d.title || "فلاش", opt));
 });
 self.addEventListener("notificationclick", function (e) {
@@ -6836,7 +6837,7 @@ app.post("/api/bank/notify", ensureBankKey, async (req, res) => {
         const body = String(b.body || "").trim().slice(0, 300);
         if (!CARD_UID_RE.test(uid) || !body) return res.json({ success: false, msg: "بيانات ناقصة" });
         const title = String(b.title || "🏦 بنك فلاش").slice(0, 80);
-        await pushUid(uid, { title, body, tag: "bank-" + Date.now(), url: "/?go=bank" });
+        await pushUid(uid, { title, body, tag: "bank-" + Date.now(), url: "/?go=bank", urgent: String(b.type || "") === "danger" });
         res.json({ success: true });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -10289,6 +10290,7 @@ async function sendPushTo(devs, opts) {
         body: String(opts.body || "").slice(0, 200),
         url: opts.url || pushUrlFor(opts.tag),
         tag: opts.tag || undefined,
+        urgent: opts.urgent ? true : undefined,
     });
     const list = (devs || []).filter(d => d && d.sub && d.sub.endpoint);
     let sent = 0; const failed = [];
