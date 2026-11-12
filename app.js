@@ -16903,7 +16903,7 @@ function rvEnsureStyle() {
     st.textContent = '@keyframes rvPulse{0%,100%{box-shadow:inset 0 0 90px rgba(239,68,68,.35)}50%{box-shadow:inset 0 0 170px rgba(239,68,68,.8)}}@keyframes rvSiren{0%,100%{transform:scale(1) rotate(-7deg)}50%{transform:scale(1.2) rotate(7deg)}}@keyframes rvBar{0%{background-position:0 0}100%{background-position:56px 0}}';
     document.head.appendChild(st);
 }
-var RV_AUD = { ctx: null, bus: null, nb: null, timer: null, next: 0, sig: '' };
+var RV_AUD = { ctx: null, bus: null, wn: null, bn: null, ir: null, timer: null, next: 0, sig: '' };
 function rvAc() {
     try {
         var AC = window.AudioContext || window.webkitAudioContext;
@@ -16922,62 +16922,122 @@ function rvHint(show) {
     var h = document.getElementById('rv-hint');
     if (h) h.style.display = show ? 'block' : 'none';
 }
+function rvIR(c) {
+    if (RV_AUD.ir) return RV_AUD.ir;
+    var len = Math.floor(c.sampleRate * 2.8), b = c.createBuffer(2, len, c.sampleRate);
+    for (var ch = 0; ch < 2; ch++) {
+        var d = b.getChannelData(ch);
+        for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.4);
+    }
+    RV_AUD.ir = b;
+    return b;
+}
 function rvBus(c) {
     if (RV_AUD.bus) return RV_AUD.bus;
-    var sh = c.createWaveShaper(), n = 2048, cv = new Float32Array(n);
-    for (var i = 0; i < n; i++) { var x = i * 2 / n - 1; cv[i] = Math.tanh(x * 2.6); }
-    sh.curve = cv;
+    var inp = c.createGain(); inp.gain.value = 0.85;
+    var sh = c.createWaveShaper(), n = 2048, cu = new Float32Array(n);
+    for (var i = 0; i < n; i++) { var x = i * 2 / n - 1; cu[i] = Math.tanh(x * 2.2); }
+    sh.curve = cu;
     try { sh.oversample = '2x'; } catch (e) {}
+    var cn = c.createConvolver(); cn.buffer = rvIR(c);
+    var wg = c.createGain(); wg.gain.value = 0.5;
     var cp = c.createDynamicsCompressor();
-    cp.threshold.value = -20; cp.knee.value = 10; cp.ratio.value = 14; cp.attack.value = 0.002; cp.release.value = 0.2;
+    cp.threshold.value = -18; cp.knee.value = 10; cp.ratio.value = 12; cp.attack.value = 0.003; cp.release.value = 0.25;
     var m = c.createGain(); m.gain.value = 1;
+    inp.connect(sh); inp.connect(cn); cn.connect(wg); wg.connect(sh);
     sh.connect(cp); cp.connect(m); m.connect(c.destination);
-    RV_AUD.bus = sh;
-    return sh;
+    RV_AUD.bus = inp;
+    return inp;
 }
-function rvNoise(c) {
-    if (RV_AUD.nb) return RV_AUD.nb;
-    var len = Math.floor(c.sampleRate * 3.3), b = c.createBuffer(1, len, c.sampleRate), d = b.getChannelData(0), last = 0;
-    for (var i = 0; i < len; i++) { var w = Math.random() * 2 - 1; last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; }
-    RV_AUD.nb = b;
+function rvNoiseBuf(c, brown) {
+    var key = brown ? 'bn' : 'wn';
+    if (RV_AUD[key]) return RV_AUD[key];
+    var len = Math.floor(c.sampleRate * 2), b = c.createBuffer(1, len, c.sampleRate), d = b.getChannelData(0), last = 0;
+    for (var i = 0; i < len; i++) {
+        var w = Math.random() * 2 - 1;
+        if (brown) { last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; } else d[i] = w;
+    }
+    RV_AUD[key] = b;
     return b;
+}
+function rvOsc(c, dest, type, t, dur, f0, f1, ramp, pts, det) {
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = type; o.detune.value = det || 0;
+    o.frequency.setValueAtTime(f0, t);
+    if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + ramp);
+    g.gain.setValueAtTime(0.0001, t);
+    pts.forEach(function (p) { g.gain.exponentialRampToValueAtTime(Math.max(p[1], 0.0001), t + p[0]); });
+    o.connect(g); g.connect(dest); o.start(t); o.stop(t + dur);
+}
+function rvNoise(c, dest, t, dur, brown, ftype, fa, fb, ramp, pts) {
+    var s = c.createBufferSource(); s.buffer = rvNoiseBuf(c, brown); s.loop = true;
+    var f = c.createBiquadFilter(); f.type = ftype; f.Q.value = 1.2;
+    f.frequency.setValueAtTime(fa, t);
+    if (fb !== fa) f.frequency.exponentialRampToValueAtTime(fb, t + ramp);
+    var g = c.createGain(); g.gain.setValueAtTime(0.0001, t);
+    pts.forEach(function (p) { g.gain.exponentialRampToValueAtTime(Math.max(p[1], 0.0001), t + p[0]); });
+    s.connect(f); f.connect(g); g.connect(dest); s.start(t); s.stop(t + dur);
+}
+function rvDrum(c, bus, t, v) {
+    rvOsc(c, bus, 'sine', t, 1.0, 160, 44, 0.2, [[0.004, v], [0.9, 0.0001]]);
+    rvOsc(c, bus, 'triangle', t, 0.4, 320, 90, 0.1, [[0.004, v * 0.5], [0.35, 0.0001]]);
+    rvNoise(c, bus, t, 0.35, false, 'bandpass', 220, 220, 0, [[0.003, v * 0.8], [0.3, 0.0001]]);
+}
+function rvHorn(c, bus, t, root, len, v) {
+    var lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 3;
+    lp.frequency.setValueAtTime(300, t); lp.frequency.exponentialRampToValueAtTime(3400, t + 0.35); lp.frequency.exponentialRampToValueAtTime(500, t + len);
+    var g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 0.12);
+    g.gain.exponentialRampToValueAtTime(v * 0.55, t + 1.2); g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    lp.connect(g); g.connect(bus);
+    var lfo = c.createOscillator(), lg = c.createGain();
+    lfo.frequency.value = 5.5; lg.gain.value = 14; lfo.connect(lg); lfo.start(t); lfo.stop(t + len + 0.1);
+    [1, 1.4142, 2, 2.1189, 2.8284].forEach(function (r) {
+        [-8, 8].forEach(function (det) {
+            var o = c.createOscillator(); o.type = 'sawtooth'; o.detune.value = det;
+            o.frequency.setValueAtTime(root * r * 1.5, t); o.frequency.exponentialRampToValueAtTime(root * r, t + 0.3);
+            lg.connect(o.detune);
+            var og = c.createGain(); og.gain.value = 0.1 / Math.sqrt(r);
+            o.connect(og); og.connect(lp); o.start(t); o.stop(t + len + 0.1);
+        });
+    });
+}
+function rvChoir(c, bus, t, len) {
+    var env = c.createGain();
+    env.gain.setValueAtTime(0.0001, t); env.gain.exponentialRampToValueAtTime(0.5, t + 3.0);
+    env.gain.setValueAtTime(0.5, t + len - 1); env.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    var out = c.createGain(); out.gain.value = 2.2;
+    var lfo = c.createOscillator(), lg = c.createGain();
+    lfo.frequency.value = 5.2; lg.gain.value = 0.45; lfo.connect(lg); lg.connect(out.gain); lfo.start(t); lfo.stop(t + len + 0.1);
+    [800, 1150, 2600].forEach(function (fq, i) {
+        var bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = fq; bp.Q.value = i === 2 ? 6 : 5;
+        var bg = c.createGain(); bg.gain.value = i === 2 ? 0.5 : 1;
+        env.connect(bp); bp.connect(bg); bg.connect(out);
+    });
+    out.connect(bus);
+    [146.83, 155.56, 207.65, 293.66, 311.13].forEach(function (f, i) {
+        var o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f; o.detune.value = (i % 2 ? 7 : -7);
+        var og = c.createGain(); og.gain.value = 0.25;
+        o.connect(og); og.connect(env); o.start(t); o.stop(t + len + 0.1);
+    });
 }
 function rvCycle(c, t) {
     var bus = rvBus(c);
-    var g1 = c.createGain();
-    g1.gain.setValueAtTime(0.0001, t); g1.gain.exponentialRampToValueAtTime(1, t + 0.03);
-    g1.gain.exponentialRampToValueAtTime(0.4, t + 0.9); g1.gain.exponentialRampToValueAtTime(0.0001, t + 2.6);
-    var lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6;
-    lp.frequency.setValueAtTime(2600, t); lp.frequency.exponentialRampToValueAtTime(260, t + 1.8);
-    lp.connect(g1); g1.connect(bus);
-    [46.25, 65.41, 92.5, 130.81].forEach(function (f, i) {
-        [-9, 9].forEach(function (det) {
-            var o = c.createOscillator(); o.type = 'sawtooth'; o.detune.value = det;
-            o.frequency.setValueAtTime(f * 1.6, t); o.frequency.exponentialRampToValueAtTime(f, t + 0.35);
-            var og = c.createGain(); og.gain.value = 0.34 - i * 0.05;
-            o.connect(og); og.connect(lp); o.start(t); o.stop(t + 2.7);
-        });
-    });
-    var ns = c.createBufferSource(); ns.buffer = rvNoise(c);
-    var nl = c.createBiquadFilter(); nl.type = 'lowpass'; nl.frequency.value = 160;
-    var ng = c.createGain();
-    ng.gain.setValueAtTime(0.0001, t); ng.gain.exponentialRampToValueAtTime(1.3, t + 1.2); ng.gain.exponentialRampToValueAtTime(0.0001, t + 3.1);
-    ns.connect(nl); nl.connect(ng); ng.connect(bus); ns.start(t); ns.stop(t + 3.2);
-    [1.15, 1.5, 1.85].forEach(function (d) {
-        var bg = c.createGain();
-        bg.gain.setValueAtTime(0.0001, t + d); bg.gain.exponentialRampToValueAtTime(0.4, t + d + 0.01);
-        bg.gain.setValueAtTime(0.4, t + d + 0.2); bg.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.26);
-        bg.connect(bus);
-        [698.46, 987.77].forEach(function (f) {
-            var o = c.createOscillator(); o.type = 'square'; o.frequency.value = f;
-            o.connect(bg); o.start(t + d); o.stop(t + d + 0.27);
-        });
-    });
-    var wg = c.createGain();
-    wg.gain.setValueAtTime(0.0001, t + 2.3); wg.gain.exponentialRampToValueAtTime(0.55, t + 2.4); wg.gain.exponentialRampToValueAtTime(0.0001, t + 3.15);
-    var wo = c.createOscillator(); wo.type = 'sawtooth';
-    wo.frequency.setValueAtTime(1250, t + 2.3); wo.frequency.exponentialRampToValueAtTime(140, t + 3.1);
-    wo.connect(wg); wg.connect(bus); wo.start(t + 2.3); wo.stop(t + 3.2);
+    rvChoir(c, bus, t, 7.2);
+    rvOsc(c, bus, 'sawtooth', t, 3.3, 110, 1760, 3.0, [[3.0, 0.22], [3.2, 0.0001]]);
+    rvNoise(c, bus, t, 3.3, false, 'highpass', 500, 7000, 3.0, [[3.0, 0.5], [3.2, 0.0001]]);
+    rvOsc(c, bus, 'sine', t, 3.3, 38, 58, 3.0, [[3.0, 0.9], [3.2, 0.0001]]);
+    [[1.4, 0.45], [1.9, 0.5], [2.3, 0.6], [2.6, 0.7], [2.85, 0.8], [3.02, 0.9]].forEach(function (h) { rvDrum(c, bus, t + h[0], h[1]); });
+    var i1 = t + 3.2;
+    rvDrum(c, bus, i1, 1);
+    rvHorn(c, bus, i1, 73.42, 3.8, 1);
+    rvOsc(c, bus, 'sine', i1, 3.6, 62, 30, 1.4, [[0.03, 1], [1.2, 0.55], [3.5, 0.0001]]);
+    rvNoise(c, bus, i1, 2.2, false, 'highpass', 1800, 900, 2.0, [[0.02, 0.7], [2.1, 0.0001]]);
+    rvNoise(c, bus, i1, 4.0, true, 'lowpass', 140, 140, 0, [[0.1, 1.4], [3.9, 0.0001]]);
+    var i2 = t + 5.3;
+    rvDrum(c, bus, i2, 0.9);
+    rvHorn(c, bus, i2, 69.3, 2.0, 0.9);
+    rvOsc(c, bus, 'sine', i2, 2.0, 58, 28, 0.8, [[0.03, 0.9], [2.0, 0.0001]]);
 }
 function rvTick() {
     var c = rvAc();
@@ -16986,8 +17046,8 @@ function rvTick() {
     rvHint(false);
     if (c.currentTime < RV_AUD.next - 0.2) return true;
     var t = c.currentTime + 0.05;
-    try { rvCycle(c, t); RV_AUD.next = t + 3.3; } catch (e) { return false; }
-    try { if (navigator.vibrate) navigator.vibrate([900, 150, 900, 150, 600]); } catch (e) {}
+    try { rvCycle(c, t); RV_AUD.next = t + 7.4; } catch (e) { return false; }
+    try { if (navigator.vibrate) navigator.vibrate([1, 1300, 100, 200, 100, 200, 100, 200, 100, 200, 100, 600, 1600]); } catch (e) {}
     return true;
 }
 function rvSoundStart() {
