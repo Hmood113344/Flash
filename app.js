@@ -16903,9 +16903,104 @@ function rvEnsureStyle() {
     st.textContent = '@keyframes rvPulse{0%,100%{box-shadow:inset 0 0 90px rgba(239,68,68,.35)}50%{box-shadow:inset 0 0 170px rgba(239,68,68,.8)}}@keyframes rvSiren{0%,100%{transform:scale(1) rotate(-7deg)}50%{transform:scale(1.2) rotate(7deg)}}@keyframes rvBar{0%{background-position:0 0}100%{background-position:56px 0}}';
     document.head.appendChild(st);
 }
+var RV_AUD = { ctx: null, bus: null, nb: null, timer: null, next: 0, sig: '' };
+function rvAc() {
+    try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        if (!RV_AUD.ctx) RV_AUD.ctx = new AC();
+        return RV_AUD.ctx;
+    } catch (e) { return null; }
+}
+['click', 'touchend', 'pointerdown', 'keydown'].forEach(function (ev) {
+    document.addEventListener(ev, function () {
+        var c = rvAc();
+        if (c && c.state !== 'running') c.resume().then(function () { if (RV_ON) rvTick(); }).catch(function () {});
+    }, { passive: true, capture: true });
+});
+function rvHint(show) {
+    var h = document.getElementById('rv-hint');
+    if (h) h.style.display = show ? 'block' : 'none';
+}
+function rvBus(c) {
+    if (RV_AUD.bus) return RV_AUD.bus;
+    var sh = c.createWaveShaper(), n = 2048, cv = new Float32Array(n);
+    for (var i = 0; i < n; i++) { var x = i * 2 / n - 1; cv[i] = Math.tanh(x * 2.6); }
+    sh.curve = cv;
+    try { sh.oversample = '2x'; } catch (e) {}
+    var cp = c.createDynamicsCompressor();
+    cp.threshold.value = -20; cp.knee.value = 10; cp.ratio.value = 14; cp.attack.value = 0.002; cp.release.value = 0.2;
+    var m = c.createGain(); m.gain.value = 1;
+    sh.connect(cp); cp.connect(m); m.connect(c.destination);
+    RV_AUD.bus = sh;
+    return sh;
+}
+function rvNoise(c) {
+    if (RV_AUD.nb) return RV_AUD.nb;
+    var len = Math.floor(c.sampleRate * 3.3), b = c.createBuffer(1, len, c.sampleRate), d = b.getChannelData(0), last = 0;
+    for (var i = 0; i < len; i++) { var w = Math.random() * 2 - 1; last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; }
+    RV_AUD.nb = b;
+    return b;
+}
+function rvCycle(c, t) {
+    var bus = rvBus(c);
+    var g1 = c.createGain();
+    g1.gain.setValueAtTime(0.0001, t); g1.gain.exponentialRampToValueAtTime(1, t + 0.03);
+    g1.gain.exponentialRampToValueAtTime(0.4, t + 0.9); g1.gain.exponentialRampToValueAtTime(0.0001, t + 2.6);
+    var lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6;
+    lp.frequency.setValueAtTime(2600, t); lp.frequency.exponentialRampToValueAtTime(260, t + 1.8);
+    lp.connect(g1); g1.connect(bus);
+    [46.25, 65.41, 92.5, 130.81].forEach(function (f, i) {
+        [-9, 9].forEach(function (det) {
+            var o = c.createOscillator(); o.type = 'sawtooth'; o.detune.value = det;
+            o.frequency.setValueAtTime(f * 1.6, t); o.frequency.exponentialRampToValueAtTime(f, t + 0.35);
+            var og = c.createGain(); og.gain.value = 0.34 - i * 0.05;
+            o.connect(og); og.connect(lp); o.start(t); o.stop(t + 2.7);
+        });
+    });
+    var ns = c.createBufferSource(); ns.buffer = rvNoise(c);
+    var nl = c.createBiquadFilter(); nl.type = 'lowpass'; nl.frequency.value = 160;
+    var ng = c.createGain();
+    ng.gain.setValueAtTime(0.0001, t); ng.gain.exponentialRampToValueAtTime(1.3, t + 1.2); ng.gain.exponentialRampToValueAtTime(0.0001, t + 3.1);
+    ns.connect(nl); nl.connect(ng); ng.connect(bus); ns.start(t); ns.stop(t + 3.2);
+    [1.15, 1.5, 1.85].forEach(function (d) {
+        var bg = c.createGain();
+        bg.gain.setValueAtTime(0.0001, t + d); bg.gain.exponentialRampToValueAtTime(0.4, t + d + 0.01);
+        bg.gain.setValueAtTime(0.4, t + d + 0.2); bg.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.26);
+        bg.connect(bus);
+        [698.46, 987.77].forEach(function (f) {
+            var o = c.createOscillator(); o.type = 'square'; o.frequency.value = f;
+            o.connect(bg); o.start(t + d); o.stop(t + d + 0.27);
+        });
+    });
+    var wg = c.createGain();
+    wg.gain.setValueAtTime(0.0001, t + 2.3); wg.gain.exponentialRampToValueAtTime(0.55, t + 2.4); wg.gain.exponentialRampToValueAtTime(0.0001, t + 3.15);
+    var wo = c.createOscillator(); wo.type = 'sawtooth';
+    wo.frequency.setValueAtTime(1250, t + 2.3); wo.frequency.exponentialRampToValueAtTime(140, t + 3.1);
+    wo.connect(wg); wg.connect(bus); wo.start(t + 2.3); wo.stop(t + 3.2);
+}
+function rvTick() {
+    var c = rvAc();
+    if (!c) return false;
+    if (c.state !== 'running') { c.resume().catch(function () {}); rvHint(true); return false; }
+    rvHint(false);
+    if (c.currentTime < RV_AUD.next - 0.2) return true;
+    var t = c.currentTime + 0.05;
+    try { rvCycle(c, t); RV_AUD.next = t + 3.3; } catch (e) { return false; }
+    try { if (navigator.vibrate) navigator.vibrate([900, 150, 900, 150, 600]); } catch (e) {}
+    return true;
+}
+function rvSoundStart() {
+    if (RV_AUD.timer) return;
+    RV_AUD.timer = setInterval(rvTick, 1100);
+    rvTick();
+}
 function renderRvLock(reason, title) {
     RV_ON = true;
     try { clearInterval(pollTimer); } catch (e) {}
+    var sg = String(reason || '') + '|' + String(title || '');
+    if (document.getElementById('rv-lock') && RV_AUD.sig === sg) { rvSoundStart(); return; }
+    RV_AUD.sig = sg;
     rvEnsureStyle();
     var o = document.getElementById('rv-lock');
     if (!o) { o = document.createElement('div'); o.id = 'rv-lock'; document.body.appendChild(o); }
@@ -16921,8 +17016,10 @@ function renderRvLock(reason, title) {
         '<div style="color:#f87171;font-weight:900;margin-bottom:8px;font-size:15px">⚠️ سبب الإغلاق</div>' +
         '<div style="font-size:clamp(17px,4.5vw,22px);line-height:1.9;font-weight:700;white-space:pre-wrap;overflow-wrap:anywhere">' + rvEsc(why) + '</div></div>' +
         '<p style="margin:18px 0 0;color:#fca5a5;font-size:14px;line-height:1.8">لا يمكن استخدام الموقع حالياً. يفتح تلقائياً فور رفع الإغلاق، لا تحتاج تحدّث الصفحة.</p>' +
+        '<div id="rv-hint" style="display:none;margin-top:16px;padding:13px 14px;border-radius:14px;background:#ef4444;color:#fff;font-weight:900;font-size:17px">🔊 المس الشاشة لتشغيل صوت الإنذار</div>' +
         '</div>';
     document.documentElement.style.overflow = 'hidden';
+    rvSoundStart();
 }
 async function rvCheck() {
     try {
