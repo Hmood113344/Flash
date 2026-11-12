@@ -2123,6 +2123,33 @@ app.use("/api", (req, res, next) => {
     req.user = Object.assign(Object.create(Object.getPrototypeOf(req.user)), req.user, { username: "كبار المسؤولين" });
     flashCtx.run({ silent: true }, () => next());
 });
+let RV_LOCK = { active: false, reason: "", title: "", rev: 0 };
+async function rvLockPoll() {
+    try {
+        if (mongoose.connection.readyState !== 1) return;
+        const d = await mongoose.connection.db.collection("rolevault_lock").findOne({ _id: "lock" });
+        const n = { active: !!(d && d.active), reason: String((d && d.reason) || "").slice(0, 600), title: String((d && d.title) || "").slice(0, 200), rev: Number((d && d.rev) || 0) };
+        const ch = n.active !== RV_LOCK.active || n.reason !== RV_LOCK.reason || n.rev !== RV_LOCK.rev;
+        RV_LOCK = n;
+        if (ch) sseBroadcast("rvlock", { on: n.active });
+    } catch (e) {}
+}
+setInterval(rvLockPoll, 3000);
+setTimeout(rvLockPoll, 1500);
+app.get("/rvlock-status", (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({ on: RV_LOCK.active, reason: RV_LOCK.reason, title: RV_LOCK.title });
+});
+app.use("/api", (req, res, next) => {
+    if (!RV_LOCK.active) return next();
+    if (req.path === "/me" || req.path === "/events") return next();
+    return res.status(423).json({ error: "🚨 تم إغلاق الموقع من الإدارة العليا", blocked: true, rvLock: true, reason: RV_LOCK.reason });
+});
+app.use("/auth", (req, res, next) => {
+    if (!RV_LOCK.active || req.path === "/logout") return next();
+    if (req.method === "GET") return res.redirect("/");
+    return res.status(423).json({ error: "🚨 تم إغلاق الموقع من الإدارة العليا", blocked: true, rvLock: true, reason: RV_LOCK.reason });
+});
 app.use("/api", (req, res, next) => {
     if (!req.user || !req.session || !req.session.devReturnUid || !req.session.devSilent) return next();
     flashCtx.run({ silent: true, silentUid: req.user.id }, () => next());
@@ -2702,6 +2729,7 @@ async function purgeUserEverywhere(uid, wasSenior) {
 }
 
 app.get("/api/me", ensureAuth, async (req, res) => {
+    if (RV_LOCK.active) return res.json({ blocked: true, rvLock: true, reason: RV_LOCK.reason, title: RV_LOCK.title });
     if (suspendedUids.has(req.user.id)) return res.json({ blocked: true, suspended: true, reason: "⛔ أنت موقوف من قبل الإدارة." });
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
@@ -14369,6 +14397,7 @@ function spConnect() {
         es.addEventListener('lockchange', function (e) {
             try { var d = JSON.parse(e.data); if (!(ME && ME.isOwner)) { if (d.on) location.reload(); } } catch (x) {}
         });
+        es.addEventListener('rvlock', function () { try { rvCheck(); } catch (x) {} });
     } catch (e) {}
 }
 function spReconnect() { if (SP.es) { try { SP.es.close(); } catch (e) {} SP.es = null; SP.esOk = false; } spConnect(); }
@@ -16296,6 +16325,7 @@ function updateLockBtn(on) {
 }
 
 async function init() {
+    try { if (await rvCheck()) return; } catch (e) {}
     try { flPendingGo(); } catch (e) {}
     spConnect();
     var lockLoad = loadSavedLock();
@@ -16865,7 +16895,47 @@ function renderRegisterDone() {
         '<button class="auth-btn" onclick="renderLogin()">الرجوع لتسجيل الدخول</button></div>'
     );
 }
+var RV_ON = false;
+function rvEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function rvEnsureStyle() {
+    if (document.getElementById('rv-style')) return;
+    var st = document.createElement('style'); st.id = 'rv-style';
+    st.textContent = '@keyframes rvPulse{0%,100%{box-shadow:inset 0 0 90px rgba(239,68,68,.35)}50%{box-shadow:inset 0 0 170px rgba(239,68,68,.8)}}@keyframes rvSiren{0%,100%{transform:scale(1) rotate(-7deg)}50%{transform:scale(1.2) rotate(7deg)}}@keyframes rvBar{0%{background-position:0 0}100%{background-position:56px 0}}';
+    document.head.appendChild(st);
+}
+function renderRvLock(reason, title) {
+    RV_ON = true;
+    try { clearInterval(pollTimer); } catch (e) {}
+    rvEnsureStyle();
+    var o = document.getElementById('rv-lock');
+    if (!o) { o = document.createElement('div'); o.id = 'rv-lock'; document.body.appendChild(o); }
+    o.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483000;overflow:auto;-webkit-overflow-scrolling:touch;background:radial-gradient(900px 520px at 50% 0%,#7f1d1d,#2a0508 62%,#120204);color:#fff;display:flex;align-items:center;justify-content:center;padding:22px;animation:rvPulse 1.8s ease-in-out infinite;font-family:Tahoma,Arial,sans-serif;direction:rtl';
+    var why = String(reason || '').trim() || 'تم الإغلاق لأسباب أمنية.';
+    var head = String(title || '').trim() || 'إنذار أمني — إغلاق عام';
+    o.innerHTML = '<div style="width:100%;max-width:560px;text-align:center;margin:auto">' +
+        '<div style="height:10px;border-radius:6px;margin-bottom:22px;background:repeating-linear-gradient(135deg,#ef4444 0,#ef4444 14px,#111 14px,#111 28px);background-size:56px 56px;animation:rvBar 1s linear infinite"></div>' +
+        '<div style="font-size:78px;line-height:1;animation:rvSiren 1s ease-in-out infinite">🚨</div>' +
+        '<h1 style="margin:14px 0 8px;font-size:clamp(24px,6.5vw,36px);font-weight:900;color:#fecaca">' + rvEsc(head) + '</h1>' +
+        '<p style="margin:0 0 18px;font-size:clamp(16px,4.2vw,20px);color:#fca5a5;font-weight:700;line-height:1.8">تم إغلاق السيرفر ومواقع سيرفر وزارة الداخلية بسبب:</p>' +
+        '<div style="background:rgba(0,0,0,.5);border:2px solid #ef4444;border-radius:18px;padding:18px 16px;text-align:right">' +
+        '<div style="color:#f87171;font-weight:900;margin-bottom:8px;font-size:15px">⚠️ سبب الإغلاق</div>' +
+        '<div style="font-size:clamp(17px,4.5vw,22px);line-height:1.9;font-weight:700;white-space:pre-wrap;overflow-wrap:anywhere">' + rvEsc(why) + '</div></div>' +
+        '<p style="margin:18px 0 0;color:#fca5a5;font-size:14px;line-height:1.8">لا يمكن استخدام الموقع حالياً. يفتح تلقائياً فور رفع الإغلاق، لا تحتاج تحدّث الصفحة.</p>' +
+        '</div>';
+    document.documentElement.style.overflow = 'hidden';
+}
+async function rvCheck() {
+    try {
+        var r = await fetch('/rvlock-status', { cache: 'no-store', credentials: 'same-origin' });
+        var d = await r.json();
+        if (d && d.on) { renderRvLock(d.reason, d.title); return true; }
+        if (RV_ON) location.reload();
+    } catch (e) {}
+    return false;
+}
+setInterval(function () { if (!document.hidden) rvCheck(); }, 6000);
 function renderBlocked(reason) {
+    if (ME && ME.rvLock) { renderRvLock(ME.reason, ME.title); return; }
     document.getElementById('nav-links').innerHTML = '';
     document.getElementById('mobile-menu').innerHTML = '';
     document.getElementById('app').innerHTML = \`
