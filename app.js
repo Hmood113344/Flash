@@ -2177,7 +2177,7 @@ function scheduleChanged() {
     }, 250);
 }
 app.use("/api", (req, res, next) => {
-    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0 && !/^\/officers\/rooms\/\d+\/(signal|mode|speaker|chat|iv|mute)/.test(req.path)) {
+    if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && req.path.indexOf("/support") !== 0 && req.path.indexOf("/owner/saved-login-lock") !== 0 && !/^\/officers\/rooms\/\d+\/(signal|mode|speaker|chat|iv|mute|mic|join|leave|deafen)/.test(req.path)) {
         res.on("finish", () => { if (res.statusCode < 400) scheduleChanged(); });
     }
     next();
@@ -2557,6 +2557,15 @@ app.get("/card-bg/:key", (req, res) => {
     const name = cardBgFile(key);
     if (!name) return res.status(404).end();
     res.sendFile(nodePath.join(__dirname, name), { maxAge: "5m" }, (err) => {
+        if (err && !res.headersSent) res.status(404).end();
+    });
+});
+
+const RV_ALARM_NAMES = ["alarm.mp3", "rv-alarm.mp3", "الانذار.mp3"];
+app.get("/rv-alarm.mp3", (req, res) => {
+    const name = RV_ALARM_NAMES.find(n => fsCard.existsSync(nodePath.join(__dirname, n)));
+    if (!name) return res.status(404).end();
+    res.sendFile(nodePath.join(__dirname, name), { maxAge: "1h", acceptRanges: true, headers: { "Content-Type": "audio/mpeg" } }, (err) => {
         if (err && !res.headersSent) res.status(404).end();
     });
 });
@@ -16904,6 +16913,46 @@ function rvEnsureStyle() {
     document.head.appendChild(st);
 }
 var RV_AUD = { ctx: null, bus: null, wn: null, bn: null, ir: null, timer: null, next: 0, sig: '' };
+var RV_MP3 = { el: null, bad: false, on: false, primed: false, vib: 0 };
+function rvMp3El() {
+    if (RV_MP3.el || RV_MP3.bad) return RV_MP3.el;
+    try {
+        var a = new Audio('/rv-alarm.mp3');
+        a.loop = true; a.preload = 'auto'; a.volume = 1;
+        a.setAttribute('playsinline', '');
+        a.addEventListener('error', function () { RV_MP3.bad = true; RV_MP3.on = false; });
+        RV_MP3.el = a;
+    } catch (e) { RV_MP3.bad = true; }
+    return RV_MP3.el;
+}
+function rvMp3Prime() {
+    var a = rvMp3El();
+    if (!a || RV_MP3.primed || RV_MP3.bad) return;
+    RV_MP3.primed = true;
+    a.muted = true;
+    var p = a.play();
+    if (p && p.then) p.then(function () { if (!RV_ON) { a.pause(); a.currentTime = 0; a.muted = false; } else a.muted = false; }).catch(function () { RV_MP3.primed = false; a.muted = false; });
+}
+function rvMp3Play() {
+    var a = rvMp3El();
+    if (!a || RV_MP3.bad) return false;
+    a.muted = false;
+    if (RV_MP3.on && !a.paused) return true;
+    var p;
+    try { p = a.play(); } catch (e) { return false; }
+    if (p && p.then) p.then(function () { RV_MP3.on = true; rvHint(false); }).catch(function () { RV_MP3.on = false; rvHint(true); });
+    else RV_MP3.on = true;
+    return true;
+}
+function rvMp3Vibe() {
+    var now = Date.now();
+    if (now - RV_MP3.vib < 11000) return;
+    RV_MP3.vib = now;
+    try { if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 400, 150, 800]); } catch (e) {}
+}
+['click', 'touchstart', 'touchend', 'pointerdown', 'keydown'].forEach(function (ev) {
+    document.addEventListener(ev, function () { if (RV_ON) rvMp3Play(); else rvMp3Prime(); }, { passive: true, capture: true });
+});
 function rvAc() {
     try {
         var AC = window.AudioContext || window.webkitAudioContext;
@@ -17040,6 +17089,11 @@ function rvCycle(c, t) {
     rvOsc(c, bus, 'sine', i2, 2.0, 58, 28, 0.8, [[0.03, 0.9], [2.0, 0.0001]]);
 }
 function rvTick() {
+    if (!RV_MP3.bad && rvMp3El()) {
+        rvMp3Play();
+        rvMp3Vibe();
+        return true;
+    }
     var c = rvAc();
     if (!c) return false;
     if (c.state !== 'running') { c.resume().catch(function () {}); rvHint(true); return false; }
@@ -17057,6 +17111,7 @@ function rvSoundStart() {
 }
 function renderRvLock(reason, title) {
     RV_ON = true;
+    try { if (typeof VC !== 'undefined' && VC) offLeaveVoice(true); } catch (e) {}
     try { clearInterval(pollTimer); } catch (e) {}
     var sg = String(reason || '') + '|' + String(title || '');
     if (document.getElementById('rv-lock') && RV_AUD.sig === sg) { rvSoundStart(); return; }
@@ -21972,7 +22027,14 @@ function offModeDesc(m) {
 }
 function offSignal(uid, data) {
     if (!VC) return;
-    offPost('/api/officers/rooms/' + VC.n + '/signal', { to: uid, data: data }).catch(function () {});
+    var v = VC, n = v.n;
+    var go = function (k) {
+        offPost('/api/officers/rooms/' + n + '/signal', { to: uid, data: data }).catch(function (e) {
+            if (VC !== v || k >= 3 || (e && (e.status === 404 || e.status === 400 || e.status === 423))) return;
+            setTimeout(function () { if (VC === v) go(k + 1); }, 600 * (k + 1));
+        });
+    };
+    go(0);
 }
 function offSignalAll(data) {
     if (!VC) return;
@@ -21984,9 +22046,17 @@ function offQueue(uid, fn) {
 }
 
 var OFF_MICFAIL = false;
+function offMicOpts() {
+    return { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, voiceIsolation: true, googEchoCancellation: true, googNoiseSuppression: true, googAutoGainControl: true, googHighpassFilter: true }, video: false };
+}
 async function offJoinVoice(n) {
     OFF_MICFAIL = false;
     if (VC) { toast('أنت داخل روم حالياً'); return; }
+    var preAc = null;
+    try {
+        var ACx = window.AudioContext || window.webkitAudioContext;
+        if (ACx) { preAc = new ACx(); if (preAc.state !== 'running') preAc.resume().catch(function () {}); }
+    } catch (e) { preAc = null; }
     if (!window.RTCPeerConnection || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         toast('متصفحك لا يدعم الصوت، استخدم Chrome أو Safari حديث');
         return;
@@ -21994,16 +22064,16 @@ async function offJoinVoice(n) {
     var stream;
     try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, voiceIsolation: true, googEchoCancellation: true, googNoiseSuppression: true, googAutoGainControl: true, googHighpassFilter: true }, video: false });
-    } catch (e) { OFF_MICFAIL = true; toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
+    } catch (e) { OFF_MICFAIL = true; try { if (preAc) preAc.close(); } catch (e2) {} toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
     var j;
     try { j = await offPost('/api/officers/rooms/' + n + '/join', {}); }
-    catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); toast(e.message); return; }
+    catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); try { if (preAc) preAc.close(); } catch (e2) {} toast(e.message); return; }
     var myP = offFindP(j.state, ME.discordId);
     var myRole = myP ? myP.role : (ME.isSeniorAdmin ? 'senior' : 'applicant');
     VC = {
         n: n, me: ME.discordId, isSenior: !!ME.isSeniorAdmin, stream: stream, mic: stream.getAudioTracks()[0], micOn: true,
         state: j.state, ice: j.iceServers, peers: {}, q: {}, earlyIce: {}, shareFlags: {}, speaking: {}, vol: offLoadVols(), lmute: {}, lvl: {}, dom: null, acBad: 0,
-        sharing: false, screenStream: null, screenTrack: null, timers: [], ac: null, poll: null, lastRestart: 0,
+        sharing: false, screenStream: null, screenTrack: null, timers: [], ac: preAc, poll: null, lastRestart: 0, miss: {}, micBusy: false, micMuted: 0, micFix: 0, selfT: null,
         ivQ: j.ivQuestions || [], chat: [], chatSeq: 0, chatBusy: false, ivTarget: null, profiles: {}, profBusy: {}, profOpen: false, ansOpen: false, ivHtml: '',
         training: !!(j.state && j.state.training), cyber: !!(j.state && j.state.cyber), freq: !!(j.state && j.state.freq), court: !!(j.state && j.state.court), caseId: j.caseId || null, qSeen: '', repSeen: 0, repShown: {}, ivHidden: true, chatUnread: 0, popup: null
     };
@@ -22023,6 +22093,7 @@ async function offJoinVoice(n) {
     document.body.appendChild(ov);
     document.body.style.overflow = 'hidden';
     offWatch(VC.me, stream, null);
+    offMicGuard(VC, VC.mic);
     offSheetInit();
     (j.existing || []).forEach(function (uid) { var P = offMakePeer(uid, true); offStartOffer(P, false); });
     (j.chat || []).forEach(function (m) { offChatAdd(m, true); });
@@ -22035,13 +22106,15 @@ async function offJoinVoice(n) {
     if (VC.freq || VC.court) flMicStart();
 }
 
-function offMakePeer(uid, initiator) {
+function offGen() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+function offMakePeer(uid, initiator, gen) {
     var v = VC;
     var pc = new RTCPeerConnection({ iceServers: v.ice });
     var pj = offFindP(v.state, uid);
+    var g = gen || offGen();
     var P = {
-        uid: uid, pc: pc, initiator: initiator, aSender: null, vSender: null, aCur: undefined, vCur: undefined,
-        pendingIce: v.earlyIce[uid] || [], audioEl: document.createElement('audio'), videoEl: null, videoTrack: null,
+        uid: uid, pc: pc, initiator: initiator, g: g, born: Date.now(), disAt: 0, lastFix: 0, fix: 0, aSender: null, vSender: null, aCur: undefined, vCur: undefined,
+        pendingIce: (v.earlyIce[uid] || []).filter(function (x) { return !x.g || x.g === g; }).map(function (x) { return x.ice; }), audioEl: document.createElement('audio'), videoEl: null, videoTrack: null,
         joinedAt: pj ? pj.joinedAt : null, watchT: null, stream: null
     };
     delete v.earlyIce[uid];
@@ -22054,7 +22127,7 @@ function offMakePeer(uid, initiator) {
         var tv = pc.addTransceiver('video', { direction: 'sendrecv' });
         P.aSender = ta.sender; P.vSender = tv.sender;
     }
-    pc.onicecandidate = function (e) { if (e.candidate && VC === v) offSignal(uid, { ice: e.candidate }); };
+    pc.onicecandidate = function (e) { if (e.candidate && VC === v && v.peers[uid] === P) offSignal(uid, { ice: e.candidate, g: g }); };
     pc.ontrack = function (e) {
         if (VC !== v) return;
         if (e.track.kind === 'audio') {
@@ -22192,11 +22265,109 @@ function offBindSenders(P) {
         if (kind === 'audio') P.aSender = t.sender; else P.vSender = t.sender;
     });
 }
+function offSetSender(P, kind, tr) {
+    var sd = kind === 'a' ? P.aSender : P.vSender;
+    if (!sd) return;
+    var cur = sd.track || null;
+    if (cur === tr) return;
+    var key = kind + 'Pend';
+    if (P[key] === tr) return;
+    P[key] = tr;
+    var clr = function () { if (P[key] === tr) P[key] = undefined; };
+    try { sd.replaceTrack(tr).then(clr, clr); } catch (e) { clr(); }
+}
+function offMicGuard(v, track) {
+    if (!track) return;
+    track.addEventListener('ended', function () { if (VC === v && v.mic === track) offMicRecover(v); });
+}
+async function offMicRecover(v) {
+    if (!v || v.micBusy || VC !== v) return;
+    v.micBusy = true;
+    try {
+        var s = await navigator.mediaDevices.getUserMedia(offMicOpts());
+        if (VC !== v) { s.getTracks().forEach(function (t) { t.stop(); }); return; }
+        var old = v.stream;
+        v.stream = s;
+        v.mic = s.getAudioTracks()[0];
+        offMicGuard(v, v.mic);
+        try { old.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+        Object.keys(v.peers).forEach(function (u) { v.peers[u].aPend = undefined; });
+        if (v.rec && v.ac) {
+            try { v.rec.micSrc.disconnect(); } catch (e) {}
+            try { v.rec.micSrc = v.ac.createMediaStreamSource(s); v.rec.micSrc.connect(v.rec.gain); } catch (e) {}
+        }
+        offWatch(v.me, s, null);
+        offApplyPerms();
+        if (!v.micFix) toast('🎙️ رجع المايك يشتغل');
+        v.micFix = (v.micFix || 0) + 1;
+    } catch (e) {
+        v.micFix = (v.micFix || 0) + 1;
+        if (v.micFix < 3) toast('تعذر رجوع المايك — تأكد إن الموقع مسموح له بالمايك');
+    } finally { v.micBusy = false; }
+}
+function offHealPeers() {
+    var v = VC; if (!v) return;
+    var now = Date.now();
+    var mine = offFindP(v.state, v.me);
+    var all = v.state.participants.concat(v.state.ghosts || []);
+    all.forEach(function (p) {
+        if (p.uid === v.me) return;
+        var P = v.peers[p.uid];
+        if (!P) {
+            if (!v.miss[p.uid]) v.miss[p.uid] = now;
+            var later = !!(mine && p.joinedAt && mine.joinedAt >= p.joinedAt);
+            if (later || now - v.miss[p.uid] > 10000) {
+                v.miss[p.uid] = 0;
+                var N = offMakePeer(p.uid, true);
+                offStartOffer(N, false);
+            }
+            return;
+        }
+        v.miss[p.uid] = 0;
+        var cs = P.pc.connectionState, is = P.pc.iceConnectionState;
+        var dead = cs === 'failed' || cs === 'closed' || is === 'failed' || is === 'closed';
+        var wait = (cs === 'new' || cs === 'connecting' || is === 'new' || is === 'checking');
+        var stuck = wait && now - P.born > 15000;
+        if (cs === 'disconnected' || is === 'disconnected') { if (!P.disAt) P.disAt = now; } else P.disAt = 0;
+        var gone = !!P.disAt && now - P.disAt > 7000;
+        if (!(dead || stuck || gone)) return;
+        if (now - P.lastFix < 8000) return;
+        if (!P.initiator && now - P.born < 25000 && !dead) return;
+        P.lastFix = now;
+        var k = (P.fix || 0) + 1;
+        if (P.initiator && k % 2 === 1 && !dead && P.pc.signalingState === 'stable') { P.fix = k; offStartOffer(P, true); return; }
+        offClosePeer(p.uid);
+        var N2 = offMakePeer(p.uid, true);
+        N2.fix = k;
+        offStartOffer(N2, false);
+    });
+}
+function offHeal() {
+    var v = VC; if (!v) return;
+    try { if (v.ac && v.ac.state !== 'running') v.ac.resume().catch(function () {}); } catch (e) {}
+    try {
+        if (v.mic && v.mic.readyState === 'ended') offMicRecover(v);
+        else if (v.mic && v.mic.muted) { v.micMuted = (v.micMuted || 0) + 1; if (v.micMuted >= 3 && (v.micFix || 0) < 3) { v.micMuted = 0; offMicRecover(v); } }
+        else { v.micMuted = 0; v.micFix = 0; }
+    } catch (e) {}
+    offHealPeers();
+    Object.keys(v.peers).forEach(function (uid) {
+        var P = v.peers[uid];
+        try { if (P.audioEl && P.stream && P.audioEl.paused) { var pp = P.audioEl.play(); if (pp && pp.catch) pp.catch(function () {}); } } catch (e) {}
+    });
+    offApplyPerms();
+}
+document.addEventListener('visibilitychange', function () { if (!document.hidden && VC) { offHeal(); offVoicePoll(); } });
+window.addEventListener('online', function () { if (VC) { offHeal(); offVoicePoll(); } });
+['touchend', 'click', 'pointerdown'].forEach(function (ev) {
+    document.addEventListener(ev, function () { try { if (VC && VC.ac && VC.ac.state !== 'running') VC.ac.resume().catch(function () {}); } catch (e) {} }, { passive: true, capture: true });
+});
 async function offStartOffer(P, restart) {
     try {
         var o = await P.pc.createOffer(restart ? { iceRestart: true } : undefined);
         await P.pc.setLocalDescription(o);
-        offSignal(P.uid, { sdp: P.pc.localDescription });
+        if (!VC || VC.peers[P.uid] !== P) return;
+        offSignal(P.uid, { sdp: P.pc.localDescription, g: P.g });
     } catch (e) {}
 }
 async function offFlushIce(P) {
@@ -22212,23 +22383,34 @@ async function offOnSignal(from, data) {
         if (data.sdp.type === 'offer') {
             var pj = offFindP(v.state, from);
             if (P && pj && P.joinedAt && P.joinedAt !== pj.joinedAt) { offClosePeer(from); P = null; }
-            if (!P) P = offMakePeer(from, false);
+            if (P && data.g && P.g !== data.g) {
+                if (P.initiator && P.pc.signalingState === 'have-local-offer' && v.me < from) return;
+                offClosePeer(from); P = null;
+            }
+            if (!P) P = offMakePeer(from, false, data.g);
             await P.pc.setRemoteDescription(data.sdp);
             if (VC !== v) return;
             offBindSenders(P);
             await offFlushIce(P);
             var ans = await P.pc.createAnswer();
             await P.pc.setLocalDescription(ans);
-            offSignal(from, { sdp: P.pc.localDescription });
+            offSignal(from, { sdp: P.pc.localDescription, g: P.g });
             if (v.sharing) offSignal(from, { share: true });
             offApplyPerms();
         } else if (data.sdp.type === 'answer' && P) {
+            if (data.g && P.g !== data.g) return;
+            if (P.pc.signalingState !== 'have-local-offer') return;
             await P.pc.setRemoteDescription(data.sdp);
             await offFlushIce(P);
             if (v.sharing) offSignal(from, { share: true });
         }
     } else if (data.ice) {
-        if (!P) { (v.earlyIce[from] = v.earlyIce[from] || []).push(data.ice); return; }
+        if (!P || (data.g && P.g !== data.g)) {
+            var ea = (v.earlyIce[from] = v.earlyIce[from] || []);
+            ea.push({ g: data.g || '', ice: data.ice });
+            if (ea.length > 60) ea.shift();
+            return;
+        }
         if (P.pc.remoteDescription) { try { await P.pc.addIceCandidate(data.ice); } catch (e) {} }
         else P.pendingIce.push(data.ice);
     }
@@ -22257,7 +22439,7 @@ function offOnVsig(d) {
 }
 function offApplyState(st) {
     if (!VC || !st || st.n !== VC.n) return;
-    var meIn = st.participants.some(function (p) { return p.uid === VC.me; });
+    var meIn = st.participants.some(function (p) { return p.uid === VC.me; }) || (st.ghosts || []).some(function (p) { return p.uid === VC.me; });
     if (!meIn) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); return; }
     VC.state = st;
     if ((st.chatSeq || 0) > VC.chatSeq) offChatSync();
@@ -22274,7 +22456,7 @@ async function offVoicePoll() {
     var n = VC.n;
     try {
         var d = await offFetch('/api/officers/rooms/' + n + '/state');
-        if (VC && VC.n === n) offApplyState(d.state);
+        if (VC && VC.n === n) { offApplyState(d.state); offHeal(); }
     } catch (e) {
         if (e.status === 404 || e.status === 403 || e.status === 401) { if (VC && VC.n === n) { toast('انقطع اتصالك بالروم'); offLeaveVoice(true); } }
     }
@@ -22289,10 +22471,10 @@ function offApplyPerms() {
         var P = VC.peers[uid];
         if (!P.aSender || !P.vSender) offBindSenders(P);
         var okSend = offAllowed(st, me, uid);
-        var audio = (okSend && VC.micOn) ? VC.mic : null;
+        var audio = (okSend && VC.micOn && VC.mic && VC.mic.readyState === 'live') ? VC.mic : null;
         var video = (okSend && VC.screenTrack) ? VC.screenTrack : null;
-        if (P.aSender && P.aCur !== audio) { P.aCur = audio; P.aSender.replaceTrack(audio).catch(function () {}); }
-        if (P.vSender && P.vCur !== video) { P.vCur = video; P.vSender.replaceTrack(video).catch(function () {}); }
+        offSetSender(P, 'a', audio);
+        offSetSender(P, 'v', video);
         offApplyVol(P);
     });
 }
@@ -22322,7 +22504,7 @@ function offWatch(uid, stream, P) {
                 if (el) el.classList.toggle('speaking', on);
             }
         }, 200);
-        if (P) P.watchT = t; else v.timers.push(t);
+        if (P) P.watchT = t; else { if (v.selfT) clearInterval(v.selfT); v.selfT = t; v.timers.push(t); }
     } catch (e) {}
 }
 
@@ -22838,7 +23020,7 @@ function offGateTick() {
     Object.keys(v.peers).forEach(function (uid) {
         var P = v.peers[uid];
         var g = 1;
-        if (best && uid !== best && (v.lvl[uid] || 0) < bl * 0.55) g = 0;
+        if (best && uid !== best && (v.lvl[uid] || 0) < bl * 0.3) g = 0.25;
         if (P.gate !== g) { P.gate = g; offApplyVol(P); }
     });
 }
