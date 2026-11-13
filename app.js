@@ -16935,7 +16935,7 @@ function rvMp3Prime() {
 }
 function rvMp3Play() {
     var a = rvMp3El();
-    if (!a || RV_MP3.bad) return false;
+    if (!a || RV_MP3.bad || document.hidden) return false;
     a.muted = false;
     if (RV_MP3.on && !a.paused) return true;
     var p;
@@ -16967,6 +16967,21 @@ function rvAc() {
         if (c && c.state !== 'running') c.resume().then(function () { if (RV_ON) rvTick(); }).catch(function () {});
     }, { passive: true, capture: true });
 });
+function rvMp3Stop() {
+    RV_MP3.on = false;
+    var a = RV_MP3.el;
+    if (a) { try { a.pause(); a.currentTime = 0; } catch (e) {} }
+    try { if (navigator.vibrate) navigator.vibrate(0); } catch (e) {}
+    try { if (RV_AUD.ctx && RV_AUD.ctx.state === 'running') RV_AUD.ctx.suspend().catch(function () {}); } catch (e) {}
+}
+document.addEventListener('visibilitychange', function () {
+    if (!RV_ON) return;
+    if (document.hidden) { rvMp3Stop(); return; }
+    try { rvCheck(); } catch (e) {}
+    try { if (RV_AUD.ctx && RV_AUD.ctx.state === 'suspended') RV_AUD.ctx.resume().catch(function () {}); } catch (e) {}
+    rvTick();
+});
+window.addEventListener('pagehide', function () { if (RV_ON) rvMp3Stop(); });
 function rvHint(show) {
     var h = document.getElementById('rv-hint');
     if (h) h.style.display = show ? 'block' : 'none';
@@ -17089,6 +17104,7 @@ function rvCycle(c, t) {
     rvOsc(c, bus, 'sine', i2, 2.0, 58, 28, 0.8, [[0.03, 0.9], [2.0, 0.0001]]);
 }
 function rvTick() {
+    if (document.hidden) return false;
     if (!RV_MP3.bad && rvMp3El()) {
         rvMp3Play();
         rvMp3Vibe();
