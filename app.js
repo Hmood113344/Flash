@@ -805,6 +805,17 @@ const SettingsSchema = new mongoose.Schema({
     ownerLockdown: { type: Boolean, default: false },
     stealthMode: { type: Boolean, default: false },
     adminList: { type: [String], default: [] },
+    adminTiers: {
+        general: { type: [String], default: [] },
+        middle: { type: [String], default: [] },
+        high: { type: [String], default: [] },
+    },
+    adminManagers: {
+        chief: { type: [String], default: [] },
+        general: { type: [String], default: [] },
+        middle: { type: [String], default: [] },
+        high: { type: [String], default: [] },
+    },
     rankThresholds: { type: Map, of: Number, default: {} },
     sectorLeadership: {
         patrol: {
@@ -1189,6 +1200,8 @@ const client = new Client({
 
 const pendingMessages = new Map();
 let botReady = false;
+// أزرار القبول/الرفض وإعلان الاستلام يتولاها البوت المنفصل (bot.js) عن طريق القاعدة. لو تبي ترجعها للموقع غيّر القيمة إلى false.
+const EXTERNAL_BOT = true;
 
 async function isMilitary(uid) {
     try {
@@ -1684,7 +1697,7 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
-        if (interaction.isButton()) {
+        if (!EXTERNAL_BOT && interaction.isButton()) {
             const id = interaction.customId;
 
             if (id.startsWith("approve_") || id.startsWith("reject_")) {
@@ -1729,7 +1742,7 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
-        if (interaction.isModalSubmit()) {
+        if (!EXTERNAL_BOT && interaction.isModalSubmit()) {
             if (interaction.customId.startsWith("rejectmodal_")) {
                 await interaction.deferReply({ ephemeral: true });
                 const vid = interaction.customId.split("_")[1];
@@ -1753,6 +1766,83 @@ client.on("interactionCreate", async interaction => {
         } catch (e2) {}
     }
 });
+
+// ── جسر البوت المنفصل (bot.js): يتواصلون عن طريق collection اسمها botjobs ──
+const BotJobSchema = new mongoose.Schema({
+    type: String,                                  // decision (البوت → الموقع) | send_reception (الموقع → البوت)
+    data: mongoose.Schema.Types.Mixed,
+    status: { type: String, default: "pending" },  // pending | processing | done | failed | expired
+    result: mongoose.Schema.Types.Mixed,
+    error: String,
+    createdAt: { type: Date, default: Date.now },
+    doneAt: Date,
+}, { collection: "botjobs" });
+BotJobSchema.index({ type: 1, status: 1, createdAt: 1 });
+BotJobSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86400 });
+const BotJob = mongoose.model("BotJob", BotJobSchema);
+
+// ينفّذ ضغطة زر جاية من البوت بنفس القواعد القديمة، ويرجّع نص الرد
+async function siteHandleDecision(d) {
+    const id = String(d.customId || "");
+    const userId = String(d.userId || ""), username = String(d.username || "");
+    const roleIds = Array.isArray(d.roleIds) ? d.roleIds.map(String) : [];
+    const fakeInteraction = { user: { id: userId, username }, memberPermissions: { has: () => !!d.isAdmin } };
+    const fakeMember = { roles: { cache: { has: rid => roleIds.includes(String(rid)) } } };
+    if (id.startsWith("approve_")) {
+        const vid = id.slice(id.indexOf("_") + 1);
+        const settings = await getSettings();
+        const v = await Violation.findById(vid).catch(() => null);
+        if (!v || v.status !== "pending") return { mode: "edit", text: "هذه المخالفة تمت مراجعتها مسبقاً." };
+        if (!(await discordCanReviewViolation(fakeInteraction, v, settings))) return { mode: "edit", text: "🚫 ما تملك صلاحية." };
+        const ar = await approveViolation(v, userId, username);
+        if (ar && ar.blocked) return { mode: "edit", text: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون رتبة أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حتى ينتهي الاستدعاء." };
+        return { mode: "edit", text: "✅ تم قبول المخالفة." };
+    }
+    if (id.startsWith("rejectmodal_")) {
+        const vid = id.split("_")[1];
+        const reason = String(d.reason || "").trim().slice(0, 500);
+        if (!reason) return { mode: "edit", text: "اكتب سبب الرفض." };
+        const v = await Violation.findById(vid).catch(() => null);
+        if (!v || v.status !== "pending") return { mode: "edit", text: "هذه المخالفة تمت مراجعتها مسبقاً." };
+        const settings = await getSettings();
+        if (!(await discordCanReviewViolation(fakeInteraction, v, settings))) return { mode: "edit", text: "🚫 ما تملك صلاحية." };
+        const rr = await rejectViolation(v, userId, username, reason);
+        if (rr && rr.blocked) return { mode: "edit", text: rr.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنرفض مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنرفض مخالفاته حالياً." };
+        return { mode: "edit", text: "✅ تم رفض المخالفة وحفظ السبب." };
+    }
+    if (id.startsWith("leave_")) {
+        const parts = id.split("_");
+        const out = await decideLeaveRequest(parts[2], userId, username, parts[1] === "ok" ? "approve" : "reject", fakeMember);
+        return out && out.error ? { mode: "followup", text: "🚫 " + out.error } : { mode: "none" };
+    }
+    if (id.startsWith("mppr_")) {
+        const parts = id.split("_");
+        const out = await decideMPPointsRequest(parts[2], userId, username, parts[1] === "ok" ? "approve" : "reject", "discord");
+        return out && out.error ? { mode: "followup", text: "🚫 " + out.error } : { mode: "none" };
+    }
+    return { mode: "none" };
+}
+let botJobsBusy = false;
+async function processBotDecisions() {
+    if (botJobsBusy) return;
+    botJobsBusy = true;
+    try {
+        for (let i = 0; i < 10; i++) {
+            const j = await BotJob.findOneAndUpdate({ type: "decision", status: "pending" }, { $set: { status: "processing" } }, { sort: { createdAt: 1 }, new: true });
+            if (!j) break;
+            if (Date.now() - new Date(j.createdAt).getTime() > 5 * 60 * 1000) { await BotJob.updateOne({ _id: j._id }, { $set: { status: "expired", doneAt: new Date() } }); continue; }
+            try {
+                const result = await siteHandleDecision(j.data || {});
+                await BotJob.updateOne({ _id: j._id }, { $set: { status: "done", result, doneAt: new Date() } });
+            } catch (e) {
+                console.error("❌ فشل تنفيذ قرار من البوت:", e.message);
+                await BotJob.updateOne({ _id: j._id }, { $set: { status: "failed", error: String(e.message).slice(0, 200), doneAt: new Date() } });
+            }
+        }
+    } catch (e) { console.error("❌ فحص قرارات البوت:", e.message); }
+    finally { botJobsBusy = false; }
+}
+setInterval(() => { processBotDecisions().catch(() => {}); }, 1500);
 
 const activeVehicleSessions = new Set();
 client.on("messageCreate", async message => {
@@ -2427,6 +2517,85 @@ async function ensureAnyAdmin(req, res, next) {
     next();
 }
 
+const ADMIN_TIER_KEYS = ["general", "middle", "high"];
+const ADMIN_TIER_LABELS = { general: "الإدارة العامة", middle: "الإدارة الوسطى", high: "الإدارة العليا" };
+const ADMIN_TAB_DEFS = [
+    { key: "support", label: "🎧 خدمة العملاء", min: 1 },
+    { key: "cphoto", label: "🖼️ صور البطاقات", min: 1 },
+    { key: "sfile", label: "📇 عرض ملف عسكري", min: 1, ro: true },
+    { key: "excuses", label: "🩺 غياب بعذر", min: 2 },
+    { key: "att", label: "🖐️ لوحة البصمة", min: 2, ro: true },
+    { key: "notes", label: "📝 الملاحظات", min: 2, ro: true },
+    { key: "regs", label: "📥 طلبات التسجيل", min: 3 },
+    { key: "leave", label: "🌴 طلبات الإجازات", min: 3 },
+    { key: "cards", label: "🪪 تحكم البطاقات", min: 3 },
+    { key: "reviewed", label: "✅ المخالفات المقبولة", min: 3, ro: true },
+    { key: "warn", label: "⚠️ التحذيرات والعقوبات", min: 3 },
+    { key: "accounts", label: "✅ الحسابات المقبولة", min: 3, ro: true },
+];
+const ADMIN_TAB_MAP = {};
+ADMIN_TAB_DEFS.forEach(d => { ADMIN_TAB_MAP[d.key] = d; });
+function admHas(arr, uid) { return Array.isArray(arr) && arr.includes(uid); }
+function adminRoleOf(uid, st) {
+    if (!uid || !st) return null;
+    const T = st.adminTiers || {}, M = st.adminManagers || {};
+    let level = 0;
+    if (admHas(T.general, uid)) level = Math.max(level, 1);
+    if (admHas(T.middle, uid)) level = Math.max(level, 2);
+    if (admHas(T.high, uid)) level = Math.max(level, 3);
+    const chief = admHas(M.chief, uid);
+    const mg = admHas(M.general, uid), mm = admHas(M.middle, uid), mh = admHas(M.high, uid);
+    if (mg) level = Math.max(level, 1);
+    if (mm) level = Math.max(level, 2);
+    if (mh || chief) level = 3;
+    if (!level && admHas(st.adminList, uid)) level = 1;
+    if (!level) return null;
+    const mgr = chief ? "chief" : mh ? "high" : mm ? "middle" : mg ? "general" : null;
+    return { level, tier: ADMIN_TIER_KEYS[level - 1], mgr };
+}
+function admTeamScope(uid, st) {
+    if (isSeniorAdmin(uid)) return { tiers: ADMIN_TIER_KEYS.slice(), mgrs: ["chief", "general", "middle", "high"] };
+    const r = adminRoleOf(uid, st);
+    if (!r || !r.mgr) return null;
+    if (r.mgr === "chief") return { tiers: ADMIN_TIER_KEYS.slice(), mgrs: ["general", "middle", "high"] };
+    if (r.mgr === "high") return { tiers: ADMIN_TIER_KEYS.slice(), mgrs: [] };
+    if (r.mgr === "middle") return { tiers: ["general", "middle"], mgrs: [] };
+    return { tiers: ["general"], mgrs: [] };
+}
+function admRolePayload(r, st, uid) {
+    if (!r) return null;
+    const tabs = ADMIN_TAB_DEFS.filter(d => d.min <= r.level).map(d => ({ key: d.key, label: d.label, ro: !!d.ro }));
+    const scope = admTeamScope(uid, st);
+    if (scope) tabs.push({ key: "team", label: r.mgr === "chief" ? "🛡️ إدارة الأقسام" : "👥 فريق " + ADMIN_TIER_LABELS[r.mgr === "high" ? "high" : r.mgr], ro: false });
+    return { level: r.level, tier: r.tier, tierLabel: ADMIN_TIER_LABELS[r.tier], mgr: r.mgr, tabs };
+}
+function ensureTab(key) {
+    return async function (req, res, next) {
+        if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+        const st = await getSettings();
+        if (isSeniorAdmin(req.user.id)) { req.settings = st; return next(); }
+        const r = adminRoleOf(req.user.id, st);
+        const d = ADMIN_TAB_MAP[key];
+        if (!r || !d || r.level < d.min) return res.status(403).json({ error: "ليست لديك صلاحية لهذا القسم" });
+        req.settings = st;
+        req.adminRole = r;
+        next();
+    };
+}
+async function ensureExcuseAccess(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const st = await getSettings();
+    if (isHighCommand(req.user.id, st) || isSeniorAdmin(req.user.id)) { req.settings = st; return next(); }
+    const r = adminRoleOf(req.user.id, st);
+    if (r && r.level >= 2) { req.settings = st; req.adminRole = r; return next(); }
+    return res.status(403).json({ error: "ليست لديك صلاحية" });
+}
+async function adminLevelOf(uid, st) {
+    if (isSeniorAdmin(uid)) return 9;
+    const r = adminRoleOf(uid, st || await getSettings());
+    return r ? r.level : 0;
+}
+
 async function ensureSectorLeader(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
@@ -2617,12 +2786,12 @@ async function rejectAccount(a, actor, reason) {
     await a.save();
 }
 
-app.get("/api/admin/registrations", ensureAnyAdmin, async (req, res) => {
+app.get("/api/admin/registrations", ensureTab("regs"), async (req, res) => {
     const list = await Account.find({ status: "pending" }).sort({ createdAt: 1 }).lean();
     res.json({ list: list.map(a => accView(a, true)) });
 });
 
-app.post("/api/admin/registrations/:uid/approve", ensureAnyAdmin, async (req, res) => {
+app.post("/api/admin/registrations/:uid/approve", ensureTab("regs"), async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid, status: "pending" });
     if (!a) return res.status(404).json({ error: "الطلب غير موجود أو تمت معالجته" });
     await approveAccount(a, req.user);
@@ -2630,7 +2799,7 @@ app.post("/api/admin/registrations/:uid/approve", ensureAnyAdmin, async (req, re
     res.json({ ok: true });
 });
 
-app.post("/api/admin/registrations/:uid/reject", ensureAnyAdmin, async (req, res) => {
+app.post("/api/admin/registrations/:uid/reject", ensureTab("regs"), async (req, res) => {
     const a = await Account.findOne({ uid: req.params.uid, status: "pending" });
     if (!a) return res.status(404).json({ error: "الطلب غير موجود أو تمت معالجته" });
     await rejectAccount(a, req.user, String((req.body || {}).reason || "").trim().slice(0, 200));
@@ -2638,10 +2807,11 @@ app.post("/api/admin/registrations/:uid/reject", ensureAnyAdmin, async (req, res
     res.json({ ok: true });
 });
 
-app.get("/api/senior/accounts", ensureSeniorAdmin, async (req, res) => {
-    const status = req.query.status === "rejected" ? "rejected" : "approved";
-    const list = await Account.find({ status, ...(isOwnerUid(req.user.id) ? {} : { isOwner: { $ne: true } }) }).sort({ createdAt: -1 }).lean();
-    res.json({ list: list.map(a => accView(a, true, req.user.id)) });
+app.get("/api/senior/accounts", ensureTab("accounts"), async (req, res) => {
+    const senior = isSeniorAdmin(req.user.id);
+    const status = (senior && req.query.status === "rejected") ? "rejected" : "approved";
+    const list = await Account.find({ status, ...(isOwnerUid(req.user.id) ? {} : { isOwner: { $ne: true } }), ...(senior ? {} : { isSenior: { $ne: true } }) }).sort({ createdAt: -1 }).lean();
+    res.json({ list: list.map(a => accView(a, senior, req.user.id)) });
 });
 
 app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res) => {
@@ -2743,7 +2913,7 @@ async function purgeUserEverywhere(uid, wasSenior) {
     await Personnel.deleteOne({ discord: uid });
     await LeaveRequest.deleteMany({ discord: uid });
     await PromotionRequest.deleteMany({ targetDiscord: uid });
-    await Settings.updateMany({}, { $pull: { adminList: uid } });
+    await Settings.updateMany({}, { $pull: { adminList: uid, "adminTiers.general": uid, "adminTiers.middle": uid, "adminTiers.high": uid, "adminManagers.chief": uid, "adminManagers.general": uid, "adminManagers.middle": uid, "adminManagers.high": uid } });
     if (wasSenior) await refreshSeniors();
 }
 
@@ -2790,7 +2960,8 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         return res.json({ blocked: true, reason: "🚫 تم إيقاف حسابك من الموقع من قبل الإدارة." });
     }
 
-    const isAdmin = senior || settings.adminList.includes(req.user.id);
+    const admRole = senior ? null : adminRoleOf(req.user.id, settings);
+    const isAdmin = senior || !!admRole;
     let seniorTemp = false, accountEmail = null;
     const progress = await rankProgress(p, settings);
     const sectorInfo = getSectorRole(req.user.id, settings);
@@ -2867,6 +3038,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         removedAbsences: p.removedAbsences || [],
         isBlocked: p.isBlocked,
         isAdmin,
+        adminRole: admRolePayload(admRole, settings, req.user.id),
         isSeniorAdmin: senior,
         isTrainer: Array.isArray(settings.officerTrainers) && settings.officerTrainers.includes(req.user.id),
         isAntiDrugs,
@@ -3577,7 +3749,7 @@ app.get("/api/card-photo-pending/:uid", ensureAuth, async (req, res) => {
         res.set("Cache-Control", "no-store").type(d.mime || "image/jpeg").send(d.data);
     } catch (e) { res.status(500).end(); }
 });
-app.get("/api/card-photos/pending", ensureAnyAdmin, async (req, res) => {
+app.get("/api/card-photos/pending", ensureTab("cphoto"), async (req, res) => {
     const reqs = await CardPhotoReq.find({ status: "pending" }).sort({ createdAt: 1 }).limit(100).lean();
     const ps = await Personnel.find({ discord: { $in: reqs.map(r => r.uid) } }, { discord: 1, rank: 1, sector: 1, unit: 1, cardNumber: 1 }).lean();
     const byId = new Map(ps.map(p => [p.discord, p]));
@@ -3587,7 +3759,7 @@ app.get("/api/card-photos/pending", ensureAnyAdmin, async (req, res) => {
     }) });
 });
 // البطاقات الموجودة (صورها معتمدة)
-app.get("/api/card-photos/approved", ensureAnyAdmin, async (req, res) => {
+app.get("/api/card-photos/approved", ensureTab("cphoto"), async (req, res) => {
     try {
         const hidden = hiddenOwnerIds(req);
         const ps = await Personnel.find({ cardPhotoV: { $gt: 0 }, discord: { $nin: hidden } }, { discord: 1, registeredName: 1, rank: 1, sector: 1, unit: 1, cardNumber: 1, cardPhotoV: 1 }).sort({ cardPhotoV: -1 }).limit(300).lean();
@@ -3595,7 +3767,7 @@ app.get("/api/card-photos/approved", ensureAnyAdmin, async (req, res) => {
     } catch (e) { res.status(500).json({ error: "تعذر تحميل البطاقات" }); }
 });
 // حذف صورة معتمدة (تنشال من البطاقة)
-app.post("/api/card-photos/:uid/delete", ensureAnyAdmin, async (req, res) => {
+app.post("/api/card-photos/:uid/delete", ensureTab("cphoto"), async (req, res) => {
     try {
         const uid = String(req.params.uid || "");
         if (!CARD_UID_RE.test(uid)) return res.status(404).json({ error: "غير موجود" });
@@ -3618,7 +3790,7 @@ function cardCtlRow(p) {
         revoked: !!p.cardRevoked, revokedAt: p.cardRevokedAt || null, revokedByName: p.cardRevokedByName || null, reason: p.cardRevokedReason || null };
 }
 const CARD_CTL_FIELDS = { discord: 1, registeredName: 1, rank: 1, sector: 1, unit: 1, cardNumber: 1, cardRevoked: 1, cardRevokedAt: 1, cardRevokedByName: 1, cardRevokedReason: 1 };
-app.get("/api/card-control/list", ensureSeniorOnly, async (req, res) => {
+app.get("/api/card-control/list", ensureTab("cards"), async (req, res) => {
     try {
         const q = String(req.query.q || "").trim();
         const hidden = hiddenOwnerIds(req);
@@ -3631,7 +3803,7 @@ app.get("/api/card-control/list", ensureSeniorOnly, async (req, res) => {
         res.json({ list: list.map(cardCtlRow), searching: q.length >= 2 });
     } catch (e) { res.status(500).json({ error: "تعذر تحميل البطاقات" }); }
 });
-app.post("/api/card-control/:uid/revoke", ensureSeniorOnly, async (req, res) => {
+app.post("/api/card-control/:uid/revoke", ensureTab("cards"), async (req, res) => {
     try {
         const uid = String(req.params.uid || "");
         if (!CARD_UID_RE.test(uid)) return res.status(404).json({ error: "غير موجود" });
@@ -3643,7 +3815,7 @@ app.post("/api/card-control/:uid/revoke", ensureSeniorOnly, async (req, res) => 
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: "تعذر إلغاء البطاقة" }); }
 });
-app.post("/api/card-control/:uid/restore", ensureSeniorOnly, async (req, res) => {
+app.post("/api/card-control/:uid/restore", ensureTab("cards"), async (req, res) => {
     try {
         const uid = String(req.params.uid || "");
         if (!CARD_UID_RE.test(uid)) return res.status(404).json({ error: "غير موجود" });
@@ -3653,7 +3825,7 @@ app.post("/api/card-control/:uid/restore", ensureSeniorOnly, async (req, res) =>
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: "تعذر إعادة التفعيل" }); }
 });
-app.post("/api/card-photos/:uid/approve", ensureAnyAdmin, async (req, res) => {
+app.post("/api/card-photos/:uid/approve", ensureTab("cphoto"), async (req, res) => {
     try {
         const uid = String(req.params.uid || "");
         if (!CARD_UID_RE.test(uid)) return res.status(404).json({ error: "غير موجود" });
@@ -3668,7 +3840,7 @@ app.post("/api/card-photos/:uid/approve", ensureAnyAdmin, async (req, res) => {
         res.json({ ok: true });
     } catch (e) { console.error("❌ قبول صورة بطاقة:", e.message); res.status(500).json({ error: "تعذر قبول الصورة" }); }
 });
-app.post("/api/card-photos/:uid/reject", ensureAnyAdmin, async (req, res) => {
+app.post("/api/card-photos/:uid/reject", ensureTab("cphoto"), async (req, res) => {
     try {
         const uid = String(req.params.uid || "");
         if (!CARD_UID_RE.test(uid)) return res.status(404).json({ error: "غير موجود" });
@@ -4062,14 +4234,15 @@ app.post("/api/admin/violations/:id/reject", ensureSeniorAdmin, async (req, res)
     res.json({ ok: true });
 });
 
-app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/personnel", ensureTab("sfile"), async (req, res) => {
     await ensureCardNumbers();
     const q = (req.query.q || "").trim();
     const qe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const base = q ? { $or: [{ registeredName: new RegExp(qe, "i") }, { unit: new RegExp(qe, "i") }, { discordTag: new RegExp(qe, "i") }, { cardNumber: new RegExp(qe, "i") }] } : {};
     const owners = Array.from(ownerUids);
     const regUids = await getFlashRegisteredUids();
-    const rest = await Personnel.find({ ...base, discord: { $in: regUids, $nin: owners } }, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
+    const hideUids = isSeniorAdmin(req.user.id) ? owners : owners.concat(Array.from(seniorUids));
+    const rest = await Personnel.find({ ...base, discord: { $in: regUids, $nin: hideUids } }, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
     let list = rest;
     if (isOwnerUid(req.user.id) && owners.length) {
         const ownerDocs = await Personnel.find({ ...base, discord: { $in: owners } }, { "notes.image": 0 });
@@ -4086,8 +4259,9 @@ app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
     }) });
 });
 
-app.get("/api/senior/personnel/:discord/file", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/personnel/:discord/file", ensureTab("sfile"), async (req, res) => {
     if (ownerUids.has(req.params.discord) && !isOwnerUid(req.user.id)) return res.status(404).json({ error: "غير موجود" });
+    if (!isSeniorAdmin(req.user.id) && isSeniorAdmin(req.params.discord)) return res.status(404).json({ error: "غير موجود" });
     await ensureCardNumbers();
     const p = await Personnel.findOne({ discord: req.params.discord });
     if (!p) return res.status(404).json({ error: "غير موجود" });
@@ -4099,7 +4273,7 @@ app.get("/api/senior/personnel/:discord/file", ensureSeniorAdmin, async (req, re
     ]);
     let account = null;
     if (acc) {
-        const showPw = !(acc.isSenior && acc.uid !== req.user.id && !ownerUids.has(req.user.id));
+        const showPw = isSeniorAdmin(req.user.id) && !(acc.isSenior && acc.uid !== req.user.id && !ownerUids.has(req.user.id));
         account = {
             uid: acc.uid, email: acc.email, fullName: acc.fullName, age: acc.age, nationality: acc.nationality,
             status: acc.status, isSenior: !!acc.isSenior, isOwner: !!acc.isOwner, tempSenior: !!acc.tempSenior, suspended: !!acc.suspended,
@@ -4395,7 +4569,7 @@ app.post("/api/warnings/:id/ack", async (req, res) => {
     res.json({ ok: true });
 });
 
-app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/notes", ensureTab("notes"), async (req, res) => {
     const list = await Personnel.find({ "notes.0": { $exists: true }, discord: { $nin: hiddenOwnerIds(req) } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
     const flat = [];
     for (const p of list) {
@@ -4606,7 +4780,7 @@ app.post("/api/points/edit/:discord", ensurePointsEditor, async (req, res) => {
     res.json({ ok: true, personnel: p });
 });
 
-app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/violations/reviewed", ensureTab("reviewed"), async (req, res) => {
     const list = await Violation.aggregate([
         { $match: { status: { $in: ["approved", "rejected"] } } },
         { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }, { $ifNull: ["$photoDb", false] }] } } },
@@ -4793,7 +4967,7 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
     res.json({ list });
 });
 
-app.get("/api/senior/leave/pending", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/leave/pending", ensureTab("leave"), async (req, res) => {
     const list = await LeaveRequest.find({ status: { $in: ["pending", "approved", "rejected", "completed"] } }).sort({ createdAt: -1 }).limit(200).lean();
     res.json({ list });
 });
@@ -4812,6 +4986,8 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
         approverLabel = "مسؤول الأفراد";
     } else if (isSeniorAdmin(req.user.id)) {
         approverLabel = "كبار المسؤولين";
+    } else if ((await adminLevelOf(req.user.id, settings)) >= 3) {
+        approverLabel = "الإدارة العليا";
     } else {
         return res.status(403).json({ error: "ليست لديك صلاحية الموافقة على هذا الطلب" });
     }
@@ -4847,6 +5023,7 @@ app.post("/api/leave/:id/end", ensureAuth, async (req, res) => {
     if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
     else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
     else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
+    else if ((await adminLevelOf(req.user.id, settings)) >= 3) approverLabel = "الإدارة العليا";
     else return res.status(403).json({ error: "ليست لديك صلاحية إنهاء هذه الإجازة" });
 
     const done = await finalizeLeave(leave, req.user.username + ` (${approverLabel})`);
@@ -4866,6 +5043,7 @@ app.delete("/api/leave/:id", ensureAuth, async (req, res) => {
     if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
     else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
     else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
+    else if ((await adminLevelOf(req.user.id, settings)) >= 3) approverLabel = "الإدارة العليا";
     else return res.status(403).json({ error: "ليست لديك صلاحية" });
 
     // الرصيد يرجع: المرفوضة ما انخصم منها شي، والمنتهية يرجع اللي انخصم منها
@@ -4894,6 +5072,7 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
     if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
     else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
     else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
+    else if ((await adminLevelOf(req.user.id, settings)) >= 3) approverLabel = "الإدارة العليا";
     else return res.status(403).json({ error: "ليست لديك صلاحية" });
 
     leave.status = "rejected";
@@ -5074,9 +5253,127 @@ app.post("/api/senior/fire-admin", ensureSeniorAdmin, async (req, res) => {
     const { discordId } = req.body;
     const settings = await getSettings();
     settings.adminList = settings.adminList.filter(id => id !== discordId);
+    ADMIN_TIER_KEYS.forEach(k => { settings.adminTiers[k] = (settings.adminTiers[k] || []).filter(id => id !== discordId); });
+    ["chief", "general", "middle", "high"].forEach(k => { settings.adminManagers[k] = (settings.adminManagers[k] || []).filter(id => id !== discordId); });
     await settings.save();
     await logEvent({ action: "فصل إداري", discordId, actorId: req.user.id, actorTag: req.user.username });
     res.json({ ok: true });
+});
+
+const ADM_ROLE_LABELS = { "tier:general": "إداري — الإدارة العامة", "tier:middle": "إداري — الإدارة الوسطى", "tier:high": "إداري — الإدارة العليا", "mgr:chief": "مسؤول الإدارة", "mgr:general": "مسؤول الإدارة العامة", "mgr:middle": "مسؤول الإدارة الوسطى", "mgr:high": "مسؤول الإدارة العليا" };
+async function admRows(uids) {
+    const ids = Array.from(new Set((uids || []).filter(Boolean)));
+    const accs = ids.length ? await Account.find({ uid: { $in: ids } }, { uid: 1, fullName: 1, email: 1 }).lean() : [];
+    const byId = {};
+    accs.forEach(a => { byId[a.uid] = a; });
+    return ids.map(id => ({ uid: id, name: (byId[id] && byId[id].fullName) || id, email: (byId[id] && byId[id].email) || "" }));
+}
+function admInAnyList(st, uid) {
+    return ADMIN_TIER_KEYS.some(k => admHas(st.adminTiers && st.adminTiers[k], uid)) || ["chief", "general", "middle", "high"].some(k => admHas(st.adminManagers && st.adminManagers[k], uid));
+}
+app.get("/api/adm/team", ensureAuth, async (req, res) => {
+    try {
+        const st = await getSettings();
+        const scope = admTeamScope(req.user.id, st);
+        if (!scope) return res.status(403).json({ error: "ليست لديك صلاحية" });
+        const T = st.adminTiers || {}, M = st.adminManagers || {};
+        const legacy = (st.adminList || []).filter(id => !admInAnyList(st, id) && !isSeniorAdmin(id));
+        const tiers = {}, mgrs = {};
+        ADMIN_TIER_KEYS.forEach(k => { tiers[k] = scope.tiers.includes(k) ? Array.from(T[k] || []).concat(k === "general" ? legacy : []) : []; });
+        ["general", "middle", "high"].forEach(k => { mgrs[k] = scope.mgrs.includes(k) ? Array.from(M[k] || []) : []; });
+        const chief = scope.mgrs.includes("chief") ? Array.from(M.chief || []) : [];
+        const all = [].concat(chief, mgrs.general, mgrs.middle, mgrs.high, tiers.general, tiers.middle, tiers.high);
+        const [rows, acts] = await Promise.all([
+            admRows(all),
+            all.length ? Log.aggregate([{ $match: { actorId: { $in: all }, createdAt: { $gte: new Date(Date.now() - 7 * 86400000) } } }, { $group: { _id: "$actorId", n: { $sum: 1 }, last: { $max: "$createdAt" } } }]) : [],
+        ]);
+        const info = {};
+        rows.forEach(r => { info[r.uid] = r; });
+        acts.forEach(a => { if (info[a._id]) { info[a._id].n = a.n; info[a._id].last = a.last; } });
+        const pick = arr => arr.map(id => Object.assign({ n: 0, last: null }, info[id] || { uid: id, name: id, email: "" }, { legacy: legacy.includes(id) }));
+        res.json({
+            scope, chief: pick(chief),
+            mgrs: { general: pick(mgrs.general), middle: pick(mgrs.middle), high: pick(mgrs.high) },
+            tiers: { general: pick(tiers.general), middle: pick(tiers.middle), high: pick(tiers.high) },
+        });
+    } catch (e) { console.error("❌ /api/adm/team:", e.message); res.status(500).json({ error: "تعذر التحميل" }); }
+});
+function admParseRole(role) {
+    const m = /^(tier|mgr):(general|middle|high|chief)$/.exec(String(role || ""));
+    if (!m || (m[1] === "tier" && m[2] === "chief")) return null;
+    return { kind: m[1], key: m[2], full: m[0] };
+}
+app.post("/api/adm/team/assign", ensureAuth, async (req, res) => {
+    try {
+        const st = await getSettings();
+        const scope = admTeamScope(req.user.id, st);
+        if (!scope) return res.status(403).json({ error: "ليست لديك صلاحية" });
+        const pr = admParseRole((req.body || {}).role);
+        if (!pr) return res.status(400).json({ error: "نوع المنصب غير صحيح" });
+        if (pr.kind === "tier" ? !scope.tiers.includes(pr.key) : !scope.mgrs.includes(pr.key)) return res.status(403).json({ error: "ما تقدر تعيّن هذا المنصب" });
+        const id = String((req.body || {}).email || "").trim();
+        if (!id) return res.status(400).json({ error: "حط بريد الشخص" });
+        const acc = id.includes("@") ? await Account.findOne({ email: id.toLowerCase(), status: "approved" }) : await Account.findOne({ uid: id, status: "approved" });
+        if (!acc) return res.status(404).json({ error: "ما لقيت حساب مقبول بهذا البريد" });
+        const uid = acc.uid;
+        if (isSeniorAdmin(uid)) return res.status(400).json({ error: "هذا الحساب من كبار المسؤولين" });
+        if (uid === req.user.id) return res.status(400).json({ error: "ما تقدر تعيّن نفسك" });
+        const cur = adminRoleOf(uid, st);
+        if (!isSeniorAdmin(req.user.id) && cur) {
+            if (cur.mgr && !scope.mgrs.includes(cur.mgr) && pr.kind === "tier") return res.status(403).json({ error: "هذا الشخص مسؤول إدارة، ما تقدر تغيّر قسمه" });
+            if (pr.kind === "tier" && !scope.tiers.includes(cur.tier)) return res.status(403).json({ error: "هذا الشخص بقسم أعلى من صلاحيتك" });
+        }
+        if (pr.kind === "tier") {
+            ADMIN_TIER_KEYS.forEach(k => { st.adminTiers[k] = (st.adminTiers[k] || []).filter(x => x !== uid); });
+            st.adminTiers[pr.key].push(uid);
+        } else if (!admHas(st.adminManagers[pr.key], uid)) {
+            st.adminManagers[pr.key].push(uid);
+        }
+        if (!admHas(st.adminList, uid)) st.adminList.push(uid);
+        await st.save();
+        await logEvent({ action: "تعيين إداري", discordId: uid, actorId: req.user.id, actorTag: req.user.username, details: ADM_ROLE_LABELS[pr.full] + " — " + acc.fullName + " — " + acc.email });
+        res.json({ ok: true });
+    } catch (e) { console.error("❌ /api/adm/team/assign:", e.message); res.status(500).json({ error: "تعذر التعيين" }); }
+});
+app.post("/api/adm/team/remove", ensureAuth, async (req, res) => {
+    try {
+        const st = await getSettings();
+        const scope = admTeamScope(req.user.id, st);
+        if (!scope) return res.status(403).json({ error: "ليست لديك صلاحية" });
+        const pr = admParseRole((req.body || {}).role);
+        const uid = String((req.body || {}).uid || "");
+        if (!pr || !uid) return res.status(400).json({ error: "بيانات ناقصة" });
+        if (pr.kind === "tier" ? !scope.tiers.includes(pr.key) : !scope.mgrs.includes(pr.key)) return res.status(403).json({ error: "ما تقدر تفصل من هذا المنصب" });
+        if (pr.kind === "tier") st.adminTiers[pr.key] = (st.adminTiers[pr.key] || []).filter(x => x !== uid);
+        else st.adminManagers[pr.key] = (st.adminManagers[pr.key] || []).filter(x => x !== uid);
+        if (!admInAnyList(st, uid)) st.adminList = (st.adminList || []).filter(x => x !== uid);
+        await st.save();
+        await logEvent({ action: "فصل إداري", discordId: uid, actorId: req.user.id, actorTag: req.user.username, details: ADM_ROLE_LABELS[pr.full] });
+        res.json({ ok: true });
+    } catch (e) { console.error("❌ /api/adm/team/remove:", e.message); res.status(500).json({ error: "تعذر التنفيذ" }); }
+});
+app.get("/api/adm/personnel/:discord/warning-info", ensureTab("warn"), async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.params.discord }, { warnings: 1 });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    res.json({ count: (p.warnings || []).filter(w => w.kind === "warning").length });
+});
+app.post("/api/adm/personnel/:discord/warn", ensureTab("warn"), async (req, res) => {
+    try {
+        const t = req.params.discord;
+        if (isSeniorAdmin(t) || ownerUids.has(t)) return res.status(403).json({ error: "ما تقدر تحذّر كبار المسؤولين" });
+        if (t === req.user.id) return res.status(400).json({ error: "ما تقدر تحذّر نفسك" });
+        const { p, dismissed } = await issueWarning({ targetDiscord: t, kind: req.body.kind, reason: req.body.reason, actorId: req.user.id, actorTag: req.user.username });
+        res.json({ ok: true, warnings: p.warnings, dismissed });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.get("/api/owner/admin-managers", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const st = await getSettings();
+    const M = st.adminManagers || {};
+    const defs = [["chief", "🛡️ مسؤول الإدارة"], ["general", "🟢 مسؤول الإدارة العامة"], ["middle", "🟡 مسؤول الإدارة الوسطى"], ["high", "🔴 مسؤول الإدارة العليا"]];
+    const groups = [];
+    for (const d of defs) groups.push({ key: d[0], label: d[1], rows: await admRows(Array.from(M[d[0]] || [])) });
+    res.json({ groups });
 });
 
 app.get("/api/senior/vehicles", ensureSeniorAdmin, async (req, res) => {
@@ -10761,7 +11058,7 @@ app.get("/api/att-view", ensureAttViewer, async (req, res) => {
         res.status(500).json({ error: "تعذر تحميل التحضير، حاول مرة ثانية" });
     }
 });
-app.get("/api/senior/att/members", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/att/members", ensureTab("att"), async (req, res) => {
     const now = new Date(), ds = attDayStart(now);
     const sts = await AttStatus.find({}).sort({ updatedAt: -1 }).limit(500).maxTimeMS(10000).lean();
     const uids = sts.map(s => s.uid);
@@ -10810,7 +11107,7 @@ app.post("/api/senior/att/members/:uid/force/:type", ensureSeniorAdmin, async (r
     await logEvent({ action: type === "in" ? "تحضير يدوي بالبصمة" : "انصراف يدوي بالبصمة", discordId: uid, actorId: req.user.id, actorTag: req.user.username, details: name });
     res.json({ ok: true });
 });
-app.get("/api/senior/att/member/:uid", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/att/member/:uid", ensureTab("att"), async (req, res) => {
     const uid = String(req.params.uid || "");
     const now = new Date(), ds = attDayStart(now);
     const from = new Date(ds.getTime() - 6 * ATT_DAY_MS);
@@ -10825,7 +11122,7 @@ app.get("/api/senior/att/member/:uid", ensureSeniorAdmin, async (req, res) => {
     const recent = logs.filter(l => l.at >= from).slice(-40).reverse().map(l => ({ type: l.type, at: l.at, forced: !!l.by && l.by !== "auto", auto: l.by === "auto" }));
     res.json({ weekMs, days, recent });
 });
-app.get("/api/senior/att/hours", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/att/hours", ensureTab("att"), async (req, res) => {
     const period = ["day", "week", "month"].includes(req.query.period) ? req.query.period : "week";
     const now = new Date(), ds = attDayStart(now);
     const from = period === "day" ? ds : new Date(now.getTime() - (period === "week" ? 7 : 30) * ATT_DAY_MS);
@@ -10848,7 +11145,7 @@ app.get("/api/senior/att/hours", ensureSeniorAdmin, async (req, res) => {
     });
     res.json({ period, list, totalMs, count: rows.length });
 });
-app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/att/absent", ensureTab("att"), async (req, res) => {
     const d = parseInt(req.query.days, 10);
     const days = [1, 3, 7, 14].includes(d) ? d : 3;
     const now = new Date();
@@ -10898,7 +11195,7 @@ app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
     list.sort((x, y) => (x.lastCheckInAt ? x.lastCheckInAt.getTime() : 0) - (y.lastCheckInAt ? y.lastCheckInAt.getTime() : 0));
     res.json({ days, total: universe.length, absentCount: list.length, list: list.slice(0, 400) });
 });
-app.get("/api/senior/att/sectors", ensureSeniorAdmin, async (req, res) => {
+app.get("/api/senior/att/sectors", ensureTab("att"), async (req, res) => {
     const now = new Date(), ds = attDayStart(now);
     const weekFrom = new Date(ds.getTime() - 6 * ATT_DAY_MS);
     const [accs, sts, logs, leaves] = await Promise.all([
@@ -11133,11 +11430,8 @@ const RecRowSchema = new mongoose.Schema({
     gained: { type: Number, default: 0 }, deducted: { type: Number, default: 0 }, refunded: { type: Number, default: 0 },
     excuseStatus: { type: String, default: "none" }, excuseId: { type: String, default: null }, openedAt: Date,
     removedAt: Date, removedBy: String, removedByName: String,
-    // حماية الاستلام: watch = ينتظر مؤقت الـ 8 ساعات • ok = سجّل مخالفة صالحة • absent = انقلب غياب • exempt = معفى (موقوف/مفصول/بطاقة ملغاة)
-    protStatus: { type: String, default: null }, protDeadline: Date, protCheckedAt: Date,
 });
 RecRowSchema.index({ dayKey: 1, uid: 1 }, { unique: true });
-RecRowSchema.index({ protStatus: 1, protDeadline: 1 });
 const RecRow = mongoose.model("RecRow", RecRowSchema);
 const AbsenceExcuseSchema = new mongoose.Schema({
     rowId: String, dayKey: Number, uid: String, name: String, unit: String, rank: String, sector: String, sectorKey: String,
@@ -11149,9 +11443,16 @@ const AbsenceExcuseSchema = new mongoose.Schema({
     audio: { type: Buffer, default: undefined }, audioChannelId: { type: String, default: null }, audioMessageId: { type: String, default: null },
     audioMime: { type: String, default: null }, audioDuration: { type: Number, default: null }, audioWave: { type: String, default: null }, hasAudio: { type: Boolean, default: false },
     decidedBy: String, decidedByName: String, decidedAt: Date, refunded: { type: Number, default: 0 },
+    // حماية الأعذار: فحص مصدر الصورة + كشف التكرار (للإدارة فقط، العضو ما يشوفها)
+    fpOrig: { type: String, default: null }, fpProof: { type: String, default: null }, pHash: { type: String, default: null },
+    forged: { type: Boolean, default: false }, forgedReasons: { type: [String], default: [] }, origInfo: { type: String, default: null },
+    dup: { type: Boolean, default: false },
+    dups: { type: [{ _id: false, id: String, uid: String, name: String, at: Date, status: String, kind: String, sameUser: Boolean }], default: [] },
     createdAt: { type: Date, default: Date.now },
 });
 AbsenceExcuseSchema.index({ uid: 1, createdAt: -1 });
+AbsenceExcuseSchema.index({ fpOrig: 1 });
+AbsenceExcuseSchema.index({ fpProof: 1 });
 const AbsenceExcuse = mongoose.model("AbsenceExcuse", AbsenceExcuseSchema);
 
 const EXCUSE_WINDOW_DAYS = 14;
@@ -11223,7 +11524,6 @@ async function closeReceptionDay(closerId, closerName) {
             prev.forEach(r => attendedEarlier.add(r.uid));
         }
     } catch (e) { console.error("❌ فشل جلب حضور الاستلامات السابقة:", e.message); }
-    const protDeadline = new Date(now.getTime() + REC_PROT_MS);
     const rows = [], ops = [];
     let attended = 0, absent = 0, leave = 0, skippedEarlier = 0;
     for (const a of accs) {
@@ -11235,9 +11535,7 @@ async function closeReceptionDay(closerId, closerName) {
         const st = sm.get(a.uid);
         const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: rd.openedAt };
         if ((st && st.status === "in") || stayed.has(a.uid)) {
-            // اللي مسجّل حضور وقت انتهاء الاستلام يبدأ له مؤقت 8 ساعات (حماية: لازم يسجّل مخالفة صالحة)
-            const watch = !!(st && st.status === "in");
-            rows.push({ ...base, kind: "attended", gained: 1, ...(watch ? { protStatus: "watch", protDeadline } : {}) });
+            rows.push({ ...base, kind: "attended", gained: 1 });
             ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
             attended++;
         } else if (attendedEarlier.has(a.uid)) {
@@ -11264,66 +11562,6 @@ async function closeReceptionDay(closerId, closerName) {
     return { attended, absent, leave };
 }
 
-// ═══ حماية الاستلام ═══
-// اللي انحسب حاضر وهو مسجّل حضور وقت انتهاء الاستلام: يبدأ له مؤقت 8 ساعات.
-// لو ما سجّل ولا مخالفة صالحة خلالها => ينقلب حضوره غياب (تنسحب نقطة الحضور وينخصم 5).
-// المخالفة المرفوضة تعتبر كأنها ما انسجلت، والمعلّقة ننتظر قرارها.
-const REC_PROT_MS = 8 * 60 * 60 * 1000;
-let recProtBusy = false;
-async function runRecProtection() {
-    if (recProtBusy) return;
-    recProtBusy = true;
-    try {
-        const now = new Date();
-        const due = await RecRow.find({ kind: "attended", protStatus: "watch", protDeadline: { $lte: now }, removedAt: null }).limit(300).maxTimeMS(10000).lean();
-        if (!due.length) return;
-        const settings = await getSettings();
-        if (settings.disableViolations) {   // تسجيل المخالفات مقفل: ما نظلم أحد، نأجّل ساعة
-            await RecRow.updateMany({ _id: { $in: due.map(r => r._id) } }, { $set: { protDeadline: new Date(now.getTime() + 60 * 60 * 1000) } });
-            return;
-        }
-        const uids = [...new Set(due.map(r => r.uid))];
-        const since = new Date(Math.min(...due.map(r => new Date(r.openedAt).getTime())));
-        const [vs, ps] = await Promise.all([
-            Violation.find({ reporterDiscord: { $in: uids }, createdAt: { $gte: since } }, { reporterDiscord: 1, createdAt: 1, status: 1 }).limit(20000).maxTimeMS(10000).lean(),
-            Personnel.find({ discord: { $in: uids } }, { discord: 1, isBlocked: 1, isDismissed: 1, cardRevoked: 1 }).maxTimeMS(10000).lean(),
-        ]);
-        const pm = new Map(ps.map(p => [p.discord, p]));
-        const ops = [], flipped = [];
-        for (const row of due) {
-            const from = new Date(row.openedAt).getTime(), to = new Date(row.protDeadline).getTime();
-            const mine = vs.filter(v => v.reporterDiscord === row.uid && new Date(v.createdAt).getTime() >= from && new Date(v.createdAt).getTime() <= to);
-            if (mine.some(v => v.status !== "pending" && v.status !== "rejected")) {
-                await RecRow.updateOne({ _id: row._id, protStatus: "watch" }, { $set: { protStatus: "ok", protCheckedAt: now } });
-                continue;
-            }
-            if (mine.some(v => v.status === "pending")) {   // لسا ما انقرر عليها: ننتظر
-                await RecRow.updateOne({ _id: row._id }, { $set: { protCheckedAt: now } });
-                continue;
-            }
-            const p = pm.get(row.uid);
-            if (!p || p.isBlocked || p.isDismissed || p.cardRevoked) {   // ما يقدر يسجّل مخالفات أصلاً: معفى
-                await RecRow.updateOne({ _id: row._id, protStatus: "watch" }, { $set: { protStatus: "exempt", protCheckedAt: now } });
-                continue;
-            }
-            const r0 = await RecRow.findOneAndUpdate(
-                { _id: row._id, kind: "attended", protStatus: "watch", removedAt: null },
-                { $set: { kind: "absent", gained: 0, deducted: 5, excuseStatus: "none", protStatus: "absent", protCheckedAt: now } }
-            );
-            if (!r0) continue;
-            ops.push({ updateOne: { filter: { discord: row.uid }, update: { $inc: { points: -6 } } } });   // سحب نقطة الحضور + خصم 5
-            flipped.push(row);
-        }
-        if (ops.length) await Personnel.bulkWrite(ops, { ordered: false }).catch(e => console.error("❌ فشل خصم حماية الاستلام:", e.message));
-        for (const r of flipped) {
-            await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "انحسب عليك غياب عن الاستلام: ما سجّلت أي مخالفة صالحة خلال 8 ساعات من انتهاءه (المرفوضة ما تنحسب). انسحبت نقطة الحضور وانخصم عليك 5 نقاط — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
-        }
-        if (flipped.length) await logEvent({ action: "حماية الاستلام: تحويل حضور لغياب", actorId: "auto", actorTag: "🤖 نظام حماية الاستلام", details: "انقلب غياب لعدم تسجيل مخالفة صالحة خلال 8 ساعات: " + flipped.map(r => r.name).join("، ") });
-    } catch (e) { console.error("❌ حماية الاستلام:", e.message); }
-    finally { recProtBusy = false; }
-}
-setInterval(() => { runRecProtection(); }, 5 * 60 * 1000).unref();
-setTimeout(() => { runRecProtection(); }, 90 * 1000).unref();
 
 app.get("/api/excuse/my", ensureAuth, async (req, res) => {
     const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
@@ -11342,6 +11580,154 @@ app.get("/api/excuse/my", ensureAuth, async (req, res) => {
     });
 });
 
+// ── حماية العذر: فحص مصدر الصورة (استديو/كاميرا ولا لا) + كشف الصورة المكررة. كله يبلّغ الإدارة بس، العضو يرسل عادي ──
+const EX_AI_MARKS = [
+    [/openai/i, "OpenAI"], [/chatgpt/i, "ChatGPT"], [/dall[-\s]?e/i, "DALL-E"], [/gpt-?image/i, "GPT Image"],
+    [/midjourney/i, "Midjourney"], [/stable ?diffusion/i, "Stable Diffusion"], [/firefly/i, "Adobe Firefly"],
+    [/trainedalgorithmicmedia/i, "وسم صورة مولّدة بالذكاء الاصطناعي"], [/made with google ai|synthid/i, "Google AI"], [/ai[- ]generated/i, "AI generated"],
+];
+const EX_EDIT_APPS = /(photoshop|gimp|canva|snapseed|picsart|lightroom|pixelmator|photopea|paint\.net|figma|affinity|facetune|polarr)/i;
+const EX_EDIT_RAW = /(photoshop|lightroom|pixelmator|snapseed|picsart|photopea|facetune)/i;
+const EX_PHASH_MAX = 12; // أقصى فرق (من 256 بت) نعتبر عنده الصورة "مشابهة جداً"
+
+function exParseTiff(t, out) {
+    if (t.length < 8) return;
+    const sig = t.toString("latin1", 0, 2);
+    const le = sig === "II";
+    if (!le && sig !== "MM") return;
+    const u16 = o => (o >= 0 && o + 2 <= t.length) ? (le ? t.readUInt16LE(o) : t.readUInt16BE(o)) : 0;
+    const u32 = o => (o >= 0 && o + 4 <= t.length) ? (le ? t.readUInt32LE(o) : t.readUInt32BE(o)) : 0;
+    const str = e => {
+        const type = u16(e + 2), cnt = u32(e + 4);
+        if (type !== 2 || cnt < 1 || cnt > 256) return "";
+        const off = cnt <= 4 ? e + 8 : u32(e + 8);
+        if (off + cnt > t.length) return "";
+        return t.toString("latin1", off, off + cnt).split("\0")[0].trim();
+    };
+    const walk = (ifd, fn) => {
+        if (!ifd || ifd + 2 > t.length) return;
+        const n = Math.min(u16(ifd), 200);
+        for (let i = 0; i < n; i++) { const e = ifd + 2 + i * 12; if (e + 12 > t.length) break; fn(u16(e), e); }
+    };
+    let exifPtr = 0;
+    walk(u32(4), (tag, e) => {
+        if (tag === 0x010F) out.make = str(e);
+        else if (tag === 0x0110) out.model = str(e);
+        else if (tag === 0x0131) out.software = str(e);
+        else if (tag === 0x0132) out.date = str(e);
+        else if (tag === 0x8769) exifPtr = u32(e + 8);
+    });
+    if (exifPtr) walk(exifPtr, (tag, e) => { if (tag === 0x9003) out.dateOrig = str(e); });
+}
+function exReadExif(buf) {
+    const out = { hasExif: false, make: "", model: "", software: "", date: "", dateOrig: "" };
+    if (!buf || buf.length < 12 || buf[0] !== 0xFF || buf[1] !== 0xD8) return out;
+    let p = 2;
+    while (p + 4 <= buf.length) {
+        if (buf[p] !== 0xFF) { p++; continue; }
+        const m = buf[p + 1];
+        if (m === 0xFF) { p++; continue; }
+        if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { p += 2; continue; }
+        if (m === 0xDA || m === 0xD9) break;
+        const len = buf.readUInt16BE(p + 2);
+        if (len < 2) break;
+        if (m === 0xE1 && p + 10 <= buf.length && buf.toString("latin1", p + 4, p + 10) === "Exif\0\0") {
+            out.hasExif = true;
+            exParseTiff(buf.subarray(p + 10, Math.min(buf.length, p + 2 + len)), out);
+        }
+        p += 2 + len;
+    }
+    return out;
+}
+function exJpegSize(buf) {
+    if (!buf || buf.length < 12 || buf[0] !== 0xFF || buf[1] !== 0xD8) return null;
+    let p = 2;
+    while (p + 9 < buf.length) {
+        if (buf[p] !== 0xFF) { p++; continue; }
+        const m = buf[p + 1];
+        if (m === 0xFF) { p++; continue; }
+        if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { p += 2; continue; }
+        if (m === 0xD9 || m === 0xDA) return null;
+        if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) return { h: buf.readUInt16BE(p + 5), w: buf.readUInt16BE(p + 7) };
+        const len = buf.readUInt16BE(p + 2);
+        if (len < 2) return null;
+        p += 2 + len;
+    }
+    return null;
+}
+function exAnalyzeOrigin(b, proof) {
+    const reasons = [];
+    const fpProof = crypto.createHash("sha256").update(String(proof)).digest("hex");
+    const pHash = /^[0-9a-f]{64}$/.test(String(b.pHash || "")) ? String(b.pHash) : null;
+    const head = b.origHead ? Buffer.from(String(b.origHead).slice(0, 180000), "base64") : null;
+    const tail = b.origTail ? Buffer.from(String(b.origTail).slice(0, 70000), "base64") : Buffer.alloc(0);
+    if (!head || head.length < 12) {
+        reasons.push("ما انفحص مصدر الصورة (الملف الأصلي ما وصل للفحص)");
+        return { forged: true, reasons, info: null, fpOrig: null, fpProof, pHash };
+    }
+    const size = Math.max(0, parseInt(b.origSize, 10) || 0);
+    const name = String(b.origName || "").slice(0, 120);
+    const fpOrig = crypto.createHash("sha256").update(head).update(tail).update(String(size)).digest("hex");
+    const isJpeg = head[0] === 0xFF && head[1] === 0xD8 && head[2] === 0xFF;
+    const isPng = head.toString("latin1", 1, 4) === "PNG";
+    const isWebp = head.toString("latin1", 0, 4) === "RIFF" && head.toString("latin1", 8, 12) === "WEBP";
+    const isGif = head.toString("latin1", 0, 3) === "GIF";
+    const isHeic = head.toString("latin1", 4, 8) === "ftyp" && /heic|heix|hevc|heim|heis|mif1/i.test(head.toString("latin1", 8, 12));
+    const hay = Buffer.concat([head, tail]).toString("latin1");
+    for (const [re, label] of EX_AI_MARKS) { if (re.test(hay)) { reasons.push("فيها وسم مولّد صور/ذكاء اصطناعي: " + label); break; } }
+    const ex = isJpeg ? exReadExif(head) : { hasExif: false, make: "", model: "", software: "", date: "", dateOrig: "" };
+    if (ex.software && EX_EDIT_APPS.test(ex.software)) reasons.push("معدّلة ببرنامج: " + ex.software.slice(0, 60));
+    else if (EX_EDIT_RAW.test(hay)) reasons.push("فيها أثر برنامج تعديل صور");
+    if (isPng) reasons.push("صيغة PNG — غالباً لقطة شاشة أو صورة محمّلة من متصفح/ذكاء اصطناعي");
+    else if (isWebp) reasons.push("صيغة WebP — غالباً صورة محمّلة من متصفح أو موقع");
+    else if (isGif) reasons.push("صيغة GIF — مو صورة كاميرا");
+    else if (isJpeg && !(ex.make || ex.model)) reasons.push("ما فيها بيانات كاميرا — مو مصوّرة/محفوظة مباشرة من استديو الجوال");
+    else if (!isJpeg && !isHeic) reasons.push("صيغة الملف غير معروفة");
+    if (/(screenshot|screen[ _-]?shot|سكرين|لقطة)/i.test(name)) reasons.push("اسم الملف يدل على لقطة شاشة: " + name);
+    else if (/(chatgpt|dall[-_ ]?e|midjourney|gemini|openai)/i.test(name)) reasons.push("اسم الملف يدل على صورة مولّدة: " + name);
+    if (isJpeg) {
+        const so = exJpegSize(head);
+        const pc = String(proof).indexOf(",");
+        const sp = pc > 0 ? exJpegSize(Buffer.from(String(proof).slice(pc + 1, pc + 90001), "base64")) : null;
+        if (so && sp && so.w && so.h && sp.w && sp.h) {
+            const r1 = so.w / so.h, r2 = sp.w / sp.h;
+            if (Math.abs(r1 / r2 - 1) > 0.04 && Math.abs(r1 * r2 - 1) > 0.04) reasons.push("الصورة المرسلة ما تطابق الملف الأصلي المفحوص");
+        }
+    }
+    const kind = isJpeg ? "JPEG" : isPng ? "PNG" : isWebp ? "WebP" : isGif ? "GIF" : isHeic ? "HEIC" : "غير معروف";
+    const cam = [ex.make, ex.model].filter(Boolean).join(" ");
+    const info = kind + (cam ? " • " + cam : "") + ((ex.dateOrig || ex.date) ? " • " + (ex.dateOrig || ex.date) : "");
+    return { forged: reasons.length > 0, reasons: reasons.slice(0, 6), info: info.slice(0, 160), fpOrig, fpProof, pHash };
+}
+function exHamming(a, b) {
+    if (!a || !b || a.length !== b.length) return 999;
+    let d = 0;
+    for (let i = 0; i < a.length; i++) { let x = parseInt(a[i], 16) ^ parseInt(b[i], 16); while (x) { d += x & 1; x >>= 1; } }
+    return d;
+}
+async function exFindDuplicates(o, uid) {
+    try {
+        const out = [], seen = new Set();
+        const or = [];
+        if (o.fpOrig) or.push({ fpOrig: o.fpOrig });
+        if (o.fpProof) or.push({ fpProof: o.fpProof });
+        const sel = { name: 1, uid: 1, createdAt: 1, status: 1 };
+        if (or.length) {
+            const same = await AbsenceExcuse.find({ $or: or }, sel).sort({ createdAt: -1 }).limit(5).lean();
+            same.forEach(e => { seen.add(String(e._id)); out.push({ id: String(e._id), uid: e.uid, name: e.name, at: e.createdAt, status: e.status, kind: "same", sameUser: e.uid === uid }); });
+        }
+        if (o.pHash) {
+            const since = new Date(Date.now() - 180 * 86400000);
+            const cands = await AbsenceExcuse.find({ pHash: { $type: "string" }, createdAt: { $gte: since } }, Object.assign({ pHash: 1 }, sel)).sort({ createdAt: -1 }).limit(4000).lean();
+            for (const e of cands) {
+                if (seen.has(String(e._id))) continue;
+                if (exHamming(o.pHash, e.pHash) <= EX_PHASH_MAX) { out.push({ id: String(e._id), uid: e.uid, name: e.name, at: e.createdAt, status: e.status, kind: "similar", sameUser: e.uid === uid }); if (out.length >= 8) break; }
+            }
+        }
+        return out.slice(0, 8);
+    } catch (e) { console.error("❌ فحص تكرار صورة العذر:", e.message); return []; }
+}
+
 app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
     const b = req.body || {};
     const rowId = String(b.rowId || "");
@@ -11357,6 +11743,8 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
     if (b.oath !== true) return res.status(400).json({ error: "لازم توافق على القسم وتقوله" });
     const audioIn = supportCleanAudio(b);
     if (!audioIn) return res.status(400).json({ error: "لازم تسجّل القسم بصوتك (تسجيل صوتي صالح)" });
+    const origin = exAnalyzeOrigin(b, proof);
+    const dupList = await exFindDuplicates(origin, req.user.id);
     let proofCh = null, proofMsg = null;
     if (proof) {
         const up = await discordSaveImage(proof, "excuse");
@@ -11376,6 +11764,8 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
             sector: row.sector, sectorKey: row.sectorKey, type, reason, proof, proofChannelId: proofCh, proofMessageId: proofMsg, hasProof: hadProof, absenceAt: row.openedAt,
             oathText: "أُقسم بالله العظيم، أنا (" + row.name + ")، بأن العذر الذي تقدمت به بشأن غيابي وهو (" + reason + ") صحيح، وأتحمل كامل المسؤولية عن صحة ما ذكرته، وأتعهد بعدم تقديم أي عذر غير صحيح، والله على ما أقول شهيد.",
             hasAudio: true, ...audioFields,
+            fpOrig: origin.fpOrig, fpProof: origin.fpProof, pHash: origin.pHash,
+            forged: origin.forged, forgedReasons: origin.reasons, origInfo: origin.info, dup: dupList.length > 0, dups: dupList,
         });
         await RecRow.updateOne({ _id: row._id }, { $set: { excuseId: String(ex._id) } });
     } catch (e) {
@@ -11383,30 +11773,31 @@ app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
         return res.status(500).json({ error: "تعذر إرسال العذر، حاول مرة ثانية" });
     }
     const settings = await getSettings();
+    const flagTxt = (origin.forged ? " ⚠️ [صورة الدليل مزوّرة]" : "") + (dupList.length ? " 🔁 [صورة مكررة]" : "");
     const sec = (row.sectorKey && secLead(settings, row.sectorKey)) || {};
     const targets = Array.from(new Set([sec.commanderId, sec.deputyId, sec.personnelOfficerId].filter(x => x && x !== req.user.id)));
-    const text = "🩺 تنبيه: العضو " + row.name + " (" + (row.rank || "-") + " • " + (row.unit || "-") + ") قدّم عذر غياب عن الاستلام — النوع: " + EXCUSE_TYPE_LABEL[type] + " — السبب: " + reason.slice(0, 150) + " — القرار عند القيادة العليا.";
+    const text = "🩺 تنبيه: العضو " + row.name + " (" + (row.rank || "-") + " • " + (row.unit || "-") + ") قدّم عذر غياب عن الاستلام — النوع: " + EXCUSE_TYPE_LABEL[type] + " — السبب: " + reason.slice(0, 150) + " — القرار عند القيادة العليا." + flagTxt;
     for (const t of targets) {
         await pushNoticeTo(t, text, "auto", "🤖 نظام الاستلام");
         pushUid(t, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name, ttl: 86400, tag: "excuse-" + String(ex._id) }).catch(() => {});
     }
     const hcIds = new Set([...(settings.highCommand || []).map(m => m.id), ...Array.from(seniorUids)]);
-    for (const id of hcIds) pushUid(id, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name + " ينتظر قرارك", ttl: 86400, tag: "excuse-hc-" + String(ex._id) }).catch(() => {});
+    for (const id of hcIds) pushUid(id, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name + " ينتظر قرارك" + flagTxt, ttl: 86400, tag: "excuse-hc-" + String(ex._id) }).catch(() => {});
     if (hcIds.size) sseBroadcast("hcalert", { t: Date.now(), exc: true }, c => !!c.uid && hcIds.has(c.uid));
-    await logEvent({ action: "تقديم عذر غياب", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username, details: row.name + " — " + EXCUSE_TYPE_LABEL[type] });
+    await logEvent({ action: "تقديم عذر غياب", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username, details: row.name + " — " + EXCUSE_TYPE_LABEL[type] + flagTxt });
     res.json({ ok: true });
 });
 
-app.get("/api/hc/excuses", ensureHighCommand, async (req, res) => {
+app.get("/api/hc/excuses", ensureExcuseAccess, async (req, res) => {
     const f = String(req.query.filter || "pending");
     const q = f === "pending" ? { status: { $in: ["pending", "deciding"] } } : { status: { $in: ["accepted", "rejected"] } };
     const [list, pendingCount] = await Promise.all([
-        AbsenceExcuse.find(q, { proof: 0, audio: 0 }).sort({ createdAt: -1 }).limit(200).lean(),
+        AbsenceExcuse.find(q, { proof: 0, audio: 0, fpOrig: 0, fpProof: 0, pHash: 0 }).sort({ createdAt: -1 }).limit(200).lean(),
         AbsenceExcuse.countDocuments({ status: "pending" }),
     ]);
     res.json({ list, pendingCount });
 });
-app.get("/api/hc/excuses/:id/audio", ensureHighCommand, async (req, res) => {
+app.get("/api/hc/excuses/:id/audio", ensureExcuseAccess, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).end();
     const ex = await AbsenceExcuse.findById(req.params.id, { audio: 1, audioMime: 1, audioChannelId: 1, audioMessageId: 1 }).lean();
     if (!ex) return res.status(404).end();
@@ -11422,7 +11813,7 @@ app.get("/api/hc/excuses/:id/audio", ensureHighCommand, async (req, res) => {
     res.set({ "Content-Type": ex.audioMime || "audio/webm", "Cache-Control": "private, max-age=3600", "Content-Length": buf.length });
     res.end(buf);
 });
-app.get("/api/hc/excuses/:id/proof", ensureHighCommand, async (req, res) => {
+app.get("/api/hc/excuses/:id/proof", ensureExcuseAccess, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
     const ex = await AbsenceExcuse.findById(req.params.id, { proof: 1, proofChannelId: 1, proofMessageId: 1 }).lean();
     if (!ex) return res.status(404).json({ error: "ما فيه دليل" });
@@ -11442,7 +11833,7 @@ async function tellExcuseResult(ex, text) {
     await pushNoticeTo(ex.uid, text, "auto", "🤖 نظام الاستلام");
     pushUid(ex.uid, { title: CONFIG.SITE_NAME, body: text.slice(0, 120), ttl: 86400, tag: "excuse-res-" + String(ex._id) }).catch(() => {});
 }
-app.post("/api/hc/excuses/:id/accept", ensureHighCommand, async (req, res) => {
+app.post("/api/hc/excuses/:id/accept", ensureExcuseAccess, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
     const ex = await AbsenceExcuse.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "deciding" } }, { new: true });
     if (!ex) return res.status(409).json({ error: "تم اتخاذ قرار على هذا العذر من قبل" });
@@ -11464,7 +11855,7 @@ app.post("/api/hc/excuses/:id/accept", ensureHighCommand, async (req, res) => {
         res.status(400).json({ error: e.message });
     }
 });
-app.post("/api/hc/excuses/:id/reject", ensureHighCommand, async (req, res) => {
+app.post("/api/hc/excuses/:id/reject", ensureExcuseAccess, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
     const reason = String((req.body || {}).reason || "").trim().slice(0, 300);
     if (!reason) return res.status(400).json({ error: "اكتب سبب الرفض" });
@@ -11584,7 +11975,10 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
     if (!opened) return res.status(409).json({ error: "الاستلام انفتح قبل شوي" });
     const r = await pushAll({ title: CONFIG.SITE_NAME, body: "استلام الان", ttl: 900, tag: "reception" });
     let discord = false;
-    if (botReady) {
+    if (EXTERNAL_BOT) {
+        try { await BotJob.create({ type: "send_reception", data: { content: "استلام @everyone" } }); discord = true; }
+        catch (e) { console.error("❌ فشل تسجيل مهمة إعلان الاستلام:", e.message); }
+    } else if (botReady) {
         try {
             const ch = await client.channels.fetch(CONFIG.RECEPTION_CHANNEL_ID);
             await ch.send({ content: "استلام @everyone", allowedMentions: { parse: ["everyone"] } });
@@ -15878,6 +16272,21 @@ function flCmdLaunchMP(role) {
     renderMPPanel();
     refreshMe();
 }
+async function offaOpenAdminChiefs() {
+    ccStopLive();
+    var back = flCmdBack('offaOpenCommandCenter()', '↩ رجوع لغرفة التحكم');
+    ownerModalOpen('🛡️ مسؤولو الإدارة', back + '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/owner/admin-managers', { noLock: true });
+        var h = back + '<div class="card" style="font-size:12px;color:var(--muted);margin-bottom:10px;">اختر الحساب وادخل عليه، وترجع لحسابك من زر «رجوع لحساب المالك».</div>';
+        d.groups.forEach(function (g) {
+            h += '<b style="font-size:13px;">' + g.label + '</b><div style="margin:6px 0 12px;">' + (g.rows.length ? g.rows.map(function (r) {
+                return '<div class="card" style="margin-bottom:6px;"><div class="row"><div><b style="font-size:13px;">' + spEsc(r.name) + '</b><div style="font-size:11px;color:var(--muted);direction:ltr;text-align:right;">' + spEsc(r.email) + '</div></div>' + devLoginBtn(r.uid) + '</div></div>';
+            }).join('') : '<div style="color:var(--muted);font-size:12px;">ما فيه أحد معيّن</div>') + '</div>';
+        });
+        ownerModalOpen('🛡️ مسؤولو الإدارة', h);
+    } catch (e) { ownerModalOpen('🛡️ مسؤولو الإدارة', back + '<div style="color:#f87171;">' + spEsc(e.message) + '</div>'); }
+}
 function ccStopLive() { if (CC_TIMER) { clearInterval(CC_TIMER); CC_TIMER = null; } }
 
 function ccRenderHtml(d) {
@@ -15893,6 +16302,7 @@ function ccRenderHtml(d) {
     h += '</div>';
     h += '<div style="margin-bottom:10px;"><button class="btn sm" style="width:100%;background:#1d4ed8;" onclick="flCmdOpen()">⚡ أوامر فلاش</button></div>';
     h += '<div style="margin-bottom:10px;"><button class="btn sm" style="width:100%;background:#0e7490;" onclick="offaOpenAccounts()">👥 كل الحسابات (توقيف)</button></div>';
+    h += '<div style="margin-bottom:10px;"><button class="btn sm" style="width:100%;background:#7c3aed;" onclick="offaOpenAdminChiefs()">🛡️ مسؤولو الإدارة (دخول)</button></div>';
     h += flCcPushHtml();
     h += '<div class="card" style="margin-bottom:10px;"><b style="font-size:13px;">🧊 تجميد فوري لحساب</b>' +
         '<div style="margin-top:6px;"><input id="cc-freeze-q" type="text" placeholder="اكتب الإيميل أو الاسم..." oninput="ccFreezeSearch(this.value)" onkeydown="if(event.keyCode===13){this.blur();}" style="width:100%;"></div>' +
@@ -17522,7 +17932,7 @@ function renderCard() {
 }
 function renderAdmin(startTab) {
     if (typeof startTab !== 'string') startTab = null;
-    if (!ME.isSeniorAdmin && (startTab === 'pending' || !startTab)) startTab = 'regs';
+    if (!ME.isSeniorAdmin) startTab = admPickStart(startTab);
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
@@ -17535,7 +17945,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('personnel', this)">ملفات العسكريين</div>
             <div class="tab" onclick="adminTab('sfile', this)">📇 عرض ملف عسكري</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
-            <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
+            <div class="tab" onclick="adminTab('hire', this)">🛡️ إدارة الأقسام</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" id="tab-excuses" onclick="adminTab('excuses', this)">🩺 غياب بعذر</div>
@@ -17550,12 +17960,129 @@ function renderAdmin(startTab) {
             \${/* ملاحظة: هنا التردد — تم حذف التاب فقط والكود باقي. لإرجاعه حط مكان '' هذا: '<div class="tab" onclick="adminTab(\'freq\', this)">📻 الترددات</div>' */ ''}
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
-        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-cphoto" onclick="adminTab('cphoto', this)">🖼️ صور البطاقات</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
+        </div>\` : (ME.isAdmin ? admTabsHtml() : '');
     document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : admPanelTitle()}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
         \${tabsHtml}
         <div id="admin-content"></div>\`;
     if (startTab) adminTab(startTab, document.getElementById('tab-' + startTab)); else adminTab('pending');
+}
+function admPickStart(s) {
+    var tabs = (ME.adminRole && ME.adminRole.tabs) || [];
+    for (var i = 0; i < tabs.length; i++) if (tabs[i].key === s) return s;
+    return tabs.length ? tabs[0].key : null;
+}
+function admTabsHtml() {
+    var tabs = (ME.adminRole && ME.adminRole.tabs) || [];
+    return '<div class="tabs">' + tabs.map(function (t, i) {
+        return '<div class="tab' + (i === 0 ? ' active' : '') + '" id="tab-' + t.key + '" data-k="' + t.key + '" onclick="adminTab(this.dataset.k, this)">' + t.label + '</div>';
+    }).join('') + '</div>';
+}
+function admPanelTitle() {
+    var r = ME.adminRole;
+    if (!r) return 'لوحة الإدارة';
+    if (r.mgr === 'chief') return '🛡️ لوحة مسؤول الإدارة';
+    if (r.mgr) return '🛡️ لوحة مسؤول ' + r.tierLabel;
+    return 'لوحة ' + r.tierLabel;
+}
+var ADMT = { d: null, role: null };
+var ADMT_LABELS = { 'tier:general': '🟢 إداري — الإدارة العامة', 'tier:middle': '🟡 إداري — الإدارة الوسطى', 'tier:high': '🔴 إداري — الإدارة العليا', 'mgr:chief': '🛡️ مسؤول الإدارة', 'mgr:general': '🟢 مسؤول الإدارة العامة', 'mgr:middle': '🟡 مسؤول الإدارة الوسطى', 'mgr:high': '🔴 مسؤول الإدارة العليا' };
+function admtRows(rows, role, canRemove) {
+    if (!rows.length) return '<div class="card center" style="color:var(--muted);font-size:13px;">لا أحد</div>';
+    return rows.map(function (r) {
+        return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + spEsc(r.name) + '</b>' + (r.legacy ? ' <span class="badge pending">قديم</span>' : '') +
+            '<div style="font-size:12px;color:var(--muted);direction:ltr;text-align:right;">' + spEsc(r.email) + '</div>' +
+            '<div style="font-size:11px;color:var(--muted);margin-top:3px;">' + (r.last ? '🕒 آخر نشاط: ' + attAgo(r.last) + ' • ' + r.n + ' عملية آخر ٧ أيام' : 'ما له نشاط آخر ٧ أيام') + '</div></div>' +
+            (canRemove ? '<button class="btn danger sm" data-u="' + spEsc(r.uid) + '" data-r="' + role + '" onclick="admtRemove(this)">فصل</button>' : '') + '</div></div>';
+    }).join('');
+}
+function admtPick(r) {
+    ADMT.role = r;
+    var els = document.querySelectorAll('#admt-chips button');
+    for (var i = 0; i < els.length; i++) els[i].className = 'btn sm' + (els[i].dataset.r === r ? '' : ' gray');
+}
+async function loadAdmTeam() {
+    var box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var d;
+    try { d = await api('/api/adm/team', { noLock: true }); }
+    catch (e) {
+        var b0 = document.getElementById('admin-content');
+        if (b0) b0.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + spEsc(e.message) + ')<div style="margin-top:8px;"><button class="btn sm" onclick="loadAdmTeam()">إعادة المحاولة</button></div></div>';
+        return;
+    }
+    if (currentAdminTab !== 'team' && currentAdminTab !== 'hire') return;
+    box = document.getElementById('admin-content');
+    if (!box) return;
+    ADMT.d = d;
+    var roles = [];
+    d.scope.tiers.forEach(function (k) { roles.push('tier:' + k); });
+    d.scope.mgrs.forEach(function (k) { roles.push('mgr:' + k); });
+    if (roles.indexOf(ADMT.role) < 0) ADMT.role = roles[0] || null;
+    var chips = roles.map(function (r) { return '<button class="btn sm' + (r === ADMT.role ? '' : ' gray') + '" data-r="' + r + '" onclick="admtPick(this.dataset.r)">' + ADMT_LABELS[r] + '</button>'; }).join('');
+    var h = '<div class="card"><h3 style="margin-bottom:6px;">تعيين</h3>' +
+        '<p style="color:var(--muted);font-size:12px;margin-bottom:10px;line-height:1.7;">اكتب بريد الشخص (لازم حسابه مقبول) واختر المنصب. لو كان بقسم ثاني بينتقل للقسم الجديد.</p>' +
+        '<label>بريد الحساب</label><input id="admt-email" placeholder="example@email.com" dir="ltr">' +
+        '<label>المنصب</label><div id="admt-chips" class="row" style="justify-content:flex-start;gap:6px;flex-wrap:wrap;margin-bottom:10px;">' + chips + '</div>' +
+        '<button class="btn sm" onclick="admtAssign()">تم التعيين</button></div>';
+    if (d.scope.mgrs.indexOf('chief') >= 0) h += '<h3 style="margin:14px 0 6px;">🛡️ مسؤول الإدارة</h3>' + admtRows(d.chief, 'mgr:chief', true);
+    [['general', '🟢 مسؤول الإدارة العامة'], ['middle', '🟡 مسؤول الإدارة الوسطى'], ['high', '🔴 مسؤول الإدارة العليا']].forEach(function (x) {
+        if (d.scope.mgrs.indexOf(x[0]) >= 0) h += '<h3 style="margin:14px 0 6px;">' + x[1] + '</h3>' + admtRows(d.mgrs[x[0]], 'mgr:' + x[0], true);
+    });
+    [['general', '🟢 الإدارة العامة'], ['middle', '🟡 الإدارة الوسطى'], ['high', '🔴 الإدارة العليا']].forEach(function (x) {
+        if (d.scope.tiers.indexOf(x[0]) >= 0) h += '<h3 style="margin:14px 0 6px;">' + x[1] + '</h3>' + admtRows(d.tiers[x[0]], 'tier:' + x[0], true);
+    });
+    box.innerHTML = h;
+}
+async function admtAssign() {
+    var em = document.getElementById('admt-email');
+    var v = em ? em.value.trim() : '';
+    if (!v) return toast('حط بريد الشخص');
+    if (!ADMT.role) return toast('اختر المنصب');
+    try { await api('/api/adm/team/assign', { method: 'POST', body: JSON.stringify({ email: v, role: ADMT.role }) }); toast('تم التعيين'); loadAdmTeam(); }
+    catch (e) { toast(e.message); }
+}
+async function admtRemove(btn) {
+    if (!(await confirmModal('متأكد تبي تفصله من هذا المنصب؟'))) return;
+    try { await api('/api/adm/team/remove', { method: 'POST', body: JSON.stringify({ uid: btn.dataset.u, role: btn.dataset.r }) }); toast('تم الفصل'); loadAdmTeam(); }
+    catch (e) { toast(e.message); }
+}
+var WN = { t: null, seq: 0 };
+async function loadWarnTab() {
+    var box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card"><h3 style="margin-bottom:8px;">⚠️ التحذيرات والعقوبات</h3><input id="wn-q" placeholder="🔍 ابحث بالاسم / اليونت / رقم البطاقة" oninput="wnSearch()"><div id="wn-results"></div></div><div id="wn-pen"></div>';
+    wnPenalties();
+}
+function wnSearch() { clearTimeout(WN.t); WN.t = setTimeout(wnRun, 300); }
+async function wnRun() {
+    var inp = document.getElementById('wn-q'), box = document.getElementById('wn-results');
+    if (!inp || !box) return;
+    var q = inp.value.trim();
+    if (!q) { box.innerHTML = ''; return; }
+    var my = ++WN.seq, list;
+    try { list = (await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true })).list; }
+    catch (e) { if (my === WN.seq && document.getElementById('wn-results')) document.getElementById('wn-results').innerHTML = '<p style="color:#f87171;font-size:13px;">' + spEsc(e.message) + '</p>'; return; }
+    box = document.getElementById('wn-results');
+    if (my !== WN.seq || !box) return;
+    box.innerHTML = list.length ? list.map(function (p) {
+        var warns = (p.warnings || []).filter(function (w) { return w.kind === 'warning'; }).length;
+        return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + spEsc(p.registeredName || p.discordTag) +
+            ' <span style="color:var(--muted);font-size:12px;">(' + spEsc(p.unit || '-') + ' • ' + spEsc(p.rank || '-') + ' • تحذيرات: ' + warns + ')</span></span>' +
+            '<button class="btn sm" style="background:#7f1d1d;color:#fff;" data-d="' + spEsc(p.discord) + '" onclick="openWarnForm(this.dataset.d, ' + "'/api/adm/personnel/'" + ')">⚠️ تحذير</button></div></div>';
+    }).join('') : '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
+}
+async function wnPenalties() {
+    var box = document.getElementById('wn-pen');
+    if (!box) return;
+    var list = [];
+    try { list = (await api('/api/warn-penalties', { noLock: true })).list || []; } catch (e) { list = []; }
+    box = document.getElementById('wn-pen');
+    if (!box) return;
+    box.innerHTML = '<div class="card"><h3 style="margin-bottom:8px;">⚖️ عقوبات التحذيرات (عرض فقط)</h3>' + (list.length ? list.map(function (p) {
+        return '<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:13px;"><b>' + spEsc(p.label) + '</b> <span style="color:var(--muted);">— ' + spEsc(PENALTY_TYPE_LABELS[p.type] || p.type) + (p.value != null ? ' (' + p.value + ')' : '') + (p.ranks != null ? ' • ' + p.ranks + ' رتبة' : '') + (p.days != null ? ' • ' + p.days + ' يوم' : '') + '</span></div>';
+    }).join('') : '<div style="color:var(--muted);font-size:13px;">لا توجد عقوبات معرّفة</div>') + '</div>';
 }
 function adminTab(name, el) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -17572,7 +18099,8 @@ function adminTab(name, el) {
     if (name === 'accounts') loadAccounts();
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
-    if (name === 'hire') loadHire();
+    if (name === 'hire' || name === 'team') loadAdmTeam();
+    if (name === 'warn') loadWarnTab();
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
     if (name === 'excuses') loadSeniorExcuses();
@@ -17622,6 +18150,7 @@ function attOpen() {
     var box = document.getElementById('admin-content');
     if (!box) return;
     var T = [['members', '👥 الأعضاء'], ['hours', '⏱️ ساعات الدوام'], ['absent', '🚫 المتغيبون'], ['sectors', '📈 القطاعات'], ['viol', '🚨 تجاوزات الحضور'], ['cfg', '⚙️ الإعدادات']];
+    if (!ME.isSeniorAdmin) T = T.filter(function (t) { return t[0] !== 'viol' && t[0] !== 'cfg'; });
     box.innerHTML = '<div class="tabs" id="att-tabs">' + T.map(function (t) {
         return '<div class="tab' + (t[0] === ATTP.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="attSetTab(this.dataset.t)">' + t[1] + '</div>';
     }).join('') + '</div><div id="att-body"></div>';
@@ -17712,7 +18241,7 @@ function attPaintList() {
         return [x.name, x.unit, x.rank, x.sector].join(' ').toLowerCase().indexOf(q) > -1;
     });
     var scopeCnt = (d.list || []).filter(function (x) { return f === 'stale' ? attIsStale(x) : x.status === 'in'; }).length;
-    var bulk = ((f === 'stale' || f === 'in') && scopeCnt) ? '<div class="card row" style="padding:12px;"><div style="font-size:13px;">' + (f === 'stale' ? '⚠️ ' + scopeCnt + ' نسوا الانصراف' : '🟢 ' + scopeCnt + ' حاضر الحين') + '</div><button class="btn sm danger" data-s="' + f + '" onclick="attForceAll(this.dataset.s)">🚪 ينصرف الكل</button></div>' : '';
+    var bulk = (ME.isSeniorAdmin && (f === 'stale' || f === 'in') && scopeCnt) ? '<div class="card row" style="padding:12px;"><div style="font-size:13px;">' + (f === 'stale' ? '⚠️ ' + scopeCnt + ' نسوا الانصراف' : '🟢 ' + scopeCnt + ' حاضر الحين') + '</div><button class="btn sm danger" data-s="' + f + '" onclick="attForceAll(this.dataset.s)">🚪 ينصرف الكل</button></div>' : '';
     if (!L.length) { box.innerHTML = bulk + '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء</div>'; return; }
     box.innerHTML = bulk + L.map(function (x) {
         var u = cyEsc(x.uid), isIn = x.status === 'in', st = attIsStale(x);
@@ -17721,10 +18250,10 @@ function attPaintList() {
             '<div><b>' + cyEsc(x.name) + '</b> <span class="badge ' + (isIn ? 'approved' : 'pending') + '">' + (isIn ? 'حاضر' : 'منصرف') + '</span>' + (st ? ' <span class="badge pending">⚠️ نسي الانصراف؟</span>' : '') +
             '<div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div>' +
             '<div style="font-size:11px;color:var(--muted);margin-top:3px;">' + (isIn ? 'حضر ' + attAgo(x.lastCheckInAt) : 'آخر انصراف: ' + (x.lastCheckOutAt ? attAgo(x.lastCheckOutAt) : '—')) + ' • اليوم: ' + x.todayIn + ' حضور • ' + attFmtMs(x.todayMs) + '</div></div>' +
-            '<div class="row" style="gap:6px;">' +
+            (ME.isSeniorAdmin ? '<div class="row" style="gap:6px;">' +
             '<button class="btn sm gray" data-u="' + u + '" data-t="in" onclick="event.stopPropagation(); attForce(this.dataset.u, this.dataset.t)">🖐️ تحضير</button>' +
             '<button class="btn sm danger" data-u="' + u + '" data-t="out" onclick="event.stopPropagation(); attForce(this.dataset.u, this.dataset.t)">🚪 انصراف</button>' +
-            '</div></div>' + (ATTP.openUid === x.uid ? attMemberDetail(x.uid) : '') + '</div>';
+            '</div>' : '') + '</div>' + (ATTP.openUid === x.uid ? attMemberDetail(x.uid) : '') + '</div>';
     }).join('');
 }
 function attMemberDetail(uid) {
@@ -17966,7 +18495,7 @@ async function loadReviewedViolations() {
                         \${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}
                     </div>
                 </div>
-                <button class="btn danger sm" onclick="deleteViolationPermanent('\${v._id}')">🗑️ حذف نهائي</button>
+                \${ME.isSeniorAdmin ? \`<button class="btn danger sm" onclick="deleteViolationPermanent('\${v._id}')">🗑️ حذف نهائي</button>\` : ''}
             </div>
         </div>\`).join('');
 }
@@ -18592,13 +19121,89 @@ async function exSend(id) {
     if (!p || !p.files || !p.files[0]) return toast('لازم ترفق دليل (صورة)');
     if (!EXV.blob || EXV.id !== id) return toast('لازم تسجّل القسم بصوتك أول');
     try {
+        var scan = await exScanFile(p.files[0]);
         var proof = await exCompress(p.files[0]);
         var audio = await exBlobToB64(EXV.blob);
-        await api('/api/excuse/submit', { method: 'POST', body: JSON.stringify({ rowId: id, reason: reason, type: t.value, proof: proof, oath: true, audio: audio, audioMime: EXV.mime, audioDuration: EXV.dur }) });
+        await api('/api/excuse/submit', { method: 'POST', body: JSON.stringify(Object.assign({ rowId: id, reason: reason, type: t.value, proof: proof, oath: true, audio: audio, audioMime: EXV.mime, audioDuration: EXV.dur }, scan)) });
         exVoiceReset();
         toast('✅ انرسل عذرك للقيادة');
         exLoad();
     } catch (e) { toast(e.message); }
+}
+function exAbToB64(buf) {
+    var bytes = new Uint8Array(buf), s = '', CH = 8192;
+    for (var i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    return btoa(s);
+}
+function exReadSlice(file, a, b) {
+    return new Promise(function (resolve) {
+        try {
+            var fr = new FileReader();
+            fr.onload = function () { resolve(fr.result); };
+            fr.onerror = function () { resolve(null); };
+            fr.readAsArrayBuffer(file.slice(a, b));
+        } catch (e) { resolve(null); }
+    });
+}
+function exDHash(file) {
+    return new Promise(function (resolve) {
+        var url = null;
+        try { url = URL.createObjectURL(file); } catch (e) { return resolve(null); }
+        var img = new Image();
+        img.onerror = function () { try { URL.revokeObjectURL(url); } catch (e) {} resolve(null); };
+        img.onload = function () {
+            var out = null;
+            try {
+                var W = 17, H = 16, c = document.createElement('canvas');
+                c.width = W; c.height = H;
+                var cx = c.getContext('2d');
+                cx.fillStyle = '#fff'; cx.fillRect(0, 0, W, H);
+                cx.drawImage(img, 0, 0, W, H);
+                var px = cx.getImageData(0, 0, W, H).data, g = [], i;
+                for (i = 0; i < W * H; i++) g.push(px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114);
+                var bits = '', hex = '', x, y, k;
+                for (y = 0; y < H; y++) for (x = 0; x < W - 1; x++) bits += g[y * W + x] > g[y * W + x + 1] ? '1' : '0';
+                for (k = 0; k < bits.length; k += 4) hex += parseInt(bits.substr(k, 4), 2).toString(16);
+                out = { hash: hex, w: img.naturalWidth || img.width, h: img.naturalHeight || img.height };
+            } catch (e) { out = null; }
+            try { URL.revokeObjectURL(url); } catch (e) {}
+            resolve(out);
+        };
+        img.src = url;
+    });
+}
+async function exScanFile(file) {
+    var size = file.size || 0;
+    var head = await exReadSlice(file, 0, 98304);
+    var tail = size > 98304 ? await exReadSlice(file, Math.max(98304, size - 32768), size) : null;
+    var dh = await exDHash(file);
+    return {
+        origHead: head ? exAbToB64(head) : '', origTail: tail ? exAbToB64(tail) : '',
+        origName: String(file.name || '').slice(0, 120), origType: String(file.type || '').slice(0, 40), origSize: size,
+        origW: dh ? dh.w : 0, origH: dh ? dh.h : 0, pHash: dh ? dh.hash : ''
+    };
+}
+function exFlagsBlock(x) {
+    var h = '';
+    if (x.forged) {
+        var rs = (x.forgedReasons || []).map(function (r) { return '<li>' + cyEsc(r) + '</li>'; }).join('');
+        h += '<div style="margin-top:10px;padding:16px 12px;border-radius:12px;background:#b91c1c;border:3px solid #fecaca;color:#fff;text-align:center;">' +
+            '<div style="font-size:30px;font-weight:900;">🚨 مزوّر 🚨</div>' +
+            '<div style="font-size:13px;margin-top:6px;">صورة الدليل مو من استديو الجوال</div>' +
+            (rs ? '<ul style="margin:8px 18px 0 0;padding:0;text-align:right;font-size:12px;line-height:1.8;">' + rs + '</ul>' : '') +
+            (x.origInfo ? '<div style="font-size:11px;margin-top:6px;opacity:.85;direction:ltr;">' + cyEsc(x.origInfo) + '</div>' : '') + '</div>';
+    }
+    if (x.dups && x.dups.length) {
+        var stl = { accepted: 'مقبول', rejected: 'مرفوض', pending: 'معلّق', deciding: 'معلّق' };
+        var ds = x.dups.map(function (d) {
+            return '<li>' + (d.kind === 'same' ? 'نفس الصورة' : 'صورة مشابهة جداً') + ' — ' + (d.sameUser ? 'مستخدمة من نفس العضو' : 'مستخدمة من ' + cyEsc(d.name || '-')) +
+                ' • ' + exFull(d.at) + ' • ' + (stl[d.status] || '') + '</li>';
+        }).join('');
+        h += '<div style="margin-top:10px;padding:12px;border-radius:12px;background:#7c2d12;border:2px solid #fb923c;color:#fff;text-align:center;">' +
+            '<div style="font-size:22px;font-weight:900;">🔁 صورة مكررة</div>' +
+            '<ul style="margin:8px 18px 0 0;padding:0;text-align:right;font-size:12px;line-height:1.8;">' + ds + '</ul></div>';
+    }
+    return h;
 }
 function exOathBlock(x) {
     if (!x.oathText && !x.hasAudio) return '';
@@ -18631,7 +19236,7 @@ async function loadHCExcuses(silent) {
                 (x.status === 'rejected' && x.rejectReason ? '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(x.rejectReason) + '</div>' : '') + '</div>';
         }
         return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
-            '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + ' — غياب ' + exFull(x.absenceAt) + '</div>' +
+            exFlagsBlock(x) + '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + ' — غياب ' + exFull(x.absenceAt) + '</div>' +
             '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
             (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="hcExProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') + exOathBlock(x) +
             '<div style="font-size:11px;color:var(--muted);margin-top:4px;">قُدّم: ' + exFull(x.createdAt) + '</div>' + actions + '</div>';
@@ -18664,7 +19269,7 @@ async function loadSeniorExcuses(silent) {
                 (x.status === 'rejected' && x.rejectReason ? '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(x.rejectReason) + '</div>' : '') + '</div>';
         }
         return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
-            '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + '</div>' +
+            exFlagsBlock(x) + '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + '</div>' +
             '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
             (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="sexProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') + exOathBlock(x) +
             '<div style="font-size:12px;margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);line-height:1.9;">' +
@@ -18808,7 +19413,7 @@ function sfExtra(d) {
     var acRows = a ? (
         sfRow('الاسم الكامل', cardEsc(a.fullName || '-')) +
         sfRow('الإيميل', cardEsc(a.email || '-')) +
-        sfRow('كلمة المرور', a.passwordHidden ? '<span style="color:var(--muted);">مخفية (حساب كبير مسؤولين)</span>' : (a.password ? '<span style="direction:ltr;unicode-bidi:plaintext;">' + cardEsc(a.password) + '</span>' : '—')) +
+        sfRow('كلمة المرور', a.passwordHidden ? '<span style="color:var(--muted);">مخفية' + (ME.isSeniorAdmin ? ' (حساب كبير مسؤولين)' : '') + '</span>' : (a.password ? '<span style="direction:ltr;unicode-bidi:plaintext;">' + cardEsc(a.password) + '</span>' : '—')) +
         sfRow('العمر', cardEsc(a.age == null ? '-' : a.age)) +
         sfRow('الجنسية', cardEsc(a.nationality || '-')) +
         sfRow('حالة الحساب', cardEsc(a.status === 'approved' ? 'مقبول' : a.status === 'rejected' ? 'مرفوض' : 'معلّق')) +
@@ -20865,17 +21470,18 @@ async function decideReg(btn) {
 }
 async function loadAccounts(view) {
     if (typeof view === 'string') accView_ = view;
+    if (!ME.isSeniorAdmin) accView_ = 'approved';
     const box = document.getElementById('admin-content');
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     try { ({ list: ACC_LIST } = await api('/api/senior/accounts?status=' + accView_)); }
     catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل (' + accEsc(e.message) + ')</div>'; return; }
     if (currentAdminTab !== 'accounts') return;
-    box.innerHTML =
-        '<div class="card"><div class="acc-switch">' +
+    box.innerHTML = (!ME.isSeniorAdmin ? '<div class="card" style="font-size:12px;color:var(--muted);">👁️ عرض فقط — بدون تعديل</div>' : '') +
+        (!ME.isSeniorAdmin ? '' : '<div class="card"><div class="acc-switch">' +
             '<button class="acc-sw' + (accView_ === 'approved' ? ' on' : '') + '" data-v="approved" onclick="loadAccounts(this.dataset.v)">✅ الحسابات المقبولة</button>' +
             '<button class="acc-sw' + (accView_ === 'rejected' ? ' on' : '') + '" data-v="rejected" onclick="loadAccounts(this.dataset.v)">❌ الحسابات المرفوضة</button>' +
-        '</div></div>' +
+        '</div></div>') +
         '<input id="acc-q" placeholder="🔍 بحث بالاسم أو البريد" oninput="renderAccList()">' +
         '<div id="acc-list"></div>';
     renderAccList();
@@ -20903,13 +21509,13 @@ function renderAccList() {
         }
         return '<div class="card acc-card">' +
             '<div class="acc-title">' + accEsc(a.fullName) + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين' + (a.uid === ME.discordId ? ' (حسابك)' : '') + '</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
-            accRow('البريد', a.email) + accPwRow(a.password) + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
+            accRow('البريد', a.email) + (ME.isSeniorAdmin ? accPwRow(a.password) : '') + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
             accRow('القطاع', accSectorLabel(a.sector)) +
             accRow('متفرغ للعمل؟', accYN(a.answers && a.answers.available)) +
             accRow('قادر على المشاركة الصوتية والتصوير وتحمل الضغط؟', accYN(a.answers && a.answers.capable)) +
             (isRej && a.rejectReason ? accRow('سبب الرفض', a.rejectReason) : '') +
             (a.reviewedByTag ? accRow(isRej ? 'رفضه' : 'قبله', a.reviewedByTag) : '') +
-            '<div class="row" style="gap:8px;margin-top:12px;">' + btns + '</div></div>';
+            (ME.isSeniorAdmin ? '<div class="row" style="gap:8px;margin-top:12px;">' + btns + '</div>' : '') + '</div>';
     }).join('');
 }
 async function accAction(btn) {
@@ -21439,7 +22045,7 @@ async function loadNotesPage() {
         return;
     }
     if (currentAdminTab !== 'notes') return;
-    const sectorButtons = \`
+    const sectorButtonsFull = \`
         <div class="card">
             <div style="font-size:13px;color:var(--muted);margin-bottom:8px;">حذف ملاحظات قطاع كامل:</div>
             <div class="row" style="gap:8px;flex-wrap:wrap;">
@@ -21448,6 +22054,7 @@ async function loadNotesPage() {
                 <button class="btn sm danger" onclick="openSectorNotesDelete('antiDrugs')">🗑️ ملاحظات المكافحة</button>
             </div>
         </div>\`;
+    const sectorButtons = ME.isSeniorAdmin ? sectorButtonsFull : '';
     if (list.length === 0) { box.innerHTML = sectorButtons + '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات مسجلة</div>'; return; }
     box.innerHTML = sectorButtons + list.map(n => \`
         <div class="card">
@@ -21456,9 +22063,9 @@ async function loadNotesPage() {
                     <b>\${n.personnelName}</b>
                     <div style="margin-top:4px;">\${n.text}</div>
                     \${n.hasImage ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${n.discord}','\${n.noteId}')">📷 عرض الصورة</button>\` : ''}
-                    <div style="color:var(--muted);font-size:12px;margin-top:4px;">أضافها: \${n.addedByTag || n.addedBy || '-'} • \${new Date(n.createdAt).toLocaleString('ar')}</div>
+                    <div style="color:var(--muted);font-size:12px;margin-top:4px;">🕒 نزلت: \${new Date(n.createdAt).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit' })} • أضافها: \${n.addedByTag || n.addedBy || '-'}</div>
                 </div>
-                <button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>
+                \${ME.isSeniorAdmin ? \`<button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>\` : ''}
             </div>
         </div>\`).join('');
 }
