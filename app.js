@@ -130,6 +130,7 @@ const CONFIG = {
         antiDrugs: "مكافحة المخدرات",
         cyber: "الأمن السيبراني",
         mp: "الشرطة العسكرية",
+        media: "الهيئة الإعلامية والسناب الأمني",
     },
 
     MILITARY_POLICE_ROLE_ID: process.env.MILITARY_POLICE_ROLE_ID || "1545415273438249010",
@@ -1200,8 +1201,6 @@ const client = new Client({
 
 const pendingMessages = new Map();
 let botReady = false;
-// أزرار القبول/الرفض وإعلان الاستلام يتولاها البوت المنفصل (bot.js) عن طريق القاعدة. لو تبي ترجعها للموقع غيّر القيمة إلى false.
-const EXTERNAL_BOT = true;
 
 async function isMilitary(uid) {
     try {
@@ -1697,7 +1696,7 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
-        if (!EXTERNAL_BOT && interaction.isButton()) {
+        if (interaction.isButton()) {
             const id = interaction.customId;
 
             if (id.startsWith("approve_") || id.startsWith("reject_")) {
@@ -1742,7 +1741,7 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
-        if (!EXTERNAL_BOT && interaction.isModalSubmit()) {
+        if (interaction.isModalSubmit()) {
             if (interaction.customId.startsWith("rejectmodal_")) {
                 await interaction.deferReply({ ephemeral: true });
                 const vid = interaction.customId.split("_")[1];
@@ -1766,83 +1765,6 @@ client.on("interactionCreate", async interaction => {
         } catch (e2) {}
     }
 });
-
-// ── جسر البوت المنفصل (bot.js): يتواصلون عن طريق collection اسمها botjobs ──
-const BotJobSchema = new mongoose.Schema({
-    type: String,                                  // decision (البوت → الموقع) | send_reception (الموقع → البوت)
-    data: mongoose.Schema.Types.Mixed,
-    status: { type: String, default: "pending" },  // pending | processing | done | failed | expired
-    result: mongoose.Schema.Types.Mixed,
-    error: String,
-    createdAt: { type: Date, default: Date.now },
-    doneAt: Date,
-}, { collection: "botjobs" });
-BotJobSchema.index({ type: 1, status: 1, createdAt: 1 });
-BotJobSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86400 });
-const BotJob = mongoose.model("BotJob", BotJobSchema);
-
-// ينفّذ ضغطة زر جاية من البوت بنفس القواعد القديمة، ويرجّع نص الرد
-async function siteHandleDecision(d) {
-    const id = String(d.customId || "");
-    const userId = String(d.userId || ""), username = String(d.username || "");
-    const roleIds = Array.isArray(d.roleIds) ? d.roleIds.map(String) : [];
-    const fakeInteraction = { user: { id: userId, username }, memberPermissions: { has: () => !!d.isAdmin } };
-    const fakeMember = { roles: { cache: { has: rid => roleIds.includes(String(rid)) } } };
-    if (id.startsWith("approve_")) {
-        const vid = id.slice(id.indexOf("_") + 1);
-        const settings = await getSettings();
-        const v = await Violation.findById(vid).catch(() => null);
-        if (!v || v.status !== "pending") return { mode: "edit", text: "هذه المخالفة تمت مراجعتها مسبقاً." };
-        if (!(await discordCanReviewViolation(fakeInteraction, v, settings))) return { mode: "edit", text: "🚫 ما تملك صلاحية." };
-        const ar = await approveViolation(v, userId, username);
-        if (ar && ar.blocked) return { mode: "edit", text: ar.unassigned ? "🚫 حساب مقدّم المخالفة بدون رتبة أو قطاع، ما تنقبل مخالفاته." : ar.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنقبل مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنقبل مخالفاته حتى ينتهي الاستدعاء." };
-        return { mode: "edit", text: "✅ تم قبول المخالفة." };
-    }
-    if (id.startsWith("rejectmodal_")) {
-        const vid = id.split("_")[1];
-        const reason = String(d.reason || "").trim().slice(0, 500);
-        if (!reason) return { mode: "edit", text: "اكتب سبب الرفض." };
-        const v = await Violation.findById(vid).catch(() => null);
-        if (!v || v.status !== "pending") return { mode: "edit", text: "هذه المخالفة تمت مراجعتها مسبقاً." };
-        const settings = await getSettings();
-        if (!(await discordCanReviewViolation(fakeInteraction, v, settings))) return { mode: "edit", text: "🚫 ما تملك صلاحية." };
-        const rr = await rejectViolation(v, userId, username, reason);
-        if (rr && rr.blocked) return { mode: "edit", text: rr.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، ما تنرفض مخالفاته حالياً." : "🚨 على هذا العسكري استدعاء نشط، ما تنرفض مخالفاته حالياً." };
-        return { mode: "edit", text: "✅ تم رفض المخالفة وحفظ السبب." };
-    }
-    if (id.startsWith("leave_")) {
-        const parts = id.split("_");
-        const out = await decideLeaveRequest(parts[2], userId, username, parts[1] === "ok" ? "approve" : "reject", fakeMember);
-        return out && out.error ? { mode: "followup", text: "🚫 " + out.error } : { mode: "none" };
-    }
-    if (id.startsWith("mppr_")) {
-        const parts = id.split("_");
-        const out = await decideMPPointsRequest(parts[2], userId, username, parts[1] === "ok" ? "approve" : "reject", "discord");
-        return out && out.error ? { mode: "followup", text: "🚫 " + out.error } : { mode: "none" };
-    }
-    return { mode: "none" };
-}
-let botJobsBusy = false;
-async function processBotDecisions() {
-    if (botJobsBusy) return;
-    botJobsBusy = true;
-    try {
-        for (let i = 0; i < 10; i++) {
-            const j = await BotJob.findOneAndUpdate({ type: "decision", status: "pending" }, { $set: { status: "processing" } }, { sort: { createdAt: 1 }, new: true });
-            if (!j) break;
-            if (Date.now() - new Date(j.createdAt).getTime() > 5 * 60 * 1000) { await BotJob.updateOne({ _id: j._id }, { $set: { status: "expired", doneAt: new Date() } }); continue; }
-            try {
-                const result = await siteHandleDecision(j.data || {});
-                await BotJob.updateOne({ _id: j._id }, { $set: { status: "done", result, doneAt: new Date() } });
-            } catch (e) {
-                console.error("❌ فشل تنفيذ قرار من البوت:", e.message);
-                await BotJob.updateOne({ _id: j._id }, { $set: { status: "failed", error: String(e.message).slice(0, 200), doneAt: new Date() } });
-            }
-        }
-    } catch (e) { console.error("❌ فحص قرارات البوت:", e.message); }
-    finally { botJobsBusy = false; }
-}
-setInterval(() => { processBotDecisions().catch(() => {}); }, 1500);
 
 const activeVehicleSessions = new Set();
 client.on("messageCreate", async message => {
@@ -3005,9 +2927,10 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     const mePwa = !!mePwaDoc;
     if (senior && meAcc) { accountEmail = meAcc.email; seniorTemp = !!meAcc.tempSenior; }
     const meCpReq = await CardPhotoReq.findOne({ uid: req.user.id }, { status: 1, rejectReason: 1 }).lean().catch(() => null);
+    const meMedia = await mediaRoleOf(req.user.id).catch(() => ({ isMedia: false, isLeader: false, canOpen: false }));
     res.json({
         blocked: false,
-        att: meAtt, attRequired: attRequired(req.user.id), pwaInstalled: mePwa,
+        att: meAtt, attRequired: attRequired(req.user.id) && !meMedia.isMedia, pwaInstalled: mePwa,
         isReceptionOfficer: isReceptionOfficer(req.user.id, settings) || senior,
         receptionOpen: recState.open,
         courtStaff: meCourt.staff, courtLeader: meCourt.leader, courtLocked: !!courtCaseOf(req.user.id), courtCase: courtCaseOf(req.user.id), courtSoon: courtSoonOf(req.user.id),
@@ -3049,6 +2972,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isMilitaryPolice,
         isHighCommand: isHighCommand(req.user.id, settings),
         cyber: meCyber,
+        media: meMedia,
         cyberLocked: underInvestigation.has(req.user.id),
         deviceLocked: meDevLocked,
         unassigned: meUnassigned,
@@ -3057,14 +2981,14 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         canIssueCert: !!(await certIssuerRole(req.user.id, settings)),
         sectorViolOfficer: getSectorViolOfficer(req.user.id, settings),
         sectorAttOfficer: getSectorAttOfficer(req.user.id, settings),
-        canAttView: !!(sectorInfo && sectorInfo.role === "commander") || !!getSectorAttOfficer(req.user.id, settings) || isMilitaryPolice,
+        canAttView: !!(sectorInfo && sectorInfo.role === "commander" && sectorInfo.sector !== "media") || !!getSectorAttOfficer(req.user.id, settings) || isMilitaryPolice,
         isOwner: isOwnerUid(req.user.id),
         seniorTemp,
         accountEmail,
         summon,
         summonLocked: isSummonBlocking(p),
         maintenance: settings.isMaintenance,
-        violationsDisabled: settings.disableViolations,
+        violationsDisabled: settings.disableViolations || meMedia.isMedia,
         nextRank: progress.nextRank,
         pointsThreshold: progress.threshold,
         pointsRemaining: progress.remaining,
@@ -3876,6 +3800,7 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
     try {
         const settings = await getSettings();
         if (settings.disableViolations) return res.status(403).json({ error: "تسجيل المخالفات مغلق حالياً" });
+        if ((await mediaRoleOf(req.user.id)).isMedia) return res.status(403).json({ error: "الهيئة الإعلامية ما عندها تسجيل مخالفات" });
         const p = await Personnel.findOne({ discord: req.user.id });
         if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
@@ -5733,7 +5658,7 @@ app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, re
     const { role, discordId } = req.body;
     if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
     if (!SECTOR_ROLE_LABELS[role]) return res.status(400).json({ error: "دور غير معروف" });
-    if (sector === "cyber" && role === "personnelOfficer") return res.status(400).json({ error: "الأمن السيبراني ما يكون له مسؤول أفراد" });
+    if ((sector === "cyber" || sector === "media") && role === "personnelOfficer") return res.status(400).json({ error: (sector === "media" ? "الهيئة الإعلامية" : "الأمن السيبراني") + " ما يكون لها مسؤول أفراد" });
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
 
     const person = await Personnel.findOne({ discord: discordId.trim() });
@@ -6034,7 +5959,7 @@ app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, 
 });
 
 app.post("/api/sector/personnel-officer/assign", ensureSectorLeader, async (req, res) => {
-    if (req.sectorInfo.sector === "cyber") return res.status(400).json({ error: "الأمن السيبراني ما يكون له مسؤول أفراد" });
+    if (req.sectorInfo.sector === "cyber" || req.sectorInfo.sector === "media") return res.status(400).json({ error: (req.sectorInfo.sector === "media" ? "الهيئة الإعلامية" : "الأمن السيبراني") + " ما يكون لها مسؤول أفراد" });
     const { discordId } = req.body;
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
     const person = await Personnel.findOne({ discord: discordId.trim() });
@@ -10930,6 +10855,7 @@ app.get("/api/attendance/status", ensureAuth, async (req, res) => {
     res.json(await getAttState(req.user.id));
 });
 app.post("/api/attendance/scan", ensureAuth, async (req, res) => {
+    if ((await mediaRoleOf(req.user.id)).isMedia) return res.status(403).json({ error: "الهيئة الإعلامية ما عندها تسجيل حضور" });
     if (Math.random() < CONFIG.FP_FAIL_RATE) return res.json({ success: false });
     const name = await cyName(req.user.id);
     let st = await AttStatus.findOne({ uid: req.user.id });
@@ -11531,13 +11457,17 @@ async function closeReceptionDay(closerId, closerName) {
         const p = pm.get(a.uid);
         if (!p || !p.registeredName || p.isDismissed || p.isBlocked) continue;
         const key = a.sector || p.sector || null;
-        if (!p.unit || !key) continue;
+        // الهيئة الإعلامية + الإداريين: ما ينحسب عليهم غياب ولا إجازة، بس لو حضروا ياخذون نقطة الحضور
+        const noPen = key === "media" || !!adminRoleOf(a.uid, settings);
+        if (!noPen && (!p.unit || !key)) continue;
         const st = sm.get(a.uid);
-        const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: rd.openedAt };
+        const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit || "", rank: p.rank, sector: (key && CONFIG.SECTORS[key]) || null, sectorKey: key, openedAt: rd.openedAt };
         if ((st && st.status === "in") || stayed.has(a.uid)) {
             rows.push({ ...base, kind: "attended", gained: 1 });
             ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
             attended++;
+        } else if (noPen) {
+            continue;   // ما يسجَّل عليه شي (لا غياب ولا خصم)
         } else if (attendedEarlier.has(a.uid)) {
             skippedEarlier++;   // حضر استلام سابق اليوم: هذا الاستلام ما يحسب عليه
         } else if (lv.has(a.uid)) {
@@ -11975,10 +11905,7 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
     if (!opened) return res.status(409).json({ error: "الاستلام انفتح قبل شوي" });
     const r = await pushAll({ title: CONFIG.SITE_NAME, body: "استلام الان", ttl: 900, tag: "reception" });
     let discord = false;
-    if (EXTERNAL_BOT) {
-        try { await BotJob.create({ type: "send_reception", data: { content: "استلام @everyone" } }); discord = true; }
-        catch (e) { console.error("❌ فشل تسجيل مهمة إعلان الاستلام:", e.message); }
-    } else if (botReady) {
+    if (botReady) {
         try {
             const ch = await client.channels.fetch(CONFIG.RECEPTION_CHANNEL_ID);
             await ch.send({ content: "استلام @everyone", allowedMentions: { parse: ["everyone"] } });
@@ -16240,6 +16167,7 @@ function flCmdOpen() {
         '<button class="btn" style="background:#0e7490;" data-r="commander" onclick="flCmdSectors(this.dataset.r)">🎖️ لوحة قيادة القطاعات</button>' +
         '<button class="btn" style="background:#6d28d9;" data-r="deputy" onclick="flCmdSectors(this.dataset.r)">🎖️ لوحة نواب القطاعات</button>' +
         '<button class="btn" style="background:#92400e;" onclick="flCmdMP()">🚔 الشرطة العسكرية (القادة والنواب)</button>' +
+        '<button class="btn" style="background:#be185d;" onclick="flCmdMedia()">📸 هيئة الإعلام (القائد والنائب والأعضاء)</button>' +
         '</div>');
 }
 function flCmdSectors(role) {
@@ -16832,7 +16760,7 @@ function buildNav() {
         items.push({ label: '📝 تسجيل تقرير (شرطة عسكرية)', fn: "openMPReportForm('renderDashboard()')" });
     } else if (ME.isAntiDrugs && !ME.isSeniorAdmin) {
         items.push({ label: '📝 تسجيل تقرير', fn: 'renderNewReport()' });
-    } else {
+    } else if (!(ME.media && ME.media.isMedia)) {
         items.push({ label: '📝 تسجيل مخالفة', fn: 'renderNewViolation()' });
     }
     items.push(
@@ -16845,6 +16773,7 @@ function buildNav() {
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) items.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
+    if (ME.media && ME.media.canOpen) items.push({ label: '📸 الهيئة الإعلامية', fn: 'renderMediaPanel()' });
     if (ME.isViolationsOfficer) items.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.canFraud) items.push({ label: '🛡️ كشف التلاعب', fn: 'renderFraudPanel()' });
     if (ME.sectorViolOfficer) items.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
@@ -16854,7 +16783,7 @@ function buildNav() {
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.courtStaff) items.push({ label: '⚖️ المحكمة العسكرية', fn: 'renderCourtPanel()' });
     if (ME.courtStaff) items.push({ label: '🔎 التحقيق العسكري', fn: 'renderInvPanel()' });
-    if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
+    if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber' && ME.sectorInfo.sector !== 'media') items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
     if (ME.isTrainer && !ME.isSeniorAdmin) items.push({ label: '🏋️ صفحة المدرب', fn: 'renderTrainerPage()' });
@@ -16872,13 +16801,14 @@ function renderFabs() {
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) fabs.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
+    if (ME.media && ME.media.canOpen) fabs.push({ label: '📸 الهيئة الإعلامية', fn: 'renderMediaPanel()' });
     if (ME.isViolationsOfficer) fabs.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.sectorViolOfficer) fabs.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
     if (ME.canAttView) fabs.push({ label: '🖐️ التحضير', fn: 'renderAttViewPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) { fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' }); fabs.push({ label: '👮 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' }); }
     else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
-    if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
+    if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber' && ME.sectorInfo.sector !== 'media') fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
 }
@@ -17614,7 +17544,7 @@ function renderDashboard() {
             <div class="row" style="gap:8px;">
                 <button class="btn sm btn-checkout" onclick="flBankOpen()">🏦 بنك فلاش</button>
                 \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
-                \${(ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
+                \${(ME.sectorInfo && ME.sectorInfo.sector !== 'cyber' && ME.sectorInfo.sector !== 'media') ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
             </div>
         </div>
@@ -21415,7 +21345,7 @@ async function clearAllLogs() {
 }
 let accView_ = 'approved';
 let ACC_LIST = [];
-const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات'], ['cyber', 'الأمن السيبراني'], ['mp', 'الشرطة العسكرية']];
+const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات'], ['cyber', 'الأمن السيبراني'], ['mp', 'الشرطة العسكرية'], ['media', 'الهيئة الإعلامية والسناب الأمني']];
 function accEsc(t) {
     return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -24973,6 +24903,7 @@ async function doFingerprintScan() {
 }
 function flAttCardHtml() {
     if (!ME) return '';
+    if (ME.media && ME.media.isMedia) return mediaDashCardHtml();
     if (ME.att && ME.att.status === 'in') {
         return '<div class="card att-card in"><b>✅ مسجّل حضورك</b>' + (ME.att.at ? ' <span style="font-size:12px;color:var(--muted);">منذ ' + flTime(ME.att.at) + '</span>' : '') + '</div>';
     }
@@ -25905,11 +25836,843 @@ function flHideCyberPO() {
 }
 
 
+${MEDIA_CLIENT_JS}
+
 init();
 </script>
 </body>
 </html>`);
 });
+
+// ======================================================================
+// 📸 الهيئة الإعلامية والسناب الأمني — قطاع غير عسكري
+// الغياب ما ينحسب، الحضور ما ينسجّل، ما عندهم تسجيل مخالفات، ويأخذون نقاط على شغلهم
+// ======================================================================
+const MEDIA_SECTOR_KEY = "media";
+const MEDIA_SNAP_DEFAULT_POINTS = 2;
+const MediaDesign = mongoose.model("MediaDesign", new mongoose.Schema({
+    sector: { type: String, index: true }, title: String, conditions: { type: String, default: "" },
+    image: String, w: Number, h: Number,
+    createdBy: String, createdByName: String, createdAt: { type: Date, default: Date.now }, updatedAt: Date,
+}));
+const MediaSnap = mongoose.model("MediaSnap", new mongoose.Schema({
+    uid: { type: String, index: true }, name: String, sector: String, sectorLabel: String,
+    hasDesign: { type: Boolean, default: false }, designId: { type: String, default: null }, caption: { type: String, default: "" },
+    image: String, status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
+    points: { type: Number, default: 0 }, rejectReason: { type: String, default: null },
+    reviewedBy: String, reviewedByName: String, reviewedAt: Date, createdAt: { type: Date, default: Date.now, index: true },
+}));
+const MediaNotice = mongoose.model("MediaNotice", new mongoose.Schema({
+    title: String, body: String, createdBy: String, createdByName: String, createdAt: { type: Date, default: Date.now },
+}));
+const MediaLog = mongoose.model("MediaLog", new mongoose.Schema({
+    kind: String, uid: String, name: String, delta: { type: Number, default: 0 }, reason: String,
+    byId: String, byName: String, at: { type: Date, default: Date.now, index: true },
+}));
+
+const mediaRoleCache = new Map();
+async function mediaRoleOf(uid) {
+    const hit = mediaRoleCache.get(uid);
+    if (hit && Date.now() - hit.t < 15000) return hit.v;
+    const settings = await getSettings();
+    const sl = secLead(settings, MEDIA_SECTOR_KEY) || {};
+    const isCommander = !!uid && sl.commanderId === uid, isDeputy = !!uid && sl.deputyId === uid;
+    const senior = isSeniorAdmin(uid);
+    const acc = await Account.findOne({ uid }, { sector: 1 }).lean();
+    const isMember = !!(acc && acc.sector === MEDIA_SECTOR_KEY);
+    const isMedia = isCommander || isDeputy || isMember;
+    const v = { isMedia, isLeader: isCommander || isDeputy || senior, isCommander, isDeputy, isMember, canOpen: isMedia || senior };
+    mediaRoleCache.set(uid, { t: Date.now(), v });
+    return v;
+}
+async function mediaAuth(req, res, next) {
+    if (!req.isAuthenticated || !req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    try {
+        const r = await mediaRoleOf(req.user.id);
+        if (!r.canOpen) return res.status(403).json({ error: "هذا القسم للهيئة الإعلامية فقط" });
+        req.mr = r; next();
+    } catch (e) { res.status(500).json({ error: "تعذر التحقق من الصلاحية" }); }
+}
+async function mediaLeaderAuth(req, res, next) {
+    return mediaAuth(req, res, () => {
+        if (!req.mr.isLeader) return res.status(403).json({ error: "هذي الصفحة لقائد ونائب الهيئة الإعلامية فقط" });
+        next();
+    });
+}
+async function mediaName(uid) {
+    const p = await Personnel.findOne({ discord: uid }, { registeredName: 1 }).lean();
+    if (p && p.registeredName) return p.registeredName;
+    const a = await Account.findOne({ uid }, { fullName: 1 }).lean();
+    return (a && a.fullName) || uid;
+}
+async function mediaMemberIds() {
+    const accs = await Account.find({ status: "approved", sector: MEDIA_SECTOR_KEY }, { uid: 1 }).lean();
+    return accs.map(a => a.uid);
+}
+function mediaDataUrl(s, kinds, maxLen) {
+    if (typeof s !== "string") return null;
+    const m = new RegExp("^data:image/(" + kinds + ");base64,").exec(s);
+    if (!m || s.length > maxLen) return null;
+    return s;
+}
+function mediaSendImg(res, dataUrl) {
+    const m = /^data:(image\/[a-z+]+);base64,(.+)$/s.exec(dataUrl || "");
+    if (!m) return res.status(404).end();
+    res.set("Content-Type", m[1]); res.set("Cache-Control", "private, max-age=300");
+    res.end(Buffer.from(m[2], "base64"));
+}
+// يتأكد إن التصميم فيه شفافية (بدون خلفية)
+async function mediaHasTransparency(dataUrl) {
+    if (!sharpLib) return true;
+    try {
+        const m = /^data:image\/[a-z+]+;base64,(.+)$/s.exec(dataUrl);
+        const { data, info } = await sharpLib(Buffer.from(m[1], "base64")).resize(400, 400, { fit: "inside" }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        let clear = 0; const total = info.width * info.height;
+        for (let i = 3; i < data.length; i += info.channels) if (data[i] < 12) clear++;
+        return clear / total >= 0.01;
+    } catch (e) { return true; }
+}
+async function mediaLog(o) { try { await MediaLog.create(o); } catch (e) {} }
+async function mediaAddPoints(uid, delta) { await Personnel.updateOne({ discord: uid }, { $inc: { points: delta } }); }
+
+app.get("/api/media/me", mediaAuth, async (req, res) => {
+    try {
+        const uid = req.user.id;
+        const [p, ids, notices] = await Promise.all([
+            Personnel.findOne({ discord: uid }, { points: 1, registeredName: 1 }).lean(),
+            mediaMemberIds(),
+            MediaNotice.find().sort({ createdAt: -1 }).limit(6).lean(),
+        ]);
+        const [approved, pending, rejected, designs] = await Promise.all([
+            MediaSnap.countDocuments({ uid, status: "approved" }), MediaSnap.countDocuments({ uid, status: "pending" }),
+            MediaSnap.countDocuments({ uid, status: "rejected" }), MediaDesign.countDocuments({}),
+        ]);
+        const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, points: 1 }).lean() : [];
+        const mine = (p && p.points) || 0;
+        const rank = ps.filter(x => (x.points || 0) > mine).length + 1;
+        const extra = {};
+        if (req.mr.isLeader) {
+            extra.leader = { members: ids.length, pendingAll: await MediaSnap.countDocuments({ status: "pending" }), approvedAll: await MediaSnap.countDocuments({ status: "approved" }), designs };
+        }
+        res.json({
+            role: req.mr, name: (p && p.registeredName) || await mediaName(uid), points: mine,
+            stats: { approved, pending, rejected, total: approved + pending + rejected, rank, members: ids.length },
+            sectors: CONFIG.SECTORS, defaultPoints: MEDIA_SNAP_DEFAULT_POINTS, designsCount: designs, extra,
+            notices: notices.map(n => ({ id: String(n._id), title: n.title, body: n.body, by: n.createdByName, at: n.createdAt })),
+        });
+    } catch (e) { console.error("❌ /api/media/me:", e.message); res.status(500).json({ error: "تعذر تحميل بيانات الهيئة" }); }
+});
+
+app.get("/api/media/board", mediaAuth, async (req, res) => {
+    try {
+        const ids = await mediaMemberIds();
+        const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, registeredName: 1, rank: 1, points: 1 }).lean() : [];
+        const cnt = await MediaSnap.aggregate([{ $match: { status: "approved" } }, { $group: { _id: "$uid", n: { $sum: 1 } } }]);
+        const cm = {}; cnt.forEach(c => { cm[c._id] = c.n; });
+        const list = ps.map(p => ({ uid: p.discord, name: p.registeredName || p.discord, rank: p.rank || "", points: p.points || 0, approved: cm[p.discord] || 0 }))
+            .sort((a, b) => b.points - a.points).slice(0, 100);
+        res.json({ list, me: req.user.id });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل الترتيب" }); }
+});
+
+// ---------- التصاميم الموحدة (بدون خلفية) ----------
+app.get("/api/media/designs", mediaAuth, async (req, res) => {
+    const q = {}; if (req.query.sector && CONFIG.SECTORS[req.query.sector]) q.sector = req.query.sector;
+    const list = await MediaDesign.find(q, { image: 0 }).sort({ sector: 1, createdAt: -1 }).limit(300).lean();
+    res.json({ list: list.map(d => ({ id: String(d._id), sector: d.sector, sectorLabel: CONFIG.SECTORS[d.sector] || d.sector, title: d.title, conditions: d.conditions || "", w: d.w, h: d.h, by: d.createdByName, at: d.createdAt })) });
+});
+app.get("/api/media/designs/:id/img", mediaAuth, async (req, res) => {
+    try { const d = await MediaDesign.findById(req.params.id, { image: 1 }).lean(); if (!d) return res.status(404).end(); mediaSendImg(res, d.image); }
+    catch (e) { res.status(404).end(); }
+});
+async function mediaDesignFields(body) {
+    const sector = String(body.sector || "");
+    if (!CONFIG.SECTORS[sector]) throw new Error("اختر القطاع اللي يخصه التصميم من القائمة");
+    const title = String(body.title || "").trim().slice(0, 80) || CONFIG.SECTORS[sector];
+    const conditions = String(body.conditions || "").trim().slice(0, 1500);
+    return { sector, title, conditions };
+}
+app.post("/api/media/designs", mediaLeaderAuth, async (req, res) => {
+    try {
+        const f = await mediaDesignFields(req.body || {});
+        const image = mediaDataUrl(req.body.image, "png|webp", 5000000);
+        if (!image) return res.status(400).json({ error: "التصميم لازم يكون صورة PNG شفافة (بدون خلفية) وحجمها أقل من 3.5MB" });
+        if (!(await mediaHasTransparency(image))) return res.status(400).json({ error: "التصميم لازم يكون بدون خلفية — استخدم زر إزالة الخلفية" });
+        if ((await MediaDesign.countDocuments({ sector: f.sector })) >= 12) return res.status(400).json({ error: "وصلت الحد الأعلى (12 تصميم) لهذا القطاع، احذف تصميم قديم" });
+        const name = await mediaName(req.user.id);
+        const d = await MediaDesign.create({ ...f, image, w: parseInt(req.body.w) || 0, h: parseInt(req.body.h) || 0, createdBy: req.user.id, createdByName: name });
+        await mediaLog({ kind: "design", uid: req.user.id, name, reason: "إضافة تصميم موحد — " + CONFIG.SECTORS[f.sector], byId: req.user.id, byName: name });
+        res.json({ ok: true, id: String(d._id) });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.put("/api/media/designs/:id", mediaLeaderAuth, async (req, res) => {
+    try {
+        const f = await mediaDesignFields(req.body || {});
+        const upd = { ...f, updatedAt: new Date() };
+        if (req.body.image) {
+            const image = mediaDataUrl(req.body.image, "png|webp", 5000000);
+            if (!image) return res.status(400).json({ error: "التصميم لازم يكون PNG شفاف وأقل من 3.5MB" });
+            if (!(await mediaHasTransparency(image))) return res.status(400).json({ error: "التصميم لازم يكون بدون خلفية" });
+            upd.image = image; upd.w = parseInt(req.body.w) || 0; upd.h = parseInt(req.body.h) || 0;
+        }
+        const d = await MediaDesign.findByIdAndUpdate(req.params.id, { $set: upd });
+        if (!d) return res.status(404).json({ error: "التصميم غير موجود" });
+        res.json({ ok: true });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.delete("/api/media/designs/:id", mediaLeaderAuth, async (req, res) => {
+    try { await MediaDesign.findByIdAndDelete(req.params.id); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: "تعذر الحذف" }); }
+});
+
+// ---------- السناب الأمني (إرسال ومراجعة) ----------
+const mediaSnapLocks = new Map();
+app.post("/api/media/snaps", mediaAuth, async (req, res) => {
+    if (!req.mr.isMedia) return res.status(403).json({ error: "الإرسال لأعضاء الهيئة الإعلامية فقط" });
+    if (!lockTake(mediaSnapLocks, req.user.id, 8000)) return res.status(429).json({ error: "انتظر ثواني وجرّب" });
+    try {
+        const sector = String(req.body.sector || "");
+        if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "اختر القطاع من القائمة" });
+        const image = mediaDataUrl(req.body.image, "jpeg|png|webp", 5500000);
+        if (!image) return res.status(400).json({ error: "ضع صورة صحيحة (حجمها أقل من 4MB)" });
+        if ((await MediaSnap.countDocuments({ uid: req.user.id, status: "pending" })) >= 8) return res.status(429).json({ error: "عندك 8 سنابات بانتظار المراجعة، انتظر القائد يراجعها" });
+        const name = await mediaName(req.user.id);
+        const s = await MediaSnap.create({
+            uid: req.user.id, name, sector, sectorLabel: CONFIG.SECTORS[sector], hasDesign: !!req.body.hasDesign,
+            designId: req.body.designId ? String(req.body.designId).slice(0, 40) : null, caption: String(req.body.caption || "").trim().slice(0, 400), image,
+        });
+        const settings = await getSettings(); const sl = secLead(settings, MEDIA_SECTOR_KEY) || {};
+        [sl.commanderId, sl.deputyId].filter(Boolean).forEach(t => pushUid(t, { title: CONFIG.SITE_NAME, body: "📸 سناب أمني جديد من " + name + " ينتظر مراجعتك", tag: "media-snap-new", ttl: 86400 }).catch(() => {}));
+        await mediaLog({ kind: "snap", uid: req.user.id, name, reason: "رفع سناب — " + CONFIG.SECTORS[sector], byId: req.user.id, byName: name });
+        res.json({ ok: true, id: String(s._id) });
+    } catch (e) { console.error("❌ /api/media/snaps:", e.message); res.status(500).json({ error: "تعذر إرسال السناب" }); }
+});
+app.get("/api/media/snaps/mine", mediaAuth, async (req, res) => {
+    const list = await MediaSnap.find({ uid: req.user.id }, { image: 0 }).sort({ createdAt: -1 }).limit(60).lean();
+    res.json({ list: list.map(s => ({ id: String(s._id), sector: s.sectorLabel, hasDesign: s.hasDesign, caption: s.caption, status: s.status, points: s.points, rejectReason: s.rejectReason, at: s.createdAt })) });
+});
+app.get("/api/media/snaps/pending", mediaLeaderAuth, async (req, res) => {
+    const pending = await MediaSnap.find({ status: "pending" }, { image: 0 }).sort({ createdAt: 1 }).limit(60).lean();
+    const done = await MediaSnap.find({ status: { $ne: "pending" } }, { image: 0 }).sort({ reviewedAt: -1 }).limit(25).lean();
+    const m = s => ({ id: String(s._id), uid: s.uid, name: s.name, sector: s.sectorLabel, hasDesign: s.hasDesign, caption: s.caption, status: s.status, points: s.points, rejectReason: s.rejectReason, by: s.reviewedByName, at: s.createdAt });
+    res.json({ pending: pending.map(m), done: done.map(m), defaultPoints: MEDIA_SNAP_DEFAULT_POINTS });
+});
+app.get("/api/media/snaps/:id/img", mediaAuth, async (req, res) => {
+    try {
+        const s = await MediaSnap.findById(req.params.id, { image: 1, uid: 1 }).lean();
+        if (!s) return res.status(404).end();
+        if (s.uid !== req.user.id && !req.mr.isLeader) return res.status(403).end();
+        mediaSendImg(res, s.image);
+    } catch (e) { res.status(404).end(); }
+});
+const SnapBotJob = (() => {
+    if (mongoose.models.BotJob) return mongoose.models.BotJob;
+    const sc = new mongoose.Schema({
+        type: String, data: mongoose.Schema.Types.Mixed, status: { type: String, default: "pending" },
+        result: mongoose.Schema.Types.Mixed, error: String, createdAt: { type: Date, default: Date.now }, doneAt: Date,
+    }, { collection: "botjobs" });
+    sc.index({ type: 1, status: 1, createdAt: 1 });
+    sc.index({ createdAt: 1 }, { expireAfterSeconds: 86400 });
+    return mongoose.model("BotJob", sc);
+})();
+async function postApprovedSnap(snapId) {
+    try {
+        const s = await MediaSnap.findById(snapId, { image: 1 }).lean();
+        if (!s || typeof s.image !== "string" || !/^data:image\/(jpeg|png|webp);base64,/.test(s.image)) return;
+        await SnapBotJob.create({ type: "send_snap", data: { image: s.image } });
+    } catch (e) { console.error("❌ تجهيز السناب للبوت:", e.message); }
+}
+app.post("/api/media/snaps/:id/review", mediaLeaderAuth, async (req, res) => {
+    try {
+        const action = req.body.action === "approve" ? "approve" : "reject";
+        let pts = 0, reason = null;
+        if (action === "approve") pts = Math.max(0, Math.min(10, parseInt(req.body.points, 10) || 0));
+        else { reason = String(req.body.reason || "").trim().slice(0, 200); if (!reason) return res.status(400).json({ error: "اكتب سبب الرفض" }); }
+        const byName = await mediaName(req.user.id);
+        const s = await MediaSnap.findOneAndUpdate({ _id: req.params.id, status: "pending" },
+            { $set: { status: action === "approve" ? "approved" : "rejected", points: pts, rejectReason: reason, reviewedBy: req.user.id, reviewedByName: byName, reviewedAt: new Date() } }, { new: true, projection: { image: 0 } });
+        if (!s) return res.status(409).json({ error: "هذا السناب انراجع أو انحذف" });
+        if (action === "approve" && pts) await mediaAddPoints(s.uid, pts);
+        if (action === "approve") postApprovedSnap(s._id).catch(() => {});
+        pushUid(s.uid, { title: CONFIG.SITE_NAME, body: action === "approve" ? "✅ انقبل سنابك الأمني" + (pts ? " وأخذت " + pts + " نقطة" : "") : "❌ انرفض سنابك الأمني: " + reason, tag: "media-snap-" + s._id, ttl: 86400 }).catch(() => {});
+        await mediaLog({ kind: "snap", uid: s.uid, name: s.name, delta: pts, reason: (action === "approve" ? "قبول سناب" : "رفض سناب — " + reason) + " (" + s.sectorLabel + ")", byId: req.user.id, byName });
+        await logEvent({ action: action === "approve" ? "قبول سناب أمني" : "رفض سناب أمني", discordId: s.uid, actorId: req.user.id, actorTag: byName + " (الهيئة الإعلامية)", details: s.name + " — " + s.sectorLabel + (pts ? " — +" + pts : "") });
+        res.json({ ok: true });
+    } catch (e) { console.error("❌ media review:", e.message); res.status(500).json({ error: "تعذر تنفيذ القرار" }); }
+});
+
+// ---------- الأعضاء والنقاط ----------
+app.get("/api/media/members", mediaLeaderAuth, async (req, res) => {
+    const settings = await getSettings(); const sl = secLead(settings, MEDIA_SECTOR_KEY) || {};
+    const ids = Array.from(new Set((await mediaMemberIds()).concat([sl.commanderId, sl.deputyId].filter(Boolean))));
+    const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, registeredName: 1, rank: 1, points: 1 }).lean() : [];
+    const pm = new Map(ps.map(p => [p.discord, p]));
+    const grp = async st => { const a = await MediaSnap.aggregate([{ $match: { status: st } }, { $group: { _id: "$uid", n: { $sum: 1 } } }]); const o = {}; a.forEach(x => { o[x._id] = x.n; }); return o; };
+    const [ap, pe] = await Promise.all([grp("approved"), grp("pending")]);
+    const list = ids.map(id => { const p = pm.get(id) || {}; return { uid: id, name: p.registeredName || id, rank: p.rank || "", points: p.points || 0, approved: ap[id] || 0, pending: pe[id] || 0, role: id === sl.commanderId ? "قائد" : id === sl.deputyId ? "نائب" : "عضو" }; })
+        .sort((a, b) => b.points - a.points);
+    res.json({ list });
+});
+app.post("/api/media/points", mediaLeaderAuth, async (req, res) => {
+    try {
+        const uid = String(req.body.uid || ""); let delta = parseInt(req.body.delta, 10);
+        if (!delta || Math.abs(delta) > 20) return res.status(400).json({ error: "عدد النقاط من 1 إلى 20 (سالب للخصم)" });
+        const kind = req.body.kind === "attendance" ? "attendance" : "manual";
+        const reason = kind === "attendance" ? "نقطة حضور" : String(req.body.reason || "").trim().slice(0, 150);
+        if (!reason) return res.status(400).json({ error: "اكتب السبب" });
+        if (uid === req.user.id) return res.status(400).json({ error: "ما تقدر تعدّل نقاط نفسك" });
+        const ids = await mediaMemberIds();
+        if (!ids.includes(uid)) return res.status(400).json({ error: "هذا مو من أعضاء الهيئة الإعلامية" });
+        const byName = await mediaName(req.user.id), name = await mediaName(uid);
+        await mediaAddPoints(uid, delta);
+        pushUid(uid, { title: CONFIG.SITE_NAME, body: (delta > 0 ? "➕ أخذت " + delta + " نقطة" : "➖ انخصم عليك " + Math.abs(delta) + " نقطة") + " — " + reason, tag: "media-pts", ttl: 86400 }).catch(() => {});
+        await mediaLog({ kind, uid, name, delta, reason, byId: req.user.id, byName });
+        await logEvent({ action: delta > 0 ? "نقاط الهيئة الإعلامية (+)" : "نقاط الهيئة الإعلامية (-)", discordId: uid, actorId: req.user.id, actorTag: byName + " (الهيئة الإعلامية)", details: name + " — " + delta + " — " + reason });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر تعديل النقاط" }); }
+});
+
+// ---------- المهام والتعاميم ----------
+app.get("/api/media/notices", mediaAuth, async (req, res) => {
+    const list = await MediaNotice.find().sort({ createdAt: -1 }).limit(40).lean();
+    res.json({ list: list.map(n => ({ id: String(n._id), title: n.title, body: n.body, by: n.createdByName, at: n.createdAt })) });
+});
+app.post("/api/media/notices", mediaLeaderAuth, async (req, res) => {
+    const title = String(req.body.title || "").trim().slice(0, 80), body = String(req.body.body || "").trim().slice(0, 1200);
+    if (!title || !body) return res.status(400).json({ error: "اكتب العنوان والتفاصيل" });
+    const byName = await mediaName(req.user.id);
+    const n = await MediaNotice.create({ title, body, createdBy: req.user.id, createdByName: byName });
+    const ids = (await mediaMemberIds()).filter(i => i !== req.user.id);
+    flNotifyMany(ids, { title: CONFIG.SITE_NAME, body: "📢 " + title, tag: "media-notice-" + n._id, ttl: 86400 }).catch(() => {});
+    await mediaLog({ kind: "notice", uid: req.user.id, name: byName, reason: "تعميم: " + title, byId: req.user.id, byName });
+    res.json({ ok: true });
+});
+app.delete("/api/media/notices/:id", mediaLeaderAuth, async (req, res) => {
+    try { await MediaNotice.findByIdAndDelete(req.params.id); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: "تعذر الحذف" }); }
+});
+app.get("/api/media/log", mediaLeaderAuth, async (req, res) => {
+    const list = await MediaLog.find().sort({ at: -1 }).limit(120).lean();
+    res.json({ list: list.map(l => ({ kind: l.kind, name: l.name, delta: l.delta, reason: l.reason, by: l.byName, at: l.at })) });
+});
+
+// ---------- غرفة التحكم (المالك): دخول حساب القائد والنائب والأعضاء ----------
+app.get("/api/owner/media-team", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const st = await getSettings(); const sl = secLead(st, MEDIA_SECTOR_KEY) || {};
+    const members = (await mediaMemberIds()).filter(i => i !== sl.commanderId && i !== sl.deputyId);
+    const ps = members.length ? await Personnel.find({ discord: { $in: members } }, { discord: 1, registeredName: 1 }).lean() : [];
+    const pn = {}; ps.forEach(p => { pn[p.discord] = p.registeredName; });
+    const fix = async ids => (await admRows(ids)).map(r => Object.assign(r, pn[r.uid] ? { name: pn[r.uid] } : {}));
+    res.json({ groups: [
+        { key: "commander", label: "🎖️ قائد الهيئة الإعلامية", rows: await fix([sl.commanderId].filter(Boolean)) },
+        { key: "deputy", label: "🎖️ نائب الهيئة الإعلامية", rows: await fix([sl.deputyId].filter(Boolean)) },
+        { key: "members", label: "📸 أعضاء الهيئة الإعلامية", rows: await fix(members) },
+    ] });
+});
+
+const MEDIA_CLIENT_JS = String.raw`
+/* ===================== 📸 الهيئة الإعلامية والسناب الأمني ===================== */
+var MD = { tab: null, me: null, sectors: {}, snap: null, ed: null, dz: null, designs: [] };
+function mdCss() {
+    if (document.getElementById('md-css')) return;
+    var s = document.createElement('style'); s.id = 'md-css';
+    s.textContent = '.md-tabs{display:flex;gap:6px;overflow-x:auto;padding:4px 0 10px;-webkit-overflow-scrolling:touch}' +
+        '.md-tab{flex:0 0 auto;border:1px solid var(--border,#334155);background:var(--panel,#0f172a);color:#e5e7eb;padding:8px 12px;border-radius:10px;font-size:13px;cursor:pointer;white-space:nowrap}' +
+        '.md-tab.on{background:linear-gradient(135deg,#be185d,#7c3aed);border-color:transparent;color:#fff}' +
+        '.md-checker{background-color:#cbd5e1;background-image:linear-gradient(45deg,#94a3b8 25%,transparent 25%),linear-gradient(-45deg,#94a3b8 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#94a3b8 75%),linear-gradient(-45deg,transparent 75%,#94a3b8 75%);background-size:16px 16px;background-position:0 0,0 8px,8px -8px,-8px 0;border-radius:10px;overflow:hidden}' +
+        '.md-cv{max-width:100%;display:block;margin:0 auto;touch-action:none;border-radius:8px}' +
+        '.md-steps{display:flex;gap:6px;margin-bottom:12px}.md-step{flex:1;height:5px;border-radius:5px;background:#334155}.md-step.on{background:#ec4899}' +
+        '.md-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.md-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}' +
+        '.md-thumb{width:100%;height:110px;object-fit:contain;display:block}.md-ctl{display:grid;gap:8px;margin:10px 0}.md-ctl label{font-size:12px;color:var(--muted,#94a3b8);display:flex;justify-content:space-between}' +
+        '.md-ctl input[type=range]{width:100%}.md-pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px}' +
+        '.md-pill.pending{background:#78350f;color:#fde68a}.md-pill.approved{background:#14532d;color:#86efac}.md-pill.rejected{background:#7f1d1d;color:#fca5a5}' +
+        '.md-big{width:100%;max-height:340px;object-fit:contain;background:#020617;border-radius:10px}';
+    document.head.appendChild(s);
+}
+function mdSectorOpts(sel) {
+    return '<option value="">— اختر القطاع —</option>' + Object.keys(MD.sectors).map(function (k) {
+        return '<option value="' + spEsc(k) + '"' + (k === sel ? ' selected' : '') + '>' + spEsc(MD.sectors[k]) + '</option>';
+    }).join('');
+}
+function mdDate(d) { try { return new Date(d).toLocaleString('ar-SA', { dateStyle: 'short', timeStyle: 'short' }); } catch (e) { return ''; } }
+function mdIsLead() { return !!(MD.me && MD.me.role && MD.me.role.isLeader); }
+function mdTabsList() {
+    return mdIsLead()
+        ? [['ov', '📊 نظرة عامة'], ['mem', '👥 الأعضاء'], ['des', '🖼️ التصاميم الموحدة'], ['rev', '📥 مراجعة السناب'], ['not', '📢 المهام والتعاميم'], ['log', '🧾 السجل']]
+        : [['home', '🏠 الرئيسية'], ['snap', '📸 السناب الأمني'], ['des', '🖼️ التصاميم الموحدة'], ['mine', '📋 أعمالي'], ['board', '🏆 النقاط والترتيب']];
+}
+function mediaDashCardHtml() {
+    return '<div class="card att-card"><div class="row"><div><b>📸 قسم الإعلام</b>' +
+        '<div style="color:var(--muted);font-size:12px;margin-top:3px;">السناب الأمني والتصاميم الموحدة ومهامك الإعلامية</div></div>' +
+        '<button class="btn" onclick="renderMediaPanel()">📸 فتح قسم الإعلام</button></div></div>';
+}
+async function renderMediaPanel(tab) {
+    mdCss();
+    document.getElementById('app').innerHTML = '<div class="card row"><h2>📸 الهيئة الإعلامية والسناب الأمني</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>' +
+        '<div id="md-tabs" class="md-tabs"></div><div id="md-body"><div class="card center" style="color:var(--muted);">جارِ التحميل...</div></div>';
+    try { MD.me = await api('/api/media/me'); }
+    catch (e) { var b = document.getElementById('md-body'); if (b) b.innerHTML = '<div class="card" style="color:#f87171;">' + spEsc(e.message) + '</div>'; return; }
+    MD.sectors = MD.me.sectors || {};
+    var tabs = mdTabsList();
+    MD.tab = (tab && tabs.some(function (t) { return t[0] === tab; })) ? tab : tabs[0][0];
+    mdPaintTabs(); mdLoad();
+}
+function mdPaintTabs() {
+    var el = document.getElementById('md-tabs'); if (!el) return;
+    el.innerHTML = mdTabsList().map(function (t) {
+        return '<button class="md-tab' + (t[0] === MD.tab ? ' on' : '') + '" onclick="mdGo(\'' + t[0] + '\')">' + t[1] + '</button>';
+    }).join('');
+}
+function mdGo(t) { MD.tab = t; mdPaintTabs(); mdLoad(); }
+function mdBody(h) { var b = document.getElementById('md-body'); if (b) b.innerHTML = h; return b; }
+function mdErr(e) { mdBody('<div class="card" style="color:#f87171;">' + spEsc(e && e.message ? e.message : String(e)) + '</div>'); }
+function mdLoad() {
+    var t = MD.tab, lead = mdIsLead();
+    mdBody('<div class="card center" style="color:var(--muted);">جارِ التحميل...</div>');
+    if (lead) {
+        if (t === 'ov') return mdOverview();
+        if (t === 'mem') return mdMembers();
+        if (t === 'des') return mdDesignsLead();
+        if (t === 'rev') return mdReview();
+        if (t === 'not') return mdNotices();
+        if (t === 'log') return mdLog();
+    } else {
+        if (t === 'home') return mdHome();
+        if (t === 'snap') return mdSnap();
+        if (t === 'des') return mdDesignsMember();
+        if (t === 'mine') return mdMine();
+        if (t === 'board') return mdBoard();
+    }
+}
+function mdNoticesHtml(list) {
+    if (!list || !list.length) return '<div style="color:var(--muted);font-size:13px;">ما فيه تعاميم أو مهام حالياً</div>';
+    return list.map(function (n) {
+        return '<div class="card" style="margin:0 0 8px;"><b>📢 ' + spEsc(n.title) + '</b><div style="font-size:13px;margin-top:4px;white-space:pre-wrap;">' + spEsc(n.body) + '</div>' +
+            '<div style="font-size:11px;color:var(--muted);margin-top:6px;">' + spEsc(n.by || '') + ' • ' + mdDate(n.at) + '</div></div>';
+    }).join('');
+}
+
+/* ---------------- صفحات العضو ---------------- */
+function mdHome() {
+    var m = MD.me, s = m.stats;
+    mdBody('<div class="grid3"><div class="stat"><div class="num">' + m.points + '</div><div class="lbl">نقاطي</div></div>' +
+        '<div class="stat"><div class="num">' + s.approved + '</div><div class="lbl">سناب مقبول</div></div>' +
+        '<div class="stat"><div class="num">' + s.pending + '</div><div class="lbl">بانتظار المراجعة</div></div></div>' +
+        '<div class="card" style="margin-top:12px;"><div class="row"><div><b>🏅 ترتيبك: ' + s.rank + '</b> من ' + s.members + '<div style="font-size:12px;color:var(--muted);margin-top:3px;">تنقبل لك النقاط لما القائد يقبل سنابك</div></div>' +
+        '<div class="md-row"><button class="btn" onclick="mdGo(\'snap\')">📸 سناب جديد</button><button class="btn gray" onclick="mdGo(\'des\')">🖼️ التصاميم</button></div></div></div>' +
+        '<div class="card" style="font-size:12px;color:var(--muted);">ℹ️ الهيئة الإعلامية قطاع غير عسكري: الغياب ما ينحسب والحضور ما ينسجّل، وتاخذ نقاط على شغلك وحضورك مع القيادة.</div>' +
+        '<b style="font-size:13px;">📢 المهام والتعاميم</b><div style="margin-top:6px;">' + mdNoticesHtml(m.notices) + '</div>');
+}
+function mdSnap() {
+    if (!MD.snap) MD.snap = { step: 1, sector: '', hasDesign: null, photo: null, designs: [], designId: null, ov: null, loading: false };
+    var S = MD.snap, h = '<div class="card"><div class="md-steps">' + [1, 2, 3].map(function (i) { return '<div class="md-step' + (S.step >= i ? ' on' : '') + '"></div>'; }).join('') + '</div>';
+    if (S.step === 1) {
+        h += '<h3>📸 السناب الأمني</h3><label>أي قطاع صورته؟</label><select id="md-s-sector" onchange="MD.snap.sector=this.value" style="width:100%;">' + mdSectorOpts(S.sector) + '</select>' +
+            '<div class="md-row" style="margin-top:12px;"><button class="btn" onclick="mdSnapNext1()">التالي ←</button></div>';
+    } else if (S.step === 2) {
+        h += '<h3>🎨 التصميم</h3><div style="margin-bottom:10px;">القطاع: <b>' + spEsc(MD.sectors[S.sector] || '') + '</b></div>' +
+            '<div style="margin-bottom:10px;">هل الصورة اللي صورتها فيها تصميم؟ ولا تبي التصميم الافتراضي؟</div>' +
+            '<div class="md-row"><button class="btn" onclick="mdSnapHas(true)">✅ إي، فيها تصميم</button><button class="btn" style="background:#7c3aed;" onclick="mdSnapHas(false)">🎨 لا، أبي التصميم الافتراضي</button>' +
+            '<button class="btn gray" onclick="MD.snap.step=1;mdSnap()">→ رجوع</button></div>';
+    } else {
+        h += '<h3>🖼️ ضع الصورة</h3><div style="margin-bottom:8px;font-size:13px;">القطاع: <b>' + spEsc(MD.sectors[S.sector] || '') + '</b> • ' + (S.hasDesign ? 'الصورة فيها تصميم' : 'التصميم الافتراضي') + '</div>' +
+            '<input type="file" id="md-s-file" accept="image/*" onchange="mdSnapFile(this)">' +
+            '<div id="md-s-work"></div>' +
+            '<div class="md-row" style="margin-top:10px;"><button class="btn gray" onclick="MD.snap.step=2;mdSnap()">→ رجوع</button></div>';
+    }
+    mdBody(h + '</div>');
+    if (S.step === 3 && S.photo) mdSnapWork();
+}
+function mdSnapNext1() {
+    if (!MD.snap.sector) { toast('اختر القطاع من القائمة'); return; }
+    MD.snap.step = 2; mdSnap();
+}
+async function mdSnapHas(has) {
+    var S = MD.snap; S.hasDesign = has; S.step = 3; S.photo = null; S.ov = null; S.designs = [];
+    if (!has) {
+        try { var d = await api('/api/media/designs?sector=' + encodeURIComponent(S.sector)); S.designs = d.list || []; } catch (e) { toast(e.message); }
+        if (!S.designId || !S.designs.some(function (x) { return x.id === S.designId; })) S.designId = S.designs.length ? S.designs[0].id : null;
+    }
+    mdSnap();
+}
+function mdLoadImg(src) {
+    return new Promise(function (ok, no) { var i = new Image(); i.onload = function () { ok(i); }; i.onerror = function () { no(new Error('تعذر قراءة الصورة')); }; i.src = src; });
+}
+function mdReadFile(f) {
+    return new Promise(function (ok, no) { var r = new FileReader(); r.onload = function () { ok(r.result); }; r.onerror = function () { no(new Error('تعذر قراءة الملف')); }; r.readAsDataURL(f); });
+}
+async function mdSnapFile(inp) {
+    var f = inp.files && inp.files[0]; if (!f) return;
+    try {
+        var img = await mdLoadImg(await mdReadFile(f));
+        MD.snap.photo = img; MD.snap.ov = null;
+        if (!MD.snap.hasDesign && MD.snap.designId) MD.snap.ov = await mdLoadImg('/api/media/designs/' + MD.snap.designId + '/img');
+        mdSnapWork();
+    } catch (e) { toast(e.message); }
+}
+function mdSnapWork() {
+    var S = MD.snap, box = document.getElementById('md-s-work'); if (!box) return;
+    var h = '';
+    if (S.hasDesign) {
+        h += '<div style="margin-top:10px;"><img class="md-big" src="' + S.photo.src + '"></div>';
+    } else {
+        if (!S.designs.length) {
+            h += '<div class="card" style="margin-top:10px;color:#fbbf24;">⚠️ ما فيه تصميم موحد لهذا القطاع للحين. تقدر ترسل الصورة بدون تصميم أو تطلب من القائد يضيف تصميم.</div><div style="margin-top:10px;"><img class="md-big" src="' + S.photo.src + '"></div>';
+        } else {
+            var cur = S.designs.filter(function (d) { return d.id === S.designId; })[0] || S.designs[0];
+            h += '<div class="md-grid" style="margin:10px 0;">' + S.designs.map(function (d) {
+                return '<div class="card" style="padding:6px;cursor:pointer;margin:0;' + (d.id === S.designId ? 'border-color:#ec4899;' : '') + '" onclick="mdSnapPick(\'' + d.id + '\')"><div class="md-checker"><img class="md-thumb" src="/api/media/designs/' + d.id + '/img"></div><div style="font-size:11px;margin-top:4px;">' + spEsc(d.title) + '</div></div>';
+            }).join('') + '</div>';
+            if (cur && cur.conditions) h += '<div class="card" style="font-size:12px;white-space:pre-wrap;"><b>📜 شروط التصميم:</b>\n' + spEsc(cur.conditions) + '</div>' +
+                '<label style="display:flex;gap:8px;align-items:center;margin:6px 0;"><input type="checkbox" id="md-s-agree"> التزمت بالشروط</label>';
+            h += '<div class="md-checker" style="padding:6px;"><canvas id="md-cv" class="md-cv"></canvas></div>' +
+                '<div class="md-ctl"><label>العرض <span id="md-lw">45%</span></label><input type="range" id="md-w" min="8" max="100" value="45" oninput="mdEdChange()">' +
+                '<label>التدوير <span id="md-lr">0°</span></label><input type="range" id="md-r" min="-180" max="180" value="0" oninput="mdEdChange()">' +
+                '<label>الشفافية <span id="md-la">100%</span></label><input type="range" id="md-a" min="20" max="100" value="100" oninput="mdEdChange()"></div>' +
+                '<div class="md-row"><button class="btn sm gray" onclick="mdEdPreset(0.5,0.12)">⬆️ أعلى</button><button class="btn sm gray" onclick="mdEdPreset(0.5,0.5)">⏺️ وسط</button><button class="btn sm gray" onclick="mdEdPreset(0.5,0.88)">⬇️ أسفل</button></div>' +
+                '<div style="font-size:11px;color:var(--muted);margin-top:6px;">اسحب التصميم على الصورة بإصبعك لتحريكه</div>';
+        }
+    }
+    h += '<label style="margin-top:12px;">وصف (اختياري)</label><input type="text" id="md-s-cap" maxlength="300" style="width:100%;" placeholder="مثال: مداهمة ناجحة في ...">' +
+        '<div class="md-row" style="margin-top:12px;"><button class="btn" id="md-s-send" onclick="mdSnapSend()">📤 إرسال للمراجعة</button></div>';
+    box.innerHTML = h;
+    if (!S.hasDesign && S.designs.length) mdEdStart(S.photo, S.ov);
+}
+async function mdSnapPick(id) {
+    var S = MD.snap; S.designId = id;
+    try { S.ov = await mdLoadImg('/api/media/designs/' + id + '/img'); } catch (e) { toast(e.message); return; }
+    mdSnapWork();
+}
+/* محرر الدمج: الصورة + التصميم (سحب / عرض / تدوير / شفافية) */
+function mdEdStart(base, ov) {
+    var cv = document.getElementById('md-cv'); if (!cv || !base) return;
+    var sc = Math.min(1, 1400 / base.width); cv.width = Math.round(base.width * sc); cv.height = Math.round(base.height * sc);
+    MD.ed = { base: base, ov: ov, x: 0.5, y: 0.88, w: 45, r: 0, a: 100, drag: null };
+    cv.onpointerdown = function (e) { var r = cv.getBoundingClientRect(); MD.ed.drag = { px: e.clientX, py: e.clientY, x: MD.ed.x, y: MD.ed.y, rw: r.width, rh: r.height }; try { cv.setPointerCapture(e.pointerId); } catch (x) {} e.preventDefault(); };
+    cv.onpointermove = function (e) { var d = MD.ed.drag; if (!d) return; MD.ed.x = Math.max(0, Math.min(1, d.x + (e.clientX - d.px) / d.rw)); MD.ed.y = Math.max(0, Math.min(1, d.y + (e.clientY - d.py) / d.rh)); mdEdDraw(); };
+    cv.onpointerup = cv.onpointercancel = function () { MD.ed.drag = null; };
+    mdEdDraw();
+}
+function mdEdChange() {
+    if (!MD.ed) return;
+    MD.ed.w = +document.getElementById('md-w').value; MD.ed.r = +document.getElementById('md-r').value; MD.ed.a = +document.getElementById('md-a').value;
+    document.getElementById('md-lw').textContent = MD.ed.w + '%'; document.getElementById('md-lr').textContent = MD.ed.r + '°'; document.getElementById('md-la').textContent = MD.ed.a + '%';
+    mdEdDraw();
+}
+function mdEdPreset(x, y) { if (!MD.ed) return; MD.ed.x = x; MD.ed.y = y; mdEdDraw(); }
+function mdEdDraw(target) {
+    var E = MD.ed, cv = target || document.getElementById('md-cv'); if (!E || !cv) return;
+    var c = cv.getContext('2d'); c.clearRect(0, 0, cv.width, cv.height); c.drawImage(E.base, 0, 0, cv.width, cv.height);
+    if (!E.ov) return;
+    var ow = cv.width * E.w / 100, oh = ow * E.ov.height / E.ov.width;
+    c.save(); c.globalAlpha = E.a / 100; c.translate(E.x * cv.width, E.y * cv.height); c.rotate(E.r * Math.PI / 180); c.drawImage(E.ov, -ow / 2, -oh / 2, ow, oh); c.restore();
+}
+async function mdSnapSend() {
+    var S = MD.snap, btn = document.getElementById('md-s-send');
+    if (!S.photo) { toast('ضع الصورة أول'); return; }
+    var ag = document.getElementById('md-s-agree'); if (ag && !ag.checked) { toast('لازم توافق على شروط التصميم'); return; }
+    var data;
+    if (S.hasDesign || !S.designs.length) {
+        var sc = Math.min(1, 1400 / S.photo.width), c = document.createElement('canvas'); c.width = Math.round(S.photo.width * sc); c.height = Math.round(S.photo.height * sc);
+        c.getContext('2d').drawImage(S.photo, 0, 0, c.width, c.height); data = c.toDataURL('image/jpeg', 0.86);
+    } else data = document.getElementById('md-cv').toDataURL('image/jpeg', 0.88);
+    if (btn) btn.disabled = true;
+    try {
+        await api('/api/media/snaps', { method: 'POST', body: JSON.stringify({ sector: S.sector, hasDesign: !!S.hasDesign, designId: (!S.hasDesign && S.designs.length) ? S.designId : null, caption: (document.getElementById('md-s-cap') || {}).value || '', image: data }) });
+        toast('✅ انرسل سنابك للمراجعة'); MD.snap = null; MD.ed = null; mdGo('mine');
+    } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
+}
+async function mdMine() {
+    try {
+        var d = await api('/api/media/snaps/mine');
+        if (!d.list.length) return mdBody('<div class="card" style="color:var(--muted);">ما أرسلت أي سناب للحين</div>');
+        mdBody(d.list.map(function (s) {
+            var st = { pending: 'بانتظار المراجعة', approved: 'مقبول', rejected: 'مرفوض' }[s.status];
+            return '<div class="card"><div class="md-row" style="align-items:flex-start;"><img src="/api/media/snaps/' + s.id + '/img" style="width:90px;height:90px;object-fit:cover;border-radius:8px;background:#020617;" loading="lazy">' +
+                '<div style="flex:1;min-width:140px;"><b>' + spEsc(s.sector) + '</b> <span class="md-pill ' + s.status + '">' + st + '</span>' +
+                (s.status === 'approved' && s.points ? ' <span style="color:#4ade80;font-size:12px;">+' + s.points + ' نقطة</span>' : '') +
+                (s.caption ? '<div style="font-size:12px;margin-top:4px;">' + spEsc(s.caption) + '</div>' : '') +
+                (s.status === 'rejected' && s.rejectReason ? '<div style="font-size:12px;color:#fca5a5;margin-top:4px;">السبب: ' + spEsc(s.rejectReason) + '</div>' : '') +
+                '<div style="font-size:11px;color:var(--muted);margin-top:4px;">' + mdDate(s.at) + '</div></div></div></div>';
+        }).join(''));
+    } catch (e) { mdErr(e); }
+}
+async function mdBoard() {
+    try {
+        var d = await api('/api/media/board');
+        mdBody('<div class="card"><b>🏆 ترتيب الهيئة الإعلامية</b><table style="margin-top:8px;"><tr><th>#</th><th>الاسم</th><th>السناب المقبول</th><th>النقاط</th></tr>' +
+            d.list.map(function (r, i) { return '<tr' + (r.uid === d.me ? ' style="background:rgba(236,72,153,.15);"' : '') + '><td>' + (i + 1) + '</td><td>' + spEsc(r.name) + '</td><td>' + r.approved + '</td><td>' + r.points + '</td></tr>'; }).join('') + '</table></div>' +
+            '<div class="card" style="font-size:12px;color:var(--muted);line-height:1.9;"><b style="color:#e5e7eb;">كيف تاخذ نقاط؟</b><br>• كل سناب أمني ينقبل من القيادة يعطيك نقاط (الافتراضي ' + MD.me.defaultPoints + ').<br>• نقطة حضور لما تحضر مع القيادة.<br>• ما ينخصم عليك شي بسبب الغياب.</div>');
+    } catch (e) { mdErr(e); }
+}
+async function mdDesignsMember() {
+    try {
+        var d = await api('/api/media/designs'); MD.designs = d.list || [];
+        mdBody('<div class="card"><label>القطاع</label><select id="md-f-sec" onchange="mdDesignsDraw()" style="width:100%;">' + mdSectorOpts('').replace('— اختر القطاع —', 'كل القطاعات') + '</select></div><div id="md-dg"></div>');
+        mdDesignsDraw();
+    } catch (e) { mdErr(e); }
+}
+function mdDesignsDraw() {
+    var f = (document.getElementById('md-f-sec') || {}).value || '', lead = mdIsLead(), box = document.getElementById('md-dg'); if (!box) return;
+    var list = MD.designs.filter(function (x) { return !f || x.sector === f; });
+    if (!list.length) { box.innerHTML = '<div class="card" style="color:var(--muted);">ما فيه تصاميم موحدة هنا بعد</div>'; return; }
+    box.innerHTML = list.map(function (x) {
+        return '<div class="card"><div class="md-checker" style="padding:6px;"><img class="md-thumb" style="height:130px;" src="/api/media/designs/' + x.id + '/img" loading="lazy"></div>' +
+            '<div style="margin-top:8px;"><b>' + spEsc(x.title) + '</b> <span style="font-size:12px;color:var(--muted);">— ' + spEsc(x.sectorLabel) + '</span></div>' +
+            (x.conditions ? '<div style="font-size:12px;white-space:pre-wrap;margin-top:6px;"><b>📜 الشروط:</b>\n' + spEsc(x.conditions) + '</div>' : '') +
+            '<div class="md-row" style="margin-top:8px;">' +
+            (lead ? '<button class="btn sm gray" onclick="mdDesEdit(\'' + x.id + '\')">✏️ تعديل</button><button class="btn sm danger" onclick="mdDesDel(\'' + x.id + '\')">🗑️ حذف</button>'
+                : '<button class="btn sm" onclick="mdUseDesign(\'' + x.sector + '\',\'' + x.id + '\')">🎨 استخدمه في سناب</button>') +
+            '<a class="btn sm gray" href="/api/media/designs/' + x.id + '/img" download="design.png">⬇️ تنزيل</a></div></div>';
+    }).join('');
+}
+function mdUseDesign(sector, id) {
+    MD.snap = { step: 2, sector: sector, hasDesign: null, photo: null, designs: [], designId: id, ov: null };
+    mdGo('snap'); mdSnapHas(false);
+}
+
+/* ---------------- صفحات القيادة ---------------- */
+async function mdOverview() {
+    var m = MD.me, x = m.extra.leader || {};
+    var h = '<div class="grid3"><div class="stat"><div class="num">' + (x.members || 0) + '</div><div class="lbl">الأعضاء</div></div>' +
+        '<div class="stat"><div class="num">' + (x.pendingAll || 0) + '</div><div class="lbl">سناب بانتظار المراجعة</div></div>' +
+        '<div class="stat"><div class="num">' + (x.approvedAll || 0) + '</div><div class="lbl">سناب مقبول</div></div></div>' +
+        '<div class="card" style="margin-top:12px;"><div class="row"><div><b>🖼️ التصاميم الموحدة: ' + (x.designs || 0) + '</b></div><div class="md-row"><button class="btn" onclick="mdGo(\'rev\')">📥 المراجعة</button><button class="btn gray" onclick="mdGo(\'des\')">🖼️ التصاميم</button></div></div></div>' +
+        '<b style="font-size:13px;">📢 آخر التعاميم</b><div style="margin-top:6px;">' + mdNoticesHtml(m.notices) + '</div>';
+    mdBody(h);
+}
+async function mdMembers() {
+    try {
+        var d = await api('/api/media/members');
+        mdBody('<div class="card" style="font-size:12px;color:var(--muted);">الغياب ما ينحسب على الإعلام، والحضور ما ينسجّل. تقدر تعطي نقطة حضور أو تعدّل النقاط يدوياً.</div>' + d.list.map(function (r) {
+            return '<div class="card"><div class="row"><div><b>' + spEsc(r.name) + '</b> <span class="md-pill approved">' + r.role + '</span><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + spEsc(r.rank) + ' • سناب مقبول ' + r.approved + ' • معلّق ' + r.pending + '</div></div>' +
+                '<div class="md-row"><b style="font-size:18px;">' + r.points + '</b>' +
+                (r.role === 'عضو' ? '<button class="btn sm" onclick="mdPts(\'' + r.uid + '\',1,\'attendance\')">✅ حضر +1</button><button class="btn sm gray" onclick="mdPtsAsk(\'' + r.uid + '\')">± نقاط</button>' : '') + '</div></div></div>';
+        }).join(''));
+    } catch (e) { mdErr(e); }
+}
+async function mdPts(uid, delta, kind, reason) {
+    try { await api('/api/media/points', { method: 'POST', body: JSON.stringify({ uid: uid, delta: delta, kind: kind, reason: reason || '' }) }); toast('✅ تم'); mdMembers(); } catch (e) { toast(e.message); }
+}
+function mdPtsAsk(uid) {
+    var v = parseInt(prompt('عدد النقاط (موجب للإضافة، سالب للخصم — من 1 إلى 20):') || '', 10); if (!v) return;
+    var r = prompt('السبب:'); if (!r) return;
+    mdPts(uid, v, 'manual', r);
+}
+async function mdReview() {
+    try {
+        var d = await api('/api/media/snaps/pending');
+        var h = '<b style="font-size:13px;">📥 بانتظار المراجعة (' + d.pending.length + ')</b>';
+        if (!d.pending.length) h += '<div class="card" style="margin-top:6px;color:var(--muted);">ما فيه سنابات معلّقة</div>';
+        h += d.pending.map(function (s) {
+            return '<div class="card" style="margin-top:8px;"><div class="row"><b>' + spEsc(s.name) + '</b><span style="font-size:12px;color:var(--muted);">' + spEsc(s.sector) + ' • ' + (s.hasDesign ? 'فيها تصميم' : 'تصميم افتراضي') + '</span></div>' +
+                '<img class="md-big" style="margin-top:8px;" src="/api/media/snaps/' + s.id + '/img" loading="lazy">' +
+                (s.caption ? '<div style="font-size:13px;margin-top:6px;">' + spEsc(s.caption) + '</div>' : '') +
+                '<div class="md-row" style="margin-top:8px;"><select id="md-pt-' + s.id + '">' + [1, 2, 3, 4, 5, 0].map(function (n) { return '<option value="' + n + '"' + (n === d.defaultPoints ? ' selected' : '') + '>' + n + ' نقطة</option>'; }).join('') + '</select>' +
+                '<button class="btn sm" onclick="mdDecide(\'' + s.id + '\',\'approve\')">✅ قبول</button><button class="btn sm danger" onclick="mdDecide(\'' + s.id + '\',\'reject\')">❌ رفض</button></div></div>';
+        }).join('');
+        if (d.done.length) h += '<b style="font-size:13px;display:block;margin-top:14px;">آخر القرارات</b>' + d.done.map(function (s) {
+            return '<div class="card" style="margin-top:6px;font-size:12px;">' + spEsc(s.name) + ' — ' + spEsc(s.sector) + ' <span class="md-pill ' + s.status + '">' + (s.status === 'approved' ? 'مقبول +' + s.points : 'مرفوض') + '</span> <span style="color:var(--muted);">' + spEsc(s.by || '') + '</span></div>';
+        }).join('');
+        mdBody(h);
+    } catch (e) { mdErr(e); }
+}
+async function mdDecide(id, action) {
+    var body = { action: action };
+    if (action === 'approve') body.points = +document.getElementById('md-pt-' + id).value;
+    else { var r = prompt('سبب الرفض:'); if (!r) return; body.reason = r; }
+    try { await api('/api/media/snaps/' + id + '/review', { method: 'POST', body: JSON.stringify(body) }); toast('✅ تم'); mdReview(); } catch (e) { toast(e.message); }
+}
+async function mdNotices() {
+    try {
+        var d = await api('/api/media/notices');
+        mdBody('<div class="card"><h3>📢 مهمة أو تعميم جديد</h3><input type="text" id="md-n-t" maxlength="80" placeholder="العنوان" style="width:100%;margin-bottom:8px;"><textarea id="md-n-b" rows="4" maxlength="1200" placeholder="التفاصيل..." style="width:100%;"></textarea>' +
+            '<div class="md-row" style="margin-top:8px;"><button class="btn" onclick="mdNoticeSend()">📤 نشر وإشعار الأعضاء</button></div></div>' +
+            d.list.map(function (n) {
+                return '<div class="card"><div class="row"><b>📢 ' + spEsc(n.title) + '</b><button class="btn sm danger" onclick="mdNoticeDel(\'' + n.id + '\')">🗑️</button></div><div style="font-size:13px;margin-top:4px;white-space:pre-wrap;">' + spEsc(n.body) + '</div><div style="font-size:11px;color:var(--muted);margin-top:6px;">' + spEsc(n.by || '') + ' • ' + mdDate(n.at) + '</div></div>';
+            }).join(''));
+    } catch (e) { mdErr(e); }
+}
+async function mdNoticeSend() {
+    try { await api('/api/media/notices', { method: 'POST', body: JSON.stringify({ title: document.getElementById('md-n-t').value, body: document.getElementById('md-n-b').value }) }); toast('✅ تم النشر'); mdNotices(); } catch (e) { toast(e.message); }
+}
+async function mdNoticeDel(id) { if (!confirm('حذف التعميم؟')) return; try { await api('/api/media/notices/' + id, { method: 'DELETE' }); mdNotices(); } catch (e) { toast(e.message); } }
+async function mdLog() {
+    try {
+        var d = await api('/api/media/log');
+        mdBody(d.list.length ? d.list.map(function (l) {
+            return '<div class="card" style="font-size:12px;"><div class="row"><b>' + spEsc(l.name || '') + '</b><span style="color:var(--muted);">' + mdDate(l.at) + '</span></div>' + spEsc(l.reason || '') +
+                (l.delta ? ' <b style="color:' + (l.delta > 0 ? '#4ade80' : '#f87171') + ';">' + (l.delta > 0 ? '+' : '') + l.delta + '</b>' : '') + '<div style="color:var(--muted);">بواسطة ' + spEsc(l.by || '') + '</div></div>';
+        }).join('') : '<div class="card" style="color:var(--muted);">السجل فاضي</div>');
+    } catch (e) { mdErr(e); }
+}
+
+/* ---------------- إدارة التصاميم الموحدة (للقيادة) + محرر مثل كانفا ---------------- */
+async function mdDesignsLead() {
+    try {
+        var d = await api('/api/media/designs'); MD.designs = d.list || [];
+        mdBody('<div class="card"><div class="row"><div><b>🖼️ التصاميم الموحدة</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">لازم التصميم يكون بدون خلفية (PNG شفاف)</div></div>' +
+            '<button class="btn" onclick="document.getElementById(\'md-d-file\').click()">➕ إضافة تصميم</button></div>' +
+            '<input type="file" id="md-d-file" accept="image/*" style="display:none" onchange="mdDesPick(this)"></div>' +
+            '<div class="card"><label>القطاع</label><select id="md-f-sec" onchange="mdDesignsDraw()" style="width:100%;">' + mdSectorOpts('').replace('— اختر القطاع —', 'كل القطاعات') + '</select></div><div id="md-dg"></div>');
+        mdDesignsDraw();
+    } catch (e) { mdErr(e); }
+}
+async function mdDesPick(inp) {
+    var f = inp.files && inp.files[0]; if (!f) return;
+    try {
+        var img = await mdLoadImg(await mdReadFile(f));
+        MD.dz = { id: null, img: img, sector: '', title: '', conditions: '' };
+        mdDesAsk();
+    } catch (e) { toast(e.message); }
+}
+function mdDesAsk() {
+    var Z = MD.dz;
+    mdBody('<div class="card"><h3>🧭 هذا التصميم يخص أي قطاع؟</h3><select id="md-z-sec" style="width:100%;">' + mdSectorOpts(Z.sector) + '</select>' +
+        '<div class="md-row" style="margin-top:12px;"><button class="btn" onclick="mdDesAsked()">التالي: تعديل الصورة ←</button><button class="btn gray" onclick="MD.dz=null;mdGo(\'des\')">إلغاء</button></div></div>');
+}
+function mdDesAsked() {
+    var v = document.getElementById('md-z-sec').value; if (!v) { toast('اختر القطاع من القائمة'); return; }
+    MD.dz.sector = v; mdDesEditor();
+}
+function mdDzCanvas(img, maxW) {
+    var sc = Math.min(1, maxW / img.width), c = document.createElement('canvas'); c.width = Math.max(1, Math.round(img.width * sc)); c.height = Math.max(1, Math.round(img.height * sc));
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); return c;
+}
+function mdAlphaRatio(cv) {
+    var d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data, n = 0, t = 0;
+    for (var i = 3; i < d.length; i += 16) { t++; if (d[i] < 12) n++; }
+    return t ? n / t : 0;
+}
+function mdDesEditor() {
+    var Z = MD.dz; mdCss();
+    Z.orig = mdDzCanvas(Z.img, 2400); Z.cv = document.createElement('canvas'); Z.cv.width = Z.orig.width; Z.cv.height = Z.orig.height; Z.cv.getContext('2d').drawImage(Z.orig, 0, 0);
+    Z.tol = 40; Z.outW = Math.min(1400, Z.orig.width); Z.pockets = true;
+    mdBody('<div class="card"><h3>✏️ تعديل التصميم — ' + spEsc(MD.sectors[Z.sector]) + '</h3><div class="md-checker" style="padding:8px;"><canvas id="md-pv" class="md-cv"></canvas></div>' +
+        '<div class="md-ctl"><label>حساسية إزالة الخلفية <span id="md-lt">40</span></label><input type="range" id="md-z-tol" min="5" max="90" value="40" oninput="document.getElementById(\'md-lt\').textContent=this.value">' +
+        '<label>العرض النهائي (بكسل) <span id="md-lo">' + Z.outW + '</span></label><input type="range" id="md-z-w" min="300" max="2000" step="50" value="' + Z.outW + '" oninput="MD.dz.outW=+this.value;document.getElementById(\'md-lo\').textContent=this.value;mdDzInfo()"></div>' +
+        '<label style="display:flex;gap:8px;align-items:center;"><input type="checkbox" id="md-z-pk" checked onchange="MD.dz.pockets=this.checked"> إزالة الخلفية داخل الحروف (الفراغات المغلقة)</label>' +
+        '<div class="md-row" style="margin:10px 0;"><button class="btn sm" onclick="mdDzBg()">🪄 إزالة الخلفية</button><button class="btn sm gray" onclick="mdDzTrim()">✂️ قص الفراغات</button><button class="btn sm gray" onclick="mdDzRot()">⟳ تدوير</button><button class="btn sm gray" onclick="mdDzFlip()">⇋ قلب</button><button class="btn sm gray" onclick="mdDzReset()">↩ الأصل</button></div>' +
+        '<div id="md-z-info" style="font-size:12px;color:var(--muted);"></div>' +
+        '<label style="margin-top:10px;">اسم التصميم (اختياري)</label><input type="text" id="md-z-title" maxlength="80" style="width:100%;" value="' + spEsc(Z.title) + '">' +
+        '<label style="margin-top:10px;">شروط استخدام التصميم</label><textarea id="md-z-cond" rows="4" maxlength="1500" style="width:100%;" placeholder="مثال: ينحط أسفل الصورة، ما يغطي الوجوه، ...">' + spEsc(Z.conditions) + '</textarea>' +
+        '<div class="md-row" style="margin-top:12px;"><button class="btn" id="md-z-save" onclick="mdDzSave()">💾 حفظ التصميم</button><button class="btn gray" onclick="MD.dz=null;mdGo(\'des\')">إلغاء</button></div></div>');
+    if (mdAlphaRatio(Z.cv) < 0.01) { mdDzBg(true); } else mdDzPaint();
+}
+function mdDzPaint() {
+    var Z = MD.dz, pv = document.getElementById('md-pv'); if (!pv) return;
+    var sc = Math.min(1, 520 / Z.cv.width); pv.width = Math.round(Z.cv.width * sc); pv.height = Math.round(Z.cv.height * sc);
+    var c = pv.getContext('2d'); c.clearRect(0, 0, pv.width, pv.height); c.drawImage(Z.cv, 0, 0, pv.width, pv.height); mdDzInfo();
+}
+function mdDzInfo() {
+    var Z = MD.dz, el = document.getElementById('md-z-info'); if (!el) return;
+    var r = mdAlphaRatio(Z.cv), h = Math.round(Z.outW * Z.cv.height / Z.cv.width);
+    el.innerHTML = 'الحجم النهائي: ' + Z.outW + '×' + h + ' • ' + (r >= 0.01 ? '<span style="color:#4ade80;">✅ فيه شفافية (بدون خلفية)</span>' : '<span style="color:#fbbf24;">⚠️ التصميم لسا فيه خلفية — اضغط إزالة الخلفية</span>');
+}
+function mdDzBg(auto) {
+    var Z = MD.dz; Z.tol = +document.getElementById('md-z-tol').value; Z.pockets = document.getElementById('md-z-pk').checked;
+    mdRemoveBg(Z.cv, Z.tol, Z.pockets); mdDzTrim(true); if (auto) toast('🪄 انشالت الخلفية تلقائياً، عدّل الحساسية لو تبي');
+}
+function mdDzTrim(quiet) {
+    var Z = MD.dz, w = Z.cv.width, h = Z.cv.height, d = Z.cv.getContext('2d').getImageData(0, 0, w, h).data, x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) if (d[(y * w + x) * 4 + 3] > 10) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    if (x1 >= 0) {
+        var p = 3; x0 = Math.max(0, x0 - p); y0 = Math.max(0, y0 - p); x1 = Math.min(w - 1, x1 + p); y1 = Math.min(h - 1, y1 + p);
+        var n = document.createElement('canvas'); n.width = x1 - x0 + 1; n.height = y1 - y0 + 1; n.getContext('2d').drawImage(Z.cv, x0, y0, n.width, n.height, 0, 0, n.width, n.height); Z.cv = n;
+    } else if (!quiet) toast('ما لقيت شي أقصّه');
+    mdDzPaint();
+}
+function mdDzRot() { var Z = MD.dz, n = document.createElement('canvas'); n.width = Z.cv.height; n.height = Z.cv.width; var c = n.getContext('2d'); c.translate(n.width, 0); c.rotate(Math.PI / 2); c.drawImage(Z.cv, 0, 0); Z.cv = n; mdDzPaint(); }
+function mdDzFlip() { var Z = MD.dz, n = document.createElement('canvas'); n.width = Z.cv.width; n.height = Z.cv.height; var c = n.getContext('2d'); c.translate(n.width, 0); c.scale(-1, 1); c.drawImage(Z.cv, 0, 0); Z.cv = n; mdDzPaint(); }
+function mdDzReset() { var Z = MD.dz; Z.cv = document.createElement('canvas'); Z.cv.width = Z.orig.width; Z.cv.height = Z.orig.height; Z.cv.getContext('2d').drawImage(Z.orig, 0, 0); mdDzPaint(); }
+/* إزالة الخلفية: ملء من الحواف (أبيض/رمادي الشطرنج أو أسود) بدون ما يلمس الحروف المحددة */
+function mdRemoveBg(cv, tol, pockets) {
+    var w = cv.width, h = cv.height, ctx = cv.getContext('2d'), id = ctx.getImageData(0, 0, w, h), d = id.data, N = w * h;
+    var corners = [0, (w - 1) * 4, (h - 1) * w * 4, ((h - 1) * w + w - 1) * 4], lum = 0;
+    corners.forEach(function (i) { lum += (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000; }); lum /= 4;
+    var dark = lum < 90;
+    function bgAt(i, k) {
+        if (d[i + 3] < 10) return true;
+        var r = d[i], g = d[i + 1], b = d[i + 2], mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        if (dark) return mx < tol * 0.9 * k + 8;
+        return mn > 255 - tol * 1.6 * k - 10 && (mx - mn) < tol * 0.8 * k + 12;
+    }
+    var vis = new Uint8Array(N), stack = new Int32Array(N), sp = 0;
+    function push(p) { if (!vis[p] && bgAt(p * 4, 1)) { vis[p] = 1; stack[sp++] = p; } }
+    for (var x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+    for (var y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+    while (sp) {
+        var p = stack[--sp], px = p % w, py = (p / w) | 0;
+        if (px > 0) push(p - 1); if (px < w - 1) push(p + 1); if (py > 0) push(p - w); if (py < h - 1) push(p + w);
+    }
+    if (pockets && !dark) {
+        var seen = new Uint8Array(N);
+        for (var s = 0; s < N; s++) {
+            if (vis[s] || seen[s] || !bgAt(s * 4, 1)) continue;
+            var comp = [s], q = 0; seen[s] = 1; var sum = 0;
+            while (q < comp.length) {
+                var c = comp[q++]; sum += Math.min(d[c * 4], d[c * 4 + 1], d[c * 4 + 2]);
+                var cx = c % w, cy = (c / w) | 0, nb = [];
+                if (cx > 0) nb.push(c - 1); if (cx < w - 1) nb.push(c + 1); if (cy > 0) nb.push(c - w); if (cy < h - 1) nb.push(c + w);
+                for (var j = 0; j < nb.length; j++) { var t = nb[j]; if (!seen[t] && !vis[t] && bgAt(t * 4, 1)) { seen[t] = 1; comp.push(t); } }
+            }
+            if (sum / comp.length < 249) for (var m = 0; m < comp.length; m++) vis[comp[m]] = 1;
+        }
+    }
+    for (var i = 0; i < N; i++) if (vis[i]) d[i * 4 + 3] = 0;
+    // تنعيم الحواف: بكسلات الحافة القريبة من لون الخلفية تنشال، والباقي ينعّم شوي
+    var edge = [];
+    for (var e = 0; e < N; e++) {
+        if (vis[e]) continue; var ex = e % w, ey = (e / w) | 0;
+        if ((ex > 0 && vis[e - 1]) || (ex < w - 1 && vis[e + 1]) || (ey > 0 && vis[e - w]) || (ey < h - 1 && vis[e + w])) edge.push(e);
+    }
+    edge.forEach(function (e) { d[e * 4 + 3] = bgAt(e * 4, 1.5) ? 0 : 200; });
+    ctx.putImageData(id, 0, 0);
+}
+function mdDzOut() {
+    var Z = MD.dz, ow = Math.min(2000, Z.outW), oh = Math.round(ow * Z.cv.height / Z.cv.width), c = document.createElement('canvas'); c.width = ow; c.height = oh;
+    c.getContext('2d').drawImage(Z.cv, 0, 0, ow, oh); return c;
+}
+async function mdDzSave() {
+    var Z = MD.dz, btn = document.getElementById('md-z-save');
+    if (mdAlphaRatio(Z.cv) < 0.01) { toast('التصميم لازم يكون بدون خلفية — اضغط إزالة الخلفية'); return; }
+    var out = mdDzOut(), url = out.toDataURL('image/png');
+    if (url.length > 4800000) { toast('الصورة كبيرة، صغّر العرض النهائي'); return; }
+    var body = { sector: Z.sector, title: document.getElementById('md-z-title').value, conditions: document.getElementById('md-z-cond').value, image: url, w: out.width, h: out.height };
+    if (btn) btn.disabled = true;
+    try {
+        if (Z.id) await api('/api/media/designs/' + Z.id, { method: 'PUT', body: JSON.stringify(body) });
+        else await api('/api/media/designs', { method: 'POST', body: JSON.stringify(body) });
+        toast('✅ انحفظ التصميم'); MD.dz = null; mdGo('des');
+    } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
+}
+async function mdDesEdit(id) {
+    var x = MD.designs.filter(function (d) { return d.id === id; })[0]; if (!x) return;
+    try {
+        var img = await mdLoadImg('/api/media/designs/' + id + '/img');
+        MD.dz = { id: id, img: img, sector: x.sector, title: x.title, conditions: x.conditions };
+        mdDesAsk();
+    } catch (e) { toast(e.message); }
+}
+async function mdDesDel(id) { if (!confirm('حذف هذا التصميم؟')) return; try { await api('/api/media/designs/' + id, { method: 'DELETE' }); mdGo('des'); } catch (e) { toast(e.message); } }
+
+/* ---------------- غرفة التحكم (المالك): هيئة الإعلام ---------------- */
+async function flCmdMedia() {
+    ccStopLive();
+    var back = flCmdBack('flCmdOpen()', '↩ رجوع');
+    ownerModalOpen('📸 هيئة الإعلام', back + '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/owner/media-team', { noLock: true });
+        var h = back + '<div class="card" style="font-size:12px;color:var(--muted);margin-bottom:10px;">اختر الحساب وادخل عليه، وترجع لحسابك من زر «رجوع لحساب المالك».</div>';
+        d.groups.forEach(function (g) {
+            h += '<b style="font-size:13px;">' + g.label + '</b><div style="margin:6px 0 12px;">' + (g.rows.length ? g.rows.map(function (r) {
+                return '<div class="card" style="margin-bottom:6px;"><div class="row"><div><b style="font-size:13px;">' + spEsc(r.name) + '</b><div style="font-size:11px;color:var(--muted);direction:ltr;text-align:right;">' + spEsc(r.email) + '</div></div>' + devLoginBtn(r.uid) + '</div></div>';
+            }).join('') : '<div style="color:var(--muted);font-size:12px;">ما فيه أحد معيّن</div>') + '</div>';
+        });
+        ownerModalOpen('📸 هيئة الإعلام', h);
+    } catch (e) { ownerModalOpen('📸 هيئة الإعلام', back + '<div style="color:#f87171;">' + spEsc(e.message) + '</div>'); }
+}
+
+`;
 
 app.use((err, req, res, next) => {
     console.error("❌ خطأ غير متوقع بالسيرفر:", err);
