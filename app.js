@@ -26036,10 +26036,16 @@ app.post("/api/media/snaps", mediaAuth, async (req, res) => {
         if (!image) return res.status(400).json({ error: "ضع صورة صحيحة (حجمها أقل من 4MB)" });
         if ((await MediaSnap.countDocuments({ uid: req.user.id, status: "pending" })) >= 8) return res.status(429).json({ error: "عندك 8 سنابات بانتظار المراجعة، انتظر القائد يراجعها" });
         const name = await mediaName(req.user.id);
-        const s = await MediaSnap.create({
+        const isLead = !!(req.mr.isCommander || req.mr.isDeputy);
+        const s = await MediaSnap.create(Object.assign({
             uid: req.user.id, name, sector, sectorLabel: CONFIG.SECTORS[sector], hasDesign: !!req.body.hasDesign,
             designId: req.body.designId ? String(req.body.designId).slice(0, 40) : null, caption: String(req.body.caption || "").trim().slice(0, 400), image,
-        });
+        }, isLead ? { status: "approved", points: 0, reviewedBy: req.user.id, reviewedByName: name, reviewedAt: new Date() } : {}));
+        if (isLead) {
+            postApprovedSnap(s._id).catch(() => {});
+            await mediaLog({ kind: "snap", uid: req.user.id, name, reason: "نشر سناب (قيادة) — " + CONFIG.SECTORS[sector], byId: req.user.id, byName: name });
+            return res.json({ ok: true, id: String(s._id), auto: true });
+        }
         const settings = await getSettings(); const sl = secLead(settings, MEDIA_SECTOR_KEY) || {};
         [sl.commanderId, sl.deputyId].filter(Boolean).forEach(t => pushUid(t, { title: CONFIG.SITE_NAME, body: "📸 سناب أمني جديد من " + name + " ينتظر مراجعتك", tag: "media-snap-new", ttl: 86400 }).catch(() => {}));
         await mediaLog({ kind: "snap", uid: req.user.id, name, reason: "رفع سناب — " + CONFIG.SECTORS[sector], byId: req.user.id, byName: name });
@@ -26196,8 +26202,9 @@ function mdSectorOpts(sel) {
 function mdDate(d) { try { return new Date(d).toLocaleString('ar-SA', { dateStyle: 'short', timeStyle: 'short' }); } catch (e) { return ''; } }
 function mdIsLead() { return !!(MD.me && MD.me.role && MD.me.role.isLeader); }
 function mdTabsList() {
+    var canPost = !!(MD.me && MD.me.role && MD.me.role.isMedia);
     return mdIsLead()
-        ? [['ov', '📊 نظرة عامة'], ['mem', '👥 الأعضاء'], ['des', '🖼️ التصاميم الموحدة'], ['rev', '📥 مراجعة السناب'], ['not', '📢 المهام والتعاميم'], ['log', '🧾 السجل']]
+        ? [['ov', '📊 نظرة عامة'], ['mem', '👥 الأعضاء'], ['des', '🖼️ التصاميم الموحدة'], ['rev', '📥 مراجعة السناب']].concat(canPost ? [['snap', '📸 نشر سناب'], ['mine', '📋 أعمالي']] : [], [['not', '📢 المهام والتعاميم'], ['log', '🧾 السجل']])
         : [['home', '🏠 الرئيسية'], ['snap', '📸 السناب الأمني'], ['des', '🖼️ التصاميم الموحدة'], ['mine', '📋 أعمالي'], ['board', '🏆 النقاط والترتيب']];
 }
 function mediaDashCardHtml() {
@@ -26233,6 +26240,8 @@ function mdLoad() {
         if (t === 'mem') return mdMembers();
         if (t === 'des') return mdDesignsLead();
         if (t === 'rev') return mdReview();
+        if (t === 'snap') return mdSnap();
+        if (t === 'mine') return mdMine();
         if (t === 'not') return mdNotices();
         if (t === 'log') return mdLog();
     } else {
@@ -26377,8 +26386,8 @@ async function mdSnapSend() {
     } else data = document.getElementById('md-cv').toDataURL('image/jpeg', 0.88);
     if (btn) btn.disabled = true;
     try {
-        await api('/api/media/snaps', { method: 'POST', body: JSON.stringify({ sector: S.sector, hasDesign: !!S.hasDesign, designId: (!S.hasDesign && S.designs.length) ? S.designId : null, caption: (document.getElementById('md-s-cap') || {}).value || '', image: data }) });
-        toast('✅ انرسل سنابك للمراجعة'); MD.snap = null; MD.ed = null; mdGo('mine');
+        var r = await api('/api/media/snaps', { method: 'POST', body: JSON.stringify({ sector: S.sector, hasDesign: !!S.hasDesign, designId: (!S.hasDesign && S.designs.length) ? S.designId : null, caption: (document.getElementById('md-s-cap') || {}).value || '', image: data }) });
+        toast(r && r.auto ? '✅ اننشر سنابك' : '✅ انرسل سنابك للمراجعة'); MD.snap = null; MD.ed = null; mdGo('mine');
     } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
 }
 async function mdMine() {
