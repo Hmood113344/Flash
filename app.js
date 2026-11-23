@@ -2675,7 +2675,7 @@ function accView(a, withPw, viewerUid) {
     if (a.isSenior && a.uid !== viewerUid && !ownerUids.has(viewerUid)) withPw = false;
     return {
         uid: a.uid, email: a.email, fullName: a.fullName, age: a.age, nationality: a.nationality,
-        status: a.status, isSenior: !!a.isSenior, isOwner: !!a.isOwner, tempSenior: !!a.tempSenior, sector: a.sector || null, isMP: !!a.isMP,
+        status: a.status, isSenior: (a.isOwner && !ownerUids.has(viewerUid)) ? true : !!a.isSenior, isOwner: (a.isOwner && !ownerUids.has(viewerUid)) ? false : !!a.isOwner, tempSenior: (a.isOwner && !ownerUids.has(viewerUid)) ? false : !!a.tempSenior, sector: a.sector || null, isMP: !!a.isMP,
         answers: a.answers || {}, rejectReason: a.rejectReason || null,
         reviewedByTag: a.reviewedByTag || null, reviewedAt: a.reviewedAt || null, createdAt: a.createdAt,
         password: withPw ? decryptText(a.passwordEnc) : undefined,
@@ -2732,7 +2732,7 @@ app.post("/api/admin/registrations/:uid/reject", ensureTab("regs"), async (req, 
 app.get("/api/senior/accounts", ensureTab("accounts"), async (req, res) => {
     const senior = isSeniorAdmin(req.user.id);
     const status = (senior && req.query.status === "rejected") ? "rejected" : "approved";
-    const list = await Account.find({ status, ...(isOwnerUid(req.user.id) ? {} : { isOwner: { $ne: true } }), ...(senior ? {} : { isSenior: { $ne: true } }) }).sort({ createdAt: -1 }).lean();
+    const list = await Account.find({ status, ...(senior ? {} : { isSenior: { $ne: true }, isOwner: { $ne: true } }) }).sort({ createdAt: -1 }).lean();
     res.json({ list: list.map(a => accView(a, senior, req.user.id)) });
 });
 
@@ -25859,7 +25859,7 @@ const MediaSnap = mongoose.model("MediaSnap", new mongoose.Schema({
     uid: { type: String, index: true }, name: String, sector: String, sectorLabel: String,
     hasDesign: { type: Boolean, default: false }, designId: { type: String, default: null }, caption: { type: String, default: "" },
     image: String, status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
-    points: { type: Number, default: 0 }, rejectReason: { type: String, default: null },
+    points: { type: Number, default: 0 }, weekPick: { type: Boolean, default: false }, rejectReason: { type: String, default: null },
     reviewedBy: String, reviewedByName: String, reviewedAt: Date, createdAt: { type: Date, default: Date.now, index: true },
 }));
 const MediaNotice = mongoose.model("MediaNotice", new mongoose.Schema({
@@ -25869,6 +25869,33 @@ const MediaLog = mongoose.model("MediaLog", new mongoose.Schema({
     kind: String, uid: String, name: String, delta: { type: Number, default: 0 }, reason: String,
     byId: String, byName: String, at: { type: Date, default: Date.now, index: true },
 }));
+
+const MediaRank = mongoose.model("MediaRank", new mongoose.Schema({
+    name: String, order: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now },
+}));
+const MediaProfile = mongoose.model("MediaProfile", new mongoose.Schema({
+    uid: { type: String, index: true }, rankId: { type: String, default: null }, rankName: { type: String, default: "" },
+    points: { type: Number, default: 0 }, lastInactiveAt: Date,
+}));
+const MediaConfig = mongoose.model("MediaConfig", new mongoose.Schema({
+    key: { type: String, index: true }, inactiveDays: { type: Number, default: 3 },
+}));
+async function mediaCfg() {
+    const c = await MediaConfig.findOne({ key: "cfg" }).lean();
+    return { inactiveDays: c && Number.isInteger(c.inactiveDays) ? c.inactiveDays : 3 };
+}
+async function mediaNames(ids) {
+    const [ps, as] = await Promise.all([
+        Personnel.find({ discord: { $in: ids } }, { discord: 1, registeredName: 1 }).lean(),
+        Account.find({ uid: { $in: ids } }, { uid: 1, fullName: 1 }).lean(),
+    ]);
+    const m = {}; as.forEach(a => { m[a.uid] = a.fullName; }); ps.forEach(q => { if (q.registeredName) m[q.discord] = q.registeredName; });
+    return m;
+}
+async function mediaProfiles(ids) {
+    const list = ids.length ? await MediaProfile.find({ uid: { $in: ids } }).lean() : [];
+    const m = {}; list.forEach(x => { m[x.uid] = x; }); return m;
+}
 
 const mediaRoleCache = new Map();
 async function mediaRoleOf(uid) {
@@ -25933,13 +25960,13 @@ async function mediaHasTransparency(dataUrl) {
     } catch (e) { return true; }
 }
 async function mediaLog(o) { try { await MediaLog.create(o); } catch (e) {} }
-async function mediaAddPoints(uid, delta) { await Personnel.updateOne({ discord: uid }, { $inc: { points: delta } }); }
+async function mediaAddPoints(uid, delta) { await MediaProfile.updateOne({ uid }, { $inc: { points: delta } }, { upsert: true }); }
 
 app.get("/api/media/me", mediaAuth, async (req, res) => {
     try {
         const uid = req.user.id;
-        const [p, ids, notices] = await Promise.all([
-            Personnel.findOne({ discord: uid }, { points: 1, registeredName: 1 }).lean(),
+        const [pr, ids, notices] = await Promise.all([
+            MediaProfile.findOne({ uid }, { points: 1, rankName: 1 }).lean(),
             mediaMemberIds(),
             MediaNotice.find().sort({ createdAt: -1 }).limit(6).lean(),
         ]);
@@ -25947,15 +25974,31 @@ app.get("/api/media/me", mediaAuth, async (req, res) => {
             MediaSnap.countDocuments({ uid, status: "approved" }), MediaSnap.countDocuments({ uid, status: "pending" }),
             MediaSnap.countDocuments({ uid, status: "rejected" }), MediaDesign.countDocuments({}),
         ]);
-        const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, points: 1 }).lean() : [];
-        const mine = (p && p.points) || 0;
-        const rank = ps.filter(x => (x.points || 0) > mine).length + 1;
+        const profs = ids.length ? await MediaProfile.find({ uid: { $in: ids } }, { uid: 1, points: 1 }).lean() : [];
+        const mine = (pr && pr.points) || 0;
+        const rank = profs.filter(x => (x.points || 0) > mine).length + 1;
         const extra = {};
         if (req.mr.isLeader) {
-            extra.leader = { members: ids.length, pendingAll: await MediaSnap.countDocuments({ status: "pending" }), approvedAll: await MediaSnap.countDocuments({ status: "approved" }), designs };
+            const now = Date.now(), dayAgo = new Date(now - 86400000), weekAgo = new Date(now - 7 * 86400000);
+            const [pendingAll, approvedAll, today, week, apr, rej, topM, topS, cfg] = await Promise.all([
+                MediaSnap.countDocuments({ status: "pending" }), MediaSnap.countDocuments({ status: "approved" }),
+                MediaSnap.countDocuments({ createdAt: { $gte: dayAgo } }), MediaSnap.countDocuments({ createdAt: { $gte: weekAgo } }),
+                MediaSnap.countDocuments({ status: "approved", createdAt: { $gte: weekAgo } }), MediaSnap.countDocuments({ status: "rejected", createdAt: { $gte: weekAgo } }),
+                MediaSnap.aggregate([{ $match: { status: "approved", createdAt: { $gte: weekAgo } } }, { $group: { _id: "$uid", name: { $last: "$name" }, n: { $sum: 1 } } }, { $sort: { n: -1 } }, { $limit: 1 }]),
+                MediaSnap.aggregate([{ $match: { createdAt: { $gte: weekAgo } } }, { $group: { _id: "$sectorLabel", n: { $sum: 1 } } }, { $sort: { n: -1 } }, { $limit: 1 }]),
+                mediaCfg(),
+            ]);
+            extra.leader = {
+                members: ids.length, pendingAll, approvedAll, designs,
+                stats: {
+                    today, week, approved: apr, rejected: rej, rate: (apr + rej) ? Math.round(apr * 100 / (apr + rej)) : 0,
+                    topMember: topM[0] ? { name: topM[0].name, n: topM[0].n } : null, topSector: topS[0] && topS[0]._id ? { name: topS[0]._id, n: topS[0].n } : null,
+                    inactiveDays: cfg.inactiveDays,
+                },
+            };
         }
         res.json({
-            role: req.mr, name: (p && p.registeredName) || await mediaName(uid), points: mine,
+            role: req.mr, uid, name: await mediaName(uid), points: mine, rankName: (pr && pr.rankName) || "",
             stats: { approved, pending, rejected, total: approved + pending + rejected, rank, members: ids.length },
             sectors: CONFIG.SECTORS, defaultPoints: MEDIA_SNAP_DEFAULT_POINTS, designsCount: designs, extra,
             notices: notices.map(n => ({ id: String(n._id), title: n.title, body: n.body, by: n.createdByName, at: n.createdAt })),
@@ -25966,10 +26009,10 @@ app.get("/api/media/me", mediaAuth, async (req, res) => {
 app.get("/api/media/board", mediaAuth, async (req, res) => {
     try {
         const ids = await mediaMemberIds();
-        const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, registeredName: 1, rank: 1, points: 1 }).lean() : [];
+        const [pm, nm] = await Promise.all([mediaProfiles(ids), ids.length ? mediaNames(ids) : {}]);
         const cnt = await MediaSnap.aggregate([{ $match: { status: "approved" } }, { $group: { _id: "$uid", n: { $sum: 1 } } }]);
         const cm = {}; cnt.forEach(c => { cm[c._id] = c.n; });
-        const list = ps.map(p => ({ uid: p.discord, name: p.registeredName || p.discord, rank: p.rank || "", points: p.points || 0, approved: cm[p.discord] || 0 }))
+        const list = ids.map(id => ({ uid: id, name: nm[id] || id, rank: (pm[id] && pm[id].rankName) || "", points: (pm[id] && pm[id].points) || 0, approved: cm[id] || 0 }))
             .sort((a, b) => b.points - a.points).slice(0, 100);
         res.json({ list, me: req.user.id });
     } catch (e) { res.status(500).json({ error: "تعذر تحميل الترتيب" }); }
@@ -26059,7 +26102,7 @@ app.get("/api/media/snaps/mine", mediaAuth, async (req, res) => {
 app.get("/api/media/snaps/pending", mediaLeaderAuth, async (req, res) => {
     const pending = await MediaSnap.find({ status: "pending" }, { image: 0 }).sort({ createdAt: 1 }).limit(60).lean();
     const done = await MediaSnap.find({ status: { $ne: "pending" } }, { image: 0 }).sort({ reviewedAt: -1 }).limit(25).lean();
-    const m = s => ({ id: String(s._id), uid: s.uid, name: s.name, sector: s.sectorLabel, hasDesign: s.hasDesign, caption: s.caption, status: s.status, points: s.points, rejectReason: s.rejectReason, by: s.reviewedByName, at: s.createdAt });
+    const m = s => ({ id: String(s._id), uid: s.uid, name: s.name, sector: s.sectorLabel, hasDesign: s.hasDesign, caption: s.caption, status: s.status, points: s.points, week: !!s.weekPick, rejectReason: s.rejectReason, by: s.reviewedByName, at: s.createdAt });
     res.json({ pending: pending.map(m), done: done.map(m), defaultPoints: MEDIA_SNAP_DEFAULT_POINTS });
 });
 app.get("/api/media/snaps/:id/img", mediaAuth, async (req, res) => {
@@ -26080,11 +26123,11 @@ const SnapBotJob = (() => {
     sc.index({ createdAt: 1 }, { expireAfterSeconds: 86400 });
     return mongoose.model("BotJob", sc);
 })();
-async function postApprovedSnap(snapId) {
+async function postApprovedSnap(snapId, title) {
     try {
         const s = await MediaSnap.findById(snapId, { image: 1 }).lean();
         if (!s || typeof s.image !== "string" || !/^data:image\/(jpeg|png|webp);base64,/.test(s.image)) return;
-        await SnapBotJob.create({ type: "send_snap", data: { image: s.image } });
+        await SnapBotJob.create({ type: "send_snap", data: { image: s.image, title: title || null } });
     } catch (e) { console.error("❌ تجهيز السناب للبوت:", e.message); }
 }
 app.post("/api/media/snaps/:id/review", mediaLeaderAuth, async (req, res) => {
@@ -26106,35 +26149,64 @@ app.post("/api/media/snaps/:id/review", mediaLeaderAuth, async (req, res) => {
     } catch (e) { console.error("❌ media review:", e.message); res.status(500).json({ error: "تعذر تنفيذ القرار" }); }
 });
 
-// ---------- الأعضاء والنقاط ----------
+// ---------- الأعضاء والرتب ----------
 app.get("/api/media/members", mediaLeaderAuth, async (req, res) => {
     const settings = await getSettings(); const sl = secLead(settings, MEDIA_SECTOR_KEY) || {};
     const ids = Array.from(new Set((await mediaMemberIds()).concat([sl.commanderId, sl.deputyId].filter(Boolean))));
-    const ps = ids.length ? await Personnel.find({ discord: { $in: ids } }, { discord: 1, registeredName: 1, rank: 1, points: 1 }).lean() : [];
-    const pm = new Map(ps.map(p => [p.discord, p]));
+    const [pm, nm] = await Promise.all([mediaProfiles(ids), ids.length ? mediaNames(ids) : {}]);
     const grp = async st => { const a = await MediaSnap.aggregate([{ $match: { status: st } }, { $group: { _id: "$uid", n: { $sum: 1 } } }]); const o = {}; a.forEach(x => { o[x._id] = x.n; }); return o; };
     const [ap, pe] = await Promise.all([grp("approved"), grp("pending")]);
-    const list = ids.map(id => { const p = pm.get(id) || {}; return { uid: id, name: p.registeredName || id, rank: p.rank || "", points: p.points || 0, approved: ap[id] || 0, pending: pe[id] || 0, role: id === sl.commanderId ? "قائد" : id === sl.deputyId ? "نائب" : "عضو" }; })
+    const list = ids.map(id => { const p = pm[id] || {}; return { uid: id, name: nm[id] || id, rank: p.rankName || "", rankId: p.rankId || null, points: p.points || 0, approved: ap[id] || 0, pending: pe[id] || 0, role: id === sl.commanderId ? "قائد" : id === sl.deputyId ? "نائب" : "عضو" }; })
         .sort((a, b) => b.points - a.points);
     res.json({ list });
 });
-app.post("/api/media/points", mediaLeaderAuth, async (req, res) => {
+app.get("/api/media/ranks", mediaAuth, async (req, res) => {
+    const list = await MediaRank.find().sort({ order: 1, createdAt: 1 }).lean();
+    res.json({ list: list.map(r => ({ id: String(r._id), name: r.name })) });
+});
+app.post("/api/media/members/rank", mediaLeaderAuth, async (req, res) => {
     try {
-        const uid = String(req.body.uid || ""); let delta = parseInt(req.body.delta, 10);
-        if (!delta || Math.abs(delta) > 20) return res.status(400).json({ error: "عدد النقاط من 1 إلى 20 (سالب للخصم)" });
-        const kind = req.body.kind === "attendance" ? "attendance" : "manual";
-        const reason = kind === "attendance" ? "نقطة حضور" : String(req.body.reason || "").trim().slice(0, 150);
-        if (!reason) return res.status(400).json({ error: "اكتب السبب" });
-        if (uid === req.user.id) return res.status(400).json({ error: "ما تقدر تعدّل نقاط نفسك" });
-        const ids = await mediaMemberIds();
-        if (!ids.includes(uid)) return res.status(400).json({ error: "هذا مو من أعضاء الهيئة الإعلامية" });
+        const uid = String(req.body.uid || "");
+        if (uid === req.user.id) return res.status(400).json({ error: "ما تقدر تعدّل رتبة نفسك" });
+        const settings = await getSettings(); const sl = secLead(settings, MEDIA_SECTOR_KEY) || {};
+        const ids = (await mediaMemberIds()).concat([sl.commanderId, sl.deputyId].filter(Boolean));
+        if (!ids.includes(uid)) return res.status(400).json({ error: "هذا مو من الهيئة الإعلامية" });
+        let rankId = null, rankName = "";
+        if (req.body.rankId) {
+            let r = null;
+            try { r = await MediaRank.findById(String(req.body.rankId)).lean(); } catch (e) { r = null; }
+            if (!r) return res.status(400).json({ error: "الرتبة غير موجودة" });
+            rankId = String(r._id); rankName = r.name;
+        }
+        await MediaProfile.updateOne({ uid }, { $set: { rankId, rankName } }, { upsert: true });
         const byName = await mediaName(req.user.id), name = await mediaName(uid);
-        await mediaAddPoints(uid, delta);
-        pushUid(uid, { title: CONFIG.SITE_NAME, body: (delta > 0 ? "➕ أخذت " + delta + " نقطة" : "➖ انخصم عليك " + Math.abs(delta) + " نقطة") + " — " + reason, tag: "media-pts", ttl: 86400 }).catch(() => {});
-        await mediaLog({ kind, uid, name, delta, reason, byId: req.user.id, byName });
-        await logEvent({ action: delta > 0 ? "نقاط الهيئة الإعلامية (+)" : "نقاط الهيئة الإعلامية (-)", discordId: uid, actorId: req.user.id, actorTag: byName + " (الهيئة الإعلامية)", details: name + " — " + delta + " — " + reason });
+        pushUid(uid, { title: CONFIG.SITE_NAME, body: rankName ? "🏷️ رتبتك في الهيئة الإعلامية صارت: " + rankName : "🏷️ انشالت رتبتك من الهيئة الإعلامية", tag: "media-rank", ttl: 86400 }).catch(() => {});
+        await mediaLog({ kind: "rank", uid, name, reason: rankName ? "تعديل الرتبة إلى " + rankName : "إزالة الرتبة", byId: req.user.id, byName });
         res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: "تعذر تعديل النقاط" }); }
+    } catch (e) { res.status(500).json({ error: "تعذر تعديل الرتبة" }); }
+});
+app.post("/api/media/snaps/:id/week", mediaLeaderAuth, async (req, res) => {
+    try {
+        const pts = Math.max(0, Math.min(20, parseInt(req.body.points, 10) || 0));
+        const byName = await mediaName(req.user.id);
+        const s = await MediaSnap.findOneAndUpdate({ _id: req.params.id, status: "approved", weekPick: { $ne: true }, uid: { $ne: req.user.id } }, { $set: { weekPick: true } }, { new: true, projection: { image: 0 } });
+        if (!s) return res.status(409).json({ error: "السناب مو مقبول، أو انختار قبل، أو هو سنابك" });
+        if (pts) await mediaAddPoints(s.uid, pts);
+        postApprovedSnap(s._id, "**__سناب الأسبوع__**").catch(() => {});
+        pushUid(s.uid, { title: CONFIG.SITE_NAME, body: "⭐ سنابك انختار سناب الأسبوع" + (pts ? " وأخذت " + pts + " نقطة" : ""), tag: "media-week-" + s._id, ttl: 86400 }).catch(() => {});
+        await mediaLog({ kind: "week", uid: s.uid, name: s.name, delta: pts, reason: "سناب الأسبوع (" + s.sectorLabel + ")", byId: req.user.id, byName });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر اختيار سناب الأسبوع" }); }
+});
+app.post("/api/media/config", mediaLeaderAuth, async (req, res) => {
+    try {
+        const d = parseInt(req.body.inactiveDays, 10);
+        if (!Number.isInteger(d) || d < 0 || d > 30) return res.status(400).json({ error: "عدد الأيام من 0 إلى 30" });
+        await MediaConfig.updateOne({ key: "cfg" }, { $set: { inactiveDays: d } }, { upsert: true });
+        const byName = await mediaName(req.user.id);
+        await mediaLog({ kind: "config", uid: req.user.id, name: byName, reason: d ? "تنبيه الخاملين بعد " + d + " أيام" : "إيقاف تنبيه الخاملين", byId: req.user.id, byName });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر الحفظ" }); }
 });
 
 // ---------- المهام والتعاميم ----------
@@ -26174,6 +26246,54 @@ app.get("/api/owner/media-team", ensureAuth, async (req, res) => {
         { key: "members", label: "📸 أعضاء الهيئة الإعلامية", rows: await fix(members) },
     ] });
 });
+
+app.get("/api/owner/media-ranks", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const list = await MediaRank.find().sort({ order: 1, createdAt: 1 }).lean();
+    res.json({ list: list.map(r => ({ id: String(r._id), name: r.name })) });
+});
+app.post("/api/owner/media-ranks", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const name = String((req.body || {}).name || "").trim().slice(0, 30);
+    if (!name) return res.status(400).json({ error: "اكتب اسم الرتبة" });
+    const n = await MediaRank.countDocuments({});
+    if (n >= 30) return res.status(400).json({ error: "وصلت الحد الأعلى (30 رتبة)" });
+    if (await MediaRank.findOne({ name })) return res.status(409).json({ error: "الرتبة موجودة" });
+    await MediaRank.create({ name, order: n });
+    res.json({ ok: true });
+});
+app.delete("/api/owner/media-ranks/:id", ensureAuth, async (req, res) => {
+    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    try {
+        const id = String(req.params.id);
+        await MediaRank.findByIdAndDelete(id);
+        await MediaProfile.updateMany({ rankId: id }, { $set: { rankId: null, rankName: "" } });
+        res.json({ ok: true });
+    } catch (e) { res.status(400).json({ error: "تعذر الحذف" }); }
+});
+
+async function mediaInactiveSweep() {
+    try {
+        const cfg = await mediaCfg();
+        if (!cfg.inactiveDays) return;
+        const cutoff = new Date(Date.now() - cfg.inactiveDays * 86400000);
+        const st = await getSettings(); const sl = secLead(st, MEDIA_SECTOR_KEY) || {};
+        const ids = (await mediaMemberIds()).filter(i => i !== sl.commanderId && i !== sl.deputyId);
+        if (!ids.length) return;
+        const [recent, profs, accs] = await Promise.all([
+            MediaSnap.distinct("uid", { uid: { $in: ids }, createdAt: { $gte: cutoff } }),
+            MediaProfile.find({ uid: { $in: ids } }, { uid: 1, lastInactiveAt: 1 }).lean(),
+            Account.find({ uid: { $in: ids } }, { uid: 1, createdAt: 1 }).lean(),
+        ]);
+        const rs = new Set(recent), pm = {}, am = {};
+        profs.forEach(x => { pm[x.uid] = x; }); accs.forEach(x => { am[x.uid] = x; });
+        const targets = ids.filter(id => !rs.has(id) && !(pm[id] && pm[id].lastInactiveAt && pm[id].lastInactiveAt >= cutoff) && !(am[id] && am[id].createdAt && am[id].createdAt >= cutoff));
+        if (!targets.length) return;
+        await flNotifyMany(targets, { title: CONFIG.SITE_NAME, body: "📸 تنبيه: ما أرسلت سناب أمني من " + cfg.inactiveDays + " أيام", tag: "media-inactive", ttl: 86400 }).catch(() => {});
+        await MediaProfile.bulkWrite(targets.map(uid => ({ updateOne: { filter: { uid }, update: { $set: { lastInactiveAt: new Date() } }, upsert: true } })));
+    } catch (e) { console.error("❌ تنبيه الخاملين:", e.message); }
+}
+setInterval(() => { mediaInactiveSweep().catch(() => {}); }, 3600000);
 
 const MEDIA_CLIENT_JS = String.raw`
 /* ===================== 📸 الهيئة الإعلامية والسناب الأمني ===================== */
@@ -26266,9 +26386,9 @@ function mdHome() {
     mdBody('<div class="grid3"><div class="stat"><div class="num">' + m.points + '</div><div class="lbl">نقاطي</div></div>' +
         '<div class="stat"><div class="num">' + s.approved + '</div><div class="lbl">سناب مقبول</div></div>' +
         '<div class="stat"><div class="num">' + s.pending + '</div><div class="lbl">بانتظار المراجعة</div></div></div>' +
-        '<div class="card" style="margin-top:12px;"><div class="row"><div><b>🏅 ترتيبك: ' + s.rank + '</b> من ' + s.members + '<div style="font-size:12px;color:var(--muted);margin-top:3px;">تنقبل لك النقاط لما القائد يقبل سنابك</div></div>' +
+        '<div class="card" style="margin-top:12px;"><div class="row"><div><b>🏅 ترتيبك: ' + s.rank + '</b> من ' + s.members + ' • الرتبة: ' + spEsc(m.rankName || 'بدون رتبة') + '<div style="font-size:12px;color:var(--muted);margin-top:3px;">تنقبل لك النقاط لما القائد يقبل سنابك</div></div>' +
         '<div class="md-row"><button class="btn" onclick="mdGo(\'snap\')">📸 سناب جديد</button><button class="btn gray" onclick="mdGo(\'des\')">🖼️ التصاميم</button></div></div></div>' +
-        '<div class="card" style="font-size:12px;color:var(--muted);">ℹ️ الهيئة الإعلامية قطاع غير عسكري: الغياب ما ينحسب والحضور ما ينسجّل، وتاخذ نقاط على شغلك وحضورك مع القيادة.</div>' +
+        '<div class="card" style="font-size:12px;color:var(--muted);">ℹ️ الهيئة الإعلامية قطاع غير عسكري: الغياب ما ينحسب والحضور ما ينسجّل، وتاخذ نقاط على سناباتك المقبولة.</div>' +
         '<b style="font-size:13px;">📢 المهام والتعاميم</b><div style="margin-top:6px;">' + mdNoticesHtml(m.notices) + '</div>');
 }
 function mdSnap() {
@@ -26409,8 +26529,8 @@ async function mdBoard() {
     try {
         var d = await api('/api/media/board');
         mdBody('<div class="card"><b>🏆 ترتيب الهيئة الإعلامية</b><table style="margin-top:8px;"><tr><th>#</th><th>الاسم</th><th>السناب المقبول</th><th>النقاط</th></tr>' +
-            d.list.map(function (r, i) { return '<tr' + (r.uid === d.me ? ' style="background:rgba(236,72,153,.15);"' : '') + '><td>' + (i + 1) + '</td><td>' + spEsc(r.name) + '</td><td>' + r.approved + '</td><td>' + r.points + '</td></tr>'; }).join('') + '</table></div>' +
-            '<div class="card" style="font-size:12px;color:var(--muted);line-height:1.9;"><b style="color:#e5e7eb;">كيف تاخذ نقاط؟</b><br>• كل سناب أمني ينقبل من القيادة يعطيك نقاط (الافتراضي ' + MD.me.defaultPoints + ').<br>• نقطة حضور لما تحضر مع القيادة.<br>• ما ينخصم عليك شي بسبب الغياب.</div>');
+            d.list.map(function (r, i) { return '<tr' + (r.uid === d.me ? ' style="background:rgba(236,72,153,.15);"' : '') + '><td>' + (i + 1) + '</td><td>' + spEsc(r.name) + (r.rank ? ' <span style="font-size:11px;color:var(--muted);">' + spEsc(r.rank) + '</span>' : '') + '</td><td>' + r.approved + '</td><td>' + r.points + '</td></tr>'; }).join('') + '</table></div>' +
+            '<div class="card" style="font-size:12px;color:var(--muted);line-height:1.9;"><b style="color:#e5e7eb;">كيف تاخذ نقاط؟</b><br>• كل سناب أمني ينقبل من القيادة يعطيك نقاط (الافتراضي ' + MD.me.defaultPoints + ').<br>• سناب الأسبوع يعطي صاحبه نقاط إضافية.<br>• ما ينخصم عليك شي بسبب الغياب.</div>');
     } catch (e) { mdErr(e); }
 }
 async function mdDesignsMember() {
@@ -26441,32 +26561,72 @@ function mdUseDesign(sector, id) {
 
 /* ---------------- صفحات القيادة ---------------- */
 async function mdOverview() {
-    var m = MD.me, x = m.extra.leader || {};
+    var m = MD.me, x = m.extra.leader || {}, st = x.stats || {};
     var h = '<div class="grid3"><div class="stat"><div class="num">' + (x.members || 0) + '</div><div class="lbl">الأعضاء</div></div>' +
         '<div class="stat"><div class="num">' + (x.pendingAll || 0) + '</div><div class="lbl">سناب بانتظار المراجعة</div></div>' +
         '<div class="stat"><div class="num">' + (x.approvedAll || 0) + '</div><div class="lbl">سناب مقبول</div></div></div>' +
+        '<div class="card" style="margin-top:12px;"><b>📊 إحصائيات الهيئة</b><div class="grid3" style="margin-top:8px;">' +
+        '<div class="stat"><div class="num">' + (st.today || 0) + '</div><div class="lbl">سنابات اليوم</div></div>' +
+        '<div class="stat"><div class="num">' + (st.week || 0) + '</div><div class="lbl">سنابات الأسبوع</div></div>' +
+        '<div class="stat"><div class="num">' + (st.rate || 0) + '%</div><div class="lbl">نسبة القبول</div></div></div>' +
+        '<div style="font-size:13px;margin-top:10px;line-height:2;">🏆 أنشط عضو هذا الأسبوع: <b>' + (st.topMember ? spEsc(st.topMember.name) + ' (' + st.topMember.n + ')' : 'لا أحد بعد') + '</b><br>' +
+        '📍 أكثر قطاع يتصور: <b>' + (st.topSector ? spEsc(st.topSector.name) + ' (' + st.topSector.n + ')' : 'لا أحد بعد') + '</b></div></div>' +
+        '<div class="card" style="margin-top:12px;"><div class="row"><div><b>⏰ تنبيه الخاملين</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' +
+        (st.inactiveDays ? 'بعد ' + st.inactiveDays + ' أيام بدون سناب (تنبيه فقط، بدون أي إجراء)' : 'مطفي') + '</div></div>' +
+        '<button class="btn sm gray" onclick="mdInactiveOpen()">تعديل</button></div></div>' +
         '<div class="card" style="margin-top:12px;"><div class="row"><div><b>🖼️ التصاميم الموحدة: ' + (x.designs || 0) + '</b></div><div class="md-row"><button class="btn" onclick="mdGo(\'rev\')">📥 المراجعة</button><button class="btn gray" onclick="mdGo(\'des\')">🖼️ التصاميم</button></div></div></div>' +
         '<b style="font-size:13px;">📢 آخر التعاميم</b><div style="margin-top:6px;">' + mdNoticesHtml(m.notices) + '</div>';
     mdBody(h);
 }
+function mdModal(html) {
+    mdModalClose();
+    var o = document.createElement('div'); o.id = 'md-modal';
+    o.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;background:rgba(2,6,23,.78);z-index:99999;display:flex;align-items:center;justify-content:center;padding:14px;';
+    o.innerHTML = '<div class="card" style="width:100%;max-width:420px;max-height:85vh;overflow:auto;margin:0;">' + html + '</div>';
+    o.addEventListener('click', function (e) { if (e.target === o) mdModalClose(); });
+    document.body.appendChild(o);
+}
+function mdModalClose() { var o = document.getElementById('md-modal'); if (o) o.parentNode.removeChild(o); }
+function mdInactiveOpen() {
+    var cur = ((MD.me.extra.leader || {}).stats || {}).inactiveDays;
+    mdModal('<h3>⏰ تنبيه الخاملين</h3><div style="font-size:12px;color:var(--muted);margin-bottom:8px;">يوصل العضو تنبيه فقط إذا ما أرسل سناب خلال المدة، بدون أي خصم أو إجراء.</div>' +
+        '<select id="md-in-d" style="width:100%;margin-bottom:10px;">' + [[0, 'مطفي'], [2, 'بعد يومين'], [3, 'بعد 3 أيام'], [5, 'بعد 5 أيام'], [7, 'بعد أسبوع'], [14, 'بعد أسبوعين']].map(function (o) { return '<option value="' + o[0] + '"' + (o[0] === cur ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select>' +
+        '<div class="md-row"><button class="btn" onclick="mdInactiveSave()">💾 حفظ</button><button class="btn gray" onclick="mdModalClose()">إلغاء</button></div>');
+}
+async function mdInactiveSave() {
+    var d = +document.getElementById('md-in-d').value;
+    try {
+        await api('/api/media/config', { method: 'POST', body: JSON.stringify({ inactiveDays: d }) });
+        MD.me = await api('/api/media/me'); mdModalClose(); toast('✅ تم الحفظ'); mdOverview();
+    } catch (e) { toast(e.message); }
+}
 async function mdMembers() {
     try {
-        var d = await api('/api/media/members');
-        mdBody('<div class="card" style="font-size:12px;color:var(--muted);">الغياب ما ينحسب على الإعلام، والحضور ما ينسجّل. تقدر تعطي نقطة حضور أو تعدّل النقاط يدوياً.</div>' + d.list.map(function (r) {
-            return '<div class="card"><div class="row"><div><b>' + spEsc(r.name) + '</b> <span class="md-pill approved">' + r.role + '</span><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + spEsc(r.rank) + ' • سناب مقبول ' + r.approved + ' • معلّق ' + r.pending + '</div></div>' +
-                '<div class="md-row"><b style="font-size:18px;">' + r.points + '</b>' +
-                (r.role === 'عضو' ? '<button class="btn sm" onclick="mdPts(\'' + r.uid + '\',1,\'attendance\')">✅ حضر +1</button><button class="btn sm gray" onclick="mdPtsAsk(\'' + r.uid + '\')">± نقاط</button>' : '') + '</div></div></div>';
+        var d = await api('/api/media/members'); MD.mem = d.list;
+        mdBody('<div class="card" style="font-size:12px;color:var(--muted);">الرتب إعلامية ويحددها المالك، والنقاط تجي من السنابات المقبولة وسناب الأسبوع.</div>' + d.list.map(function (r) {
+            return '<div class="card"><div class="row"><div><b>' + spEsc(r.name) + '</b> <span class="md-pill approved">' + r.role + '</span><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + spEsc(r.rank || 'بدون رتبة') + ' • سناب مقبول ' + r.approved + ' • معلّق ' + r.pending + ' • ' + r.points + ' نقطة</div></div>' +
+                (r.uid === MD.me.uid ? '' : '<button class="btn sm" onclick="mdRankOpen(\'' + r.uid + '\')">✏️ تعديل رتبة</button>') + '</div></div>';
         }).join(''));
     } catch (e) { mdErr(e); }
 }
-async function mdPts(uid, delta, kind, reason) {
-    try { await api('/api/media/points', { method: 'POST', body: JSON.stringify({ uid: uid, delta: delta, kind: kind, reason: reason || '' }) }); toast('✅ تم'); mdMembers(); } catch (e) { toast(e.message); }
+async function mdRankOpen(uid) {
+    try {
+        var d = await api('/api/media/ranks');
+        var m = (MD.mem || []).filter(function (x) { return x.uid === uid; })[0] || {};
+        var h = '<h3>🏷️ رتبة ' + spEsc(m.name || '') + '</h3>';
+        if (!d.list.length) h += '<div style="color:var(--muted);font-size:13px;margin-bottom:10px;">المالك ما أضاف رتب للهيئة بعد.</div>';
+        else h += d.list.map(function (r) {
+            var on = r.id === m.rankId;
+            return '<button class="btn' + (on ? '' : ' gray') + '" style="width:100%;margin-bottom:6px;' + (on ? 'background:#16a34a;' : '') + '" onclick="mdRankSet(\'' + uid + '\',\'' + r.id + '\')">' + (on ? '✅ ' : '') + spEsc(r.name) + '</button>';
+        }).join('') + '<button class="btn gray" style="width:100%;margin-bottom:6px;" onclick="mdRankSet(\'' + uid + '\',\'\')">🚫 بدون رتبة</button>';
+        h += '<button class="btn gray" style="width:100%;" onclick="mdModalClose()">إغلاق</button>';
+        mdModal(h);
+    } catch (e) { toast(e.message); }
 }
-function mdPtsAsk(uid) {
-    var v = parseInt(prompt('عدد النقاط (موجب للإضافة، سالب للخصم — من 1 إلى 20):') || '', 10); if (!v) return;
-    var r = prompt('السبب:'); if (!r) return;
-    mdPts(uid, v, 'manual', r);
+async function mdRankSet(uid, rankId) {
+    try { await api('/api/media/members/rank', { method: 'POST', body: JSON.stringify({ uid: uid, rankId: rankId }) }); mdModalClose(); toast('✅ تم'); mdMembers(); } catch (e) { toast(e.message); }
 }
+var MD_REASONS = ['جودة الصورة ضعيفة', 'التصميم ناقص أو ما يطابق الشروط', 'القطاع غير صحيح', 'السناب مكرر', 'محتوى غير مناسب'];
 async function mdReview() {
     try {
         var d = await api('/api/media/snaps/pending');
@@ -26480,16 +26640,40 @@ async function mdReview() {
                 '<button class="btn sm" onclick="mdDecide(\'' + s.id + '\',\'approve\')">✅ قبول</button><button class="btn sm danger" onclick="mdDecide(\'' + s.id + '\',\'reject\')">❌ رفض</button></div></div>';
         }).join('');
         if (d.done.length) h += '<b style="font-size:13px;display:block;margin-top:14px;">آخر القرارات</b>' + d.done.map(function (s) {
-            return '<div class="card" style="margin-top:6px;font-size:12px;">' + spEsc(s.name) + ' — ' + spEsc(s.sector) + ' <span class="md-pill ' + s.status + '">' + (s.status === 'approved' ? 'مقبول +' + s.points : 'مرفوض') + '</span> <span style="color:var(--muted);">' + spEsc(s.by || '') + '</span></div>';
+            var canWeek = s.status === 'approved' && !s.week && s.uid !== MD.me.uid;
+            return '<div class="card" style="margin-top:6px;font-size:12px;"><div class="row"><div>' + spEsc(s.name) + ' — ' + spEsc(s.sector) + ' <span class="md-pill ' + s.status + '">' + (s.status === 'approved' ? 'مقبول +' + s.points : 'مرفوض') + '</span>' + (s.week ? ' <span class="md-pill approved">⭐ سناب الأسبوع</span>' : '') + ' <span style="color:var(--muted);">' + spEsc(s.by || '') + '</span></div>' +
+                (canWeek ? '<button class="btn sm" onclick="mdWeekOpen(\'' + s.id + '\')">⭐ سناب الأسبوع</button>' : '') + '</div></div>';
         }).join('');
         mdBody(h);
     } catch (e) { mdErr(e); }
 }
 async function mdDecide(id, action) {
-    var body = { action: action };
-    if (action === 'approve') body.points = +document.getElementById('md-pt-' + id).value;
-    else { var r = prompt('سبب الرفض:'); if (!r) return; body.reason = r; }
+    if (action === 'reject') return mdRejectOpen(id);
+    var body = { action: action, points: +document.getElementById('md-pt-' + id).value };
     try { await api('/api/media/snaps/' + id + '/review', { method: 'POST', body: JSON.stringify(body) }); toast('✅ تم'); mdReview(); } catch (e) { toast(e.message); }
+}
+function mdRejectOpen(id) {
+    mdModal('<h3>❌ سبب الرفض</h3>' + MD_REASONS.map(function (r, i) { return '<button class="btn gray" style="width:100%;margin-bottom:6px;" onclick="mdRejectSend(\'' + id + '\',' + i + ')">' + spEsc(r) + '</button>'; }).join('') +
+        '<button class="btn" style="width:100%;margin-bottom:6px;" onclick="mdRejectCustom(\'' + id + '\')">✍️ كتابة سبب</button><div id="md-rj-box"></div>' +
+        '<button class="btn gray" style="width:100%;" onclick="mdModalClose()">إلغاء</button>');
+}
+function mdRejectCustom(id) {
+    var b = document.getElementById('md-rj-box'); if (!b) return;
+    b.innerHTML = '<textarea id="md-rj-t" rows="3" maxlength="200" placeholder="اكتب السبب..." style="width:100%;margin-bottom:6px;font-size:16px;"></textarea><button class="btn danger" style="width:100%;margin-bottom:6px;" onclick="mdRejectSend(\'' + id + '\',-1)">إرسال الرفض</button>';
+}
+async function mdRejectSend(id, i) {
+    var reason = i >= 0 ? MD_REASONS[i] : String((document.getElementById('md-rj-t') || {}).value || '').trim();
+    if (!reason) { toast('اكتب السبب'); return; }
+    try { await api('/api/media/snaps/' + id + '/review', { method: 'POST', body: JSON.stringify({ action: 'reject', reason: reason }) }); mdModalClose(); toast('✅ تم'); mdReview(); } catch (e) { toast(e.message); }
+}
+function mdWeekOpen(id) {
+    mdModal('<h3>⭐ سناب الأسبوع</h3><div style="font-size:12px;color:var(--muted);margin-bottom:8px;">ينرسل بالبوت بعنوان مميز، وصاحبه ياخذ نقاط إضافية.</div><label>النقاط الإضافية</label>' +
+        '<select id="md-wk-p" style="width:100%;margin:6px 0 10px;">' + [1, 2, 3, 5, 10, 15, 20].map(function (n) { return '<option value="' + n + '"' + (n === 5 ? ' selected' : '') + '>' + n + ' نقطة</option>'; }).join('') + '</select>' +
+        '<div class="md-row"><button class="btn" onclick="mdWeekSend(\'' + id + '\')">⭐ تأكيد</button><button class="btn gray" onclick="mdModalClose()">إلغاء</button></div>');
+}
+async function mdWeekSend(id) {
+    var p = +document.getElementById('md-wk-p').value;
+    try { await api('/api/media/snaps/' + id + '/week', { method: 'POST', body: JSON.stringify({ points: p }) }); mdModalClose(); toast('✅ انرسل كسناب الأسبوع'); mdReview(); } catch (e) { toast(e.message); }
 }
 async function mdNotices() {
     try {
@@ -26665,13 +26849,35 @@ async function mdDesEdit(id) {
 async function mdDesDel(id) { if (!confirm('حذف هذا التصميم؟')) return; try { await api('/api/media/designs/' + id, { method: 'DELETE' }); mdGo('des'); } catch (e) { toast(e.message); } }
 
 /* ---------------- غرفة التحكم (المالك): هيئة الإعلام ---------------- */
+async function flCmdMediaRanks() {
+    var back = flCmdBack('flCmdMedia()', '↩ رجوع');
+    ownerModalOpen('🏷️ رتب الهيئة الإعلامية', back + '<div style="color:var(--muted);">جارِ التحميل...</div>');
+    try {
+        var d = await api('/api/owner/media-ranks', { noLock: true });
+        var h = back + '<div class="card" style="font-size:12px;color:var(--muted);margin-bottom:10px;">هذي الرتب تطلع لقائد ونائب الهيئة عند «تعديل رتبة»، وهي رتب إعلامية مستقلة عن الرتب العسكرية.</div>' +
+            '<div class="card" style="margin-bottom:10px;"><input type="text" id="mr-new" maxlength="30" placeholder="اسم الرتبة" style="width:100%;margin-bottom:8px;"><button class="btn" onclick="flCmdMediaRankAdd()">➕ إضافة رتبة</button></div>';
+        h += d.list.length ? d.list.map(function (r) {
+            return '<div class="card" style="margin-bottom:6px;"><div class="row"><b>' + spEsc(r.name) + '</b><button class="btn sm danger" onclick="flCmdMediaRankDel(\'' + r.id + '\')">🗑️ حذف</button></div></div>';
+        }).join('') : '<div style="color:var(--muted);font-size:12px;">ما فيه رتب بعد</div>';
+        ownerModalOpen('🏷️ رتب الهيئة الإعلامية', h);
+    } catch (e) { ownerModalOpen('🏷️ رتب الهيئة الإعلامية', back + '<div style="color:#f87171;">' + spEsc(e.message) + '</div>'); }
+}
+async function flCmdMediaRankAdd() {
+    var v = String((document.getElementById('mr-new') || {}).value || '').trim();
+    if (!v) { toast('اكتب اسم الرتبة'); return; }
+    try { await api('/api/owner/media-ranks', { method: 'POST', body: JSON.stringify({ name: v }), noLock: true }); flCmdMediaRanks(); } catch (e) { toast(e.message); }
+}
+async function flCmdMediaRankDel(id) {
+    if (!confirm('حذف الرتبة؟ تنشال من كل من يحملها.')) return;
+    try { await api('/api/owner/media-ranks/' + id, { method: 'DELETE', noLock: true }); flCmdMediaRanks(); } catch (e) { toast(e.message); }
+}
 async function flCmdMedia() {
     ccStopLive();
     var back = flCmdBack('flCmdOpen()', '↩ رجوع');
     ownerModalOpen('📸 هيئة الإعلام', back + '<div style="color:var(--muted);">جارِ التحميل...</div>');
     try {
         var d = await api('/api/owner/media-team', { noLock: true });
-        var h = back + '<div class="card" style="font-size:12px;color:var(--muted);margin-bottom:10px;">اختر الحساب وادخل عليه، وترجع لحسابك من زر «رجوع لحساب المالك».</div>';
+        var h = back + '<button class="btn" style="width:100%;margin-bottom:10px;" onclick="flCmdMediaRanks()">🏷️ رتب الهيئة الإعلامية</button><div class="card" style="font-size:12px;color:var(--muted);margin-bottom:10px;">اختر الحساب وادخل عليه، وترجع لحسابك من زر «رجوع لحساب المالك».</div>';
         d.groups.forEach(function (g) {
             h += '<b style="font-size:13px;">' + g.label + '</b><div style="margin:6px 0 12px;">' + (g.rows.length ? g.rows.map(function (r) {
                 return '<div class="card" style="margin-bottom:6px;"><div class="row"><div><b style="font-size:13px;">' + spEsc(r.name) + '</b><div style="font-size:11px;color:var(--muted);direction:ltr;text-align:right;">' + spEsc(r.email) + '</div></div>' + devLoginBtn(r.uid) + '</div></div>';
