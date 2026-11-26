@@ -151,7 +151,13 @@ const CONFIG = {
     FREQ_MAX_EXTRA: 5,       // عدد الترددات الإضافية اللي يسويها الكبار
     RECEPTION_CHANNEL_ID: process.env.RECEPTION_CHANNEL_ID || "1556661220998774905",
     RECEPTION_START_HOUR: 14, // الاستلام من 2 العصر
-    RECEPTION_END_HOUR: 21,   // إلى 9 الليل (بتوقيت الرياض)
+    RECEPTION_END_HOUR: 21,   // (قديم - ما عاد يُستخدم، الأوقات صارت بالشفتات تحت)
+    // شفتات الاستلام (بتوقيت الرياض) — كلها بالدقائق من بداية اليوم
+    // start..openUntil = وقت فتح الاستلام • minClose = أقرب وقت يمدي أحد يقفله • autoClose = يقفل تلقائي
+    RECEPTION_SHIFTS: [
+        { id: 1, label: "الشفت الأول",  start: 15 * 60 + 30, openUntil: 15 * 60 + 45, minClose: 17 * 60,      autoClose: 17 * 60 + 30 },
+        { id: 2, label: "الشفت الثاني", start: 20 * 60,      openUntil: 20 * 60 + 15, minClose: 21 * 60 + 30, autoClose: 22 * 60 },
+    ],
 
     WARNING_PENALTIES: [
         { id: "deduct5",          label: "خصم 5 نقاط",                        type: "points",  value: 5 },
@@ -1011,6 +1017,34 @@ async function sweepExpiredLeaves() {
 }
 setInterval(() => { sweepExpiredLeaves().catch(() => {}); }, 5 * 60 * 1000);
 setTimeout(() => { sweepExpiredLeaves().catch(() => {}); }, 20000);
+
+// ── تجديد رصيد الإجازات شهرياً: أول كل شهر الساعة 12 بالليل بتوقيت مكة المكرمة (Asia/Riyadh) ──
+// يرجّع رصيد الكل للرصيد الافتراضي (settings.leaveBalanceDefault = 10 يوم). يتسجّل الشهر في الجدول عشان ما يتكرر.
+const LeaveRenewRun = mongoose.model("LeaveRenewRun", new mongoose.Schema({
+    monthKey: { type: String, unique: true }, at: { type: Date, default: Date.now },
+    seeded: { type: Boolean, default: false }, count: { type: Number, default: 0 }, balance: { type: Number, default: 0 },
+}));
+function makkahMonthKey() {
+    const p = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Riyadh", year: "numeric", month: "2-digit" }).formatToParts(new Date());
+    return (p.find(x => x.type === "year") || {}).value + "-" + (p.find(x => x.type === "month") || {}).value;
+}
+async function renewLeaveBalancesTick() {
+    const monthKey = makkahMonthKey();
+    if (await LeaveRenewRun.exists({ monthKey })) return;
+    // أول تشغيل للنظام: نسجّل الشهر الحالي بدون تجديد (عشان ما يتصفّر الرصيد في نص الشهر) — أول تجديد فعلي مع بداية الشهر الجاي
+    const first = !(await LeaveRenewRun.exists({}));
+    try { await LeaveRenewRun.create({ monthKey, seeded: first }); } catch (e) { return; } // unique = ما يتكرر حتى لو في أكثر من نسخة شغالة
+    if (first) { console.log("🌴 نظام تجديد الإجازات الشهري شغال — أول تجديد مع بداية الشهر الجاي (" + monthKey + " تم تسجيله بدون تجديد)"); return; }
+    const settings = await getSettings();
+    const bal = settings.leaveBalanceDefault ?? CONFIG.DEFAULT_LEAVE_BALANCE;
+    const r = await Personnel.updateMany({}, { $set: { leaveBalance: bal } });
+    const count = r.matchedCount ?? r.n ?? 0;
+    await LeaveRenewRun.updateOne({ monthKey }, { $set: { count, balance: bal } });
+    await logEvent({ action: "تجديد رصيد الإجازات الشهري", actorId: "system", actorTag: "النظام", details: "شهر " + monthKey + " — رجع رصيد " + count + " عسكري إلى " + bal + " يوم" });
+    console.log("🌴 تجديد رصيد الإجازات (" + monthKey + "): " + count + " → " + bal + " يوم");
+}
+setInterval(() => { renewLeaveBalancesTick().catch(e => console.error("❌ تجديد رصيد الإجازات:", e.message)); }, 60 * 1000);
+setTimeout(() => { renewLeaveBalancesTick().catch(() => {}); }, 30000);
 // تسجيل حضور أثناء الإجازة => تنتهي الإجازة ويُخصم من الرصيد الأيام اللي قضاها فقط
 async function endLeaveOnAttendance(uid) {
     const leave = await LeaveRequest.findOne({ discord: uid, status: "approved" });
@@ -2510,6 +2544,7 @@ async function ensureExcuseAccess(req, res, next) {
     if (isHighCommand(req.user.id, st) || isSeniorAdmin(req.user.id)) { req.settings = st; return next(); }
     const r = adminRoleOf(req.user.id, st);
     if (r && r.level >= 2) { req.settings = st; req.adminRole = r; return next(); }
+    if (await isMPReviewer(req.user.id, st)) { req.settings = st; req.mpReviewer = true; return next(); }
     return res.status(403).json({ error: "ليست لديك صلاحية" });
 }
 async function adminLevelOf(uid, st) {
@@ -2624,6 +2659,13 @@ async function ensureMPMember(req, res, next) {
     next();
 }
 
+// الشرطة العسكرية (الأعضاء + القيادة + مسؤول الأفراد): صلاحية مراجعة المخالفات والإجازات والأعذار
+async function isMPReviewer(uid, settings) {
+    if (!uid) return false;
+    if (getMPRole(uid, settings) || isMPPersonnelOfficer(uid, settings)) return true;
+    return await isMilitaryPoliceMember(uid);
+}
+
 async function ensureHighCommand(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
@@ -2635,7 +2677,8 @@ async function ensureViolationsOfficer(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
     if (isViolationsOfficer(req.user.id, settings) || isSeniorAdmin(req.user.id)) { req.settings = settings; return next(); }
-    return res.status(403).json({ error: "هذا القسم لمسؤول المخالفات فقط" });
+    if (await isMPReviewer(req.user.id, settings)) { req.settings = settings; req.mpReviewer = true; return next(); }
+    return res.status(403).json({ error: "هذا القسم لمسؤول المخالفات أو الشرطة العسكرية فقط" });
 }
 
 async function ensureJuniorInMySector(req, res, discordId) {
@@ -2933,6 +2976,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         att: meAtt, attRequired: attRequired(req.user.id) && !meMedia.isMedia, pwaInstalled: mePwa,
         isReceptionOfficer: isReceptionOfficer(req.user.id, settings) || senior,
         receptionOpen: recState.open,
+        receptionShifts: CONFIG.RECEPTION_SHIFTS.map(sh => ({ id: sh.id, label: sh.label, start: sh.start, openUntil: sh.openUntil })),
         courtStaff: meCourt.staff, courtLeader: meCourt.leader, courtLocked: !!courtCaseOf(req.user.id), courtCase: courtCaseOf(req.user.id), courtSoon: courtSoonOf(req.user.id),
         discordId: req.user.id,
         discordTag: req.user.username,
@@ -2970,6 +3014,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         mpInfo,
         mpPersonnelOfficer,
         isMilitaryPolice,
+        isMPReviewer: isMilitaryPolice,
         isHighCommand: isHighCommand(req.user.id, settings),
         cyber: meCyber,
         media: meMedia,
@@ -3879,7 +3924,8 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
             || settings.adminList.includes(req.user.id)
             || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
             || !!getSectorViolOfficer(req.user.id, settings)
-            || isViolationsOfficer(req.user.id, settings) || isHighCommand(req.user.id, settings);
+            || isViolationsOfficer(req.user.id, settings) || isHighCommand(req.user.id, settings)
+            || await isMPReviewer(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
         { const d = await violationPhotoDoc(v); if (d && d.full) return res.json({ photo: d.full }); }
 
@@ -3942,7 +3988,8 @@ async function violationPhotoAllowed(req, v) {
         || settings.adminList.includes(req.user.id)
         || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
         || !!getSectorViolOfficer(req.user.id, settings)
-        || isViolationsOfficer(req.user.id, settings) || isHighCommand(req.user.id, settings);
+        || isViolationsOfficer(req.user.id, settings) || isHighCommand(req.user.id, settings)
+            || await isMPReviewer(req.user.id, settings);
 }
 async function violationPhotoDoc(v) {
     if (!(v && v.photoDb && ViolationPhoto)) return null;
@@ -3973,7 +4020,8 @@ app.get("/api/violations/:id/photo-file", ensureAuth, async (req, res) => {
             || settings.adminList.includes(req.user.id)
             || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
             || !!getSectorViolOfficer(req.user.id, settings)
-            || isViolationsOfficer(req.user.id, settings) || isHighCommand(req.user.id, settings);
+            || isViolationsOfficer(req.user.id, settings) || isHighCommand(req.user.id, settings)
+            || await isMPReviewer(req.user.id, settings);
         if (!allowed) return res.status(403).send("forbidden");
         { const d = await violationPhotoDoc(v); if (d && sendDataUrl(res, d.full)) return; }
         if (v.photoChannelId && v.photoMessageId) {
@@ -4872,10 +4920,14 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const leaderInfo = getSectorRole(req.user.id, settings);
     const poInfo = getPersonnelOfficerSector(req.user.id, settings);
-    if (!leaderInfo && !poInfo && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "ليست لديك صلاحية" });
+    const mpRev = await isMPReviewer(req.user.id, settings);
+    if (!leaderInfo && !poInfo && !isSeniorAdmin(req.user.id) && !mpRev) return res.status(403).json({ error: "ليست لديك صلاحية" });
 
     let query = { status: { $in: ["pending", "approved", "rejected", "completed"] } };
-    if (isSeniorAdmin(req.user.id) && !leaderInfo && !poInfo) {
+    if (mpRev && !isSeniorAdmin(req.user.id)) {
+        const q = (req.query.sector || "").trim();
+        if (q && CONFIG.SECTORS[q]) query.sector = q;   // الشرطة العسكرية تشوف طلبات كل القطاعات
+    } else if (isSeniorAdmin(req.user.id) && !leaderInfo && !poInfo) {
         const q = (req.query.sector || "").trim();
         if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
         query.sector = q;
@@ -4886,7 +4938,7 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
     }
 
     let list = await LeaveRequest.find(query).sort({ createdAt: -1 }).limit(100).lean();
-    if (poInfo && !leaderInfo) {
+    if (poInfo && !leaderInfo && !mpRev) {
         list = list.filter(l => isJuniorRank(l.rank));
     }
     res.json({ list });
@@ -4913,6 +4965,8 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
         approverLabel = "كبار المسؤولين";
     } else if ((await adminLevelOf(req.user.id, settings)) >= 3) {
         approverLabel = "الإدارة العليا";
+    } else if (await isMPReviewer(req.user.id, settings)) {
+        approverLabel = "الشرطة العسكرية";
     } else {
         return res.status(403).json({ error: "ليست لديك صلاحية الموافقة على هذا الطلب" });
     }
@@ -4998,6 +5052,7 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
     else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
     else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
     else if ((await adminLevelOf(req.user.id, settings)) >= 3) approverLabel = "الإدارة العليا";
+    else if (await isMPReviewer(req.user.id, settings)) approverLabel = "الشرطة العسكرية";
     else return res.status(403).json({ error: "ليست لديك صلاحية" });
 
     leave.status = "rejected";
@@ -6308,7 +6363,7 @@ app.get("/api/violations-officer/log", ensureViolationsOfficer, async (req, res)
 app.post("/api/violations-officer/violations/:id/approve", ensureViolationsOfficer, async (req, res) => {
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    const r = await approveViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)");
+    const r = await approveViolation(v, req.user.id, req.user.username + (req.mpReviewer ? " (الشرطة العسكرية)" : " (مسؤول المخالفات)"));
     if (r.blocked) return res.status(403).json({ error: r.unassigned ? "🚫 لا يمكن قبول هذي المخالفة: حساب مقدّمها بدون رتبة أو قطاع" : r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن قبول مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
@@ -6317,7 +6372,7 @@ app.post("/api/violations-officer/violations/:id/reject", ensureViolationsOffice
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    const r = await rejectViolation(v, req.user.id, req.user.username + " (مسؤول المخالفات)", reason.trim());
+    const r = await rejectViolation(v, req.user.id, req.user.username + (req.mpReviewer ? " (الشرطة العسكرية)" : " (مسؤول المخالفات)"), reason.trim());
     if (r.blocked) return res.status(403).json({ error: r.investigation ? "🔒 هذا العسكري تحت التحقيق السيبراني، لا يمكن رفض مخالفاته حالياً" : "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
@@ -11347,7 +11402,9 @@ app.post("/api/hc/att-violations/:id/decide", ensureHighCommand, async (req, res
 
 const RecDay = mongoose.model("RecDay", new mongoose.Schema({
     dayKey: { type: Number, unique: true }, openedAt: Date, openedBy: String, openedByName: String,
-    status: { type: String, default: "closed" }, // open = الاستلام مفتوح الحين • closed = انسكّر وانحسبت الغيابات
+    status: { type: String, default: "closed" }, // open = الاستلام مفتوح الحين • closed = انسكّر وانحسب الحضور
+    shift: { type: Number, default: null },       // 1 = الشفت الأول • 2 = الشفت الثاني
+    free: { type: Boolean, default: false },      // مفتوح من الكبار خارج الشفتات (بدون قيود إقفال)
     closedAt: Date, closedBy: String, closedByName: String,
 }));
 const RecRowSchema = new mongoose.Schema({
@@ -11385,11 +11442,16 @@ const EXCUSE_WINDOW_DAYS = 14;
 const EXCUSE_TYPE_LABEL = { medical: "طبي", nonmedical: "بدون طبي" };
 
 // فتح الاستلام: بس يسجّل إنه مفتوح (ما يحسب غياب الحين)
-async function openReceptionDay(openerId, openerName) {
+async function openReceptionDay(openerId, openerName, shift, free) {
     const now = new Date();
-    const dayKey = now.getTime(); // كل استلام له مفتاح خاص (يتكرر باليوم أكثر من مرة)
-    try { await RecDay.create({ dayKey, openedAt: now, openedBy: openerId, openedByName: openerName, status: "open" }); }
+    const dayKey = now.getTime(); // كل استلام له مفتاح خاص
+    try { await RecDay.create({ dayKey, openedAt: now, openedBy: openerId, openedByName: openerName, status: "open", shift: shift || null, free: !!free }); }
     catch (e) { return null; }
+    if (shift && !free) {
+        // حماية من الضغط المتكرر/السبام: لو انفتح أكثر من استلام لنفس الشفت بنفس الوقت، يبقى الأول فقط
+        const first = await RecDay.findOne({ shift, free: { $ne: true }, openedAt: { $gte: attDayStart(now) } }).sort({ openedAt: 1, dayKey: 1 }).lean();
+        if (first && first.dayKey !== dayKey) { await RecDay.deleteOne({ dayKey }).catch(() => {}); return null; }
+    }
     return { dayKey, openedAt: now };
 }
 
@@ -11466,19 +11528,8 @@ async function closeReceptionDay(closerId, closerName) {
             rows.push({ ...base, kind: "attended", gained: 1 });
             ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
             attended++;
-        } else if (noPen) {
-            continue;   // ما يسجَّل عليه شي (لا غياب ولا خصم)
-        } else if (attendedEarlier.has(a.uid)) {
-            skippedEarlier++;   // حضر استلام سابق اليوم: هذا الاستلام ما يحسب عليه
-        } else if (lv.has(a.uid)) {
-            rows.push({ ...base, kind: "leave" });
-            leave++;
-        } else {
-            const ded = 5; // خصم ثابت خمس نقاط حتى لو رصيده 0 أو 1 (يصير بالسالب)
-            rows.push({ ...base, kind: "absent", deducted: ded, excuseStatus: "none" });
-            if (ded) ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: -ded } } } });
-            absent++;
         }
+        // الغياب والإجازة ما ينحسبون هنا — الغياب ينحسب الساعة 12 بالليل (processDailyAbsences) لمن ما حضر أي شفت
     }
     if (rows.length) await RecRow.insertMany(rows, { ordered: false }).catch(e => console.error("❌ فشل حفظ حضور الاستلام:", e.message));
     if (ops.length) await Personnel.bulkWrite(ops, { ordered: false }).catch(e => console.error("❌ فشل تحديث نقاط الاستلام:", e.message));
@@ -11488,10 +11539,92 @@ async function closeReceptionDay(closerId, closerName) {
             await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "غبت عن الاستلام" + (r.deducted ? " وانخصم عليك " + r.deducted + " نقطة" : "") + " — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
         }
     })();
-    await logEvent({ action: "إغلاق استلام وحساب الغيابات", actorId: closerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-5) • إجازة " + leave + (skippedEarlier ? " • ما انحسب عليهم (حضروا استلام سابق اليوم) " + skippedEarlier : "") });
+    await logEvent({ action: "إغلاق استلام", actorId: closerId, details: "حضروا " + attended + " (+1) — الغياب ينحسب الساعة 12 بالليل" });
     return { attended, absent, leave };
 }
 
+
+// ── إقفال تلقائي للاستلام: الشفت الأول 5:30 • الشفت الثاني 10:00 ──
+async function autoCloseReceptions() {
+    const rd = await RecDay.findOne({ status: "open", free: { $ne: true }, shift: { $in: CONFIG.RECEPTION_SHIFTS.map(s => s.id) } }).sort({ openedAt: -1 }).lean();
+    if (!rd) return;
+    const sh = CONFIG.RECEPTION_SHIFTS.find(s => s.id === rd.shift);
+    if (!sh) return;
+    const sameDay = new Date(rd.openedAt).getTime() >= attDayStart(new Date()).getTime();
+    if (!sameDay || riyadhMinutes() >= sh.autoClose) {
+        const r = await closeReceptionDay("system", "تلقائي");
+        if (r) console.log("🔒 إقفال تلقائي للاستلام (" + sh.label + ") — حضروا " + r.attended);
+    }
+}
+setInterval(() => { autoCloseReceptions().catch(e => console.error("❌ الإقفال التلقائي للاستلام:", e.message)); }, 30 * 1000);
+
+// ── حساب الغياب اليومي الساعة 12 بالليل (بتوقيت الرياض) ──
+// يتغيّب من ما حضر لا الشفت الأول ولا الثاني. اللي حضر شفت واحد (أي شفت) ما ينحسب عليه غياب.
+const RecAbsRun = mongoose.model("RecAbsRun", new mongoose.Schema({
+    dayStart: { type: Number, unique: true }, at: { type: Date, default: Date.now },
+    absent: { type: Number, default: 0 }, leave: { type: Number, default: 0 }, attended: { type: Number, default: 0 }, note: String,
+}));
+async function processDailyAbsences(dayStartMs) {
+    try { await RecAbsRun.create({ dayStart: dayStartMs }); } catch (e) { return null; }   // انحسب قبل
+    const from = new Date(dayStartMs), to = new Date(dayStartMs + ATT_DAY_MS);
+    // لو في استلام ناسينه مفتوح من ذاك اليوم نسكّره أول عشان ينحسب حضوره
+    try {
+        for (let i = 0; i < 3; i++) {
+            const op = await RecDay.findOne({ status: "open", openedAt: { $gte: from, $lt: to } }).lean();
+            if (!op) break;
+            await closeReceptionDay("system", "تلقائي");
+        }
+    } catch (e) { console.error("❌ فشل إقفال استلام ناسيينه:", e.message); }
+    const days = await RecDay.find({ openedAt: { $gte: from, $lt: to }, shift: { $in: CONFIG.RECEPTION_SHIFTS.map(s => s.id) } }, { dayKey: 1, openedAt: 1 }).sort({ openedAt: 1 }).lean();
+    if (!days.length) { await RecAbsRun.updateOne({ dayStart: dayStartMs }, { $set: { note: "ما فيه استلامات بالشفتات هذا اليوم" } }); return null; }
+    const last = days[days.length - 1];
+    const dayKeys = days.map(d => d.dayKey);
+    const settings = await getSettings();
+    const [accs, ps, leaves, attRows] = await Promise.all([
+        Account.find({ status: "approved" }, { uid: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(20000).lean(),
+        Personnel.find({}, { discord: 1, registeredName: 1, unit: 1, rank: 1, sector: 1, isDismissed: 1, isBlocked: 1 }).limit(5000).maxTimeMS(20000).lean(),
+        LeaveRequest.find({ status: "approved" }, { discord: 1, startDate: 1, endDate: 1 }).limit(5000).maxTimeMS(20000).lean(),
+        RecRow.find({ dayKey: { $in: dayKeys }, kind: "attended", removedAt: null }, { uid: 1 }).limit(50000).maxTimeMS(20000).lean(),
+    ]);
+    const pm = new Map(ps.map(p => [p.discord, p]));
+    const attended = new Set(attRows.map(r => r.uid));
+    const lv = new Set(leaves.filter(l => (!l.startDate || l.startDate < to) && (!l.endDate || l.endDate > from)).map(l => l.discord));
+    const rows = [], ops = [];
+    let absent = 0, leave = 0;
+    for (const a of accs) {
+        if (a.isSenior || a.isOwner || a.tempSenior || isSeniorAdmin(a.uid) || isHighCommand(a.uid, settings)) continue;
+        const p = pm.get(a.uid);
+        if (!p || !p.registeredName || p.isDismissed || p.isBlocked) continue;
+        const key = a.sector || p.sector || null;
+        const noPen = key === "media" || !!adminRoleOf(a.uid, settings);
+        if (noPen || !p.unit || !key) continue;
+        if (attended.has(a.uid)) continue;       // حضر أي شفت = ما ينحسب عليه غياب
+        const base = { dayKey: last.dayKey, uid: a.uid, name: p.registeredName, unit: p.unit || "", rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: last.openedAt };
+        if (lv.has(a.uid)) { rows.push({ ...base, kind: "leave" }); leave++; continue; }
+        const ded = 5; // خصم ثابت خمس نقاط
+        rows.push({ ...base, kind: "absent", deducted: ded, excuseStatus: "none" });
+        ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: -ded } } } });
+        absent++;
+    }
+    if (rows.length) await RecRow.insertMany(rows, { ordered: false }).catch(e => console.error("❌ فشل حفظ غيابات اليوم:", e.message));
+    if (ops.length) await Personnel.bulkWrite(ops, { ordered: false }).catch(e => console.error("❌ فشل خصم نقاط الغياب:", e.message));
+    await RecAbsRun.updateOne({ dayStart: dayStartMs }, { $set: { absent, leave, attended: attended.size } });
+    (async () => {
+        for (const r of rows) {
+            if (r.kind !== "absent") continue;
+            await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "انحسب عليك غياب أمس (ما حضرت أي استلام) وانخصم " + r.deducted + " نقاط — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs-" + r.dayKey }).catch(() => {});
+        }
+    })();
+    await logEvent({ action: "حساب غياب اليوم (12 بالليل)", actorId: "system", details: "حضروا " + attended.size + " • غابوا " + absent + " (-5) • إجازة " + leave });
+    return { absent, leave };
+}
+async function dailyAbsenceTick() {
+    const yStart = attDayStart(new Date()).getTime() - ATT_DAY_MS;   // أمس (الساعة 12 بالليل بالرياض يبدأ يوم جديد)
+    if (await RecAbsRun.exists({ dayStart: yStart })) return;
+    await processDailyAbsences(yStart);
+}
+setInterval(() => { dailyAbsenceTick().catch(e => console.error("❌ حساب الغياب اليومي:", e.message)); }, 60 * 1000);
+setTimeout(() => { dailyAbsenceTick().catch(() => {}); }, 45 * 1000);
 
 app.get("/api/excuse/my", ensureAuth, async (req, res) => {
     const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
@@ -11890,6 +12023,16 @@ function riyadhHour() {
     const h = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Riyadh", hour: "2-digit", hour12: false }).format(new Date()), 10);
     return h % 24;
 }
+function riyadhMinutes() {
+    const p = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Riyadh", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
+    const h = parseInt((p.find(x => x.type === "hour") || {}).value, 10) % 24;
+    const m = parseInt((p.find(x => x.type === "minute") || {}).value, 10);
+    return h * 60 + m;
+}
+function fmtMin(m) {
+    const h = Math.floor(m / 60) % 12 || 12, mm = m % 60;
+    return h + ":" + (mm < 10 ? "0" : "") + mm;
+}
 let lastReceptionAt = 0;
 app.post("/api/reception/open", ensureAuth, async (req, res) => {
     const settings = await getSettings();
@@ -11897,11 +12040,25 @@ app.post("/api/reception/open", ensureAuth, async (req, res) => {
     if (!isSr && !isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
     const att = await getAttState(req.user.id);
     if (!isSr && att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
-    const h = riyadhHour();
-    if (!isSr && (h < CONFIG.RECEPTION_START_HOUR || h >= CONFIG.RECEPTION_END_HOUR)) return res.status(400).json({ error: "⏰ مو وقت الاستلام — الاستلام من الساعة 2 العصر إلى 9 الليل" });
+    const nowMin = riyadhMinutes();
     const state = await getReceptionState();
     if (state.open) return res.status(409).json({ error: "الاستلام مفتوح الحين", receptionOpen: state.open });
-    const opened = await openReceptionDay(req.user.id, await cyName(req.user.id));
+    let shiftId = null;
+    if (!isSr) {
+        const sh = CONFIG.RECEPTION_SHIFTS.find(s => nowMin >= s.start && nowMin <= s.openUntil);
+        if (!sh) {
+            // بعد انتهاء وقت فتح أي شفت (3:45 للأول / 8:15 للثاني) الزر يتقفل ويطلع له: انتهى وقت الاستلام
+            if (CONFIG.RECEPTION_SHIFTS.some(s => nowMin > s.openUntil)) return res.status(400).json({ error: "⛔ انتهى وقت الاستلام", closedWindow: true });
+            const nxt = CONFIG.RECEPTION_SHIFTS.find(s => nowMin < s.start);
+            return res.status(400).json({ error: "⏰ مو وقت فتح الاستلام — " + (nxt ? (nxt.label + " يفتح من " + fmtMin(nxt.start) + " إلى " + fmtMin(nxt.openUntil)) : "الاستلام الجاي بكرة") });
+        }
+        const done = await RecDay.findOne({ shift: sh.id, free: { $ne: true }, openedAt: { $gte: attDayStart(new Date()) } }, { _id: 1 }).lean();
+        if (done) return res.status(409).json({ error: "🚫 " + sh.label + " انفتح له استلام اليوم ولا يتكرر" });
+        shiftId = sh.id;
+    } else {
+        shiftId = nowMin < 18 * 60 ? 1 : 2;
+    }
+    const opened = await openReceptionDay(req.user.id, await cyName(req.user.id), shiftId, isSr);
     if (!opened) return res.status(409).json({ error: "الاستلام انفتح قبل شوي" });
     const r = await pushAll({ title: CONFIG.SITE_NAME, body: "استلام الان", ttl: 900, tag: "reception" });
     let discord = false;
@@ -11923,6 +12080,11 @@ app.post("/api/reception/close", ensureAuth, async (req, res) => {
     if (!isSr && att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
     const state = await getReceptionState();
     if (!state.open) return res.status(409).json({ error: "الاستلام مو مفتوح الحين", receptionOpen: null });
+    if (!isSr) {
+        const rdOpen = await RecDay.findOne({ status: "open" }).sort({ openedAt: -1 }).lean();
+        const sh = rdOpen && !rdOpen.free && CONFIG.RECEPTION_SHIFTS.find(s => s.id === rdOpen.shift);
+        if (sh && riyadhMinutes() < sh.minClose) return res.status(403).json({ error: "🔒 ما يمديك تقفل الاستلام قبل " + fmtMin(sh.minClose) + " — وبيقفل تلقائي " + fmtMin(sh.autoClose) });
+    }
     let rec = null;
     try { rec = await closeReceptionDay(req.user.id, await cyName(req.user.id)); }
     catch (e) { console.error("❌ فشل إغلاق الاستلام:", e.message); return res.status(500).json({ error: "صار خطأ وقت إغلاق الاستلام" }); }
@@ -16775,6 +16937,7 @@ function buildNav() {
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) items.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.media && ME.media.canOpen) items.push({ label: '📸 الهيئة الإعلامية', fn: 'renderMediaPanel()' });
     if (ME.isViolationsOfficer) items.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
+    if (ME.isMPReviewer) items.push({ label: '🚔 مراجعة (مخالفات • إجازات • أعذار)', fn: 'renderMPReviewPanel()' });
     if (ME.canFraud) items.push({ label: '🛡️ كشف التلاعب', fn: 'renderFraudPanel()' });
     if (ME.sectorViolOfficer) items.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
     if (ME.canAttView) items.push({ label: '🖐️ التحضير', fn: 'renderAttViewPanel()' });
@@ -16803,6 +16966,7 @@ function renderFabs() {
     if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) fabs.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.media && ME.media.canOpen) fabs.push({ label: '📸 الهيئة الإعلامية', fn: 'renderMediaPanel()' });
     if (ME.isViolationsOfficer) fabs.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
+    if (ME.isMPReviewer) fabs.push({ label: '🚔 مراجعة الشرطة العسكرية', fn: 'renderMPReviewPanel()' });
     if (ME.sectorViolOfficer) fabs.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
     if (ME.canAttView) fabs.push({ label: '🖐️ التحضير', fn: 'renderAttViewPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
@@ -21657,6 +21821,30 @@ function loadSectorAtt() {
     loadAttInto('att-view-box-sec');
 }
 
+function renderMPReviewPanel() {
+    document.getElementById('app').innerHTML =
+        '<div class="card row"><h2>🚔 مراجعة الشرطة العسكرية</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>' +
+        '<div class="tabs">' +
+            '<div class="tab active" data-t="vio" onclick="mpRvSwitch(this.dataset.t, this)">⚖️ المخالفات</div>' +
+            '<div class="tab" data-t="vlog" onclick="mpRvSwitch(this.dataset.t, this)">📜 سجل المخالفات</div>' +
+            '<div class="tab" data-t="leave" onclick="mpRvSwitch(this.dataset.t, this)">🌴 الإجازات</div>' +
+            '<div class="tab" data-t="exc" onclick="mpRvSwitch(this.dataset.t, this)">🩺 الأعذار</div>' +
+        '</div>' +
+        '<div id="vo-content"></div><div id="sector-content" style="display:none;"></div><div id="hc-content" style="display:none;"></div>';
+    mpRvSwitch('vio', null);
+}
+function mpRvSwitch(t, el) {
+    document.querySelectorAll('.tab').forEach(function (x) { x.classList.remove('active'); });
+    if (el) el.classList.add('active');
+    var vo = document.getElementById('vo-content'), sc = document.getElementById('sector-content'), hc = document.getElementById('hc-content');
+    if (vo) vo.style.display = (t === 'vio' || t === 'vlog') ? '' : 'none';
+    if (sc) sc.style.display = t === 'leave' ? '' : 'none';
+    if (hc) hc.style.display = t === 'exc' ? '' : 'none';
+    if (t === 'vio') { voTab = 'pending'; loadVOPending(); }
+    else if (t === 'vlog') { voTab = 'log'; loadVOLog(); }
+    else if (t === 'leave') { sectorPanelTab = 'leave'; loadSectorLeavePending(); }
+    else { hcTab = 'exc'; loadHCExcuses(); }
+}
 function renderViolationsOfficerPanel() {
     voTab = 'pending';
     document.getElementById('app').innerHTML =
@@ -24913,10 +25101,29 @@ function flAttCardHtml() {
 }
 // ملاحظة: هنا التردد — زر التردد محذوف من الصفحة الرئيسية، والكود باقي ما انحذف
 function flFreqBtnHtml() { return '<button class="btn sm" onclick="flFreqOpen()">📻 تردد القطاعات المشتركة</button>'; }
+function flRcMin() {
+    var p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Riyadh', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(new Date());
+    var h = parseInt((p.find(function (x) { return x.type === 'hour'; }) || {}).value, 10) % 24;
+    var m = parseInt((p.find(function (x) { return x.type === 'minute'; }) || {}).value, 10);
+    return h * 60 + m;
+}
+function flRcFmt(m) { var h = Math.floor(m / 60) % 12 || 12, mm = m % 60; return h + ':' + (mm < 10 ? '0' : '') + mm; }
+// وقت فتح الاستلام: بعد انتهاء وقت الشفت (3:45 / 8:15) الزر يتقفل. الكبار مستثنين.
+function flRcWindow() {
+    if (!ME || ME.isSeniorAdmin) return { ok: true };
+    var sh = ME.receptionShifts || [];
+    if (!sh.length) return { ok: true };
+    var n = flRcMin();
+    for (var i = 0; i < sh.length; i++) if (n >= sh[i].start && n <= sh[i].openUntil) return { ok: true };
+    for (var j = 0; j < sh.length; j++) if (n > sh[j].openUntil) return { ok: false, msg: '⛔ انتهى وقت الاستلام' };
+    return { ok: false, msg: '⏰ مو وقت فتح الاستلام — ' + sh[0].label + ' يفتح من ' + flRcFmt(sh[0].start) + ' إلى ' + flRcFmt(sh[0].openUntil) };
+}
+function flReceptionLocked() { toast(flRcWindow().msg || '⛔ انتهى وقت الاستلام'); }
 function flRcBtnHtml() {
     if (!ME || !ME.isReceptionOfficer) return '';
     if (!ME.isSeniorAdmin && !(ME.att && ME.att.status === 'in')) return '';
     if (ME.receptionOpen) return '<button class=\"btn sm danger\" onclick=\"flReceptionClose()\">🔒 إغلاق الاستلام</button>';
+    if (!flRcWindow().ok) return '<button class=\"btn sm gray\" style=\"opacity:.6;\" onclick=\"flReceptionLocked()\">🔒 فتح استلام</button>';
     return '<button class=\"btn sm\" onclick=\"flReceptionOpen()\">🎤 فتح استلام</button>';
 }
 function flRcRefresh() {
@@ -24925,6 +25132,7 @@ function flRcRefresh() {
     var h = flRcBtnHtml();
     if (w.innerHTML !== h) w.innerHTML = h;
 }
+setInterval(function () { try { flRcRefresh(); } catch (e) {} }, 15000);
 function flAfterBtnsHtml() {
     var h = '';
     if (ME && ME.att && ME.att.status === 'in') {
@@ -24934,7 +25142,7 @@ function flAfterBtnsHtml() {
     return h;
 }
 async function flReceptionOpen() {
-    if (!(await confirmModal('تبي تفتح الاستلام وترسل إشعار للجميع؟ (الغيابات تنحسب لما تسكّر الاستلام)'))) return;
+    if (!(await confirmModal('تبي تفتح الاستلام وترسل إشعار للجميع؟ (ما تقدر تسكّره قبل وقت الإقفال المحدد، وبيتسكّر تلقائي)'))) return;
     try {
         var r = await api('/api/reception/open', { method: 'POST', body: '{}' });
         ME.receptionOpen = r.receptionOpen || { openedAt: new Date().toISOString() };
@@ -24946,12 +25154,12 @@ async function flReceptionOpen() {
     }
 }
 async function flReceptionClose() {
-    if (!(await confirmModal('تسكّر الاستلام؟ بيتم حساب الحضور والغياب الحين وخصم نقاط الغايبين.'))) return;
+    if (!(await confirmModal('تسكّر الاستلام؟ بيتم حساب الحضور الحين (الغياب ينحسب الساعة 12 بالليل).'))) return;
     try {
         var r = await api('/api/reception/close', { method: 'POST', body: '{}' });
         ME.receptionOpen = null;
         flRcRefresh();
-        toast('🔒 انسكّر الاستلام — حضروا ' + r.rec.attended + ' / غابوا ' + r.rec.absent + ' / إجازة ' + r.rec.leave);
+        toast('🔒 انسكّر الاستلام — حضروا ' + r.rec.attended + ' (الغياب ينحسب الساعة 12 بالليل)');
     } catch (e) {
         if (e.message && /مو مفتوح|انسكّر/.test(e.message)) { try { var f = await api('/api/me'); ME = f; } catch (x) {} flRcRefresh(); }
         toast(e.message);
